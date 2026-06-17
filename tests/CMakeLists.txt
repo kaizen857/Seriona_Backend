@@ -5,9 +5,14 @@ add_executable(seriona_audio_contract_tests
 add_executable(seriona_audio_fixture_tests
   audio/audio_fixture_tests.cpp
 )
+add_executable(seriona_playback_state_machine_tests
+  audio/playback_state_machine_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
+)
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_playback_state_machine_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -21,6 +26,10 @@ target_include_directories(seriona_audio_fixture_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
 )
+target_include_directories(seriona_playback_state_machine_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_link_libraries(seriona_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -33,11 +42,17 @@ target_link_libraries(seriona_audio_fixture_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
 )
+target_link_libraries(seriona_playback_state_machine_tests PRIVATE
+  seriona_third_party_headers
+)
 
 seriona_enable_warnings(seriona_tests)
 seriona_enable_warnings(seriona_audio_contract_tests)
 seriona_enable_warnings(seriona_audio_fixture_tests)
+seriona_enable_warnings(seriona_playback_state_machine_tests)
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
 add_test(NAME seriona.audio_contract COMMAND seriona_audio_contract_tests)
 add_test(NAME seriona.audio_fixture COMMAND seriona_audio_fixture_tests)
+add_test(NAME seriona.playback_state_machine COMMAND seriona_playback_state_machine_tests --test-case-exclude=*cancellation*)
+add_test(NAME seriona.playback_state_machine_cancellation COMMAND seriona_playback_state_machine_tests --test-case=*cancellation*)
