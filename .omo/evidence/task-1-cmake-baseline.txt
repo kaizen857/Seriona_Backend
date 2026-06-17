@@ -1,0 +1,11 @@
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+[100%] Built target seriona_tests
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+    Start 1: seriona.doctest.placeholder
+1/1 Test #1: seriona.doctest.placeholder ......   Passed    0.05 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   0.05 sec
