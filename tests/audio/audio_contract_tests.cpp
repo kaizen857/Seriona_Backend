@@ -47,15 +47,14 @@ TEST_CASE("audio contract symbols are value types") {
 TEST_CASE("backend event preserves payload and version semantics") {
   const auto request = TrackPlaybackRequest{
       .trackId = "track-1",
-      .filePath = "music/track-1.flac",
+      .filePath = "music/track-1.wav",
       .title = "Track One",
-      .artist = "Seriona",
       .offset = std::chrono::milliseconds{250},
       .duration = std::chrono::milliseconds{180000},
       .sampleRate = 48000,
       .bitDepth = 24,
       .channels = 2,
-      .format = std::string{"flac"},
+      .format = std::string{"wav"},
   };
 
   const auto clock = makeClock("track-1", 17, std::chrono::milliseconds{1250});
