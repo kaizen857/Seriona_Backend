@@ -16,7 +16,6 @@ TrackPlaybackRequest request(std::string id = "track-1") {
   track.trackId = std::move(id);
   track.filePath = "fixture.wav";
   track.title = "Fixture";
-  track.artist = "Seriona";
   return track;
 }
 
