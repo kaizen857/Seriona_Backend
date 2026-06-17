@@ -8,3 +8,5 @@
 2026-06-17：系统环境同时提供了 `/usr/include/doctest/doctest.h` 与 `/usr/include/miniaudio/miniaudio.h`，后续以系统安装源文件作为可追溯快照复制到 `third_party/`。
 
 2026-06-17：T2 已开始定义音频公共契约，新增 `inc/seriona/audio/audio_contracts.h`，把 `AudioPlayer`、`AudioPlaybackService`、`TrackPlaybackRequest`、`AudioOutputConfig`、`AudioDeviceFormat`、`PlaybackClockSnapshot`、`PlaybackEvent`、`PlaybackState`、`PlaybackErrorCode`、`BackendEvent` 和 `BackendEventSink` 收敛到同一公共边界。
+
+2026-06-18：T2 在重启/中断后已重新复验，`seriona_audio_contract_tests` 与 `audio_contract` 通过，公共边界 grep 仍为空。

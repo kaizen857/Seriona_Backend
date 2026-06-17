@@ -1,8 +1,8 @@
 [100%] Built target seriona_audio_contract_tests
-ib)/Seriona_Backend/build
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
     Start 2: seriona.audio_contract
-1/1 Test #2: seriona.audio_contract ...........   Passed    0.04 sec
+1/1 Test #2: seriona.audio_contract ...........   Passed    0.03 sec
 
 100% tests passed, 0 tests failed out of 1
 
-Total Test time (real) =   0.04 sec
+Total Test time (real) =   0.03 sec
