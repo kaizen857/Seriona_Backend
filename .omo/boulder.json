@@ -1,0 +1,75 @@
+{
+  "schema_version": 2,
+  "active_work_id": "audio-player-module-4ff21ec8",
+  "works": {
+    "audio-player-module-3bdc4128": {
+      "work_id": "audio-player-module-3bdc4128",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/audio-player-module.md",
+      "plan_name": "audio-player-module",
+      "status": "active",
+      "started_at": "2026-06-17T12:42:12.991Z",
+      "updated_at": "2026-06-17T12:42:12.991Z",
+      "session_ids": [
+        "opencode:ses_12cfe860affeW2Q6wG169HG60N"
+      ],
+      "session_origins": {
+        "opencode:ses_12cfe860affeW2Q6wG169HG60N": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "audio-player-module-4ff21ec8": {
+      "work_id": "audio-player-module-4ff21ec8",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/audio-player-module.md",
+      "plan_name": "audio-player-module",
+      "status": "active",
+      "started_at": "2026-06-17T12:42:13.000Z",
+      "updated_at": "2026-06-17T12:44:28.222Z",
+      "session_ids": [
+        "opencode:ses_12cfe860affeW2Q6wG169HG60N"
+      ],
+      "session_origins": {
+        "opencode:ses_12cfe860affeW2Q6wG169HG60N": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:0": {
+          "task_key": "todo:0",
+          "task_label": "0",
+          "task_title": "Check required system dependencies",
+          "session_id": "opencode:ses_12a6420d5ffebqjGLT3QyybnQi",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-low",
+          "updated_at": "2026-06-17T12:44:28.222Z",
+          "started_at": "2026-06-17T12:44:28.222Z",
+          "status": "running"
+        }
+      }
+    }
+  },
+  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/audio-player-module.md",
+  "started_at": "2026-06-17T12:42:13.000Z",
+  "status": "active",
+  "updated_at": "2026-06-17T12:44:28.222Z",
+  "session_ids": [
+    "opencode:ses_12cfe860affeW2Q6wG169HG60N"
+  ],
+  "session_origins": {
+    "opencode:ses_12cfe860affeW2Q6wG169HG60N": "direct"
+  },
+  "plan_name": "audio-player-module",
+  "task_sessions": {
+    "todo:0": {
+      "task_key": "todo:0",
+      "task_label": "0",
+      "task_title": "Check required system dependencies",
+      "session_id": "opencode:ses_12a6420d5ffebqjGLT3QyybnQi",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-06-17T12:44:28.222Z",
+      "started_at": "2026-06-17T12:44:28.222Z",
+      "status": "running"
+    }
+  },
+  "agent": "atlas"
+}
