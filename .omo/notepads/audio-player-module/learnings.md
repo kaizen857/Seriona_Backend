@@ -6,3 +6,5 @@
 2026-06-17：第三方头已切换为上游官方快照：`doctest` 取自 `v2.5.2`，`miniaudio` 取自 `master` 的当前单头；`third_party/` 继续保留显式 include 路径契约。
 
 2026-06-17：系统环境同时提供了 `/usr/include/doctest/doctest.h` 与 `/usr/include/miniaudio/miniaudio.h`，后续以系统安装源文件作为可追溯快照复制到 `third_party/`。
+
+2026-06-17：T2 已开始定义音频公共契约，新增 `inc/seriona/audio/audio_contracts.h`，把 `AudioPlayer`、`AudioPlaybackService`、`TrackPlaybackRequest`、`AudioOutputConfig`、`AudioDeviceFormat`、`PlaybackClockSnapshot`、`PlaybackEvent`、`PlaybackState`、`PlaybackErrorCode`、`BackendEvent` 和 `BackendEventSink` 收敛到同一公共边界。
