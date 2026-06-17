@@ -10,3 +10,4 @@
 2026-06-17：T2 已开始定义音频公共契约，新增 `inc/seriona/audio/audio_contracts.h`，把 `AudioPlayer`、`AudioPlaybackService`、`TrackPlaybackRequest`、`AudioOutputConfig`、`AudioDeviceFormat`、`PlaybackClockSnapshot`、`PlaybackEvent`、`PlaybackState`、`PlaybackErrorCode`、`BackendEvent` 和 `BackendEventSink` 收敛到同一公共边界。
 
 2026-06-18：T2 在重启/中断后已重新复验，`seriona_audio_contract_tests` 与 `audio_contract` 通过，公共边界 grep 仍为空。
+2026-06-18：T3 采用测试时生成的 WAV fixture 方案，`seriona.audio_fixture` 已通过；生成文件落在构建树下的 `generated_audio_fixtures/`，不需要提交二进制素材。

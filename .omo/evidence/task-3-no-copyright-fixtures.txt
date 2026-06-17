@@ -1,0 +1,5 @@
+rg: tests/fixtures: No such file or directory (os error 2)
+rg: tools: No such file or directory (os error 2)
+tests/audio/audio_contract_tests.cpp:50:      .filePath = "music/track-1.flac",
+tests/audio/audio_contract_tests.cpp:52:      .artist = "Seriona",
+tests/audio/audio_contract_tests.cpp:58:      .format = std::string{"flac"},
