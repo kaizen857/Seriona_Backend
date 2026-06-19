@@ -36,3 +36,5 @@
 2026-06-19：T15 新增可选平台原型 harness `seriona_miniaudio_platform_probe`，通过 `SERIONA_BUILD_TOOLS=ON` 才配置 `tools/`，且目标使用 `EXCLUDE_FROM_ALL`，不会进入默认 build 或默认 CTest。harness 默认 `--list-only`，只做 miniaudio 设备枚举和 stopped `ma_device_init()` 格式探测，不调用 `ma_device_start()`；无设备或枚举失败时打印 `skip_reason` 并正常退出。已验证默认 `cmake --build build && ctest --test-dir build --output-on-failure` 24/24 通过，平台原型在本机枚举到 4 个播放设备并输出 default format，证据见 `.omo/evidence/task-15-default-tests.txt` 与 `.omo/evidence/task-15-platform-prototype.txt`。
 
 2026-06-19：T14 文档已补齐。`docs/audio-player.md` 记录了 `AudioPlayer` / `AudioPlaybackService` 命名边界、FFmpeg 与 `miniaudio` 的职责切分、SPSC 固定容量队列、实时回调禁止事项、默认生成 fixture 策略，以及仅将 `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON`、`cmake --build build`、`ctest --test-dir build --output-on-failure` 视为已验证命令；平台硬件 harness 仅作为 T15 的非默认依赖项。
+
+2026-06-19：F2 final-review blocker 修复确认：`FfmpegAudioFrame::sampleBytes` 的公共契约必须保持 packed/interleaved PCM，因为 `FfmpegFilterPipeline` 使用 packed FFmpeg sample format 并复制到 `AVFrame::data[0]`。`FfmpegAudioSource` 现在对 planar FFmpeg 解码帧按 sample→channel 顺序交错输出，测试新增 stereo planar PCM fixture 验证 `L0,R0,L1,R1` 顺序，避免 mono fixture 漏掉 plane-concatenation 问题。

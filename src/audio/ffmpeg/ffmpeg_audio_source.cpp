@@ -117,23 +117,46 @@ std::chrono::microseconds framePosition(const AVFrame& frame, const AVStream& st
   return std::chrono::microseconds{av_rescale_q(timestamp, stream.time_base, AVRational{1, 1'000'000})};
 }
 
+int frameChannelCount(const AVFrame& frame) {
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+  return std::max(0, frame.ch_layout.nb_channels);
+#else
+  return std::max(0, frame.channels);
+#endif
+}
+
 std::vector<std::uint8_t> copyFrameBytes(const AVFrame& frame) {
-  const auto sampleCount = frame.nb_samples;
+  const auto sampleCount = std::max(0, frame.nb_samples);
   const auto format = static_cast<AVSampleFormat>(frame.format);
-  const auto planes = av_sample_fmt_is_planar(format) != 0 ? frame.ch_layout.nb_channels : 1;
-  const auto bytesPerSample = av_get_bytes_per_sample(format);
-  const auto planeSamples = av_sample_fmt_is_planar(format) != 0 ? sampleCount : sampleCount * frame.ch_layout.nb_channels;
-  const auto planeBytes = std::max(0, planeSamples * bytesPerSample);
+  const auto channels = frameChannelCount(frame);
+  const auto bytesPerSample = std::max(0, av_get_bytes_per_sample(format));
+  const bool planar = av_sample_fmt_is_planar(format) != 0;
+  const auto expectedBytes = sampleCount * channels * bytesPerSample;
 
   std::vector<std::uint8_t> bytes;
-  bytes.reserve(static_cast<std::size_t>(std::max(0, planes) * planeBytes));
+  if (expectedBytes <= 0) {
+    return bytes;
+  }
 
-  for (int plane = 0; plane < planes; ++plane) {
-    if (frame.extended_data[plane] == nullptr || planeBytes <= 0) {
-      continue;
+  bytes.reserve(static_cast<std::size_t>(expectedBytes));
+
+  if (!planar) {
+    if (frame.extended_data[0] == nullptr) {
+      return bytes;
     }
-    const auto* begin = frame.extended_data[plane];
-    bytes.insert(bytes.end(), begin, begin + planeBytes);
+    const auto* begin = frame.extended_data[0];
+    bytes.insert(bytes.end(), begin, begin + expectedBytes);
+    return bytes;
+  }
+
+  for (int sample = 0; sample < sampleCount; ++sample) {
+    for (int channel = 0; channel < channels; ++channel) {
+      if (frame.extended_data[channel] == nullptr) {
+        return {};
+      }
+      const auto* begin = frame.extended_data[channel] + (sample * bytesPerSample);
+      bytes.insert(bytes.end(), begin, begin + bytesPerSample);
+    }
   }
 
   return bytes;
@@ -288,7 +311,7 @@ private:
     const auto* stream = format_->streams[audioStreamIndex_];
     FfmpegAudioFrame decoded{};
     decoded.sampleRate = static_cast<std::uint32_t>(std::max(0, frame_->sample_rate));
-    decoded.channelCount = static_cast<std::uint16_t>(std::clamp(frame_->ch_layout.nb_channels, 0, static_cast<int>(std::numeric_limits<std::uint16_t>::max())));
+    decoded.channelCount = static_cast<std::uint16_t>(std::clamp(frameChannelCount(*frame_), 0, static_cast<int>(std::numeric_limits<std::uint16_t>::max())));
     decoded.sampleFormat = mapSampleFormat(static_cast<AVSampleFormat>(frame_->format));
     decoded.pts = frame_->best_effort_timestamp == AV_NOPTS_VALUE ? frame_->pts : frame_->best_effort_timestamp;
     decoded.position = framePosition(*frame_, *stream);
