@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
 option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
+option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,4 +36,8 @@ if(SERIONA_BUILD_TESTS)
   include(CTest)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(SERIONA_BUILD_TOOLS)
+  add_subdirectory(tools)
 endif()

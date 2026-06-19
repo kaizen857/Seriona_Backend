@@ -1,0 +1,9 @@
+add_executable(seriona_miniaudio_platform_probe EXCLUDE_FROM_ALL
+  miniaudio_platform_probe.cpp
+)
+
+target_link_libraries(seriona_miniaudio_platform_probe PRIVATE
+  seriona_third_party_headers
+)
+
+seriona_enable_warnings(seriona_miniaudio_platform_probe)
