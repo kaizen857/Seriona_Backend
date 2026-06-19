@@ -32,6 +32,14 @@ add_executable(seriona_playback_state_machine_tests
   audio/playback_state_machine_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
 )
+add_executable(seriona_audio_event_dispatcher_tests
+  audio/audio_event_dispatcher_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
+)
+add_executable(seriona_audio_event_dispatcher_shutdown_tests
+  audio/audio_event_dispatcher_shutdown_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
+)
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -41,6 +49,8 @@ target_compile_definitions(seriona_pcm_buffer_queue_tests PRIVATE DOCTEST_CONFIG
 target_compile_definitions(seriona_audio_output_device_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_clock_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_state_machine_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_event_dispatcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_event_dispatcher_shutdown_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -79,6 +89,14 @@ target_include_directories(seriona_playback_state_machine_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_audio_event_dispatcher_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_audio_event_dispatcher_shutdown_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_link_libraries(seriona_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -111,6 +129,12 @@ target_link_libraries(seriona_playback_clock_tests PRIVATE
 target_link_libraries(seriona_playback_state_machine_tests PRIVATE
   seriona_third_party_headers
 )
+target_link_libraries(seriona_audio_event_dispatcher_tests PRIVATE
+  seriona_third_party_headers
+)
+target_link_libraries(seriona_audio_event_dispatcher_shutdown_tests PRIVATE
+  seriona_third_party_headers
+)
 
 seriona_enable_warnings(seriona_tests)
 seriona_enable_warnings(seriona_audio_contract_tests)
@@ -121,6 +145,8 @@ seriona_enable_warnings(seriona_pcm_buffer_queue_tests)
 seriona_enable_warnings(seriona_audio_output_device_tests)
 seriona_enable_warnings(seriona_playback_clock_tests)
 seriona_enable_warnings(seriona_playback_state_machine_tests)
+seriona_enable_warnings(seriona_audio_event_dispatcher_tests)
+seriona_enable_warnings(seriona_audio_event_dispatcher_shutdown_tests)
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
 add_test(NAME seriona.audio_contract COMMAND seriona_audio_contract_tests)
@@ -136,3 +162,5 @@ add_test(NAME seriona.audio_output_device COMMAND seriona_audio_output_device_te
 add_test(NAME seriona.playback_clock COMMAND seriona_playback_clock_tests)
 add_test(NAME seriona.playback_state_machine COMMAND seriona_playback_state_machine_tests --test-case-exclude=*cancellation*)
 add_test(NAME seriona.playback_state_machine_cancellation COMMAND seriona_playback_state_machine_tests --test-case=*cancellation*)
+add_test(NAME seriona.audio_event_dispatcher COMMAND seriona_audio_event_dispatcher_tests)
+add_test(NAME seriona.audio_event_dispatcher_shutdown COMMAND seriona_audio_event_dispatcher_shutdown_tests)

@@ -1,0 +1,9 @@
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+    Start 15: seriona.audio_event_dispatcher
+1/2 Test #15: seriona.audio_event_dispatcher ............   Passed    0.00 sec
+    Start 16: seriona.audio_event_dispatcher_shutdown
+2/2 Test #16: seriona.audio_event_dispatcher_shutdown ...   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   0.00 sec
