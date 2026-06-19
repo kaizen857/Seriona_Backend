@@ -1,0 +1,7 @@
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+    Start 17: seriona.audio_player_single_track
+1/1 Test #17: seriona.audio_player_single_track ...   Passed    0.05 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   0.05 sec

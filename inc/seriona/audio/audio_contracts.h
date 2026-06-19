@@ -187,7 +187,7 @@ public:
 
 class AudioPlayer {
 public:
-  AudioPlayer() = default;
+  AudioPlayer();
   explicit AudioPlayer(std::shared_ptr<AudioPlaybackService> service);
 
   void setPlaybackService(std::shared_ptr<AudioPlaybackService> service);
