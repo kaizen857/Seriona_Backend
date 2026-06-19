@@ -1,0 +1,9 @@
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+    Start 18: seriona.output_format_negotiation
+1/2 Test #18: seriona.output_format_negotiation ...........   Passed    0.03 sec
+    Start 19: seriona.output_format_negotiation_failure
+2/2 Test #19: seriona.output_format_negotiation_failure ...   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   0.07 sec

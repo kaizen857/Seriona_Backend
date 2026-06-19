@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -38,6 +39,54 @@ std::uint32_t bufferFrameCount(std::uint32_t sampleRate, std::chrono::millisecon
   const auto durationMs = std::max<std::chrono::milliseconds::rep>(duration.count(), 1);
   const auto frameCount = (static_cast<std::uint64_t>(sampleRate) * static_cast<std::uint64_t>(durationMs)) / 1000U;
   return static_cast<std::uint32_t>(std::max<std::uint64_t>(frameCount, 1U));
+}
+
+std::string outputModeName(AudioOutputMode mode) {
+  switch (mode) {
+  case AudioOutputMode::Direct:
+    return "direct";
+  case AudioOutputMode::Mixed:
+    return "mixed";
+  }
+
+  return "unknown";
+}
+
+std::string sampleFormatName(AudioSampleFormat format) {
+  switch (format) {
+  case AudioSampleFormat::Int16:
+    return "int16";
+  case AudioSampleFormat::Int24:
+    return "int24";
+  case AudioSampleFormat::Int32:
+    return "int32";
+  case AudioSampleFormat::Float32:
+    return "float32";
+  case AudioSampleFormat::Unknown:
+    return "unknown";
+  }
+
+  return "unknown";
+}
+
+std::string describeTarget(AudioOutputMode mode, const FfmpegFilterTargetFormat& target) {
+  std::ostringstream description;
+  description << outputModeName(mode) << ' ' << target.sampleRate << " Hz " << sampleFormatName(target.sampleFormat)
+              << ' ' << target.channelCount << " ch";
+  return description.str();
+}
+
+bool sameTarget(const FfmpegFilterTargetFormat& left, const FfmpegFilterTargetFormat& right) {
+  return left.sampleRate == right.sampleRate && left.sampleFormat == right.sampleFormat &&
+         left.channelCount == right.channelCount;
+}
+
+AudioOutputConfig explicitConfig(AudioOutputConfig config, AudioOutputMode mode, const FfmpegFilterTargetFormat& target) {
+  config.outputMode = mode;
+  config.targetSampleRate = target.sampleRate;
+  config.targetSampleFormat = target.sampleFormat;
+  config.targetChannelCount = target.channelCount;
+  return config;
 }
 
 }
@@ -76,37 +125,36 @@ public:
     }
 
     const auto& streamInfo = source_->streamInfo();
-    const auto target = targetFormat(streamInfo);
-    const auto sampleBytes = bytesPerSample(target.sampleFormat);
-    if (target.sampleRate == 0U || target.channelCount == 0U || sampleBytes == 0U) {
-      fail(PlaybackErrorCode::FormatNegotiationFailed, "invalid output target format", "sample rate, channel count, and sample bytes must be nonzero");
+    std::string negotiationFailure;
+    const auto negotiation = negotiateOutput(streamInfo, negotiationFailure);
+    if (!negotiation) {
+      fail(PlaybackErrorCode::FormatNegotiationFailed,
+           "failed to negotiate an output format",
+           negotiationFailure.empty() ? "no output format candidates were accepted" : negotiationFailure);
       return;
     }
+    currentTarget_ = negotiation->target;
 
-    if (const auto error = pipeline_->configure(target)) {
+    if (const auto error = pipeline_->configure(currentTarget_)) {
+      device_.uninitialize();
+      queue_.reset();
       fail(error->code, error->message, error->detail);
       return;
     }
 
-    const auto capacityFrames = bufferFrameCount(target.sampleRate, config_.bufferDuration);
-    queue_ = std::make_unique<PcmBufferQueue>(PcmBufferQueueConfig{capacityFrames, target.channelCount * sampleBytes});
-    clock_.reset(request.trackId, target.sampleRate, request.offset.value_or(std::chrono::milliseconds{0}));
+    clock_.reset(request.trackId, currentTarget_.sampleRate, request.offset.value_or(std::chrono::milliseconds{0}));
     observedQueueCounters_ = {};
 
-    AudioOutputDeviceOpenRequest openRequest{};
-    openRequest.config = config_;
-    openRequest.sampleFormat = target.sampleFormat;
-    openRequest.sampleRate = target.sampleRate;
-    openRequest.channelCount = target.channelCount;
-    openRequest.bufferFrames = std::min<std::uint32_t>(capacityFrames, 512U);
-    openRequest.pcmQueue = queue_.get();
-
-    if (!device_.initialize(openRequest)) {
-      fail(PlaybackErrorCode::DeviceUnavailable, "failed to initialize audio output device", "AudioOutputDeviceBackend::initialize returned false");
-      return;
+    if (!negotiation->fallbackReason.empty()) {
+      dispatcher_.dispatch(BackendEventType::OutputModeFallback,
+                           OutputModeFallback{config_,
+                                              negotiation->effectiveConfig,
+                                              negotiation->deviceFormat,
+                                              negotiation->fallbackReason});
     }
 
-    dispatcher_.dispatch(BackendEventType::OutputFormatChanged, OutputFormatChanged{config_, device_.currentFormat()});
+    dispatcher_.dispatch(BackendEventType::OutputFormatChanged,
+                         OutputFormatChanged{config_, negotiation->deviceFormat});
     if (!fillQueue()) {
       return;
     }
@@ -224,11 +272,92 @@ public:
   }
 
 private:
-  FfmpegFilterTargetFormat targetFormat(const FfmpegAudioStreamInfo& streamInfo) {
-    currentTarget_ = FfmpegFilterTargetFormat{config_.targetSampleRate.value_or(streamInfo.sampleRate),
-                                             config_.targetSampleFormat.value_or(AudioSampleFormat::Float32),
-                                             config_.targetChannelCount.value_or(streamInfo.channelCount)};
-    return currentTarget_;
+  struct OutputNegotiationCandidate {
+    AudioOutputConfig config{};
+    FfmpegFilterTargetFormat target{};
+    std::string fallbackReason{};
+  };
+
+  struct OutputNegotiationResult {
+    AudioOutputConfig effectiveConfig{};
+    FfmpegFilterTargetFormat target{};
+    AudioDeviceFormat deviceFormat{};
+    std::string fallbackReason{};
+  };
+
+  FfmpegFilterTargetFormat requestedTarget(const FfmpegAudioStreamInfo& streamInfo) const {
+    return FfmpegFilterTargetFormat{config_.targetSampleRate.value_or(streamInfo.sampleRate),
+                                    config_.targetSampleFormat.value_or(AudioSampleFormat::Float32),
+                                    config_.targetChannelCount.value_or(streamInfo.channelCount)};
+  }
+
+  FfmpegFilterTargetFormat sourceTarget(const FfmpegAudioStreamInfo& streamInfo) const {
+    return FfmpegFilterTargetFormat{streamInfo.sampleRate, streamInfo.sampleFormat, streamInfo.channelCount};
+  }
+
+  std::vector<OutputNegotiationCandidate> outputCandidates(const FfmpegAudioStreamInfo& streamInfo) const {
+    const auto requested = requestedTarget(streamInfo);
+    const auto source = sourceTarget(streamInfo);
+    std::vector<OutputNegotiationCandidate> candidates;
+    candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, config_.outputMode, requested), requested, {}});
+
+    if (!config_.allowFallback) {
+      return candidates;
+    }
+
+    if (config_.outputMode == AudioOutputMode::Direct) {
+      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, requested),
+                                                      requested,
+                                                      "direct output mode was unavailable; using mixed output mode"});
+    }
+
+    if (!sameTarget(requested, source)) {
+      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, source),
+                                                      source,
+                                                      "requested mixed output format was unavailable; using source format"});
+    }
+
+    return candidates;
+  }
+
+  std::optional<OutputNegotiationResult> negotiateOutput(const FfmpegAudioStreamInfo& streamInfo,
+                                                         std::string& failureDetail) {
+    std::ostringstream failures;
+    const auto candidates = outputCandidates(streamInfo);
+    for (const auto& candidate : candidates) {
+      const auto sampleBytes = bytesPerSample(candidate.target.sampleFormat);
+      if (candidate.target.sampleRate == 0U || candidate.target.channelCount == 0U || sampleBytes == 0U) {
+        failures << describeTarget(candidate.config.outputMode, candidate.target)
+                 << " rejected because sample rate, channel count, and sample bytes must be nonzero; ";
+        continue;
+      }
+
+      const auto capacityFrames = bufferFrameCount(candidate.target.sampleRate, candidate.config.bufferDuration);
+      auto candidateQueue = std::make_unique<PcmBufferQueue>(
+          PcmBufferQueueConfig{capacityFrames, candidate.target.channelCount * sampleBytes});
+
+      AudioOutputDeviceOpenRequest openRequest{};
+      openRequest.config = candidate.config;
+      openRequest.sampleFormat = candidate.target.sampleFormat;
+      openRequest.sampleRate = candidate.target.sampleRate;
+      openRequest.channelCount = candidate.target.channelCount;
+      openRequest.bufferFrames = std::min<std::uint32_t>(capacityFrames, 512U);
+      openRequest.pcmQueue = candidateQueue.get();
+
+      if (!device_.initialize(openRequest)) {
+        failures << describeTarget(candidate.config.outputMode, candidate.target)
+                 << " rejected by audio output device; ";
+        continue;
+      }
+
+      auto selectedFormat = device_.currentFormat();
+      selectedFormat.fallbackApplied = !candidate.fallbackReason.empty();
+      queue_ = std::move(candidateQueue);
+      return OutputNegotiationResult{candidate.config, candidate.target, selectedFormat, candidate.fallbackReason};
+    }
+
+    failureDetail = failures.str();
+    return std::nullopt;
   }
 
   bool fillQueue() {

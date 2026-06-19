@@ -136,6 +136,7 @@ struct OutputFormatChanged {
 struct OutputModeFallback {
   AudioOutputConfig requestedConfig{};
   AudioOutputConfig effectiveConfig{};
+  AudioDeviceFormat effectiveFormat{};
   std::string reason;
 };
 
