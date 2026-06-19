@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace seriona::audio {
 namespace {
@@ -116,6 +117,7 @@ public:
     pipeline_ = std::make_unique<FfmpegFilterPipeline>();
     currentRequest_ = request;
     loadedToEnd_ = false;
+    preloadSlot_.reset();
 
     stateMachine_.loadTrack(request);
 
@@ -134,6 +136,7 @@ public:
       return;
     }
     currentTarget_ = negotiation->target;
+    hasCurrentTarget_ = true;
 
     if (const auto error = pipeline_->configure(currentTarget_)) {
       device_.uninitialize();
@@ -163,7 +166,45 @@ public:
     publishPosition();
   }
 
-  void prepareNext(const TrackPlaybackRequest&) override {}
+  void prepareNext(const TrackPlaybackRequest& request) override {
+    preloadSlot_.reset();
+
+    PreloadSlot slot{};
+    slot.request = request;
+    slot.source = std::make_unique<FfmpegAudioSource>();
+    slot.pipeline = std::make_unique<FfmpegFilterPipeline>();
+
+    if (const auto error = slot.source->open(request.filePath)) {
+      emitPreloadError(error->code, error->message, error->detail);
+      return;
+    }
+
+    slot.target = hasCurrentTarget_ ? currentTarget_ : requestedTarget(slot.source->streamInfo());
+    const auto sampleBytes = bytesPerSample(slot.target.sampleFormat);
+    if (slot.target.sampleRate == 0U || slot.target.channelCount == 0U || sampleBytes == 0U) {
+      emitPreloadError(PlaybackErrorCode::FormatNegotiationFailed,
+                       "failed to prepare next track output format",
+                       describeTarget(config_.outputMode, slot.target));
+      return;
+    }
+
+    if (const auto error = slot.pipeline->configure(slot.target)) {
+      emitPreloadError(error->code, error->message, error->detail);
+      return;
+    }
+
+    const auto capacityFrames = bufferFrameCount(slot.target.sampleRate, config_.bufferDuration);
+    slot.queue = std::make_unique<PcmBufferQueue>(PcmBufferQueueConfig{capacityFrames, slot.target.channelCount * sampleBytes});
+    if (!fillPreloadSlot(slot)) {
+      return;
+    }
+
+    slot.ready = true;
+    slot.seamlessEligible = config_.outputMode == AudioOutputMode::Mixed && device_.initialized() &&
+                            device_.currentFormat().actualMode == AudioOutputMode::Mixed && hasCurrentTarget_ &&
+                            sameTarget(slot.target, currentTarget_);
+    preloadSlot_ = std::move(slot);
+  }
 
   void play() override {
     if (!queue_ || !source_ || !pipeline_) {
@@ -267,11 +308,22 @@ public:
   void selectOutputDevice(const std::string& deviceId) override { config_.preferredDeviceId = deviceId; }
 
   PlaybackClockSnapshot queryPlaybackClock() const override {
-    const_cast<SingleTrackAudioPlaybackService*>(this)->updateClockFromQueue();
+    const_cast<SingleTrackAudioPlaybackService*>(this)->servicePlaybackProgress();
     return clock_.snapshot();
   }
 
 private:
+  struct PreloadSlot {
+    TrackPlaybackRequest request{};
+    FfmpegFilterTargetFormat target{};
+    std::unique_ptr<FfmpegAudioSource> source{};
+    std::unique_ptr<FfmpegFilterPipeline> pipeline{};
+    std::unique_ptr<PcmBufferQueue> queue{};
+    bool loadedToEnd{false};
+    bool ready{false};
+    bool seamlessEligible{false};
+  };
+
   struct OutputNegotiationCandidate {
     AudioOutputConfig config{};
     FfmpegFilterTargetFormat target{};
@@ -397,6 +449,43 @@ private:
     return true;
   }
 
+  bool fillPreloadSlot(PreloadSlot& slot) {
+    if (!slot.source || !slot.pipeline || !slot.queue || slot.loadedToEnd) {
+      return true;
+    }
+
+    while (slot.queue->availableFrames() < slot.queue->capacityFrames()) {
+      auto readResult = slot.source->readFrame();
+      if (readResult.error) {
+        emitPreloadError(readResult.error->code, readResult.error->message, readResult.error->detail);
+        return false;
+      }
+      if (readResult.endOfStream) {
+        if (const auto error = slot.pipeline->signalEndOfInput()) {
+          emitPreloadError(error->code, error->message, error->detail);
+          return false;
+        }
+        if (!drainPreloadPipeline(slot, true)) {
+          return false;
+        }
+        slot.loadedToEnd = true;
+        return true;
+      }
+      if (!readResult.frame) {
+        continue;
+      }
+      if (const auto error = slot.pipeline->pushFrame(*readResult.frame)) {
+        emitPreloadError(error->code, error->message, error->detail);
+        return false;
+      }
+      if (!drainPreloadPipeline(slot, false)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   bool drainPipeline(bool expectEnd) {
     for (int guard = 0; guard < 256; ++guard) {
       auto filterResult = pipeline_->readFrame();
@@ -419,6 +508,30 @@ private:
     return false;
   }
 
+  bool drainPreloadPipeline(PreloadSlot& slot, bool expectEnd) {
+    for (int guard = 0; guard < 256; ++guard) {
+      auto filterResult = slot.pipeline->readFrame();
+      if (filterResult.error) {
+        emitPreloadError(filterResult.error->code, filterResult.error->message, filterResult.error->detail);
+        return false;
+      }
+      if (filterResult.endOfStream) {
+        return true;
+      }
+      if (!filterResult.frame) {
+        return !expectEnd;
+      }
+      if (!writePreloadFrame(slot, *filterResult.frame)) {
+        return true;
+      }
+    }
+
+    emitPreloadError(PlaybackErrorCode::DecodeFailed,
+                     "preload filter pipeline did not drain within guard limit",
+                     "guard exhausted while reading filtered frames");
+    return false;
+  }
+
   bool writeFrame(const FfmpegAudioFrame& frame) {
     const auto bytesPerFrame = static_cast<std::size_t>(frame.channelCount) * bytesPerSample(frame.sampleFormat);
     if (bytesPerFrame == 0U || frame.sampleBytes.size() != static_cast<std::size_t>(frame.frameCount) * bytesPerFrame) {
@@ -430,6 +543,89 @@ private:
     }
     clock_.submitFrames(frame.frameCount);
     return true;
+  }
+
+  bool writePreloadFrame(PreloadSlot& slot, const FfmpegAudioFrame& frame) {
+    const auto bytesPerFrame = static_cast<std::size_t>(frame.channelCount) * bytesPerSample(frame.sampleFormat);
+    if (bytesPerFrame == 0U || frame.sampleBytes.size() != static_cast<std::size_t>(frame.frameCount) * bytesPerFrame) {
+      emitPreloadError(PlaybackErrorCode::DecodeFailed, "preloaded frame has invalid PCM payload", "sampleBytes size does not match frame shape");
+      return false;
+    }
+    return slot.queue->write(frame.sampleBytes.data(), frame.frameCount);
+  }
+
+  void servicePlaybackProgress() {
+    updateClockFromQueue();
+    if (stateMachine_.state() == PlaybackState::Playing && !loadedToEnd_) {
+      static_cast<void>(fillQueue());
+      updateClockFromQueue();
+    }
+
+    if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && queue_ && queue_->availableFrames() == 0U) {
+      if (handoffToPreparedNext()) {
+        return;
+      }
+
+      stopDevice();
+      clock_.pause();
+      stateMachine_.naturalEnd();
+      publishPosition();
+    }
+  }
+
+  bool handoffToPreparedNext() {
+    if (!preloadSlot_ || !preloadSlot_->ready || !preloadSlot_->seamlessEligible || !queue_ ||
+        !sameTarget(preloadSlot_->target, currentTarget_)) {
+      return false;
+    }
+
+    const auto endedClock = clock_.snapshot();
+    dispatcher_.dispatch(BackendEventType::PlaybackEnded, PlaybackEnded{currentRequest_, endedClock});
+
+    auto slot = std::move(*preloadSlot_);
+    preloadSlot_.reset();
+    source_ = std::move(slot.source);
+    pipeline_ = std::move(slot.pipeline);
+    currentRequest_ = slot.request;
+    currentTarget_ = slot.target;
+    hasCurrentTarget_ = true;
+    loadedToEnd_ = false;
+
+    clock_.reset(currentRequest_.trackId, currentTarget_.sampleRate, currentRequest_.offset.value_or(std::chrono::milliseconds{0}));
+    clock_.resume();
+    stateMachine_.loadTrack(currentRequest_);
+    stateMachine_.completeLoad();
+    stateMachine_.play();
+
+    transferPreloadedPcm(slot);
+    loadedToEnd_ = slot.loadedToEnd && slot.queue && slot.queue->availableFrames() == 0U;
+    if (!loadedToEnd_) {
+      static_cast<void>(fillQueue());
+    }
+    observedQueueCounters_ = queue_->counters();
+    publishPosition();
+    return true;
+  }
+
+  void transferPreloadedPcm(PreloadSlot& slot) {
+    if (!slot.queue || !queue_) {
+      return;
+    }
+
+    std::vector<std::uint8_t> pcm;
+    while (slot.queue->availableFrames() > 0U && queue_->availableFrames() < queue_->capacityFrames()) {
+      const auto writableFrames = queue_->capacityFrames() - queue_->availableFrames();
+      const auto frames = std::min(slot.queue->availableFrames(), writableFrames);
+      pcm.assign(static_cast<std::size_t>(frames) * queue_->bytesPerFrame(), 0U);
+      const auto readResult = slot.queue->read(pcm.data(), frames);
+      if (readResult.copiedFrames == 0U) {
+        return;
+      }
+      if (!queue_->write(pcm.data(), readResult.copiedFrames)) {
+        return;
+      }
+      clock_.submitFrames(readResult.copiedFrames);
+    }
   }
 
   void publishPosition() {
@@ -463,6 +659,16 @@ private:
     stateMachine_.fail(code, std::move(message), std::move(detail));
   }
 
+  void emitPreloadError(PlaybackErrorCode code, std::string message, std::string detail) {
+    std::optional<PlaybackClockSnapshot> clock;
+    if (source_ || queue_) {
+      updateClockFromQueue();
+      clock = clock_.snapshot();
+    }
+    dispatcher_.dispatch(BackendEventType::PlaybackError,
+                         PlaybackError{code, std::move(message), std::move(detail), std::move(clock)});
+  }
+
   AudioOutputConfig config_{};
   AudioOutputDevice device_;
   AudioEventDispatcher dispatcher_;
@@ -474,9 +680,11 @@ private:
   std::unique_ptr<FfmpegFilterPipeline> pipeline_{};
   TrackPlaybackRequest currentRequest_{};
   FfmpegFilterTargetFormat currentTarget_{};
+  std::optional<PreloadSlot> preloadSlot_{};
   float volume_{1.0F};
   bool muted_{false};
   bool loadedToEnd_{false};
+  bool hasCurrentTarget_{false};
 };
 
 std::shared_ptr<AudioPlaybackService> makeAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend) {
