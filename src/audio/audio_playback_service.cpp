@@ -101,6 +101,7 @@ public:
 
   ~SingleTrackAudioPlaybackService() override {
     dispatcher_.clearEventSink();
+    stateMachine_.clearEventSink();
     stopDevice();
     device_.uninitialize();
   }
@@ -117,6 +118,8 @@ public:
     pipeline_ = std::make_unique<FfmpegFilterPipeline>();
     currentRequest_ = request;
     loadedToEnd_ = false;
+    hasCurrentTarget_ = false;
+    currentTarget_ = {};
     preloadSlot_.reset();
 
     stateMachine_.loadTrack(request);
@@ -128,8 +131,14 @@ public:
 
     const auto& streamInfo = source_->streamInfo();
     std::string negotiationFailure;
-    const auto negotiation = negotiateOutput(streamInfo, negotiationFailure);
+    std::optional<AudioOutputDeviceError> negotiationDeviceError;
+    const auto negotiation = negotiateOutput(streamInfo, negotiationFailure, negotiationDeviceError);
     if (!negotiation) {
+      if (negotiationDeviceError) {
+        fail(negotiationDeviceError->code, negotiationDeviceError->message, negotiationDeviceError->detail);
+        return;
+      }
+
       fail(PlaybackErrorCode::FormatNegotiationFailed,
            "failed to negotiate an output format",
            negotiationFailure.empty() ? "no output format candidates were accepted" : negotiationFailure);
@@ -215,7 +224,7 @@ public:
     clock_.resume();
     if (!device_.start()) {
       clock_.pause();
-      fail(PlaybackErrorCode::DeviceUnavailable, "failed to start audio output device", "AudioOutputDeviceBackend::start returned false");
+      failWithDeviceError("failed to start audio output device", "AudioOutputDeviceBackend::start returned false");
       return;
     }
 
@@ -240,7 +249,7 @@ public:
     clock_.resume();
     if (!device_.start()) {
       clock_.pause();
-      fail(PlaybackErrorCode::DeviceUnavailable, "failed to resume audio output device", "AudioOutputDeviceBackend::start returned false");
+      failWithDeviceError("failed to resume audio output device", "AudioOutputDeviceBackend::start returned false");
       return;
     }
 
@@ -292,7 +301,7 @@ public:
       clock_.resume();
       if (!device_.start()) {
         clock_.pause();
-        fail(PlaybackErrorCode::DeviceUnavailable, "failed to restart audio output device after seek", "AudioOutputDeviceBackend::start returned false");
+        failWithDeviceError("failed to restart audio output device after seek", "AudioOutputDeviceBackend::start returned false");
         return;
       }
     } else {
@@ -373,7 +382,8 @@ private:
   }
 
   std::optional<OutputNegotiationResult> negotiateOutput(const FfmpegAudioStreamInfo& streamInfo,
-                                                         std::string& failureDetail) {
+                                                         std::string& failureDetail,
+                                                         std::optional<AudioOutputDeviceError>& deviceError) {
     std::ostringstream failures;
     const auto candidates = outputCandidates(streamInfo);
     for (const auto& candidate : candidates) {
@@ -397,6 +407,11 @@ private:
       openRequest.pcmQueue = candidateQueue.get();
 
       if (!device_.initialize(openRequest)) {
+        if (const auto error = device_.lastError(); error && error->code == PlaybackErrorCode::DeviceUnavailable) {
+          deviceError = *error;
+          return std::nullopt;
+        }
+
         failures << describeTarget(candidate.config.outputMode, candidate.target)
                  << " rejected by audio output device; ";
         continue;
@@ -643,7 +658,9 @@ private:
       clock_.consumeFrames(counters.consumedFrames - observedQueueCounters_.consumedFrames);
     }
     if (counters.silenceFrames > observedQueueCounters_.silenceFrames) {
-      clock_.reportUnderrun(counters.silenceFrames - observedQueueCounters_.silenceFrames);
+      const auto silenceDelta = counters.silenceFrames - observedQueueCounters_.silenceFrames;
+      clock_.reportUnderrun(silenceDelta);
+      emitBufferUnderrun(silenceDelta, counters.underrunCount - observedQueueCounters_.underrunCount);
     }
     observedQueueCounters_ = counters;
   }
@@ -657,6 +674,27 @@ private:
   void fail(PlaybackErrorCode code, std::string message, std::string detail) {
     stopDevice();
     stateMachine_.fail(code, std::move(message), std::move(detail));
+  }
+
+  void failWithDeviceError(std::string fallbackMessage, std::string fallbackDetail) {
+    const auto error = device_.lastError();
+    if (error) {
+      fail(error->code, error->message, error->detail);
+      return;
+    }
+
+    fail(PlaybackErrorCode::DeviceUnavailable, std::move(fallbackMessage), std::move(fallbackDetail));
+  }
+
+  void emitBufferUnderrun(std::uint64_t silenceFrames, std::uint64_t underrunCount) {
+    std::ostringstream detail;
+    detail << "audio callback requested " << silenceFrames << " silence frames across " << underrunCount
+           << " underrun read(s)";
+    dispatcher_.dispatch(BackendEventType::PlaybackError,
+                         PlaybackError{PlaybackErrorCode::BufferUnderrun,
+                                       "audio output buffer underrun",
+                                       detail.str(),
+                                       clock_.snapshot()});
   }
 
   void emitPreloadError(PlaybackErrorCode code, std::string message, std::string detail) {

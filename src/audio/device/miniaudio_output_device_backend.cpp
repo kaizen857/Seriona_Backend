@@ -4,6 +4,8 @@
 #include "seriona/audio/device/audio_output_device.h"
 
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace seriona::audio {
 namespace {
@@ -44,6 +46,10 @@ void miniaudioDataCallback(ma_device* device, void* output, const void*, ma_uint
   AudioOutputDevice::renderCallback(device != nullptr ? device->pUserData : nullptr, output, frameCount);
 }
 
+std::string miniaudioDetail(ma_result result) {
+  return "miniaudio result " + std::to_string(static_cast<int>(result));
+}
+
 class MiniaudioOutputDeviceBackend final : public AudioOutputDeviceBackend {
 public:
   MiniaudioOutputDeviceBackend() = default;
@@ -75,6 +81,7 @@ public:
   }
 
   [[nodiscard]] bool initialize(const AudioOutputDeviceOpenRequest& request) override {
+    lastError_.reset();
     if (initialized_) {
       uninitialize();
     }
@@ -89,6 +96,9 @@ public:
 
     const auto result = ma_device_init(nullptr, &config, &device_);
     if (result != MA_SUCCESS) {
+      lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                          "failed to initialize audio output device",
+                                          miniaudioDetail(result)};
       return false;
     }
     currentFormat_ = AudioDeviceFormat{.deviceId = request.config.preferredDeviceId,
@@ -104,9 +114,42 @@ public:
     return true;
   }
 
-  [[nodiscard]] bool start() override { return initialized_ && ma_device_start(&device_) == MA_SUCCESS; }
+  [[nodiscard]] bool start() override {
+    lastError_.reset();
+    if (!initialized_) {
+      lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                          "audio output device is not initialized",
+                                          "miniaudio start requested before initialize"};
+      return false;
+    }
 
-  [[nodiscard]] bool stop() override { return !initialized_ || ma_device_stop(&device_) == MA_SUCCESS; }
+    const auto result = ma_device_start(&device_);
+    if (result != MA_SUCCESS) {
+      lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                          "failed to start audio output device",
+                                          miniaudioDetail(result)};
+      return false;
+    }
+
+    return true;
+  }
+
+  [[nodiscard]] bool stop() override {
+    lastError_.reset();
+    if (!initialized_) {
+      return true;
+    }
+
+    const auto result = ma_device_stop(&device_);
+    if (result != MA_SUCCESS) {
+      lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                          "failed to stop audio output device",
+                                          miniaudioDetail(result)};
+      return false;
+    }
+
+    return true;
+  }
 
   void uninitialize() noexcept override {
     if (!initialized_) {
@@ -121,9 +164,12 @@ public:
 
   [[nodiscard]] AudioDeviceFormat currentFormat() const override { return currentFormat_; }
 
+  [[nodiscard]] std::optional<AudioOutputDeviceError> lastError() const override { return lastError_; }
+
 private:
   ma_device device_{};
   AudioDeviceFormat currentFormat_{};
+  std::optional<AudioOutputDeviceError> lastError_{};
   bool initialized_{false};
 };
 

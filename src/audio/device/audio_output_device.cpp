@@ -16,8 +16,12 @@ std::vector<AudioDeviceFormat> AudioOutputDevice::enumeratePlaybackDevices() {
 }
 
 bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) {
+  lastError_.reset();
   if (request.pcmQueue == nullptr || request.sampleRate == 0U || request.channelCount == 0U ||
       request.bufferFrames == 0U) {
+    lastError_ = AudioOutputDeviceError{PlaybackErrorCode::FormatNegotiationFailed,
+                                        "audio output device request is invalid",
+                                        "pcm queue, sample rate, channel count, and buffer frames must be set"};
     return false;
   }
 
@@ -28,6 +32,7 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   auto backendRequest = request;
   backendRequest.callbackUserData = this;
   if (!backend_->initialize(backendRequest)) {
+    lastError_ = backend_->lastError();
     return false;
   }
 
@@ -42,7 +47,11 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
 }
 
 bool AudioOutputDevice::start() {
+  lastError_.reset();
   if (!initialized_) {
+    lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                        "audio output device is not initialized",
+                                        "start requires a successful initialize call"};
     return false;
   }
 
@@ -51,6 +60,9 @@ bool AudioOutputDevice::start() {
   }
 
   if (!backend_->start()) {
+    lastError_ = backend_->lastError().value_or(AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                                                       "failed to start audio output device",
+                                                                       "AudioOutputDeviceBackend::start returned false"});
     return false;
   }
 
@@ -59,11 +71,15 @@ bool AudioOutputDevice::start() {
 }
 
 bool AudioOutputDevice::stop() {
+  lastError_.reset();
   if (!initialized_ || !started_) {
     return true;
   }
 
   if (!backend_->stop()) {
+    lastError_ = backend_->lastError().value_or(AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
+                                                                       "failed to stop audio output device",
+                                                                       "AudioOutputDeviceBackend::stop returned false"});
     return false;
   }
 
@@ -83,6 +99,7 @@ void AudioOutputDevice::uninitialize() noexcept {
 
   backend_->uninitialize();
   pcmQueue_ = nullptr;
+  lastError_.reset();
   initialized_ = false;
 }
 
@@ -91,6 +108,8 @@ bool AudioOutputDevice::initialized() const noexcept { return initialized_; }
 bool AudioOutputDevice::started() const noexcept { return started_; }
 
 AudioDeviceFormat AudioOutputDevice::currentFormat() const { return backend_->currentFormat(); }
+
+std::optional<AudioOutputDeviceError> AudioOutputDevice::lastError() const { return lastError_; }
 
 void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept {
   auto* device = static_cast<AudioOutputDevice*>(userData);

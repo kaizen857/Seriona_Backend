@@ -147,7 +147,7 @@ std::optional<FfmpegFilterPipelineError> validateInputFrame(const FfmpegAudioFra
   }
   const auto expectedBytes = static_cast<std::uint64_t>(frame.frameCount) * frame.channelCount * bytesPerSample(frame.sampleFormat);
   if (expectedBytes == 0 || expectedBytes > std::numeric_limits<int>::max() || frame.sampleBytes.size() != expectedBytes) {
-    return makeError(PlaybackErrorCode::UnsupportedFormat, "decoded frame sample data size is invalid", "sampleBytes size does not match frame format");
+    return makeError(PlaybackErrorCode::DecodeFailed, "decoded frame PCM payload is invalid", "sampleBytes size does not match frame format");
   }
 
   return std::nullopt;

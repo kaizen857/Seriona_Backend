@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,12 @@ struct AudioOutputDeviceOpenRequest {
   AudioOutputDevice* callbackUserData{nullptr};
 };
 
+struct AudioOutputDeviceError {
+  PlaybackErrorCode code{PlaybackErrorCode::DeviceUnavailable};
+  std::string message;
+  std::string detail;
+};
+
 class AudioOutputDeviceBackend {
 public:
   virtual ~AudioOutputDeviceBackend() = default;
@@ -40,6 +47,7 @@ public:
   [[nodiscard]] virtual bool stop() = 0;
   virtual void uninitialize() noexcept = 0;
   [[nodiscard]] virtual AudioDeviceFormat currentFormat() const = 0;
+  [[nodiscard]] virtual std::optional<AudioOutputDeviceError> lastError() const { return std::nullopt; }
 };
 
 class AudioOutputDevice {
@@ -61,6 +69,7 @@ public:
   [[nodiscard]] bool initialized() const noexcept;
   [[nodiscard]] bool started() const noexcept;
   [[nodiscard]] AudioDeviceFormat currentFormat() const;
+  [[nodiscard]] std::optional<AudioOutputDeviceError> lastError() const;
 
   static void renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept;
   [[nodiscard]] AudioOutputDeviceCounters counters() const noexcept;
@@ -72,6 +81,7 @@ private:
   std::atomic<std::uint64_t> requestedFrames_{0};
   std::atomic<std::uint64_t> copiedFrames_{0};
   std::atomic<std::uint64_t> silenceFrames_{0};
+  std::optional<AudioOutputDeviceError> lastError_{};
   bool initialized_{false};
   bool started_{false};
 };
