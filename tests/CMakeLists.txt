@@ -18,6 +18,12 @@ add_executable(seriona_pcm_buffer_queue_tests
   audio/pcm_buffer_queue_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
+add_executable(seriona_audio_output_device_tests
+  audio/audio_output_device_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
 add_executable(seriona_playback_clock_tests
   audio/playback_clock_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
@@ -32,6 +38,7 @@ target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_I
 target_compile_definitions(seriona_ffmpeg_audio_source_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_ffmpeg_filter_pipeline_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_pcm_buffer_queue_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_output_device_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_clock_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_state_machine_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
@@ -58,6 +65,11 @@ target_include_directories(seriona_ffmpeg_filter_pipeline_tests PRIVATE
 target_include_directories(seriona_pcm_buffer_queue_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_audio_output_device_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
 )
 target_include_directories(seriona_playback_clock_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
@@ -90,6 +102,9 @@ target_link_libraries(seriona_ffmpeg_filter_pipeline_tests PRIVATE
 target_link_libraries(seriona_pcm_buffer_queue_tests PRIVATE
   seriona_third_party_headers
 )
+target_link_libraries(seriona_audio_output_device_tests PRIVATE
+  seriona_third_party_headers
+)
 target_link_libraries(seriona_playback_clock_tests PRIVATE
   seriona_third_party_headers
 )
@@ -103,6 +118,7 @@ seriona_enable_warnings(seriona_audio_fixture_tests)
 seriona_enable_warnings(seriona_ffmpeg_audio_source_tests)
 seriona_enable_warnings(seriona_ffmpeg_filter_pipeline_tests)
 seriona_enable_warnings(seriona_pcm_buffer_queue_tests)
+seriona_enable_warnings(seriona_audio_output_device_tests)
 seriona_enable_warnings(seriona_playback_clock_tests)
 seriona_enable_warnings(seriona_playback_state_machine_tests)
 
@@ -116,6 +132,7 @@ add_test(NAME seriona.ffmpeg_filter_pipeline COMMAND seriona_ffmpeg_filter_pipel
 add_test(NAME seriona.ffmpeg_filter_pipeline_drain COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*drains*)
 add_test(NAME seriona.ffmpeg_filter_pipeline_errors COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*invalid*)
 add_test(NAME seriona.pcm_buffer_queue COMMAND seriona_pcm_buffer_queue_tests)
+add_test(NAME seriona.audio_output_device COMMAND seriona_audio_output_device_tests)
 add_test(NAME seriona.playback_clock COMMAND seriona_playback_clock_tests)
 add_test(NAME seriona.playback_state_machine COMMAND seriona_playback_state_machine_tests --test-case-exclude=*cancellation*)
 add_test(NAME seriona.playback_state_machine_cancellation COMMAND seriona_playback_state_machine_tests --test-case=*cancellation*)

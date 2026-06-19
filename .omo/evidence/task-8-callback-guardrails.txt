@@ -1,0 +1,31 @@
+Guardrail review for T8 miniaudio realtime callback
+Forbidden pattern: ma_device_(?:start|stop|uninit|init)|BackendEventSink|spdlog|av_read_frame|avcodec|new |malloc|std::mutex
+
+Callback function: src/audio/device/audio_output_device.cpp::AudioOutputDevice::renderCallback
+Callback body forbidden matches: 0
+Callback is clean: no lifecycle, FFmpeg, logging, allocation, mutex, or BackendEventSink calls found.
+
+Callback function: src/audio/device/miniaudio_output_device_backend.cpp::miniaudioDataCallback
+Callback body forbidden matches: 0
+Callback is clean: no lifecycle, FFmpeg, logging, allocation, mutex, or BackendEventSink calls found.
+
+Overall callback guardrail: PASS
+
+All forbidden-pattern matches under src/audio for context:
+src/audio/device/miniaudio_output_device_backend.cpp:90:     const auto result = ma_device_init(nullptr, &config, &device_);
+src/audio/device/miniaudio_output_device_backend.cpp:107:   [[nodiscard]] bool start() override { return initialized_ && ma_device_start(&device_) == MA_SUCCESS; }
+src/audio/device/miniaudio_output_device_backend.cpp:109:   [[nodiscard]] bool stop() override { return !initialized_ || ma_device_stop(&device_) == MA_SUCCESS; }
+src/audio/device/miniaudio_output_device_backend.cpp:116:     ma_device_uninit(&device_);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:4: #include <libavcodec/avcodec.h>
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:34:     avcodec_free_context(&context);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:173:     const auto* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:178:     codec_.reset(avcodec_alloc_context3(decoder));
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:180:       return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to allocate audio decoder", "avcodec_alloc_context3 returned null");
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:183:     result = avcodec_parameters_to_context(codec_.get(), stream->codecpar);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:188:     result = avcodec_open2(codec_.get(), decoder, nullptr);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:220:       const int readResult = av_read_frame(format_.get(), packet_.get());
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:223:         const int sendResult = avcodec_send_packet(codec_.get(), nullptr);
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:239:       const int sendResult = avcodec_send_packet(codec_.get(), packet_.get());
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:268:     avcodec_flush_buffers(codec_.get());
+src/audio/ffmpeg/ffmpeg_audio_source.cpp:277:     const int result = avcodec_receive_frame(codec_.get(), frame_.get());
+src/audio/playback_state_machine.cpp:7: void PlaybackStateMachine::setEventSink(BackendEventSink sink) { sink_ = std::move(sink); }
