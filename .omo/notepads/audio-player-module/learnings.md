@@ -14,3 +14,5 @@
 2026-06-18：T3 guardrail 修正：补齐 `tests/fixtures/` 与 `tools/` 占位目录，并清理 contract test 中的 `artist`/`flac` 字面量误报，方便精确 no-copyright grep 通过。
 
 2026-06-19：T5 新增 `FfmpegAudioSource` RAII 层，公共头通过 Pimpl 隔离 FFmpeg 原始类型；测试在构建树生成短 WAV，已验证解码非零帧、missing file -> `OpenFailed`、invalid input -> `UnsupportedFormat`、seek 后 flush 不返回 seek 前位置。
+
+2026-06-19：T6 新增 `FfmpegFilterPipeline`，公共头继续使用 Pimpl 隔离 FFmpeg 原始类型；filter graph 采用 `abuffer -> aformat -> abuffersink`，由 `aformat` 约束目标采样率、sample format 和声道布局。本机 FFmpeg `abuffersink` 的 `sample_fmts` 不能在初始化后设置，直接用 sink 约束会失败，因此目标格式转换策略应保持在 `aformat` 节点。已验证 `cmake --build build`、`ctest --test-dir build --output-on-failure -R ffmpeg_filter_pipeline`、`ctest --test-dir build --output-on-failure -R ffmpeg_filter_pipeline_errors` 和完整 `ctest --test-dir build --output-on-failure` 全部通过。
