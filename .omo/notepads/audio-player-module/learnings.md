@@ -12,3 +12,5 @@
 2026-06-18：T2 在重启/中断后已重新复验，`seriona_audio_contract_tests` 与 `audio_contract` 通过，公共边界 grep 仍为空。
 2026-06-18：T3 采用测试时生成的 WAV fixture 方案，`seriona.audio_fixture` 已通过；生成文件落在构建树下的 `generated_audio_fixtures/`，不需要提交二进制素材。
 2026-06-18：T3 guardrail 修正：补齐 `tests/fixtures/` 与 `tools/` 占位目录，并清理 contract test 中的 `artist`/`flac` 字面量误报，方便精确 no-copyright grep 通过。
+
+2026-06-19：T5 新增 `FfmpegAudioSource` RAII 层，公共头通过 Pimpl 隔离 FFmpeg 原始类型；测试在构建树生成短 WAV，已验证解码非零帧、missing file -> `OpenFailed`、invalid input -> `UnsupportedFormat`、seek 后 flush 不返回 seek 前位置。
