@@ -2,6 +2,7 @@
 
 #include "seriona/scanner/scanner_contracts.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <exception>
@@ -9,7 +10,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <atomic>
 #include <vector>
 
 namespace seriona::scanner {
