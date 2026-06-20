@@ -17,3 +17,10 @@
 - `tests/` had no scanner test directory before this task; existing tests use direct `add_executable`, per-target doctest include directories, `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, and explicit `add_test` entries.
 - The scanner production module is still a minimal link sentinel, so the harness was kept independent from production scanner internals and TagReader private types.
 - A helper-only scanner CTest can validate fake TagReader exception behavior inside the test process with `CHECK_THROWS_WITH_AS`, proving exceptions do not terminate the process.
+
+## 2026-06-20 task 5 scanner hash
+
+- `hashFileContent()` streams file bytes through `XXH3_128bits` and encodes `XXH128_canonical_t` as 32 lowercase hex characters, so hashes are portable across host endianness.
+- Directory Merkle hashing sorts children by relative UTF-8 path and includes child relative name, type, size, normalized mtime count, and child hash; tests fix mtimes when comparing two separately-created trees.
+- External `.lrc` hashing reuses the same file-content utility as audio hashing, so lyric file changes alter only the sidecar hash while the paired audio hash stays unchanged.
+- Verified Task 5 with `cmake --build build --target seriona_scanner_hash_tests` and `ctest --test-dir build -R seriona.scanner_hash --output-on-failure`.
