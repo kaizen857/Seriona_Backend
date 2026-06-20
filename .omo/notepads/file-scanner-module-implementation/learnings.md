@@ -31,3 +31,10 @@
 - Tree tests verify directory-first child ordering, empty-directory pruning, root aggregate song count/duration, external `.lrc` metadata attached to the paired song, and no `.lrc` public nodes.
 - Snapshot immutability is covered by mutating the builder after the first publish and asserting the prior snapshot's child list stays unchanged while the next version increments.
 - Verified Task 6 with `cmake --build build --target seriona_scanner_tree_tests` and `ctest --test-dir build -R seriona.scanner_tree --output-on-failure`.
+
+## 2026-06-20 task 7 scanner scheduler
+
+- `ScanScheduler` is scanner-local infrastructure: bounded submission uses condition-variable waits for backpressure, `trySubmit()` reports full queues predictably, and cancellation drains queued tasks as cancelled results.
+- Running tasks receive an atomic stop token; exceptions are captured as failed `ScanTaskResult` entries and do not prevent later task fan-in.
+- `ProgressThrottle` publishes the first progress event, then gates by completed-count delta or elapsed interval so future scanner orchestration can avoid event spam deterministically.
+- Verified Task 7 with `cmake --build build --target seriona_scanner_scheduler_tests` and `ctest --test-dir build -R seriona.scanner_scheduler --output-on-failure`.
