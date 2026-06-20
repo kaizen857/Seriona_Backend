@@ -122,6 +122,10 @@ add_executable(seriona_scanner_test_harness_tests
   scanner/scanner_test_harness_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_contract_tests
+  scanner/scanner_contract_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/file_scanner_service.cpp
+)
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -140,6 +144,7 @@ target_compile_definitions(seriona_audio_player_seamless_tests PRIVATE DOCTEST_C
 target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_shutdown_lifecycle_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -217,6 +222,10 @@ target_include_directories(seriona_audio_shutdown_lifecycle_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
 )
 target_include_directories(seriona_scanner_test_harness_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_contract_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_link_libraries(seriona_tests PRIVATE
@@ -303,6 +312,7 @@ seriona_enable_warnings(seriona_audio_player_seamless_tests)
 seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
+seriona_enable_warnings(seriona_scanner_contract_tests)
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
 add_test(NAME seriona.audio_contract COMMAND seriona_audio_contract_tests)
@@ -330,3 +340,4 @@ add_test(NAME seriona.audio_player_preload_failure COMMAND seriona_audio_player_
 add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_tests)
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
+add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)

@@ -6,6 +6,12 @@
 - Vendor `wtr/watcher` as the upstream `e-dant/watcher` release branch single header at `third_party/watcher/include/wtr/watcher.hpp`, with `SOURCE.md` and MIT license note in `third_party/watcher/`.
 - Clear tests registered by the external TagReader child directory so Seriona top-level `ctest` remains scoped to Seriona tests while still allowing `TagReaderCore` to build for scanner linkage.
 
+## 2026-06-20 task 2 public scanner contracts
+
+- Define scanner API in `inc/seriona/scanner/scanner_contracts.h` and expose the facade in `inc/seriona/scanner/file_scanner_service.h`, mirroring the audio contract/facade split while keeping scanner dependencies standard-library-only.
+- Provide `FileScanner` as the public facade name and keep `FileScannerService` as the pure virtual service semantic name; `makeFileScannerService` returns `std::shared_ptr<FileScannerService>` to match the injected-facade ownership style.
+- Keep the default factory implementation as a private no-op service stub for linkability only until later scanner implementation tasks add real scanning/cache/watcher behavior.
+
 ## 2026-06-20 task 3 scanner test harness
 
 - Keep scanner test fakes and fixtures under `tests/scanner/` as a private test harness instead of exposing new production scanner seams before scanner logic exists.

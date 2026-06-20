@@ -6,6 +6,12 @@
 - `TagReaderCore` builds as the scanner private dependency; scanner public header remains independent from `TagReader.hpp` and `MusicTag`.
 - LSP diagnostics were unavailable in this session (`Connection closed` / `Not connected`), so CMake configure/build/CTest are the hard verification source.
 
+## 2026-06-20 task 2 public scanner contracts
+
+- Audio public contracts use a single `*_contracts.h` namespace block with enum/value types first, `std::variant` event payloads, `std::function` event sinks, then the pure virtual service and facade pattern.
+- Scanner public header compile isolation can be tested without linking `seriona_scanner` and without inheriting `seriona_third_party_headers`; the contract target only needs `inc` and doctest.
+- `src/scanner/scanner_module.cpp` remains the only current scanner source that includes watcher headers; the new public scanner headers do not expose watcher, SQLite, TagReader, Qt/QML, miniaudio, or audio device names.
+
 ## 2026-06-20 task 3 scanner test harness
 
 - `tests/` had no scanner test directory before this task; existing tests use direct `add_executable`, per-target doctest include directories, `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, and explicit `add_test` entries.

@@ -61,6 +61,7 @@ if(NOT TARGET TagReaderCore)
 endif()
 
 add_library(seriona_scanner STATIC
+  src/scanner/file_scanner_service.cpp
   src/scanner/scanner_module.cpp
 )
 
