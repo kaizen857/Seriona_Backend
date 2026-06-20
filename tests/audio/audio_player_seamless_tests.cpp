@@ -187,6 +187,12 @@ AudioOutputConfig outputConfig(AudioOutputMode mode) {
   return config;
 }
 
+AudioOutputConfig smallBufferOutputConfig() {
+  auto config = outputConfig(AudioOutputMode::Mixed);
+  config.bufferDuration = 1ms;
+  return config;
+}
+
 std::vector<BackendEvent> eventsOf(const std::vector<BackendEvent>& events, BackendEventType type) {
   std::vector<BackendEvent> filtered;
   for (const auto& event : events) {
@@ -253,6 +259,30 @@ TEST_CASE("audio_player_direct_preload prepares next track but does not claim se
   const auto tracks = eventsOf(events, BackendEventType::TrackChanged);
   REQUIRE(tracks.size() == 1U);
   CHECK(std::get<TrackChanged>(tracks[0].payload).request.trackId == "direct-first");
+}
+
+TEST_CASE("audio_player_seamless_mix preserves preloaded frames larger than preload queue capacity") {
+  const auto firstPath = sineFixture("audio_player_seamless_small_buffer_first.wav", 960U, 440.0);
+  const auto secondPath = sineFixture("audio_player_seamless_small_buffer_second.wav", kSampleRate, 660.0);
+  auto backend = std::make_unique<SeamlessFakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  std::vector<BackendEvent> events;
+  player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
+  player.configureOutput(smallBufferOutputConfig());
+
+  player.loadTrack(request(firstPath, "small-buffer-first"));
+  player.prepareNext(request(secondPath, "small-buffer-second"));
+  player.play();
+  auto afterHandoff = player.queryPlaybackClock();
+  for (int index = 0; index < 80 && afterHandoff.trackId != "small-buffer-second"; ++index) {
+    fake->consumeFrames(48U);
+    afterHandoff = player.queryPlaybackClock();
+  }
+
+  CHECK(afterHandoff.trackId == "small-buffer-second");
+  CHECK(eventsOf(events, BackendEventType::PlaybackEnded).size() == 1U);
+  CHECK(eventsOf(events, BackendEventType::PlaybackError).empty());
 }
 
 TEST_CASE("audio_player_preload_failure emits error without queue policy") {

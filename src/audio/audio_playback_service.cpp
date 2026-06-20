@@ -120,6 +120,7 @@ public:
     loadedToEnd_ = false;
     hasCurrentTarget_ = false;
     currentTarget_ = {};
+    pendingFrameWrite_.reset();
     preloadSlot_.reset();
 
     stateMachine_.loadTrack(request);
@@ -245,6 +246,10 @@ public:
       fail(PlaybackErrorCode::OpenFailed, "resume requires a loaded track", "missing playback queue");
       return;
     }
+    if (stateMachine_.state() != PlaybackState::Paused) {
+      stateMachine_.resume();
+      return;
+    }
 
     clock_.resume();
     if (!device_.start()) {
@@ -264,6 +269,7 @@ public:
     if (queue_) {
       queue_->clearForSeek();
     }
+    pendingFrameWrite_.reset();
     stateMachine_.stop();
     publishPosition();
   }
@@ -271,6 +277,11 @@ public:
   void seek(std::chrono::milliseconds position) override {
     if (!source_ || !pipeline_ || !queue_) {
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
+      return;
+    }
+    if (stateMachine_.state() != PlaybackState::Ready && stateMachine_.state() != PlaybackState::Playing &&
+        stateMachine_.state() != PlaybackState::Paused) {
+      stateMachine_.seek(position);
       return;
     }
 
@@ -290,6 +301,7 @@ public:
     }
     queue_->clearForSeek();
     observedQueueCounters_ = queue_->counters();
+    pendingFrameWrite_.reset();
     clock_.seek(position);
     loadedToEnd_ = false;
     if (!fillQueue()) {
@@ -322,9 +334,15 @@ public:
   }
 
 private:
+  struct PendingFrameWrite {
+    FfmpegAudioFrame frame{};
+    std::uint32_t writtenFrames{0};
+  };
+
   struct PreloadSlot {
     TrackPlaybackRequest request{};
     FfmpegFilterTargetFormat target{};
+    std::optional<PendingFrameWrite> pendingFrameWrite{};
     std::unique_ptr<FfmpegAudioSource> source{};
     std::unique_ptr<FfmpegFilterPipeline> pipeline{};
     std::unique_ptr<PcmBufferQueue> queue{};
@@ -432,6 +450,10 @@ private:
       return true;
     }
 
+    if (pendingFrameWrite_ && !writePendingFrame()) {
+      return true;
+    }
+
     while (queue_->availableFrames() < queue_->capacityFrames()) {
       auto readResult = source_->readFrame();
       if (readResult.error) {
@@ -466,6 +488,10 @@ private:
 
   bool fillPreloadSlot(PreloadSlot& slot) {
     if (!slot.source || !slot.pipeline || !slot.queue || slot.loadedToEnd) {
+      return true;
+    }
+
+    if (slot.pendingFrameWrite && !writePendingPreloadFrame(slot)) {
       return true;
     }
 
@@ -553,10 +579,34 @@ private:
       fail(PlaybackErrorCode::DecodeFailed, "filtered frame has invalid PCM payload", "sampleBytes size does not match frame shape");
       return false;
     }
-    if (!queue_->write(frame.sampleBytes.data(), frame.frameCount)) {
-      return false;
+
+    pendingFrameWrite_ = PendingFrameWrite{frame, 0U};
+    return writePendingFrame();
+  }
+
+  bool writePendingFrame() {
+    if (!pendingFrameWrite_) {
+      return true;
     }
-    clock_.submitFrames(frame.frameCount);
+
+    auto& pending = *pendingFrameWrite_;
+    const auto bytesPerFrame = static_cast<std::size_t>(pending.frame.channelCount) * bytesPerSample(pending.frame.sampleFormat);
+    while (pending.writtenFrames < pending.frame.frameCount) {
+      const auto availableCapacity = queue_->capacityFrames() - queue_->availableFrames();
+      if (availableCapacity == 0U) {
+        return false;
+      }
+
+      const auto chunkFrames = std::min(pending.frame.frameCount - pending.writtenFrames, availableCapacity);
+      const auto byteOffset = static_cast<std::size_t>(pending.writtenFrames) * bytesPerFrame;
+      if (!queue_->write(pending.frame.sampleBytes.data() + byteOffset, chunkFrames)) {
+        return false;
+      }
+      pending.writtenFrames += chunkFrames;
+      clock_.submitFrames(chunkFrames);
+    }
+
+    pendingFrameWrite_.reset();
     return true;
   }
 
@@ -566,7 +616,34 @@ private:
       emitPreloadError(PlaybackErrorCode::DecodeFailed, "preloaded frame has invalid PCM payload", "sampleBytes size does not match frame shape");
       return false;
     }
-    return slot.queue->write(frame.sampleBytes.data(), frame.frameCount);
+
+    slot.pendingFrameWrite = PendingFrameWrite{frame, 0U};
+    return writePendingPreloadFrame(slot);
+  }
+
+  bool writePendingPreloadFrame(PreloadSlot& slot) {
+    if (!slot.pendingFrameWrite || !slot.queue) {
+      return true;
+    }
+
+    auto& pending = *slot.pendingFrameWrite;
+    const auto bytesPerFrame = static_cast<std::size_t>(pending.frame.channelCount) * bytesPerSample(pending.frame.sampleFormat);
+    while (pending.writtenFrames < pending.frame.frameCount) {
+      const auto availableCapacity = slot.queue->capacityFrames() - slot.queue->availableFrames();
+      if (availableCapacity == 0U) {
+        return false;
+      }
+
+      const auto chunkFrames = std::min(pending.frame.frameCount - pending.writtenFrames, availableCapacity);
+      const auto byteOffset = static_cast<std::size_t>(pending.writtenFrames) * bytesPerFrame;
+      if (!slot.queue->write(pending.frame.sampleBytes.data() + byteOffset, chunkFrames)) {
+        return false;
+      }
+      pending.writtenFrames += chunkFrames;
+    }
+
+    slot.pendingFrameWrite.reset();
+    return true;
   }
 
   void servicePlaybackProgress() {
@@ -575,8 +652,13 @@ private:
       static_cast<void>(fillQueue());
       updateClockFromQueue();
     }
+    if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && pendingFrameWrite_) {
+      static_cast<void>(writePendingFrame());
+      updateClockFromQueue();
+    }
 
-    if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && queue_ && queue_->availableFrames() == 0U) {
+    if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && !pendingFrameWrite_ && queue_ &&
+        queue_->availableFrames() == 0U) {
       if (handoffToPreparedNext()) {
         return;
       }
@@ -603,6 +685,7 @@ private:
     pipeline_ = std::move(slot.pipeline);
     currentRequest_ = slot.request;
     currentTarget_ = slot.target;
+    pendingFrameWrite_ = std::move(slot.pendingFrameWrite);
     hasCurrentTarget_ = true;
     loadedToEnd_ = false;
 
@@ -718,6 +801,7 @@ private:
   std::unique_ptr<FfmpegFilterPipeline> pipeline_{};
   TrackPlaybackRequest currentRequest_{};
   FfmpegFilterTargetFormat currentTarget_{};
+  std::optional<PendingFrameWrite> pendingFrameWrite_{};
   std::optional<PreloadSlot> preloadSlot_{};
   float volume_{1.0F};
   bool muted_{false};

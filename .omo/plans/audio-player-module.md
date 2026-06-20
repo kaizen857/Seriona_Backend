@@ -150,7 +150,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 > Implementation + Test = ONE task. Never separate.
 > EVERY task MUST have: Agent Profile + Parallelization + QA Scenarios.
 
-- [ ] 1. Establish CMake/CTest/dependency baseline
+- [x] 1. Establish CMake/CTest/dependency baseline
 
   **What to do**: Create `CMakeLists.txt`, `cmake/` helper modules if needed, `tests/CMakeLists.txt`, and minimal test executable wiring. Configure C++20, warnings, `SERIONA_BUILD_TESTS`, FFmpeg discovery, and `doctest` test framework. Prefer system FFmpeg discovery through CMake. Add explicit third-party header locations: `third_party/doctest/doctest.h` and `third_party/miniaudio/miniaudio.h`; if the implementation downloads them, it must fetch source headers only and record source/version in docs or CMake comments.
   **Must NOT do**: Do not implement audio playback logic in this task. Do not add Qt/QML. Do not hide dependency downloads inside opaque scripts.
@@ -193,7 +193,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `build: add cmake test baseline` | Files: `CMakeLists.txt`, `cmake/**`, `tests/**`, `.omo/evidence/task-1-*`
 
-- [ ] 2. Define audio contracts and naming boundary
+- [x] 2. Define audio contracts and naming boundary
 
   **What to do**: Add public headers under `inc/seriona/audio/` for `AudioPlayer`, `AudioPlaybackService`, `TrackPlaybackRequest`, `AudioOutputConfig`, `AudioDeviceFormat`, `PlaybackClockSnapshot`, `PlaybackEvent`, `PlaybackState`, `PlaybackErrorCode`, and the minimal backend event contract. Define `BackendEventSink` as `std::function<void(BackendEvent)>`; define `BackendEvent` with event type, source module, monotonic version, timestamp, and audio payload variant/value object sufficient for audio events. `AudioPlayer` is the public facade; `AudioPlaybackService` is the internal service interface/implementation boundary.
   **Must NOT do**: Do not implement FFmpeg/miniaudio logic. Do not expose FFmpeg raw pointers, device handles, QML, MPRIS, SMTC, or SQLite types.
@@ -236,7 +236,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): define playback contracts` | Files: `inc/seriona/audio/**`, `tests/audio/**`, `.omo/evidence/task-2-*`
 
-- [ ] 3. Add generated test audio fixtures
+- [x] 3. Add generated test audio fixtures
 
   **What to do**: Add a tiny fixture generation path that creates deterministic short WAV/PCM audio for tests, with no copyrighted assets. The generator can be C++ test helper or script invoked by CMake/CTest. Fixtures should cover silence, sine wave, short duration, and seek-friendly known sample counts.
   **Must NOT do**: Do not commit copyrighted music. Do not require network access. Do not require real audio device.
@@ -275,7 +275,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `test(audio): add generated fixtures` | Files: `tests/audio/**`, `tools/**`, `tests/fixtures/**`, `.omo/evidence/task-3-*`
 
-- [ ] 4. Implement playback state machine
+- [x] 4. Implement playback state machine
 
   **What to do**: Implement `PlaybackStateMachine` with states `Idle`, `Loading`, `Ready`, `Playing`, `Paused`, `Draining`, `Stopped`, `Error`, command serialization, cancellation semantics, and event emission into a fake sink. Cover `loadTrack`, `play`, `pause`, `resume`, `stop`, `seek`, natural end, and error recovery.
   **Must NOT do**: Do not call FFmpeg/miniaudio. Do not spawn unbounded detached threads. Do not decide next-track policy.
@@ -315,7 +315,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add playback state machine` | Files: `src/audio/**`, `inc/seriona/audio/**`, `tests/audio/**`, `.omo/evidence/task-4-*`
 
-- [ ] 5. Implement FFmpeg audio source RAII layer
+- [x] 5. Implement FFmpeg audio source RAII layer
 
   **What to do**: Implement `FfmpegAudioSource` for file open, stream selection, decoder init, packet read, `avcodec_send_packet`, looped `avcodec_receive_frame`, decoder drain with NULL packet, seek with decoder flush, and error conversion. Use RAII wrappers for format context, codec context, packets, and frames.
   **Must NOT do**: Do not implement filter graph here. Do not expose FFmpeg raw pointers in public headers. Do not access output device.
@@ -357,7 +357,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add ffmpeg source wrapper` | Files: `src/audio/ffmpeg/**`, `tests/audio/**`, `CMakeLists.txt`, `.omo/evidence/task-5-*`
 
-- [ ] 6. Implement FFmpeg filter graph pipeline
+- [x] 6. Implement FFmpeg filter graph pipeline
 
   **What to do**: Implement `FfmpegFilterPipeline` that converts decoded frames to target PCM format for both direct/mixed target decisions. Use graph alloc/parse/config, buffersrc frame input, buffersink frame output, EOF NULL handling, and clear/rebuild on seek or format change.
   **Must NOT do**: Do not perform device output. Do not embed output mode policy beyond target format conversion.
@@ -399,7 +399,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add ffmpeg filter pipeline` | Files: `src/audio/ffmpeg/**`, `tests/audio/**`, `.omo/evidence/task-6-*`
 
-- [ ] 7. Implement PCM buffer queue and playback clock
+- [x] 7. Implement PCM buffer queue and playback clock
 
   **What to do**: Implement project-owned fixed-capacity `PcmBufferQueue` ring buffer with SPSC semantics, plus `PlaybackClock` based on submitted/consumed frame counts, seek base, pause freeze, resume rebase, and underrun counters. Full queue write returns `false` and increments overflow/dropped counter; empty queue read writes silence to destination and increments underrun counter.
   **Must NOT do**: Do not allocate in consumer/read path. Do not block in consumer/read path. Do not use a third-party queue dependency in this task. Do not destroy queue while producer/consumer are active.
@@ -442,7 +442,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add pcm queue and playback clock` | Files: `src/audio/buffer/**`, `src/audio/clock/**`, `tests/audio/**`, `.omo/evidence/task-7-*`
 
-- [ ] 8. Implement miniaudio device layer with fakeable boundary
+- [x] 8. Implement miniaudio device layer with fakeable boundary
 
   **What to do**: Implement `AudioOutputDevice` around miniaudio low-level API: device enumeration, format config, init, start, stop, uninit, callback `pUserData`, and callback-to-queue read path. Add a fake device boundary for tests that do not require real hardware.
   **Must NOT do**: Do not call `ma_device_start`, `ma_device_stop`, `ma_device_uninit`, `ma_device_init`, FFmpeg, logging, allocation, locks, or `BackendEventSink` inside the callback.
@@ -485,7 +485,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add miniaudio device layer` | Files: `src/audio/device/**`, `tests/audio/**`, `CMakeLists.txt`, `.omo/evidence/task-8-*`
 
-- [ ] 9. Implement event dispatcher and sink lifecycle
+- [x] 9. Implement event dispatcher and sink lifecycle
 
   **What to do**: Implement `AudioEventDispatcher` that converts internal audio events to value-semantic `BackendEvent` or audio event payloads, handles sink cleared/shutdown behavior, version/timestamp assignment, and fake sink tests.
   **Must NOT do**: Do not call sink from realtime callback. Do not keep references to caller-owned event payloads. Do not block audio state machine on sink delivery.
@@ -526,7 +526,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add event dispatcher` | Files: `src/audio/events/**`, `tests/audio/**`, `.omo/evidence/task-9-*`
 
-- [ ] 10. Integrate `AudioPlayer` single-track playback path
+- [x] 10. Integrate `AudioPlayer` single-track playback path
 
   **What to do**: Wire `AudioPlayer` facade, `AudioPlaybackService`, state machine, FFmpeg source, filter pipeline, PCM queue/clock, device layer, and event dispatcher for single-track playback. Support `loadTrack -> play -> pause -> resume -> seek -> stop` with fake device and generated fixtures.
   **Must NOT do**: Do not implement playback queue policy. Do not access UI/OS/SQLite. Do not require real device for tests.
@@ -567,7 +567,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): integrate audio player playback path` | Files: `inc/seriona/audio/**`, `src/audio/**`, `tests/audio/**`, `.omo/evidence/task-10-*`
 
-- [ ] 11. Implement output mode negotiation and fallback
+- [x] 11. Implement output mode negotiation and fallback
 
   **What to do**: Implement direct/mix mode decision logic, device format negotiation result object, direct-to-mix fallback, mix format downgrade, `OutputFormatChanged`, `OutputModeFallback`, and `FormatNegotiationFailed` paths.
   **Must NOT do**: Do not implement cubeb backend. Do not expose negotiation details directly to UI; emit events only through sink.
@@ -608,7 +608,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add output format fallback` | Files: `src/audio/**`, `tests/audio/**`, `.omo/evidence/task-11-*`
 
-- [ ] 12. Implement preload and mix-mode seamless next-track handoff
+- [x] 12. Implement preload and mix-mode seamless next-track handoff
 
   **What to do**: Implement `prepareNext(...)`, `PreloadSlot`, background pre-open/pre-decode path, and mix-mode same-target-format natural next-track handoff into the PCM queue. Scope is only natural end of current track to prepared next track in mix mode.
   **Must NOT do**: Do not promise seamless direct mode. Do not handle device switch seamlessness. Do not implement queue policy; `mediaController` supplies next candidate.
@@ -648,7 +648,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `feat(audio): add preload seamless handoff` | Files: `src/audio/**`, `tests/audio/**`, `.omo/evidence/task-12-*`
 
-- [ ] 13. Harden error recovery, shutdown, and device-change behavior
+- [x] 13. Harden error recovery, shutdown, and device-change behavior
 
   **What to do**: Cover shutdown ordering, queue destruction lifecycle, sink clearing, decode task cancellation, device unavailable, decode failure, seek failure, underrun threshold reporting, and stop-before-destroy safety.
   **Must NOT do**: Do not add global thread pool framework. Do not make real device/manual listening the only proof.
@@ -689,7 +689,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `fix(audio): harden playback lifecycle` | Files: `src/audio/**`, `tests/audio/**`, `.omo/evidence/task-13-*`
 
-- [ ] 14. Document audio implementation research and constraints
+- [x] 14. Document audio implementation research and constraints
 
   **What to do**: Add developer-facing documentation under `docs/` or `docs/audio/` summarizing FFmpeg/miniaudio/SPSC constraints, callback forbidden operations, architecture boundaries, and how to run tests/prototypes. Because project docs path is not currently established, implementer may create `docs/audio-player.md` as part of this task.
   **Must NOT do**: Do not contradict `DESIGN.md`. Do not document unverified commands.
@@ -731,7 +731,7 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 
   **Commit**: YES | Message: `docs(audio): document playback implementation constraints` | Files: `docs/**`, `DESIGN.md` if cross-reference needed, `.omo/evidence/task-14-*`
 
-- [ ] 15. Add platform prototype harness for miniaudio local validation
+- [x] 15. Add platform prototype harness for miniaudio local validation
 
   **What to do**: Add an optional, non-default prototype executable or test target that can exercise miniaudio on the current Linux desktop with generated fixture playback, pause stop/reopen behavior, and format negotiation logging. Mark it as optional hardware-dependent because real devices are not guaranteed in CI, but keep command output capturable as evidence.
   **Must NOT do**: Do not make this required for default `ctest`. Do not require human listening for implementation completion. Do not add UI.
@@ -775,10 +775,10 @@ Wave 5: T14 docs may run after T1 but should incorporate latest implementation e
 > 4 review agents run in PARALLEL. ALL must APPROVE. Present consolidated results to user and get explicit "okay" before completing.
 > **Do NOT auto-proceed after verification. Wait for user's explicit approval before marking work complete.**
 > **Never mark F1-F4 as checked before getting user's okay.** Rejection or user feedback -> fix -> re-run -> present again -> wait for okay.
-- [ ] F1. Plan Compliance Audit — oracle
-- [ ] F2. Code Quality Review — unspecified-high
-- [ ] F3. Automated Runtime QA — unspecified-high (+ optional platform harness evidence, not UI, no human listening requirement)
-- [ ] F4. Scope Fidelity Check — deep
+- [x] F1. Plan Compliance Audit — oracle
+- [x] F2. Code Quality Review — unspecified-high
+- [x] F3. Automated Runtime QA — unspecified-high (+ optional platform harness evidence, not UI, no human listening requirement)
+- [x] F4. Scope Fidelity Check — deep
 
 ## Commit Strategy
 - Commit cadence: create one commit after each implementation task T1-T15 passes its own Acceptance Criteria and QA Scenarios. T0 dependency preflight produces evidence only and must not be committed by itself unless it creates tracked documentation, which it should not.

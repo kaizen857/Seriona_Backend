@@ -32,6 +32,8 @@ function(seriona_enable_warnings target_name)
   endif()
 endfunction()
 
+add_subdirectory(app)
+
 if(SERIONA_BUILD_TESTS)
   include(CTest)
   enable_testing()
