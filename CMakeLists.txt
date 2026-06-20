@@ -4,8 +4,10 @@ project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
 option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
 option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
+option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
+option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -24,6 +26,11 @@ target_include_directories(seriona_third_party_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/miniaudio>
 )
 
+add_library(seriona_watcher_headers INTERFACE)
+target_include_directories(seriona_watcher_headers INTERFACE
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/watcher/include>
+)
+
 function(seriona_enable_warnings target_name)
   if(MSVC)
     target_compile_options(${target_name} PRIVATE /W4 /permissive-)
@@ -31,6 +38,48 @@ function(seriona_enable_warnings target_name)
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 endfunction()
+
+if(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE)
+  message(FATAL_ERROR "seriona_scanner dependency gate: SQLite3 is required for scanner caching. Install externally, for example: sudo pacman -S sqlite")
+endif()
+
+find_package(SQLite3 REQUIRED)
+
+if(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH)
+  message(FATAL_ERROR "seriona_scanner dependency gate: libxxhash is required for scanner hashing. Install externally, for example: sudo pacman -S xxhash")
+endif()
+
+pkg_check_modules(SERIONA_XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+
+if(NOT TARGET TagReaderCore)
+  set(SERIONA_BUILD_TESTING_BEFORE_TAGREADER ${BUILD_TESTING})
+  set(BUILD_TESTING OFF CACHE BOOL "Build tests" FORCE)
+  add_subdirectory("/home/kaizen857/cppProject(app_and_lib)/TagReader" "${PROJECT_BINARY_DIR}/tagreader" EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING ${SERIONA_BUILD_TESTING_BEFORE_TAGREADER} CACHE BOOL "Build tests" FORCE)
+  unset(SERIONA_BUILD_TESTING_BEFORE_TAGREADER)
+  set_property(DIRECTORY "${PROJECT_BINARY_DIR}/tagreader/test" PROPERTY TESTS "")
+endif()
+
+add_library(seriona_scanner STATIC
+  src/scanner/scanner_module.cpp
+)
+
+target_include_directories(seriona_scanner
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(seriona_scanner
+  PRIVATE
+    SQLite3::SQLite3
+    PkgConfig::SERIONA_XXHASH
+    TagReaderCore
+    seriona_watcher_headers
+)
+
+seriona_enable_warnings(seriona_scanner)
 
 add_subdirectory(app)
 
