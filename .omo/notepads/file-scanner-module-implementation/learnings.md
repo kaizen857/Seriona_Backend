@@ -24,3 +24,10 @@
 - Directory Merkle hashing sorts children by relative UTF-8 path and includes child relative name, type, size, normalized mtime count, and child hash; tests fix mtimes when comparing two separately-created trees.
 - External `.lrc` hashing reuses the same file-content utility as audio hashing, so lyric file changes alter only the sidecar hash while the paired audio hash stays unchanged.
 - Verified Task 5 with `cmake --build build --target seriona_scanner_hash_tests` and `ctest --test-dir build -R seriona.scanner_hash --output-on-failure`.
+
+## 2026-06-20 task 6 scanner tree
+
+- `PlaylistTreeBuilder` publishes value-semantic `PlaylistTreeSnapshot` objects with stable node IDs instead of shared ownership links, so parent access is by ID and cannot form shared_ptr cycles.
+- Tree tests verify directory-first child ordering, empty-directory pruning, root aggregate song count/duration, external `.lrc` metadata attached to the paired song, and no `.lrc` public nodes.
+- Snapshot immutability is covered by mutating the builder after the first publish and asserting the prior snapshot's child list stays unchanged while the next version increments.
+- Verified Task 6 with `cmake --build build --target seriona_scanner_tree_tests` and `ctest --test-dir build -R seriona.scanner_tree --output-on-failure`.
