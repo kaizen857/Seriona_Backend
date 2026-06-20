@@ -126,6 +126,12 @@ add_executable(seriona_scanner_contract_tests
   scanner/scanner_contract_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/file_scanner_service.cpp
 )
+add_executable(seriona_scanner_paths_tests
+  scanner/scanner_paths_tests.cpp
+  scanner/scanner_test_harness.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/lrc_parser.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/path_utils.cpp
+)
 add_executable(seriona_scanner_hash_tests
   scanner/scanner_hash_tests.cpp
   scanner/scanner_test_harness.cpp
@@ -154,6 +160,7 @@ target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONF
 target_compile_definitions(seriona_audio_shutdown_lifecycle_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
@@ -236,6 +243,10 @@ target_include_directories(seriona_scanner_test_harness_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_contract_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -332,6 +343,7 @@ seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
 seriona_enable_warnings(seriona_scanner_contract_tests)
+seriona_enable_warnings(seriona_scanner_paths_tests)
 seriona_enable_warnings(seriona_scanner_hash_tests)
 seriona_enable_warnings(seriona_scanner_tree_tests)
 
@@ -366,5 +378,6 @@ add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_test
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
+add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
 add_test(NAME seriona.scanner_tree COMMAND seriona_scanner_tree_tests)
