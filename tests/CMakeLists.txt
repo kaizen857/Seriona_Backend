@@ -276,6 +276,7 @@ target_include_directories(seriona_scanner_contract_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_metadata_contract_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/src/metadata
 )
