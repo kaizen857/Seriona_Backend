@@ -9,6 +9,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -76,6 +77,106 @@ TEST_CASE("scanner public contracts use standard-library value types") {
   CHECK(metadata.offset == std::chrono::milliseconds{30000});
   CHECK(metadata.duration == std::chrono::milliseconds{180000});
   CHECK(metadata.logicalTrackId == "disc.flac#track-01");
+}
+
+TEST_CASE("scanner contract defaults are explicit and dependency-free") {
+  using namespace seriona::scanner;
+
+  const ScannerConfig config{};
+  CHECK(config.progressInterval == std::chrono::milliseconds{250});
+  CHECK(config.allowedExtensions.empty());
+  CHECK_FALSE(config.followSymlinks);
+  CHECK(config.readEmbeddedLyrics);
+  CHECK(config.readExternalLyrics);
+
+  const SongMetadata metadata{};
+  CHECK(metadata.effectiveLyricsSource == LyricsSource::None);
+  CHECK(metadata.effectiveLyrics.empty());
+  CHECK_FALSE(metadata.externalLyricsPath.has_value());
+  CHECK_FALSE(metadata.externalLyricsHash.has_value());
+  CHECK_FALSE(metadata.externalLyricsMtime.has_value());
+  CHECK(metadata.sourceFilePath.empty());
+  CHECK_FALSE(metadata.offset.has_value());
+  CHECK_FALSE(metadata.duration.has_value());
+  CHECK(metadata.logicalTrackId.empty());
+}
+
+TEST_CASE("playlist nodes distinguish structural and track-like kinds") {
+  using namespace seriona::scanner;
+
+  PlaylistNode root{};
+  root.nodeId = "root";
+  root.kind = PlaylistNodeKind::Root;
+  root.displayName = "Library";
+
+  PlaylistNode directory{};
+  directory.nodeId = "dir";
+  directory.parentNodeId = root.nodeId;
+  directory.kind = PlaylistNodeKind::Directory;
+  directory.displayName = "Music";
+
+  PlaylistNode track{};
+  track.nodeId = "track";
+  track.parentNodeId = directory.nodeId;
+  track.kind = PlaylistNodeKind::Track;
+  track.displayName = "Song";
+
+  CHECK(root.kind == PlaylistNodeKind::Root);
+  CHECK(directory.kind == PlaylistNodeKind::Directory);
+  CHECK(track.kind == PlaylistNodeKind::Track);
+  CHECK(root.kind != directory.kind);
+  CHECK(directory.kind != track.kind);
+  CHECK_FALSE(root.parentNodeId.has_value());
+  REQUIRE(directory.parentNodeId.has_value());
+  CHECK(*directory.parentNodeId == root.nodeId);
+  REQUIRE(track.parentNodeId.has_value());
+  CHECK(*track.parentNodeId == directory.nodeId);
+}
+
+TEST_CASE("scanner events keep declared type and payload alternative consistent") {
+  using namespace seriona::scanner;
+
+  ScanProgress progress{};
+  progress.filesDiscovered = 3;
+  progress.filesScanned = 2;
+  ScannerEvent progressEvent{};
+  progressEvent.type = ScannerEventType::ProgressUpdated;
+  progressEvent.payload = progress;
+  CHECK(progressEvent.type == ScannerEventType::ProgressUpdated);
+  REQUIRE(std::holds_alternative<ScanProgress>(progressEvent.payload));
+  CHECK(std::get<ScanProgress>(progressEvent.payload).filesDiscovered == 3);
+  CHECK(std::get<ScanProgress>(progressEvent.payload).filesScanned == 2);
+
+  PlaylistTreeSnapshot snapshot{};
+  snapshot.version = 7;
+  ScannerEvent snapshotEvent{};
+  snapshotEvent.type = ScannerEventType::PlaylistSnapshotUpdated;
+  snapshotEvent.payload = snapshot;
+  CHECK(snapshotEvent.type == ScannerEventType::PlaylistSnapshotUpdated);
+  REQUIRE(std::holds_alternative<PlaylistTreeSnapshot>(snapshotEvent.payload));
+  CHECK(std::get<PlaylistTreeSnapshot>(snapshotEvent.payload).version == 7);
+
+  SongMetadata song{};
+  song.trackId = "song-1";
+  song.title = "Song";
+  ScannerEvent songEvent{};
+  songEvent.type = ScannerEventType::FileScanned;
+  songEvent.payload = song;
+  CHECK(songEvent.type == ScannerEventType::FileScanned);
+  REQUIRE(std::holds_alternative<SongMetadata>(songEvent.payload));
+  CHECK(std::get<SongMetadata>(songEvent.payload).trackId == "song-1");
+  CHECK(std::get<SongMetadata>(songEvent.payload).title == "Song");
+
+  ScannerError error{};
+  error.code = ScannerErrorCode::PermissionDenied;
+  error.message = "denied";
+  ScannerEvent errorEvent{};
+  errorEvent.type = ScannerEventType::ScanError;
+  errorEvent.payload = error;
+  CHECK(errorEvent.type == ScannerEventType::ScanError);
+  REQUIRE(std::holds_alternative<ScannerError>(errorEvent.payload));
+  CHECK(std::get<ScannerError>(errorEvent.payload).code == ScannerErrorCode::PermissionDenied);
+  CHECK(std::get<ScannerError>(errorEvent.payload).message == "denied");
 }
 
 TEST_CASE("scanner service facade forwards to an injected service") {
