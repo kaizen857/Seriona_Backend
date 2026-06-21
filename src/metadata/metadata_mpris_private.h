@@ -1,0 +1,89 @@
+#pragma once
+
+#include "metadata_mapper.h"
+#include "metadata_service_backend.h"
+
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace seriona::metadata::detail {
+
+constexpr const char* kMprisBusName = "org.mpris.MediaPlayer2.seriona";
+constexpr const char* kMprisObjectPath = "/org/mpris/MediaPlayer2";
+constexpr const char* kMprisRootInterface = "org.mpris.MediaPlayer2";
+constexpr const char* kMprisPlayerInterface = "org.mpris.MediaPlayer2.Player";
+
+struct MprisObjectModel {
+  std::string objectPath{kMprisObjectPath};
+  std::string rootInterface{kMprisRootInterface};
+  std::string playerInterface{kMprisPlayerInterface};
+  std::vector<std::string> rootProperties{"CanQuit", "CanRaise", "HasTrackList", "Identity", "DesktopEntry", "SupportedUriSchemes", "SupportedMimeTypes"};
+  std::vector<std::string> playerMethods{"Next", "Previous", "Pause", "PlayPause", "Stop", "Play", "Seek", "SetPosition", "OpenUri"};
+  std::vector<std::string> playerProperties{"PlaybackStatus", "LoopStatus", "Rate", "Shuffle", "Metadata", "Volume", "Position", "MinimumRate", "MaximumRate", "CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek", "CanControl"};
+};
+
+struct MprisSnapshotRecord {
+  MetadataPlatformSnapshotDto snapshot{};
+  std::string trackObjectPath{kMprisNoTrackObjectPath};
+  std::string artUrl;
+  std::string loopStatus{"None"};
+  bool canControl{false};
+};
+
+class IMprisObject {
+public:
+  virtual ~IMprisObject() = default;
+  virtual void registerModel(const MprisObjectModel& model) = 0;
+  virtual void publish(const MprisSnapshotRecord& snapshot) = 0;
+};
+
+class IMprisBus {
+public:
+  virtual ~IMprisBus() = default;
+  virtual void requestName(std::string_view name) = 0;
+  virtual void addObjectManager(std::string_view objectPath) = 0;
+  [[nodiscard]] virtual std::unique_ptr<IMprisObject> createObject(std::string_view objectPath) = 0;
+};
+
+class LinuxMprisAdapter {
+public:
+  explicit LinuxMprisAdapter(std::unique_ptr<IMprisBus> bus = {});
+
+  void setCommandSink(control::MediaControlCommandSink sink);
+  [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state);
+  [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state);
+  [[nodiscard]] MetadataSyncResult stop();
+  [[nodiscard]] bool setPosition(const std::string& trackObjectPath, std::chrono::microseconds position);
+
+  [[nodiscard]] const MprisObjectModel& model() const noexcept { return model_; }
+  [[nodiscard]] const std::optional<MprisSnapshotRecord>& lastPublishedSnapshot() const noexcept { return lastPublishedSnapshot_; }
+
+private:
+  [[nodiscard]] static MetadataSyncResult makeFailureResult(std::string code, std::string message);
+  [[nodiscard]] static MetadataSyncResult makeAcceptedResult(const PlatformMediaState& state, bool changed);
+  [[nodiscard]] static std::string loopStatusFromRepeatMode(control::RepeatMode repeatMode);
+  [[nodiscard]] static std::string artUrlFromArtwork(const std::optional<control::ArtworkRef>& artwork);
+  [[nodiscard]] static bool canControlFromCapabilities(const control::PlaybackCapabilities& capabilities);
+  [[nodiscard]] static MprisSnapshotRecord toSnapshotRecord(const MetadataPlatformSnapshotDto& snapshot);
+
+  void ensureStarted();
+  void publishCurrentSnapshot();
+  void dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position = std::nullopt);
+
+  std::unique_ptr<IMprisBus> bus_{};
+  std::unique_ptr<IMprisObject> object_{};
+  control::MediaControlCommandSink commandSink_{};
+  std::optional<PlatformMediaState> currentState_{};
+  std::optional<MprisSnapshotRecord> lastPublishedSnapshot_{};
+  bool started_{false};
+  MprisObjectModel model_{};
+};
+
+[[nodiscard]] std::unique_ptr<MetadataServiceBackend> makeLinuxMetadataServiceBackend(std::unique_ptr<IMprisBus> bus = {});
+
+}

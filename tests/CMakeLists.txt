@@ -136,8 +136,15 @@ add_executable(seriona_metadata_service_tests
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_testing.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_recording.cpp
 )
+add_executable(seriona_metadata_service_recording_tests
+  metadata/metadata_service_recording_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_testing.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_recording.cpp
+)
 add_executable(seriona_metadata_mpris_tests
   metadata/metadata_mpris_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris_linux.cpp
 )
 add_executable(seriona_scanner_paths_tests
   scanner/scanner_paths_tests.cpp
@@ -197,6 +204,7 @@ target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG
 target_compile_definitions(seriona_metadata_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_metadata_service_recording_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -300,6 +308,11 @@ target_include_directories(seriona_metadata_mapper_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src/metadata
 )
 target_include_directories(seriona_metadata_service_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/src/metadata
+)
+target_include_directories(seriona_metadata_service_recording_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/src/metadata
@@ -420,9 +433,16 @@ target_link_libraries(seriona_metadata_mapper_tests PRIVATE
 target_link_libraries(seriona_metadata_service_tests PRIVATE
   seriona_metadata
 )
+target_link_libraries(seriona_metadata_service_recording_tests PRIVATE
+  seriona_metadata
+)
 target_link_libraries(seriona_metadata_mpris_tests PRIVATE
   seriona_metadata
 )
+
+if(UNIX AND NOT APPLE)
+  target_link_libraries(seriona_metadata_mpris_tests PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
+endif()
 
 seriona_enable_warnings(seriona_tests)
 seriona_enable_warnings(seriona_audio_contract_tests)
@@ -502,6 +522,7 @@ add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
 add_test(NAME seriona.metadata_contract COMMAND seriona_metadata_contract_tests)
 add_test(NAME seriona.metadata_mapper COMMAND seriona_metadata_mapper_tests)
 add_test(NAME seriona.metadata_service COMMAND seriona_metadata_service_tests)
+add_test(NAME seriona.metadata_service_recording COMMAND seriona_metadata_service_recording_tests)
 add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
 add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
 add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)

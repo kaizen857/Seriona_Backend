@@ -1,6 +1,12 @@
 #include "seriona/metadata/metadata_contracts.h"
 
+#include "metadata_service_backend.h"
+
 #include "metadata_synchronizer.h"
+
+#if defined(__linux__) && !defined(__APPLE__)
+#include "metadata_mpris_private.h"
+#endif
 
 #include <chrono>
 #include <memory>
@@ -19,17 +25,6 @@ namespace {
   result.message = std::move(message);
   return result;
 }
-
-class MetadataServiceBackend {
-public:
-  virtual ~MetadataServiceBackend() = default;
-  [[nodiscard]] virtual MetadataBackendKind kind() const = 0;
-  [[nodiscard]] virtual MetadataBackendCapabilities capabilities() const = 0;
-  [[nodiscard]] virtual control::SubscriptionHandle registerCommandCallback(control::MediaControlCommandSink callback) = 0;
-  [[nodiscard]] virtual MetadataSyncResult start(const PlatformMediaState& state) = 0;
-  [[nodiscard]] virtual MetadataSyncResult update(const PlatformMediaState& state) = 0;
-  [[nodiscard]] virtual MetadataSyncResult stop() = 0;
-};
 
 class NoopMetadataServiceBackend final : public MetadataServiceBackend {
 public:
@@ -142,7 +137,9 @@ private:
   std::unique_ptr<MetadataServiceBackend> backend_;
 };
 
-[[nodiscard]] std::unique_ptr<MetadataServiceBackend> makeBackend(const MetadataSharingOptions& options) {
+}
+
+[[nodiscard]] std::unique_ptr<MetadataServiceBackend> makeMetadataServiceBackendFromOptions(const MetadataSharingOptions& options) {
   if (options.backendKind == MetadataBackendKind::Windows) {
     const auto capabilities = MetadataBackendCapabilities{.requiresPlatformExtension = true,
                                                           .hasPlatformExtension = options.platformExtension != nullptr};
@@ -158,11 +155,7 @@ private:
 
   if (options.backendKind == MetadataBackendKind::Linux) {
 #if defined(__linux__) && !defined(__APPLE__)
-    return std::make_unique<UnavailableMetadataServiceBackend>(
-        MetadataBackendKind::Linux,
-        MetadataBackendCapabilities{},
-        "metadata.backend.linux.unimplemented",
-        "linux metadata backend is not implemented yet");
+    return detail::makeLinuxMetadataServiceBackend();
 #else
     return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Noop, MetadataBackendCapabilities{});
 #endif
@@ -171,10 +164,13 @@ private:
   return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Noop, MetadataBackendCapabilities{});
 }
 
+std::unique_ptr<MetadataSharingService> makeMetadataSharingServiceFromBackend(
+    MetadataBackendKind kind, std::unique_ptr<MetadataServiceBackend> backend) {
+  return std::make_unique<MetadataSharingServiceImpl>(kind, std::move(backend));
 }
 
 std::unique_ptr<MetadataSharingService> makeMetadataSharingService(const MetadataSharingOptions& options) {
-  return std::make_unique<MetadataSharingServiceImpl>(options.backendKind, makeBackend(options));
+  return makeMetadataSharingServiceFromBackend(options.backendKind, makeMetadataServiceBackendFromOptions(options));
 }
 
 }

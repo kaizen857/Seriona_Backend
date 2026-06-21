@@ -17,3 +17,5 @@
 - Todo 7 把 Noop 生命周期和测试录制 seam 分离成内部 backend 文件与 test-only recording 文件；公开工厂只处理 backend 选择，测试工厂单独注入 recording hooks。
 - Windows 无宿主句柄时的退化通过 `MetadataBackendCapabilities` 体现，不新增公开 API 分支；`requiresPlatformExtension` 和 `hasPlatformExtension` 是测试可见的能力信号。
 - `update()` 在 stop 之后明确返回失败结果（带错误码和 message），而不是静默继续接受更新；这让后续 caller 能区分正常 idle 与已停止状态。
+- Linux MPRIS adapter keeps `sdbus-c++` private to `src/metadata/*.cpp`; tests use a fake bus seam and never require a live desktop D-Bus session.
+- `seriona.metadata_mpris_smoke` remains a fixed CTest entry so the MPRIS target stays anchored even when the richer test set changes.
