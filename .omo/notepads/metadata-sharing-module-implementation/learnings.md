@@ -7,3 +7,5 @@
 - `version` / `sampledAt` 这类内部新鲜度元数据适合封装成独立的 `SnapshotFreshness` 值对象，既保留快照追踪能力，也避免把平台 payload 字段和时钟字段混在一起。
 - 契约命名最好直接贴合计划语言：`ArtworkRef`、`PlaybackCapabilities`、`PlaybackTimeline`、`PlayerStateSnapshot`、`SubscriptionHandle` 比更泛化的名字更容易和后续 Todo 3-10 对齐。
 - `MediaControlCommand` 需要显式覆盖 `SetShuffle`，否则后续 MPRIS 命令桥接会在合同层缺一个可表达的输入。
+- `MetadataSharingService` 适合直接复用控制层的 `MediaControlCommand` / `SubscriptionHandle` / `PlayerStateSnapshot` 语义；metadata 契约只需要补自己的 backend kind、capabilities、sync result 和平台扩展入口，不需要再发明一套独立命令/订阅模型。
+- 如果未来确实需要平台宿主句柄，应该放进 `MetadataSharingOptions` 的 opaque extension，而不是把 HWND/WinRT 之类平台名抬进核心 API。

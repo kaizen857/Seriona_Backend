@@ -6,3 +6,4 @@
 - `PlayerSnapshot` 的内部新鲜度信息采用 `SnapshotFreshness` 子对象承载，避免把版本/采样时间当作业务字段散落在 snapshot 根部。
 - 计划词汇优先：公共控制契约采用 `PlayerStateSnapshot` / `PlaybackCapabilities` / `PlaybackTimeline` / `ArtworkRef` / `SubscriptionHandle`，以减少后续 Todo 3-10 的映射歧义。
 - `SetShuffle` 属于合同级 command 能力，必须与 repeat/seek/volume 并列存在，方便后续 MPRIS 直接桥接。
+- metadata 服务契约应在 public header 中保持平台中立：用 `MetadataBackendKind` / `MetadataBackendCapabilities` / `PlatformMediaState` / `MetadataSyncResult` 描述能力与同步结果，平台差异通过 options/capabilities/opaque extension 承载，不新增 Windows 专属公共签名。

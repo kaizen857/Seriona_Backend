@@ -84,6 +84,8 @@ target_include_directories(seriona_scanner
 )
 
 target_include_directories(seriona_metadata
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/src/metadata
