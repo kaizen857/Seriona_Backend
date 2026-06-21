@@ -21,10 +21,20 @@ namespace {
 
 struct RecordingMprisObject final : seriona::metadata::detail::IMprisObject {
   seriona::metadata::detail::MprisObjectModel model{};
+  seriona::metadata::detail::MprisCommandHandlers handlers{};
   std::vector<seriona::metadata::detail::MprisSnapshotRecord> published{};
 
   void registerModel(const seriona::metadata::detail::MprisObjectModel& value) override { model = value; }
+  void registerCommandHandlers(const seriona::metadata::detail::MprisCommandHandlers& value) override { handlers = value; }
   void publish(const seriona::metadata::detail::MprisSnapshotRecord& snapshot) override { published.push_back(snapshot); }
+};
+
+struct CommandRecorder {
+  std::vector<seriona::control::MediaControlCommand> commands{};
+
+  seriona::control::MediaControlCommandSink sink() {
+    return [this](const seriona::control::MediaControlCommand& command) { commands.push_back(command); };
+  }
 };
 
 struct RecordingMprisBus final : seriona::metadata::detail::IMprisBus {
@@ -37,7 +47,7 @@ struct RecordingMprisBus final : seriona::metadata::detail::IMprisBus {
   void addObjectManager(std::string_view objectPath) override { objectManagerPath = std::string{objectPath}; }
   [[nodiscard]] std::unique_ptr<seriona::metadata::detail::IMprisObject> createObject(std::string_view) override {
     object = ownedObject.get();
-    return std::unique_ptr<seriona::metadata::detail::IMprisObject>{ownedObject.release()};
+    return std::unique_ptr<seriona::metadata::detail::IMprisObject>{std::move(ownedObject)};
   }
 };
 
@@ -72,6 +82,31 @@ seriona::control::PlayerStateSnapshot buildSnapshot(std::string trackId,
   return snapshot;
 }
 
+std::string trackObjectPath() {
+  const seriona::control::TrackIdentity track{
+      .trackId = "track-01",
+      .filePath = std::filesystem::path{"music/track.flac"},
+      .sourceId = "source-a",
+      .libraryId = "library-a",
+  };
+  return seriona::metadata::makeMprisTrackObjectPath(track);
+}
+
+void checkCommand(const seriona::control::MediaControlCommand& command,
+                  seriona::control::MediaControlCommandKind expectedKind,
+                  std::optional<std::chrono::milliseconds> expectedPosition = std::nullopt,
+                  std::optional<std::chrono::milliseconds> expectedDelta = std::nullopt,
+                  std::optional<float> expectedVolume = std::nullopt,
+                  std::optional<seriona::control::RepeatMode> expectedRepeatMode = std::nullopt,
+                  std::optional<bool> expectedShuffle = std::nullopt) {
+  CHECK(command.kind == expectedKind);
+  CHECK(command.position == expectedPosition);
+  CHECK(command.delta == expectedDelta);
+  CHECK(command.volume == expectedVolume);
+  CHECK(command.repeatMode == expectedRepeatMode);
+  CHECK(command.shuffle == expectedShuffle);
+}
+
 }
 
 TEST_CASE("metadata mpris smoke path returns a stable accepted result") {
@@ -88,7 +123,8 @@ TEST_CASE("linux mpris adapter exposes the real object model through a fake bus 
   auto bus = std::make_unique<RecordingMprisBus>();
   auto* busRaw = bus.get();
   auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
-  adapter.setCommandSink([](const seriona::control::MediaControlCommand&) {});
+  CommandRecorder recorder{};
+  adapter.setCommandSink(recorder.sink());
 
   const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
                                                                          .timelineUpdateInterval = std::chrono::milliseconds{1000}});
@@ -104,6 +140,43 @@ TEST_CASE("linux mpris adapter exposes the real object model through a fake bus 
   CHECK(busRaw->object->model.playerProperties == std::vector<std::string>{"PlaybackStatus", "LoopStatus", "Rate", "Shuffle", "Metadata", "Volume", "Position", "MinimumRate", "MaximumRate", "CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek", "CanControl"});
   REQUIRE_FALSE(busRaw->object->published.empty());
 
+  REQUIRE(busRaw->object->handlers.play);
+  REQUIRE(busRaw->object->handlers.pause);
+  REQUIRE(busRaw->object->handlers.playPause);
+  REQUIRE(busRaw->object->handlers.stop);
+  REQUIRE(busRaw->object->handlers.next);
+  REQUIRE(busRaw->object->handlers.previous);
+  REQUIRE(busRaw->object->handlers.seekBy);
+  REQUIRE(busRaw->object->handlers.setPosition);
+  REQUIRE(busRaw->object->handlers.setVolume);
+  REQUIRE(busRaw->object->handlers.setRepeatMode);
+  REQUIRE(busRaw->object->handlers.setShuffle);
+
+  CHECK(busRaw->object->handlers.play());
+  CHECK(busRaw->object->handlers.pause());
+  CHECK(busRaw->object->handlers.playPause());
+  CHECK(busRaw->object->handlers.stop());
+  CHECK(busRaw->object->handlers.next());
+  CHECK(busRaw->object->handlers.previous());
+  CHECK(busRaw->object->handlers.seekBy(std::chrono::microseconds{250'000}));
+  CHECK(busRaw->object->handlers.setPosition(trackObjectPath(), std::chrono::microseconds{2'000'000}));
+  CHECK(busRaw->object->handlers.setVolume(0.25F));
+  CHECK(busRaw->object->handlers.setRepeatMode(seriona::control::RepeatMode::One));
+  CHECK(busRaw->object->handlers.setShuffle(false));
+
+  REQUIRE(recorder.commands.size() == 11);
+  checkCommand(recorder.commands[0], seriona::control::MediaControlCommandKind::Play);
+  checkCommand(recorder.commands[1], seriona::control::MediaControlCommandKind::Pause);
+  checkCommand(recorder.commands[2], seriona::control::MediaControlCommandKind::TogglePlayPause);
+  checkCommand(recorder.commands[3], seriona::control::MediaControlCommandKind::Stop);
+  checkCommand(recorder.commands[4], seriona::control::MediaControlCommandKind::SkipNext);
+  checkCommand(recorder.commands[5], seriona::control::MediaControlCommandKind::SkipPrevious);
+  checkCommand(recorder.commands[6], seriona::control::MediaControlCommandKind::SeekBy, std::nullopt, std::chrono::milliseconds{250});
+  checkCommand(recorder.commands[7], seriona::control::MediaControlCommandKind::SeekTo, std::chrono::milliseconds{2000});
+  checkCommand(recorder.commands[8], seriona::control::MediaControlCommandKind::SetVolume, std::nullopt, std::nullopt, 0.25F);
+  checkCommand(recorder.commands[9], seriona::control::MediaControlCommandKind::SetRepeatMode, std::nullopt, std::nullopt, std::nullopt, seriona::control::RepeatMode::One);
+  checkCommand(recorder.commands[10], seriona::control::MediaControlCommandKind::SetShuffle, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false);
+
   const auto& published = busRaw->object->published.back();
   CHECK(published.trackObjectPath.rfind("/org/mpris", 0) != 0);
   CHECK(published.artUrl == "file://covers/track.jpg");
@@ -117,6 +190,8 @@ TEST_CASE("linux mpris adapter exposes the real object model through a fake bus 
   CHECK_FALSE(busRaw->object->published.back().canControl);
 
   CHECK_FALSE(adapter.setPosition("/org/mpris/MediaPlayer2/TrackList/NoTrack", std::chrono::microseconds{1'000'000}));
+  CHECK_FALSE(busRaw->object->handlers.seekBy(std::chrono::microseconds{-1}));
+  CHECK_FALSE(busRaw->object->handlers.setPosition("/com/seriona/metadata/track/track-01", std::chrono::microseconds{-1}));
 #endif
 }
 
@@ -131,6 +206,35 @@ TEST_CASE("metadata mpris adapter rejects stale track ids for SetPosition") {
   CHECK(start.accepted);
 
   CHECK_FALSE(adapter.setPosition("/com/seriona/metadata/track/track-02", std::chrono::microseconds{2'000'000}));
+#endif
+}
+
+TEST_CASE("metadata mpris adapter rejects commands when capabilities are disabled") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
+  CommandRecorder recorder{};
+  adapter.setCommandSink(recorder.sink());
+  const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, false),
+                                                                         .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  CHECK(start.accepted);
+  REQUIRE(busRaw->object != nullptr);
+
+  CHECK_FALSE(busRaw->object->handlers.play());
+  CHECK_FALSE(busRaw->object->handlers.pause());
+  CHECK_FALSE(busRaw->object->handlers.playPause());
+  CHECK_FALSE(busRaw->object->handlers.stop());
+  CHECK_FALSE(busRaw->object->handlers.next());
+  CHECK_FALSE(busRaw->object->handlers.previous());
+  CHECK_FALSE(busRaw->object->handlers.seekBy(std::chrono::microseconds{1'000'000}));
+  CHECK_FALSE(busRaw->object->handlers.setPosition("/com/seriona/metadata/track/track-01", std::chrono::microseconds{1'000'000}));
+  CHECK_FALSE(busRaw->object->handlers.setVolume(0.5F));
+  CHECK_FALSE(busRaw->object->handlers.setRepeatMode(seriona::control::RepeatMode::All));
+  CHECK_FALSE(busRaw->object->handlers.setShuffle(true));
+  CHECK(recorder.commands.empty());
 #endif
 }
 

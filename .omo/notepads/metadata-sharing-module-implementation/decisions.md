@@ -20,3 +20,5 @@
 - Linux MPRIS adapter keeps `sdbus-c++` private to `src/metadata/*.cpp`; tests use a fake bus seam and never require a live desktop D-Bus session.
 - `seriona.metadata_mpris_smoke` remains a fixed CTest entry so the MPRIS target stays anchored even when the richer test set changes.
 - Windows SMTC is added as a compile-isolated private scaffold: `_WIN32` selects the backend factory, Linux builds never see WinRT/SMTC headers, and the official flow shape is recorded in private helper text/types rather than runtime SDK calls.
+- Linux MPRIS command bridging keeps an explicit private `MprisCommandHandlers` seam so the adapter can register value-semantic callbacks without exposing platform logic in public headers or executing media actions directly.
+- `CanControl` gating is applied per command kind instead of as a blanket allow/deny flag, so capability checks can stay aligned with the specific MPRIS action being translated.

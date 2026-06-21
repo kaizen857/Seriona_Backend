@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +28,20 @@ struct MprisObjectModel {
   std::vector<std::string> playerProperties{"PlaybackStatus", "LoopStatus", "Rate", "Shuffle", "Metadata", "Volume", "Position", "MinimumRate", "MaximumRate", "CanGoNext", "CanGoPrevious", "CanPlay", "CanPause", "CanSeek", "CanControl"};
 };
 
+struct MprisCommandHandlers {
+  std::function<bool()> play;
+  std::function<bool()> pause;
+  std::function<bool()> playPause;
+  std::function<bool()> stop;
+  std::function<bool()> next;
+  std::function<bool()> previous;
+  std::function<bool(std::chrono::microseconds)> seekBy;
+  std::function<bool(const std::string&, std::chrono::microseconds)> setPosition;
+  std::function<bool(float)> setVolume;
+  std::function<bool(control::RepeatMode)> setRepeatMode;
+  std::function<bool(bool)> setShuffle;
+};
+
 struct MprisSnapshotRecord {
   MetadataPlatformSnapshotDto snapshot{};
   std::string trackObjectPath{kMprisNoTrackObjectPath};
@@ -39,6 +54,7 @@ class IMprisObject {
 public:
   virtual ~IMprisObject() = default;
   virtual void registerModel(const MprisObjectModel& model) = 0;
+  virtual void registerCommandHandlers(const MprisCommandHandlers& handlers) = 0;
   virtual void publish(const MprisSnapshotRecord& snapshot) = 0;
 };
 
@@ -72,8 +88,13 @@ private:
   [[nodiscard]] static MprisSnapshotRecord toSnapshotRecord(const MetadataPlatformSnapshotDto& snapshot);
 
   void ensureStarted();
+  void configureCommandModel();
   void publishCurrentSnapshot();
-  void dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position = std::nullopt);
+  [[nodiscard]] bool dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position = std::nullopt);
+  [[nodiscard]] bool dispatchSeekBy(std::chrono::microseconds delta);
+  [[nodiscard]] bool dispatchSetVolume(float volume);
+  [[nodiscard]] bool dispatchSetRepeat(control::RepeatMode repeatMode);
+  [[nodiscard]] bool dispatchSetShuffle(bool shuffle);
 
   std::unique_ptr<IMprisBus> bus_{};
   std::unique_ptr<IMprisObject> object_{};
@@ -82,6 +103,7 @@ private:
   std::optional<MprisSnapshotRecord> lastPublishedSnapshot_{};
   bool started_{false};
   MprisObjectModel model_{};
+  MprisCommandHandlers commandHandlers_{};
 };
 
 [[nodiscard]] std::unique_ptr<MetadataServiceBackend> makeLinuxMetadataServiceBackend(std::unique_ptr<IMprisBus> bus = {});
