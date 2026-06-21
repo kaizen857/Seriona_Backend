@@ -11,3 +11,5 @@
 - 如果未来确实需要平台宿主句柄，应该放进 `MetadataSharingOptions` 的 opaque extension，而不是把 HWND/WinRT 之类平台名抬进核心 API。
 - metadata 的测试目标也应该像 scanner 一样拆成 `contract` / `mapper` / `service` / `mpris` 四层，并且都链接 `seriona_metadata`，这样 CTest 名称和二进制目标能直接对应后续实现层。
 - Linux 依赖门控最好放在顶层 `CMakeLists.txt` 的 configure 阶段，模拟开关要和 scanner 的 `SERIONA_SCANNER_SIMULATE_MISSING_*` 保持同风格，便于不用卸包也能验证失败路径。
+- snapshot 到平台 DTO 的 mapper 需要把 `PlayerStateSnapshot` 里的公共字段显式分层：展示字段、时间线字段、控制能力字段可映射；`freshness.version`、`freshness.sampledAt`、`playback.errorCode`、`playback.errorMessage` 以及输出格式/错误摘要这类内部信息不应进入平台 payload。
+- MPRIS track object path 生成应使用仓库自定义前缀并保留一个明确的 no-track sentinel；只有空 track 才回退到 sentinel，其余 track id 都要生成非 `/org/mpris` 前缀的对象路径，避免和系统保留命名冲突。

@@ -9,3 +9,5 @@
 - metadata 服务契约应在 public header 中保持平台中立：用 `MetadataBackendKind` / `MetadataBackendCapabilities` / `PlatformMediaState` / `MetadataSyncResult` 描述能力与同步结果，平台差异通过 options/capabilities/opaque extension 承载，不新增 Windows 专属公共签名。
 - `seriona_metadata` 的构建拆分会提前预留 mapper/service/MPRIS 测试入口，即使实现仍是最小骨架，也要让 `ctest -R seriona.metadata` 跑到真实断言，而不是空壳。
 - Linux MPRIS 真实适配的 `sdbus-c++` 检查采用 configure gate；模拟缺失开关 `SERIONA_METADATA_SIMULATE_MISSING_SDBUS` 只用于测试依赖门，不会降级成 Noop。
+- mapper 这一层只负责把 `PlayerStateSnapshot` 转成平台中立 DTO，不做同步器、服务生命周期或传输层封装，后续 Todo 仍需在各自模块里单独实现。
+- 平台 DTO 统一保留 microseconds 级时间值，避免在 mapper 里混入平台特定时间单位转换规则；Windows DTO 刻意不声明 volume/mute 支持，避免提前承诺未实现能力。
