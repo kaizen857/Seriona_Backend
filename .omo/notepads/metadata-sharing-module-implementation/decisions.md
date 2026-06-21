@@ -22,3 +22,4 @@
 - Windows SMTC is added as a compile-isolated private scaffold: `_WIN32` selects the backend factory, Linux builds never see WinRT/SMTC headers, and the official flow shape is recorded in private helper text/types rather than runtime SDK calls.
 - Linux MPRIS command bridging keeps an explicit private `MprisCommandHandlers` seam so the adapter can register value-semantic callbacks without exposing platform logic in public headers or executing media actions directly.
 - `CanControl` gating is applied per command kind instead of as a blanket allow/deny flag, so capability checks can stay aligned with the specific MPRIS action being translated.
+- Todo 11 decision: keep metadata integration link-only at the app target boundary; do not add service construction, startup, or platform-specific metadata references to `app/main.cpp`.

@@ -27,3 +27,4 @@
 - The official SMTC flow shape is best captured as a comment/type skeleton (`GetForWindow -> DisplayUpdater.Type = Music -> MusicProperties -> Thumbnail -> Update`) rather than by introducing runtime SDK calls on non-Windows hosts.
 - Linux MPRIS command tests are easiest to keep deterministic when the fake object stores command handlers separately from the publish-only model; that lets the test trigger each handler directly and assert the emitted `MediaControlCommand` values without needing a live bus.
 - `SetPosition` coverage is more robust when the test derives the expected track object path from `makeMprisTrackObjectPath(...)` instead of hard-coding the path string, which keeps the command bridge aligned with the mapper's custom path policy.
+- Todo 11 only needs build graph wiring: `seriona` can consume `seriona_metadata` as a private link dependency without touching `app/main.cpp`, which keeps the startup path free of metadata lifecycle code.

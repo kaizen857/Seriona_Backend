@@ -22,6 +22,7 @@ target_include_directories(seriona PRIVATE
 
 target_link_libraries(seriona PRIVATE
   seriona_scanner
+  seriona_metadata
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
 )
