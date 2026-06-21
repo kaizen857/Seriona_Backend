@@ -15,6 +15,7 @@ struct SnapshotFixture {
   std::uint64_t version{0};
   std::chrono::milliseconds position{0};
   seriona::control::PlaybackStatus status{seriona::control::PlaybackStatus::Stopped};
+  std::string trackId{"track-01"};
   std::optional<std::string> title{std::string{"Song"}};
   std::optional<std::filesystem::path> artworkPath{std::filesystem::path{"covers/track-01.jpg"}};
   bool canSetRepeat{true};
@@ -25,7 +26,7 @@ seriona::control::PlayerStateSnapshot buildSnapshot(const SnapshotFixture& fixtu
   snapshot.freshness.version = fixture.version;
   snapshot.freshness.sampledAt = Clock::time_point{std::chrono::milliseconds{static_cast<std::int64_t>(fixture.version)}};
   snapshot.currentTrack = seriona::control::TrackIdentity{
-      .trackId = "track-01",
+      .trackId = fixture.trackId,
       .filePath = std::filesystem::path{"music/track-01.flac"},
       .sourceId = "source-a",
       .libraryId = "library-a",
@@ -149,12 +150,17 @@ TEST_CASE("metadata synchronizer emits immediate timeline updates for pause seek
   const auto stopped = synchronizer.synchronize(buildSnapshot(SnapshotFixture{.version = 5U,
                                                                              .position = std::chrono::milliseconds{0},
                                                                              .status = seriona::control::PlaybackStatus::Stopped}));
+  const auto trackChanged = synchronizer.synchronize(buildSnapshot(SnapshotFixture{.version = 6U,
+                                                                                   .position = std::chrono::milliseconds{0},
+                                                                                   .status = seriona::control::PlaybackStatus::Playing,
+                                                                                   .trackId = "track-02"}));
 
   CHECK(playing.emitTimeline);
   CHECK(paused.emitTimeline);
   CHECK(seeking.emitTimeline);
   CHECK(resumed.emitTimeline);
   CHECK(stopped.emitTimeline);
+  CHECK(trackChanged.emitTimeline);
 }
 
 TEST_CASE("metadata synchronizer ignores stale snapshots by freshness only") {
