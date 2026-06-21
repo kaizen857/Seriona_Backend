@@ -65,6 +65,7 @@ add_library(seriona_scanner STATIC
   src/scanner/cache/sqlite_scanner_cache.cpp
   src/scanner/lrc_parser.cpp
   src/scanner/path_utils.cpp
+  src/scanner/tag_reader_metadata_adapter.cpp
   src/scanner/scanner_module.cpp
 )
 

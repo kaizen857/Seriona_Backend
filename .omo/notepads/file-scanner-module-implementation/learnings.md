@@ -58,3 +58,10 @@
 - The cache keeps user stats (`playCount`, `rating`, `lastPlayed`) on refresh by reading the existing row before upserting refreshed metadata.
 - WAL/busy-timeout behavior is exercised by a held writer transaction on a second connection, which reliably throws on conflicting writes.
 - Verified Task 8 with `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON`, `cmake --build build`, and `ctest --test-dir build -R 'seriona.scanner_cache|seriona.scanner' --output-on-failure`.
+
+## 2026-06-21 task 9 tagreader adapter
+
+- `TagReaderMetadataReader` only calls `TagReader::Read(path, coverExportDir)` and converts the returned `MusicTag` into scanner-internal raw metadata.
+- Raw TagReader embedded lyrics are mapped into scanner embedded lyrics with millisecond conversion, while cached user stats override imported play stats on refresh.
+- Per-file TagReader exceptions are captured into `ScannerError` entries so batch reads continue after a failure.
+- Verified Task 9 with `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON`, `cmake --build build`, and `ctest --test-dir build -R 'seriona.scanner_tagreader|seriona.scanner' --output-on-failure`.
