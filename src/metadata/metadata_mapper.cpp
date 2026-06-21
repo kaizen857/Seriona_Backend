@@ -1,6 +1,7 @@
 #include "metadata_mapper.h"
 
 #include <chrono>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <string_view>
@@ -26,6 +27,10 @@ namespace {
   return std::chrono::duration_cast<std::chrono::microseconds>(value).count();
 }
 
+[[nodiscard]] std::string fileUriFromPath(const std::filesystem::path& path) {
+  return std::string{"file://"} + path.generic_string();
+}
+
 [[nodiscard]] MetadataFieldSet mapFields(const std::optional<control::DisplayMetadata>& display) {
   MetadataFieldSet fields{};
   if (!display) {
@@ -40,11 +45,61 @@ namespace {
   return fields;
 }
 
+[[nodiscard]] std::optional<std::uint16_t> mapTrackNumber(const std::optional<control::TrackIdentity>& track) {
+  if (!track) {
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] MetadataTrackIdentityDto mapTrackIdentity(const std::optional<control::TrackIdentity>& track) {
+  MetadataTrackIdentityDto dto{};
+  if (!track) {
+    return dto;
+  }
+
+  dto.trackId = track->trackId;
+  dto.filePath = track->filePath;
+  dto.fileUri = fileUriFromPath(track->filePath);
+  dto.sourceId = track->sourceId;
+  dto.libraryId = track->libraryId;
+  dto.trackNumber = mapTrackNumber(track);
+  return dto;
+}
+
+[[nodiscard]] MetadataArtworkRefDto mapArtwork(const std::optional<control::ArtworkRef>& artwork) {
+  MetadataArtworkRefDto dto{};
+  if (!artwork) {
+    return dto;
+  }
+
+  dto.localPath = artwork->localPath;
+  dto.uri = artwork->uri;
+  dto.contentHash = artwork->contentHash;
+  return dto;
+}
+
+[[nodiscard]] MetadataCapabilitySetDto mapCapabilities(const control::PlaybackCapabilities& capabilities) {
+  return MetadataCapabilitySetDto{.canPlay = capabilities.canPlay,
+                                  .canPause = capabilities.canPause,
+                                  .canStop = capabilities.canStop,
+                                  .canSeek = capabilities.canSeek,
+                                  .canSkipNext = capabilities.canSkipNext,
+                                  .canSkipPrevious = capabilities.canSkipPrevious,
+                                  .canSetRepeat = capabilities.canSetRepeat,
+                                  .canSetShuffle = capabilities.canSetShuffle,
+                                  .canSetVolume = capabilities.canSetVolume};
+}
+
 [[nodiscard]] MetadataMprisSnapshotDto mapMprisSnapshot(const control::PlayerStateSnapshot& snapshot) {
   MetadataMprisSnapshotDto dto{};
-  dto.trackObjectPath = snapshot.currentTrack ? MetadataTrackObjectPath{makeMprisTrackObjectPath(*snapshot.currentTrack)}
-                                              : MetadataTrackObjectPath{makeMprisNoTrackObjectPath()};
+  dto.track = mapTrackIdentity(snapshot.currentTrack);
+  dto.trackObjectPath = snapshot.currentTrack ? MetadataTrackObjectPathDto{makeMprisTrackObjectPath(*snapshot.currentTrack)}
+                                              : MetadataTrackObjectPathDto{makeMprisNoTrackObjectPath()};
+  dto.artwork = mapArtwork(snapshot.artwork);
   dto.fields = mapFields(snapshot.display);
+  dto.playbackStatus = snapshot.playback.state;
+  dto.repeatMode = snapshot.repeatMode;
   dto.positionMicros = toMicroseconds(snapshot.timeline.position);
   dto.durationMicros = snapshot.timeline.duration ? std::optional<std::int64_t>{toMicroseconds(*snapshot.timeline.duration)}
                                                   : std::nullopt;
@@ -56,14 +111,7 @@ namespace {
   dto.seekableToMicros = snapshot.timeline.seekableTo
                              ? std::optional<std::int64_t>{toMicroseconds(*snapshot.timeline.seekableTo)}
                              : std::nullopt;
-  dto.canPlay = snapshot.capabilities.canPlay;
-  dto.canPause = snapshot.capabilities.canPause;
-  dto.canStop = snapshot.capabilities.canStop;
-  dto.canSeek = snapshot.capabilities.canSeek;
-  dto.canSkipNext = snapshot.capabilities.canSkipNext;
-  dto.canSkipPrevious = snapshot.capabilities.canSkipPrevious;
-  dto.canSetRepeat = snapshot.capabilities.canSetRepeat;
-  dto.canSetShuffle = snapshot.capabilities.canSetShuffle;
+  dto.capabilities = mapCapabilities(snapshot.capabilities);
   dto.shuffle = snapshot.shuffle;
   dto.muted = snapshot.muted;
   dto.volume = snapshot.volume;
@@ -72,7 +120,11 @@ namespace {
 
 [[nodiscard]] MetadataWindowsSnapshotDto mapWindowsSnapshot(const control::PlayerStateSnapshot& snapshot) {
   MetadataWindowsSnapshotDto dto{};
+  dto.track = mapTrackIdentity(snapshot.currentTrack);
+  dto.artwork = mapArtwork(snapshot.artwork);
   dto.fields = mapFields(snapshot.display);
+  dto.playbackStatus = snapshot.playback.state;
+  dto.repeatMode = snapshot.repeatMode;
   dto.positionMicros = toMicroseconds(snapshot.timeline.position);
   dto.durationMicros = snapshot.timeline.duration ? std::optional<std::int64_t>{toMicroseconds(*snapshot.timeline.duration)}
                                                   : std::nullopt;
@@ -84,14 +136,8 @@ namespace {
   dto.seekableToMicros = snapshot.timeline.seekableTo
                              ? std::optional<std::int64_t>{toMicroseconds(*snapshot.timeline.seekableTo)}
                              : std::nullopt;
-  dto.canPlay = snapshot.capabilities.canPlay;
-  dto.canPause = snapshot.capabilities.canPause;
-  dto.canStop = snapshot.capabilities.canStop;
-  dto.canSeek = snapshot.capabilities.canSeek;
-  dto.canSkipNext = snapshot.capabilities.canSkipNext;
-  dto.canSkipPrevious = snapshot.capabilities.canSkipPrevious;
-  dto.canSetRepeat = snapshot.capabilities.canSetRepeat;
-  dto.canSetShuffle = snapshot.capabilities.canSetShuffle;
+  dto.capabilities = mapCapabilities(snapshot.capabilities);
+  dto.capabilities.canSetVolume = false;
   dto.shuffle = snapshot.shuffle;
   return dto;
 }

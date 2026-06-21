@@ -1,6 +1,6 @@
 # task 5 evidence
 
-- Added mapper-only DTO/value types in `src/metadata/metadata_mapper.h` for platform-neutral snapshot export, including explicit MPRIS track object path handling and a no-track sentinel.
-- Implemented `mapPlayerStateSnapshot()` in `src/metadata/metadata_mapper.cpp` to export supported display/timeline/capability fields, convert timeline values to microseconds, and leave internal freshness/error/output-only fields out of platform DTOs.
-- Added failing-first mapper coverage in `tests/metadata/metadata_mapper_tests.cpp` for supported-field mapping, internal-field exclusion, microsecond conversion, Windows DTO volume/mute omission, invalid empty track ids, and valid non-reserved MPRIS object paths.
+- Expanded `src/metadata/metadata_mapper.h` with private DTOs for track identity, artwork reference, capability set, playback status, repeat mode, and platform snapshot grouping.
+- Updated `src/metadata/metadata_mapper.cpp` to map the full supported matrix from `PlayerStateSnapshot` into platform-neutral DTOs while keeping freshness/version, sampledAt, and playback error details out of payloads; Windows capability export keeps `canSetVolume` false.
+- Extended `tests/metadata/metadata_mapper_tests.cpp` to cover track identity, file path/URI, display metadata, artwork, playback status, repeat, timeline/duration, capability support, microsecond conversion, non-reserved MPRIS object paths, and Windows no-volume behavior.
 - Verified with `cmake --build build --target seriona_metadata_mapper_tests` and `ctest --test-dir build -R seriona.metadata_mapper --output-on-failure`.

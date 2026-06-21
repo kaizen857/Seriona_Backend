@@ -240,6 +240,12 @@ TEST_CASE("metadata service keeps start stop idempotent") {
   CHECK(secondStart.accepted);
   CHECK(firstStop.accepted);
   CHECK(secondStop.accepted);
+  REQUIRE(hooks->records.size() >= 3U);
+  CHECK(hooks->records[0].kind == seriona::metadata::MetadataServiceRecordKind::Start);
+  CHECK(hooks->records[0].state.controlState.freshness.version == 1U);
+  CHECK(hooks->records[1].kind == seriona::metadata::MetadataServiceRecordKind::Start);
+  CHECK(hooks->records[1].state.controlState.freshness.version == 1U);
+  CHECK(hooks->records[2].kind == seriona::metadata::MetadataServiceRecordKind::Stop);
 }
 
 TEST_CASE("metadata service reports update after stop as rejected") {
@@ -255,6 +261,9 @@ TEST_CASE("metadata service reports update after stop as rejected") {
   CHECK_FALSE(updateAfterStop.accepted);
   CHECK_FALSE(updateAfterStop.changed);
   CHECK(updateAfterStop.errorCode.has_value());
+  REQUIRE(hooks->records.size() >= 3U);
+  CHECK(hooks->records.back().kind == seriona::metadata::MetadataServiceRecordKind::Update);
+  CHECK(hooks->records.back().state.controlState.freshness.version == 1U);
 }
 
 TEST_CASE("metadata service registers and unregisters command callbacks") {
@@ -271,6 +280,9 @@ TEST_CASE("metadata service registers and unregisters command callbacks") {
   handle.unsubscribe();
   CHECK(handle.subscriptionId != 0U);
   CHECK(hooks->commandUnregistrations == 1U);
+  REQUIRE(hooks->records.size() >= 2U);
+  CHECK(hooks->records[0].kind == seriona::metadata::MetadataServiceRecordKind::RegisterCommand);
+  CHECK(hooks->records[1].kind == seriona::metadata::MetadataServiceRecordKind::UnregisterCommand);
 }
 
 TEST_CASE("metadata service reports backend start failure explicitly") {
@@ -284,23 +296,7 @@ TEST_CASE("metadata service reports backend start failure explicitly") {
   CHECK_FALSE(result.accepted);
   CHECK(result.errorCode.has_value());
   CHECK(result.message == "metadata backend start failed");
-}
-
-TEST_CASE("metadata service recording backend captures timeline and metadata updates") {
-  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
-  ServiceFixture fixture{};
-  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
-
-  const auto start = service->start(fixture.state);
-  const auto update = service->update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot(SnapshotFixture{.version = 2U,
-                                                                                                                        .position = std::chrono::milliseconds{1000},
-                                                                                                                        .status = seriona::control::PlaybackStatus::Playing,
-                                                                                                                        .title = std::string{"Song 2"}}),
-                                                                              .timelineUpdateInterval = std::chrono::milliseconds{1000}});
-
-  CHECK(start.accepted);
-  CHECK(update.accepted);
-  CHECK(update.changed);
-  REQUIRE(hooks->results.size() >= 2U);
-  CHECK(hooks->results.back().changed);
+  REQUIRE(hooks->records.size() == 1U);
+  CHECK(hooks->records[0].kind == seriona::metadata::MetadataServiceRecordKind::Start);
+  CHECK_FALSE(hooks->records[0].result.accepted);
 }

@@ -2,10 +2,6 @@
 
 #include <optional>
 
-#if defined(__linux__) && !defined(__APPLE__)
-#include <sdbus-c++/sdbus-c++.h>
-#endif
-
 namespace seriona::metadata {
 
 MetadataSyncResult metadataMprisSmokeResult() {

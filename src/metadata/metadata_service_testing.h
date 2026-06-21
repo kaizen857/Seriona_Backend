@@ -7,6 +7,20 @@
 
 namespace seriona::metadata {
 
+enum class MetadataServiceRecordKind {
+  Start,
+  Update,
+  Stop,
+  RegisterCommand,
+  UnregisterCommand,
+};
+
+struct MetadataServiceRecord {
+  MetadataServiceRecordKind kind{MetadataServiceRecordKind::Start};
+  PlatformMediaState state{};
+  MetadataSyncResult result{};
+};
+
 struct MetadataServiceTestHooks {
   bool failStart{false};
   bool failStop{false};
@@ -17,6 +31,7 @@ struct MetadataServiceTestHooks {
   std::size_t stopCalls{0};
   std::size_t commandRegistrations{0};
   std::size_t commandUnregistrations{0};
+  std::vector<MetadataServiceRecord> records{};
   std::vector<MetadataSyncResult> results{};
 };
 
