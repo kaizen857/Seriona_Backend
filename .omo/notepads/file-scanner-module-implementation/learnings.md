@@ -17,6 +17,19 @@
 - `tests/` had no scanner test directory before this task; existing tests use direct `add_executable`, per-target doctest include directories, `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`, and explicit `add_test` entries.
 - The scanner production module is still a minimal link sentinel, so the harness was kept independent from production scanner internals and TagReader private types.
 - A helper-only scanner CTest can validate fake TagReader exception behavior inside the test process with `CHECK_THROWS_WITH_AS`, proving exceptions do not terminate the process.
+- Follow-up review found watcher warnings were hardcoded to audio path kind; warning-style fake events need the same audio/`.lrc` path-kind distinction as create/modify/destroy/rename events.
+
+## 2026-06-20 task 2 follow-up verification
+
+- Contract tests must assert default field values, not only assigned examples; scanner acceptance depends on `ScannerConfig`, lyrics defaults, and future-CUE placeholders being executable checks.
+- `ScannerEventType` and `ScannerEventPayload` are a convention pair rather than a type-enforced discriminated union, so tests should construct each event category and assert the held `std::variant` alternative matches the declared type.
+
+## 2026-06-20 task 4 scanner paths and LRC
+
+- `generic_u8string()` returns `std::u8string` under C++23/libstdc++, so scanner relative UTF-8 serialization explicitly copies `char8_t` bytes into `std::string` for public contract storage.
+- `std::filesystem::symlink_status` may report a vanished path through `std::error_code` instead of a non-existing status object; path classification maps that case to a recoverable `RootUnavailable` missing-path record.
+- LRC metadata tags are restricted to alphabetic keys such as `[ar:]`/`[ti:]`; malformed numeric timestamp tags like `[00:61.00]` remain recoverable `InvalidTimestamp` errors instead of being ignored as metadata.
+- Verified Task 4 with `cmake --build build --target seriona_scanner_paths_tests` and `ctest --test-dir build -R seriona.scanner_paths --output-on-failure`.
 
 ## 2026-06-20 task 5 scanner hash
 
@@ -38,3 +51,10 @@
 - Running tasks receive an atomic stop token; exceptions are captured as failed `ScanTaskResult` entries and do not prevent later task fan-in.
 - `ProgressThrottle` publishes the first progress event, then gates by completed-count delta or elapsed interval so future scanner orchestration can avoid event spam deterministically.
 - Verified Task 7 with `cmake --build build --target seriona_scanner_scheduler_tests` and `ctest --test-dir build -R seriona.scanner_scheduler --output-on-failure`.
+
+## 2026-06-21 task 8 sqlite scanner cache
+
+- `SQLiteScannerCache` persists root/directories/songs/errors plus embedded and external lyric rows, and reloads `LyricsSource` to reconstruct effective lyrics without TagReader.
+- The cache keeps user stats (`playCount`, `rating`, `lastPlayed`) on refresh by reading the existing row before upserting refreshed metadata.
+- WAL/busy-timeout behavior is exercised by a held writer transaction on a second connection, which reliably throws on conflicting writes.
+- Verified Task 8 with `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON`, `cmake --build build`, and `ctest --test-dir build -R 'seriona.scanner_cache|seriona.scanner' --output-on-failure`.

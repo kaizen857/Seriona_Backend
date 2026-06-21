@@ -145,6 +145,11 @@ add_executable(seriona_scanner_scheduler_tests
   scanner/scanner_scheduler_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/scan_scheduler.cpp
 )
+add_executable(seriona_scanner_cache_tests
+  scanner/scanner_cache_tests.cpp
+  scanner/scanner_test_harness.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_scanner_cache.cpp
+)
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -168,6 +173,7 @@ target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IM
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_scheduler_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -267,6 +273,10 @@ target_include_directories(seriona_scanner_scheduler_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_cache_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_link_libraries(seriona_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -356,9 +366,13 @@ seriona_enable_warnings(seriona_scanner_paths_tests)
 seriona_enable_warnings(seriona_scanner_hash_tests)
 seriona_enable_warnings(seriona_scanner_tree_tests)
 seriona_enable_warnings(seriona_scanner_scheduler_tests)
+seriona_enable_warnings(seriona_scanner_cache_tests)
 
 target_link_libraries(seriona_scanner_hash_tests PRIVATE
   PkgConfig::SERIONA_XXHASH
+)
+target_link_libraries(seriona_scanner_cache_tests PRIVATE
+  SQLite3::SQLite3
 )
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
@@ -392,3 +406,4 @@ add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
 add_test(NAME seriona.scanner_tree COMMAND seriona_scanner_tree_tests)
 add_test(NAME seriona.scanner_scheduler COMMAND seriona_scanner_scheduler_tests)
+add_test(NAME seriona.scanner_cache COMMAND seriona_scanner_cache_tests)
