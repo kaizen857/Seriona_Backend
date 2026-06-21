@@ -133,6 +133,8 @@ add_executable(seriona_metadata_mapper_tests
 )
 add_executable(seriona_metadata_service_tests
   metadata/metadata_service_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_testing.cpp
+  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_recording.cpp
 )
 add_executable(seriona_metadata_mpris_tests
   metadata/metadata_mpris_tests.cpp

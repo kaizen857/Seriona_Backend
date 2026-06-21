@@ -3,8 +3,12 @@
 #include <chrono>
 #include <filesystem>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "seriona/control/control_contracts.h"
+#include "seriona/metadata/metadata_contracts.h"
+#include "metadata_service_testing.h"
 #include "metadata_synchronizer.h"
 
 namespace {
@@ -58,7 +62,27 @@ seriona::control::PlayerStateSnapshot buildSnapshot(const SnapshotFixture& fixtu
   return snapshot;
 }
 
-}  // namespace
+}
+
+namespace {
+
+struct ServiceFixture {
+  seriona::metadata::MetadataSharingOptions options{};
+  seriona::metadata::PlatformMediaState state{.controlState = buildSnapshot(SnapshotFixture{.version = 1U,
+                                                                                           .position = std::chrono::milliseconds{0},
+                                                                                           .status = seriona::control::PlaybackStatus::Playing}),
+                                              .timelineUpdateInterval = std::chrono::milliseconds{1000}};
+};
+
+struct CommandRecorder {
+  std::vector<seriona::control::MediaControlCommand> commands{};
+
+  seriona::control::MediaControlCommandSink sink() {
+    return [this](const seriona::control::MediaControlCommand& command) { commands.push_back(command); };
+  }
+};
+
+}
 
 TEST_CASE("metadata synchronizer suppresses half-second playback ticks") {
   seriona::metadata::MetadataSynchronizer synchronizer{};
@@ -178,4 +202,105 @@ TEST_CASE("metadata synchronizer ignores stale snapshots by freshness only") {
   CHECK(fresh.emitTimeline);
   CHECK_FALSE(staleVersion.emitMetadata);
   CHECK_FALSE(staleVersion.emitTimeline);
+}
+
+TEST_CASE("metadata service selects noop backend explicitly") {
+  const auto service = seriona::metadata::makeMetadataSharingService(seriona::metadata::MetadataSharingOptions{.backendKind = seriona::metadata::MetadataBackendKind::Noop,
+                                                                                                              .platformExtension = nullptr});
+
+  REQUIRE(service != nullptr);
+  CHECK(service->backendKind() == seriona::metadata::MetadataBackendKind::Noop);
+  CHECK_FALSE(service->capabilities().canPublishMetadata);
+  CHECK_FALSE(service->capabilities().canPublishTimeline);
+  CHECK_FALSE(service->capabilities().canReceiveCommands);
+}
+
+TEST_CASE("metadata service degrades Windows backend without host through capabilities") {
+  const auto service = seriona::metadata::makeMetadataSharingService(seriona::metadata::MetadataSharingOptions{.backendKind = seriona::metadata::MetadataBackendKind::Windows,
+                                                                                                              .platformExtension = nullptr});
+
+  CHECK(service->backendKind() == seriona::metadata::MetadataBackendKind::Windows);
+  CHECK(service->capabilities().requiresPlatformExtension);
+  CHECK_FALSE(service->capabilities().hasPlatformExtension);
+  CHECK_FALSE(service->capabilities().canPublishMetadata);
+  CHECK_FALSE(service->capabilities().canPublishTimeline);
+}
+
+TEST_CASE("metadata service keeps start stop idempotent") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  ServiceFixture fixture{};
+  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
+
+  const auto firstStart = service->start(fixture.state);
+  const auto secondStart = service->start(fixture.state);
+  const auto firstStop = service->stop();
+  const auto secondStop = service->stop();
+
+  CHECK(firstStart.accepted);
+  CHECK(secondStart.accepted);
+  CHECK(firstStop.accepted);
+  CHECK(secondStop.accepted);
+}
+
+TEST_CASE("metadata service reports update after stop as rejected") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  ServiceFixture fixture{};
+  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
+
+  CHECK(service->start(fixture.state).accepted);
+  CHECK(service->stop().accepted);
+
+  const auto updateAfterStop = service->update(fixture.state);
+
+  CHECK_FALSE(updateAfterStop.accepted);
+  CHECK_FALSE(updateAfterStop.changed);
+  CHECK(updateAfterStop.errorCode.has_value());
+}
+
+TEST_CASE("metadata service registers and unregisters command callbacks") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  ServiceFixture fixture{};
+  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
+  CommandRecorder recorder{};
+
+  const auto handle = service->registerCommandCallback(recorder.sink());
+  REQUIRE(handle.unsubscribe);
+  CHECK(hooks->commandRegistrations == 1U);
+
+  handle.unsubscribe();
+  handle.unsubscribe();
+  CHECK(handle.subscriptionId != 0U);
+  CHECK(hooks->commandUnregistrations == 1U);
+}
+
+TEST_CASE("metadata service reports backend start failure explicitly") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  hooks->failStart = true;
+  ServiceFixture fixture{};
+  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
+
+  const auto result = service->start(fixture.state);
+
+  CHECK_FALSE(result.accepted);
+  CHECK(result.errorCode.has_value());
+  CHECK(result.message == "metadata backend start failed");
+}
+
+TEST_CASE("metadata service recording backend captures timeline and metadata updates") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  ServiceFixture fixture{};
+  auto service = seriona::metadata::makeRecordingMetadataSharingService(fixture.options, hooks);
+
+  const auto start = service->start(fixture.state);
+  const auto update = service->update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot(SnapshotFixture{.version = 2U,
+                                                                                                                        .position = std::chrono::milliseconds{1000},
+                                                                                                                        .status = seriona::control::PlaybackStatus::Playing,
+                                                                                                                        .title = std::string{"Song 2"}}),
+                                                                              .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+
+  CHECK(start.accepted);
+  CHECK(update.accepted);
+  CHECK(update.changed);
+  REQUIRE(hooks->results.size() >= 2U);
+  CHECK(hooks->results.back().changed);
 }

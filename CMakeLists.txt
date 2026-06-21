@@ -85,6 +85,7 @@ add_library(seriona_metadata STATIC
   src/metadata/metadata_mapper.cpp
   src/metadata/metadata_synchronizer.cpp
   src/metadata/metadata_service.cpp
+  src/metadata/metadata_service_backend.cpp
   src/metadata/metadata_mpris.cpp
 )
 

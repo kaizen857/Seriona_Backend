@@ -14,3 +14,6 @@
 - track number 采用显式可空 DTO 字段承载，但当前 snapshot 侧没有可靠来源时保持为空，避免 mapper 伪造序号。
 - artwork 输出沿用 `ArtworkRef` 的 local path/URI/content hash 三元组，mapper 只做透传，不在 Todo 5 里引入额外的文件 I/O 或封面解析逻辑。
 - Todo 6 的 synchronizer 采用双脏路径：static metadata 仅在 track / title / artwork / capability 变化时发出，timeline 仅在 1 秒节流或播放边界事件时发出，二者互不驱动。
+- Todo 7 把 Noop 生命周期和测试录制 seam 分离成内部 backend 文件与 test-only recording 文件；公开工厂只处理 backend 选择，测试工厂单独注入 recording hooks。
+- Windows 无宿主句柄时的退化通过 `MetadataBackendCapabilities` 体现，不新增公开 API 分支；`requiresPlatformExtension` 和 `hasPlatformExtension` 是测试可见的能力信号。
+- `update()` 在 stop 之后明确返回失败结果（带错误码和 message），而不是静默继续接受更新；这让后续 caller 能区分正常 idle 与已停止状态。

@@ -18,3 +18,6 @@
 - Windows capability export should explicitly force `canSetVolume = false`, so the DTO surface cannot be interpreted as a volume-support claim.
 - Synchronizer should keep static metadata and timeline cadence as separate dirty paths; cadence can be driven by second buckets while freshness fields only gate stale snapshots.
 - Metadata-only changes should not piggyback timeline emission; if a test needs to assert that, place the samples outside the 1-second cadence boundary.
+- Lifecycle code should split cleanly between a small public factory file, an internal backend implementation file, and a test-only recording seam; otherwise the service file grows past the review ceiling very quickly.
+- `SubscriptionHandle` unsubscribe semantics must be idempotent; recording tests caught duplicate callback-unregister events when the lambda lacked an internal one-shot guard.
+- Windows-without-host degradation is best expressed through `MetadataBackendCapabilities` (`requiresPlatformExtension` / `hasPlatformExtension`) rather than a separate public API shape.
