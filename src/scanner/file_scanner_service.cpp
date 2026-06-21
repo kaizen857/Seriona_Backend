@@ -1,32 +1,10 @@
 #include "seriona/scanner/file_scanner_service.h"
 
+#include "file_scanner_service_internal.h"
+
 #include <utility>
-#include <vector>
 
 namespace seriona::scanner {
-namespace {
-
-class NullFileScannerService final : public FileScannerService {
-public:
-  void setEventSink(ScannerEventSink sink) override { sink_ = std::move(sink); }
-  void configure(const ScannerConfig& config) override { config_ = config; }
-  void scan(const std::vector<ScannerRoot>& roots, ScanMode mode) override {
-    roots_ = roots;
-    mode_ = mode;
-  }
-  void stop() override { stopped_ = true; }
-  [[nodiscard]] PlaylistTreeSnapshot snapshot() const override { return snapshot_; }
-
-private:
-  ScannerEventSink sink_{};
-  ScannerConfig config_{};
-  std::vector<ScannerRoot> roots_{};
-  ScanMode mode_{ScanMode::Incremental};
-  PlaylistTreeSnapshot snapshot_{};
-  bool stopped_{false};
-};
-
-}
 
 FileScanner::FileScanner() : service_(makeFileScannerService()) {}
 
@@ -67,7 +45,7 @@ PlaylistTreeSnapshot FileScanner::snapshot() const {
 }
 
 std::shared_ptr<FileScannerService> makeFileScannerService() {
-  return std::make_shared<NullFileScannerService>();
+  return makeFileScannerService(FileScannerServiceDependencies{});
 }
 
 }

@@ -124,7 +124,6 @@ add_executable(seriona_scanner_test_harness_tests
 )
 add_executable(seriona_scanner_contract_tests
   scanner/scanner_contract_tests.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/file_scanner_service.cpp
 )
 add_executable(seriona_scanner_paths_tests
   scanner/scanner_paths_tests.cpp
@@ -154,6 +153,10 @@ add_executable(seriona_scanner_tagreader_tests
   scanner/scanner_tagreader_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
 )
+add_executable(seriona_scanner_service_tests
+  scanner/scanner_service_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -179,6 +182,7 @@ target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMP
 target_compile_definitions(seriona_scanner_scheduler_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cache_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tagreader_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -286,6 +290,11 @@ target_include_directories(seriona_scanner_tagreader_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_service_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_link_libraries(seriona_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -351,6 +360,9 @@ target_link_libraries(seriona_audio_shutdown_lifecycle_tests PRIVATE
 target_link_libraries(seriona_scanner_test_harness_tests PRIVATE
   seriona_third_party_headers
 )
+target_link_libraries(seriona_scanner_contract_tests PRIVATE
+  seriona_scanner
+)
 
 seriona_enable_warnings(seriona_tests)
 seriona_enable_warnings(seriona_audio_contract_tests)
@@ -377,6 +389,7 @@ seriona_enable_warnings(seriona_scanner_tree_tests)
 seriona_enable_warnings(seriona_scanner_scheduler_tests)
 seriona_enable_warnings(seriona_scanner_cache_tests)
 seriona_enable_warnings(seriona_scanner_tagreader_tests)
+seriona_enable_warnings(seriona_scanner_service_tests)
 
 target_link_libraries(seriona_scanner_hash_tests PRIVATE
   PkgConfig::SERIONA_XXHASH
@@ -386,6 +399,9 @@ target_link_libraries(seriona_scanner_cache_tests PRIVATE
 )
 target_link_libraries(seriona_scanner_tagreader_tests PRIVATE
   TagReaderCore
+)
+target_link_libraries(seriona_scanner_service_tests PRIVATE
+  seriona_scanner
 )
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
@@ -421,3 +437,4 @@ add_test(NAME seriona.scanner_tree COMMAND seriona_scanner_tree_tests)
 add_test(NAME seriona.scanner_scheduler COMMAND seriona_scanner_scheduler_tests)
 add_test(NAME seriona.scanner_cache COMMAND seriona_scanner_cache_tests)
 add_test(NAME seriona.scanner_tagreader COMMAND seriona_scanner_tagreader_tests)
+add_test(NAME seriona.scanner_service COMMAND seriona_scanner_service_tests)

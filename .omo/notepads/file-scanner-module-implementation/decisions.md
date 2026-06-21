@@ -17,3 +17,10 @@
 - Keep scanner test fakes and fixtures under `tests/scanner/` as a private test harness instead of exposing new production scanner seams before scanner logic exists.
 - Model fake TagReader as a test adapter with success, throw, and block/release behavior so future cancellation tests can deterministically control slow metadata reads.
 - Model fake watcher events with explicit audio versus `.lrc` path kind plus optional old path for rename events, preserving external lyric association cases without a real filesystem watcher.
+
+## 2026-06-21 task 10 scanner service orchestration
+
+- Keep the public scanner facade unchanged and add only a private `FileScannerServiceDependencies` construction seam for service tests and production factory wiring.
+- Implement task-10 scan orchestration synchronously over existing scanner primitives; watcher debounce/runtime incremental updates remain task 11.
+- Treat TagReader failure for a new audio file as an error-only outcome, not a placeholder song; if old cached metadata exists, preserve that cached song while recording the error.
+- Use SQLite `saveRoot` as the single-writer reconciliation boundary after filesystem discovery/hash/metadata/LRC decisions are made in memory.

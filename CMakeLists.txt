@@ -62,9 +62,12 @@ endif()
 
 add_library(seriona_scanner STATIC
   src/scanner/file_scanner_service.cpp
+  src/scanner/file_scanner_orchestrator.cpp
   src/scanner/cache/sqlite_scanner_cache.cpp
+  src/scanner/hash_utils.cpp
   src/scanner/lrc_parser.cpp
   src/scanner/path_utils.cpp
+  src/scanner/playlist_tree_builder.cpp
   src/scanner/tag_reader_metadata_adapter.cpp
   src/scanner/scanner_module.cpp
 )

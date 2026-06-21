@@ -65,3 +65,10 @@
 - Raw TagReader embedded lyrics are mapped into scanner embedded lyrics with millisecond conversion, while cached user stats override imported play stats on refresh.
 - Per-file TagReader exceptions are captured into `ScannerError` entries so batch reads continue after a failure.
 - Verified Task 9 with `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON`, `cmake --build build`, and `ctest --test-dir build -R 'seriona.scanner_tagreader|seriona.scanner' --output-on-failure`.
+
+## 2026-06-21 task 10 scanner service orchestration
+
+- `scanner_contract_tests` can no longer compile `file_scanner_service.cpp` directly once the default service owns cache/hash/tree/tagreader dependencies; it links `seriona_scanner` instead.
+- Hash-first service tests use fake TagReader read counts as the observable cache-hit proof: unchanged scans and `.lrc`-only changes keep the count stable, while audio byte changes increment it once.
+- Deleted `.lrc` reconciliation must clear external lyric rows and reselect effective lyrics from cached embedded lyrics or `None` without calling TagReader.
+- A stale FetchContent generator cache under `build/_deps/catch2-*` can block reconfigure even when the top-level `build` directory is valid; deleting only those generated subbuild dirs was sufficient.
