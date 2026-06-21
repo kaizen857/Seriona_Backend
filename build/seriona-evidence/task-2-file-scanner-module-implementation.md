@@ -29,3 +29,12 @@
 - `cmake --build build --target seriona_scanner_contract_tests` passed.
 - `ctest --test-dir build -R seriona.scanner_contract --output-on-failure` passed: 1/1 tests passed.
 - `cmake --build build --target seriona_scanner` passed.
+
+## Follow-up verification tightening
+
+- Extended `tests/scanner/scanner_contract_tests.cpp` to explicitly assert `ScannerConfig` default values: 250 ms progress interval, empty extension list, no symlink following, embedded lyrics enabled, and external lyrics enabled.
+- Added default `SongMetadata` assertions for `LyricsSource::None`, empty effective lyrics, unset external lyrics path/hash/mtime, empty `sourceFilePath`, unset `offset`/`duration`, and empty `logicalTrackId`.
+- Added playlist node kind distinction assertions for root, directory, and track nodes, including parent relationships between structural and track-like nodes.
+- Added scanner event type/payload consistency assertions for progress, playlist snapshot, song, and error events using `std::holds_alternative` and `std::get` on `ScannerEventPayload`.
+- Follow-up targeted verification: `cmake --build build --target seriona_scanner_contract_tests` passed.
+- Follow-up targeted verification: `ctest --test-dir build -R seriona.scanner_contract --output-on-failure` passed: 1/1 tests passed.

@@ -16,3 +16,4 @@
 ## Verification notes
 
 - First targeted scanner harness CTest run failed on incorrect expected byte counts for deterministic `.lrc` fixtures; the failure proved the helper-only target was executing and was fixed by matching the exact written fixture lengths.
+- Follow-up verification closed the watcher-warning edge: `FakeWatcher` now exposes explicit `audioWarning(...)` and `lrcWarning(...)` helpers, and the helper-only test asserts both warning events preserve their `PathKind` and path payload.
