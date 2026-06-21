@@ -146,6 +146,8 @@ public:
   virtual void setEventSink(ScannerEventSink sink) = 0;
   virtual void configure(const ScannerConfig& config) = 0;
   virtual void scan(const std::vector<ScannerRoot>& roots, ScanMode mode) = 0;
+  virtual void startWatching(const std::vector<ScannerRoot>& roots) = 0;
+  virtual void stopWatching() = 0;
   virtual void stop() = 0;
   [[nodiscard]] virtual PlaylistTreeSnapshot snapshot() const = 0;
 };

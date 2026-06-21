@@ -6,8 +6,11 @@
 #include "seriona/scanner/path_utils.h"
 #include "seriona/scanner/playlist_tree_builder.h"
 
+#include "wtr/watcher.hpp"
+
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <mutex>
@@ -15,6 +18,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -111,13 +115,96 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
   sink(ScannerEvent{.type = type, .monotonicVersion = version, .timestamp = std::chrono::steady_clock::now(), .payload = std::move(payload)});
 }
 
+[[nodiscard]] WatchEffectKind watchEffectFrom(enum wtr::event::effect_type effect) {
+  switch (effect) {
+  case wtr::event::effect_type::create:
+    return WatchEffectKind::Created;
+  case wtr::event::effect_type::modify:
+    return WatchEffectKind::Modified;
+  case wtr::event::effect_type::destroy:
+    return WatchEffectKind::Destroyed;
+  case wtr::event::effect_type::rename:
+    return WatchEffectKind::Renamed;
+  case wtr::event::effect_type::owner:
+    return WatchEffectKind::OwnerChanged;
+  case wtr::event::effect_type::other:
+    return WatchEffectKind::Other;
+  }
+  return WatchEffectKind::Other;
+}
+
+[[nodiscard]] WatchPathKind watchPathKindFrom(enum wtr::event::path_type pathType) {
+  switch (pathType) {
+  case wtr::event::path_type::file:
+  case wtr::event::path_type::hard_link:
+  case wtr::event::path_type::sym_link:
+    return WatchPathKind::File;
+  case wtr::event::path_type::dir:
+    return WatchPathKind::Directory;
+  case wtr::event::path_type::watcher:
+    return WatchPathKind::Watcher;
+  case wtr::event::path_type::other:
+    return WatchPathKind::Other;
+  }
+  return WatchPathKind::Other;
+}
+
+[[nodiscard]] WatchEvent watchEventFrom(const wtr::event& event) {
+  WatchEvent mapped{.path = event.path_name,
+                    .pathKind = watchPathKindFrom(event.path_type),
+                    .effectKind = watchEffectFrom(event.effect_type),
+                    .associated = {}};
+  if (event.associated) {
+    mapped.associated.push_back(watchEventFrom(*event.associated));
+  }
+  return mapped;
+}
+
+[[nodiscard]] bool watcherMessageRequestsRootReconciliation(const std::filesystem::path& messagePath) {
+  const auto message = messagePath.generic_string();
+  return message.starts_with("e/") || message.starts_with("w_") || message.contains("overflow") ||
+         message.contains("warning") || message.contains("error");
+}
+
+class WtrFolderWatcher final : public FolderWatcher {
+public:
+  WtrFolderWatcher(const std::filesystem::path& root, WatchEventCallback callback)
+      : watcher_(std::make_unique<wtr::watch>(root, [callback = std::move(callback)](const wtr::event& event) {
+          callback(watchEventFrom(event));
+        })) {}
+
+  ~WtrFolderWatcher() override { close(); }
+
+  void close() noexcept override {
+    if (watcher_) {
+      watcher_->close();
+      watcher_.reset();
+    }
+  }
+
+private:
+  std::unique_ptr<wtr::watch> watcher_;
+};
+
+class WtrFolderWatcherFactory final : public FolderWatcherFactory {
+public:
+  [[nodiscard]] std::unique_ptr<FolderWatcher> watch(const std::filesystem::path& root,
+                                                     WatchEventCallback callback) override {
+    return std::make_unique<WtrFolderWatcher>(root, std::move(callback));
+  }
+};
+
 class OrchestratedFileScannerService final : public FileScannerService {
 public:
   explicit OrchestratedFileScannerService(FileScannerServiceDependencies dependencies)
       : metadataReader_(std::move(dependencies.metadataReader)), databasePath_(std::move(dependencies.databasePath)),
-        coverExportDir_(std::move(dependencies.coverExportDir)) {
+        coverExportDir_(std::move(dependencies.coverExportDir)), watcherFactory_(std::move(dependencies.watcherFactory)),
+        watcherDebounce_(dependencies.watcherDebounce) {
     if (!metadataReader_) {
       metadataReader_ = std::make_shared<ProductionTagMetadataReader>();
+    }
+    if (!watcherFactory_) {
+      watcherFactory_ = std::make_shared<WtrFolderWatcherFactory>();
     }
     if (databasePath_.empty()) {
       databasePath_ = defaultDatabasePath();
@@ -126,6 +213,8 @@ public:
       coverExportDir_ = defaultCoverExportDir();
     }
   }
+
+  ~OrchestratedFileScannerService() override { stopWatching(); }
 
   void setEventSink(ScannerEventSink sink) override {
     std::scoped_lock lock{mutex_};
@@ -192,6 +281,53 @@ public:
     publishEvent(sink, ScannerEventType::ProgressUpdated, ++eventVersion_, progress);
     publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
     publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
+  }
+
+  void startWatching(const std::vector<ScannerRoot>& roots) override {
+    stopWatching();
+    std::vector<ScannerRoot> normalizedRoots;
+    normalizedRoots.reserve(roots.size());
+    for (const auto& root : roots) {
+      normalizedRoots.push_back(ScannerRoot{.path = rootPathFor(root), .recursive = root.recursive});
+    }
+    {
+      std::scoped_lock lock{watcherMutex_};
+      watchedRoots_ = normalizedRoots;
+      watcherStopping_ = false;
+      dirtyGeneration_ = 0;
+      pendingWatcherMessages_.clear();
+    }
+    debounceThread_ = std::thread([this] { debounceLoop(); });
+
+    std::vector<std::unique_ptr<FolderWatcher>> watchers;
+    watchers.reserve(normalizedRoots.size());
+    for (const auto& root : normalizedRoots) {
+      watchers.push_back(watcherFactory_->watch(root.path, [this](const WatchEvent& event) { enqueueWatcherEvent(event); }));
+    }
+    {
+      std::scoped_lock lock{watcherMutex_};
+      watchers_ = std::move(watchers);
+    }
+  }
+
+  void stopWatching() override {
+    std::vector<std::unique_ptr<FolderWatcher>> watchers;
+    {
+      std::scoped_lock lock{watcherMutex_};
+      watcherStopping_ = true;
+      watchers = std::move(watchers_);
+      watchedRoots_.clear();
+      pendingWatcherMessages_.clear();
+    }
+    watcherCv_.notify_all();
+    for (auto& watcher : watchers) {
+      if (watcher) {
+        watcher->close();
+      }
+    }
+    if (debounceThread_.joinable()) {
+      debounceThread_.join();
+    }
   }
 
   void stop() override { cancellationRequested_.store(true); }
@@ -343,13 +479,88 @@ private:
     selectEffectiveLyrics(song);
   }
 
+  void enqueueWatcherEvent(const WatchEvent& event) {
+    std::scoped_lock lock{watcherMutex_};
+    if (watcherStopping_) {
+      return;
+    }
+    if (event.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(event.path)) {
+      pendingWatcherMessages_.push_back(event.path.generic_string());
+    }
+    for (const auto& associated : event.associated) {
+      if (associated.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(associated.path)) {
+        pendingWatcherMessages_.push_back(associated.path.generic_string());
+      }
+    }
+    ++dirtyGeneration_;
+    watcherCv_.notify_one();
+  }
+
+  void debounceLoop() {
+    std::uint64_t processedGeneration = 0;
+    while (true) {
+      std::vector<ScannerRoot> roots;
+      std::vector<std::string> watcherMessages;
+      {
+        std::unique_lock lock{watcherMutex_};
+        watcherCv_.wait(lock, [this, processedGeneration] {
+          return watcherStopping_ || dirtyGeneration_ != processedGeneration;
+        });
+        if (watcherStopping_) {
+          return;
+        }
+        auto observedGeneration = dirtyGeneration_;
+        watcherCv_.wait_for(lock, watcherDebounce_, [this, observedGeneration] {
+          return watcherStopping_ || dirtyGeneration_ != observedGeneration;
+        });
+        if (watcherStopping_) {
+          return;
+        }
+        if (dirtyGeneration_ != observedGeneration) {
+          continue;
+        }
+        processedGeneration = observedGeneration;
+        roots = watchedRoots_;
+        watcherMessages = std::move(pendingWatcherMessages_);
+        pendingWatcherMessages_.clear();
+      }
+      publishWatcherMessages(watcherMessages);
+      scan(roots, ScanMode::Incremental);
+    }
+  }
+
+  void publishWatcherMessages(const std::vector<std::string>& messages) {
+    ScannerEventSink sink;
+    {
+      std::scoped_lock lock{mutex_};
+      sink = sink_;
+    }
+    for (const auto& message : messages) {
+      publishEvent(sink, ScannerEventType::ScanError, ++eventVersion_,
+                   ScannerError{.code = ScannerErrorCode::CacheUnavailable,
+                                .message = "watcher requested root reconciliation",
+                                .detail = message,
+                                .path = std::nullopt});
+    }
+  }
+
   ScannerEventSink sink_{};
   ScannerConfig config_{};
   std::shared_ptr<TagMetadataReader> metadataReader_;
   std::filesystem::path databasePath_;
   std::filesystem::path coverExportDir_;
+  std::shared_ptr<FolderWatcherFactory> watcherFactory_;
+  std::chrono::milliseconds watcherDebounce_{50};
   PlaylistTreeSnapshot snapshot_{};
   mutable std::mutex mutex_;
+  std::mutex watcherMutex_;
+  std::condition_variable watcherCv_;
+  std::vector<ScannerRoot> watchedRoots_;
+  std::vector<std::unique_ptr<FolderWatcher>> watchers_;
+  std::vector<std::string> pendingWatcherMessages_;
+  std::thread debounceThread_;
+  bool watcherStopping_{true};
+  std::uint64_t dirtyGeneration_{0};
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
 };

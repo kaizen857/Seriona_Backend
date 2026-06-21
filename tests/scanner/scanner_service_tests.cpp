@@ -72,6 +72,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
 [[nodiscard]] std::shared_ptr<FileScannerService> makeService(test::TempScannerRoot& temp,
                                                               std::shared_ptr<FakeServiceMetadataReader> reader) {
   return makeFileScannerService(FileScannerServiceDependencies{.metadataReader = std::move(reader),
+                                                               .watcherFactory = nullptr,
                                                                .databasePath = temp.dbPath(),
                                                                .coverExportDir = temp.path() / "covers"});
 }

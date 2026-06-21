@@ -16,6 +16,8 @@ public:
   void setEventSink(ScannerEventSink sink);
   void configure(const ScannerConfig& config);
   void scan(const std::vector<ScannerRoot>& roots, ScanMode mode = ScanMode::Incremental);
+  void startWatching(const std::vector<ScannerRoot>& roots);
+  void stopWatching();
   void stop();
   [[nodiscard]] PlaylistTreeSnapshot snapshot() const;
 

@@ -25,3 +25,11 @@
 - Treat TagReader failure for a new audio file as an error-only outcome, not a placeholder song; if old cached metadata exists, preserve that cached song while recording the error.
 - Use SQLite `saveRoot` as the single-writer reconciliation boundary after filesystem discovery/hash/metadata/LRC decisions are made in memory.
 - Forward fix: carry `treeRelativePath` beside each reconciled cached song so cache identity remains absolute-path based while playlist publication remains root-relative and hierarchical.
+
+
+## 2026-06-21 task 11 scanner watcher runtime
+
+- Add `startWatching`/`stopWatching` to the scanner service/facade contract while keeping all watcher implementation types private to `src/scanner`.
+- Treat watcher payloads only as dirty hints: debounce events and call the existing hash-first service reconciliation for watched roots, rather than applying create/delete/rename data directly.
+- Use root-level reconciliation for warning/error/overflow and ambiguous events in task 11; this favors correctness and preserves task-10 cache semantics over path-scoped optimization.
+- Inject `FolderWatcherFactory` only through the private `FileScannerServiceDependencies` test seam; production uses `WtrFolderWatcherFactory` automatically.

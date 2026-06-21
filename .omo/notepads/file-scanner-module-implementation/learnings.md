@@ -74,3 +74,11 @@
 - A stale FetchContent generator cache under `build/_deps/catch2-*` can block reconfigure even when the top-level `build` directory is valid; deleting only those generated subbuild dirs was sufficient.
 - Forward fix: scanner service publication must pass root-relative paths into `PlaylistTreeBuilder`; passing only `filename()` flattens nested directory roots and hides directory nodes.
 - Verification commands that build/link test executables and run CTest must run sequentially; parallel build + CTest can report a misleading "executable not found" while Ninja is still linking the target.
+
+
+## 2026-06-21 task 11 scanner watcher runtime
+
+- `wtr::watch` exposes an RAII `watch` class whose constructor starts async watching and whose `close()` joins/stops the watcher; production scanner wraps this behind a private `FolderWatcher` seam to keep public scanner headers watcher-free.
+- Normal `s/self/live` and `s/self/die` watcher messages should not be treated as scanner errors; only `e/*`, `w_*`, warning/error, or overflow-like watcher messages force a root reconciliation error event.
+- Fake watcher tests can prove `.lrc`-only runtime changes stay TagReader-free by checking fake metadata reader counts before and after watcher callbacks.
+- `stopWatching()` tests must not keep raw pointers to watcher objects after service ownership releases them; store shared fake state instead to verify close and late-callback behavior safely.

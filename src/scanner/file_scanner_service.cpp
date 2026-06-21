@@ -30,6 +30,18 @@ void FileScanner::scan(const std::vector<ScannerRoot>& roots, ScanMode mode) {
   }
 }
 
+void FileScanner::startWatching(const std::vector<ScannerRoot>& roots) {
+  if (service_) {
+    service_->startWatching(roots);
+  }
+}
+
+void FileScanner::stopWatching() {
+  if (service_) {
+    service_->stopWatching();
+  }
+}
+
 void FileScanner::stop() {
   if (service_) {
     service_->stop();

@@ -25,6 +25,10 @@ public:
     mode_ = mode;
   }
 
+  void startWatching(const std::vector<seriona::scanner::ScannerRoot>& roots) override { watchedRoots_ = roots; }
+
+  void stopWatching() override { watchingStopped_ = true; }
+
   void stop() override { stopped_ = true; }
 
   [[nodiscard]] seriona::scanner::PlaylistTreeSnapshot snapshot() const override { return snapshot_; }
@@ -32,8 +36,10 @@ public:
   seriona::scanner::ScannerEventSink sink_{};
   seriona::scanner::ScannerConfig config_{};
   std::vector<seriona::scanner::ScannerRoot> roots_{};
+  std::vector<seriona::scanner::ScannerRoot> watchedRoots_{};
   seriona::scanner::ScanMode mode_{seriona::scanner::ScanMode::Incremental};
   seriona::scanner::PlaylistTreeSnapshot snapshot_{};
+  bool watchingStopped_{false};
   bool stopped_{false};
 };
 
@@ -82,6 +88,8 @@ TEST_CASE("scanner service facade forwards to an injected service") {
   facade.setEventSink([&eventCount](ScannerEvent) { ++eventCount; });
   facade.configure(ScannerConfig{.progressInterval = std::chrono::milliseconds{250}});
   facade.scan({ScannerRoot{.path = std::filesystem::path{"music"}, .recursive = false}}, ScanMode::Full);
+  facade.startWatching({ScannerRoot{.path = std::filesystem::path{"watched"}, .recursive = true}});
+  facade.stopWatching();
   facade.stop();
 
   REQUIRE(service->sink_);
@@ -93,6 +101,9 @@ TEST_CASE("scanner service facade forwards to an injected service") {
   CHECK(service->roots_[0].path == std::filesystem::path{"music"});
   CHECK_FALSE(service->roots_[0].recursive);
   CHECK(service->mode_ == ScanMode::Full);
+  REQUIRE(service->watchedRoots_.size() == 1);
+  CHECK(service->watchedRoots_[0].path == std::filesystem::path{"watched"});
+  CHECK(service->watchingStopped_);
   CHECK(service->stopped_);
 }
 
