@@ -33,3 +33,9 @@
 - Treat watcher payloads only as dirty hints: debounce events and call the existing hash-first service reconciliation for watched roots, rather than applying create/delete/rename data directly.
 - Use root-level reconciliation for warning/error/overflow and ambiguous events in task 11; this favors correctness and preserves task-10 cache semantics over path-scoped optimization.
 - Inject `FolderWatcherFactory` only through the private `FileScannerServiceDependencies` test seam; production uses `WtrFolderWatcherFactory` automatically.
+
+## 2026-06-21 task 12 integration hardening
+
+- Link `seriona` against `seriona_scanner` without including scanner headers or constructing scanner services in `app/main.cpp`; linkability is the integration proof, not a new CLI feature.
+- Keep scanner documentation separate from audio documentation and state CUE deferral, dependency policy, and external `.lrc` priority/cache invalidation explicitly.
+- Do not add a real watcher smoke test in default CTest; task 12 evidence records the existing fake-watcher scanner group and full repository tests instead.

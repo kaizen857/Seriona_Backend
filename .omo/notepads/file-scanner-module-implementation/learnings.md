@@ -82,3 +82,10 @@
 - Normal `s/self/live` and `s/self/die` watcher messages should not be treated as scanner errors; only `e/*`, `w_*`, warning/error, or overflow-like watcher messages force a root reconciliation error event.
 - Fake watcher tests can prove `.lrc`-only runtime changes stay TagReader-free by checking fake metadata reader counts before and after watcher callbacks.
 - `stopWatching()` tests must not keep raw pointers to watcher objects after service ownership releases them; store shared fake state instead to verify close and late-callback behavior safely.
+
+## 2026-06-21 task 12 integration hardening
+
+- `tests/CMakeLists.txt` already registers every scanner CTest under names beginning with `seriona.scanner`, so `ctest -R 'seriona.scanner'` is the complete scanner grouping without adding an aggregate target.
+- App integration only needs `seriona` to link `seriona_scanner`; `app/main.cpp` remains audio-file playback only, preserving current CLI behavior while proving scanner is in the default build graph.
+- Scanner docs belong in a focused `docs/file-scanner.md` rather than `docs/audio-player.md`, because the domains and runtime constraints are separate.
+- No optional real-watcher smoke was added in task 12; default fake-watcher coverage plus full CTest keeps verification hardware/media independent.

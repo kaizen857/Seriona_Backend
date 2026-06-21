@@ -167,7 +167,7 @@ Your next move: 如果要开始实现，请显式发 `$start-work` 或“开始�
   QA scenarios (name the exact tool + invocation): happy: `ctest --test-dir build -R seriona.scanner_watcher --output-on-failure`; failure: fake watcher emits overflow/watcher error and service performs root reconciliation rather than trusting partial events.
   Commit group suggestion only | feat(scanner): add folder watcher incremental scans
 
-- [ ] 12. Integration hardening, optional smoke, docs, and full verification
+- [x] 12. Integration hardening, optional smoke, docs, and full verification
   What to do / Must NOT do: Wire app target to scanner library without changing app behavior beyond linkability; add scanner CTest groups in `tests/CMakeLists.txt`; add concise Chinese docs if public usage/configuration needs explanation, including sidecar `.lrc` matching/priority/cache invalidation rules; add optional real watcher smoke test disabled by default or guarded by env/CMake option; run full configure/build/CTest and record evidence. Must NOT make optional smoke mandatory, add formatter/linter that does not exist, or fix unrelated product bugs.
   Parallelization: Wave 5 | Blocked by: 11 | Blocks: final verification.
   References (executor has NO interview context - be exhaustive): `app/CMakeLists.txt:1`, `tests/CMakeLists.txt:295`, `docs/audio-player.md`, `AGENTS.md` Chinese docs instruction, `.omo/drafts/file-scanner-module.md:100`.
