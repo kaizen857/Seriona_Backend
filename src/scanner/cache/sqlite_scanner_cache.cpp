@@ -572,10 +572,27 @@ void SQLiteScannerCache::saveRoot(const CachedRoot& root) {
   auto transaction = beginWriter();
   const auto rootId = ensureRoot(asDb(db_), root);
   replaceDirectories(asDb(db_), rootId, root.directories);
+  std::vector<std::string> retainedTrackIds;
+  retainedTrackIds.reserve(root.songs.size());
   for (const auto& song : root.songs) {
+    retainedTrackIds.push_back(song.metadata.trackId);
     const auto songId = upsertSong(asDb(db_), rootId, song);
     replaceLyrics(asDb(db_), songId, "embedded", song.embeddedLyrics);
     replaceLyrics(asDb(db_), songId, "external", song.externalLyrics);
+  }
+  Statement select{asDb(db_), "SELECT id, track_id FROM songs WHERE root_id=?1;"};
+  select.bind(1, rootId);
+  std::vector<std::int64_t> removedIds;
+  while (select.stepRow()) {
+    const auto trackId = select.textColumn(1);
+    if (std::ranges::find(retainedTrackIds, trackId) == retainedTrackIds.end()) {
+      removedIds.push_back(select.int64Column(0));
+    }
+  }
+  for (const auto songId : removedIds) {
+    Statement remove{asDb(db_), "DELETE FROM songs WHERE id=?1;"};
+    remove.bind(1, songId);
+    remove.stepDone();
   }
   replaceErrors(asDb(db_), rootId, root.errors);
   transaction.commit();

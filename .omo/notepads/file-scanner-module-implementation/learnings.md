@@ -89,3 +89,11 @@
 - App integration only needs `seriona` to link `seriona_scanner`; `app/main.cpp` remains audio-file playback only, preserving current CLI behavior while proving scanner is in the default build graph.
 - Scanner docs belong in a focused `docs/file-scanner.md` rather than `docs/audio-player.md`, because the domains and runtime constraints are separate.
 - No optional real-watcher smoke was added in task 12; default fake-watcher coverage plus full CTest keeps verification hardware/media independent.
+
+
+## 2026-06-21 F2 scanner forward fix
+
+- Watcher callbacks must not capture `this`; a separate shared runtime state lets late callbacks become no-ops after stop/destruction without relying on `wtr::watch::close()` callback-drain guarantees.
+- Watcher startup must create all watcher objects before launching the debounce thread; if factory construction throws, close already-created watchers and leave no joinable thread.
+- `SQLiteScannerCache::saveRoot()` is the replacement-root write boundary, so stale song pruning belongs in the same writer transaction as upsert/lyrics/error replacement.
+- Existing `.lrc` parsing already has explicit bounded defaults of 1 MiB and 10,000 lines in `LrcParseOptions`; F2 evidence records this as the task-scope policy instead of adding a second service-level knob.

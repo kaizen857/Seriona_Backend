@@ -5,7 +5,9 @@
 #include <doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -22,19 +24,36 @@ namespace {
 
 class FakeWatcherMetadataReader final : public TagMetadataReader {
 public:
-  void put(std::filesystem::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
+  void put(std::filesystem::path path, RawTagMetadata metadata) {
+    std::scoped_lock lock{mutex_};
+    metadataByPath_[std::move(path)] = std::move(metadata);
+  }
+
+  void setReadDelay(std::chrono::milliseconds delay) noexcept { readDelay_ = delay; }
 
   [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
                                     const std::filesystem::path&) override {
-    std::scoped_lock lock{mutex_};
-    requestedPaths.push_back(path);
-    auto iterator = metadataByPath_.find(path);
-    if (iterator == metadataByPath_.end()) {
-      throw std::runtime_error("missing fake metadata");
+    const auto active = activeReads_.fetch_add(1U) + 1U;
+    maxConcurrentReads_.store(std::max(maxConcurrentReads_.load(), active));
+    if (readDelay_ > std::chrono::milliseconds{0}) {
+      std::this_thread::sleep_for(readDelay_);
     }
-    auto metadata = iterator->second;
-    metadata.filePath = path;
-    return metadata;
+
+    try {
+      std::scoped_lock lock{mutex_};
+      requestedPaths.push_back(path);
+      auto iterator = metadataByPath_.find(path);
+      if (iterator == metadataByPath_.end()) {
+        throw std::runtime_error("missing fake metadata");
+      }
+      auto metadata = iterator->second;
+      metadata.filePath = path;
+      activeReads_.fetch_sub(1U);
+      return metadata;
+    } catch (...) {
+      activeReads_.fetch_sub(1U);
+      throw;
+    }
   }
 
   [[nodiscard]] std::size_t readCount() const noexcept {
@@ -42,10 +61,15 @@ public:
     return requestedPaths.size();
   }
 
+  [[nodiscard]] std::size_t maxConcurrentReads() const noexcept { return maxConcurrentReads_.load(); }
+
   std::vector<std::filesystem::path> requestedPaths;
 
 private:
   std::map<std::filesystem::path, RawTagMetadata> metadataByPath_;
+  std::chrono::milliseconds readDelay_{0};
+  std::atomic_size_t activeReads_{0};
+  std::atomic_size_t maxConcurrentReads_{0};
   mutable std::mutex mutex_;
 };
 
@@ -75,16 +99,24 @@ private:
 
 class CapturingWatcherFactory final : public FolderWatcherFactory {
 public:
+  void throwAfterCreating(std::size_t count) noexcept { throwAfterCreated_ = count; }
+
   [[nodiscard]] std::unique_ptr<FolderWatcher> watch(const std::filesystem::path& root,
                                                      WatchEventCallback callback) override {
     auto state = std::make_shared<CapturedFolderWatcher::State>();
     state->root = root;
     state->callback = std::move(callback);
     states.push_back(state);
+    if (throwAfterCreated_ != 0U && states.size() >= throwAfterCreated_) {
+      throw std::runtime_error("fake watcher startup failed");
+    }
     return std::make_unique<CapturedFolderWatcher>(std::move(state));
   }
 
   std::vector<std::shared_ptr<CapturedFolderWatcher::State>> states;
+
+private:
+  std::size_t throwAfterCreated_{0};
 };
 
 [[nodiscard]] RawTagMetadata rawMetadata(std::string title, std::vector<RawTagLyricLine> lyrics = {}) {
@@ -284,6 +316,66 @@ TEST_CASE("scanner watcher stop closes watcher and ignores later callbacks") {
 
   CHECK(reader->readCount() == 1U);
   CHECK(songsIn(service->snapshot()).size() == 1U);
+}
+
+TEST_CASE("scanner watcher startup failure leaves no live callback into service") {
+  test::TempScannerRoot temp{"scanner-watcher-startup-failure"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  watchers->throwAfterCreating(1U);
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  CHECK_THROWS_AS(service->startWatching({ScannerRoot{.path = temp.path()}}), std::runtime_error);
+  REQUIRE(watchers->states.size() == 1U);
+  const auto callback = watchers->states[0]->callback;
+  service.reset();
+
+  const auto second = test::writeAudioFixture(temp.path(), "second.flac");
+  reader->put(second, rawMetadata("Second"));
+  CHECK_NOTHROW(callback(fileEvent(second, WatchEffectKind::Created)));
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  CHECK(reader->readCount() == 1U);
+}
+
+TEST_CASE("scanner service serializes concurrent manual and watcher scans") {
+  test::TempScannerRoot temp{"scanner-watcher-serialized-scans"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "second.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  reader->setReadDelay(std::chrono::milliseconds{25});
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  std::mutex startMutex;
+  std::condition_variable startCv;
+  auto readyCount = 0;
+  auto start = false;
+  auto scanAction = [&] {
+    {
+      std::unique_lock lock{startMutex};
+      ++readyCount;
+      startCv.notify_all();
+      startCv.wait(lock, [&start] { return start; });
+    }
+    service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  };
+  std::thread firstScan{scanAction};
+  std::thread secondScan{scanAction};
+  {
+    std::unique_lock lock{startMutex};
+    startCv.wait(lock, [&readyCount] { return readyCount == 2; });
+    start = true;
+  }
+  startCv.notify_all();
+  firstScan.join();
+  secondScan.join();
+
+  CHECK(reader->maxConcurrentReads() <= 1U);
 }
 
 }

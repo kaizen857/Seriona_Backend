@@ -39,3 +39,10 @@
 - Link `seriona` against `seriona_scanner` without including scanner headers or constructing scanner services in `app/main.cpp`; linkability is the integration proof, not a new CLI feature.
 - Keep scanner documentation separate from audio documentation and state CUE deferral, dependency policy, and external `.lrc` priority/cache invalidation explicitly.
 - Do not add a real watcher smoke test in default CTest; task 12 evidence records the existing fake-watcher scanner group and full repository tests instead.
+
+
+## 2026-06-21 F2 scanner forward fix
+
+- Serialize `FileScannerService::scan()` with a service-local mutex; watcher-triggered scans and manual scans may queue, but they no longer interleave snapshot/cache publication.
+- Keep callback lifetime independent from service lifetime by capturing `std::shared_ptr<WatchRuntimeState>` in watcher callbacks; service shutdown flips the state to stopping and joins the debounce thread.
+- Make `saveRoot()` prune absent songs in the same transaction, leaving `pruneMissingSongs()` as an explicit auxiliary API but no longer requiring orchestration to remember a second call.

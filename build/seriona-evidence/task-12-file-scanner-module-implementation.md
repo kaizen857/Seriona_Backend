@@ -167,3 +167,25 @@ Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
 Total Test time (real) =   0.95 sec
 ```
 full_ctest_exit=0
+
+## F2 forward-fix evidence
+
+### Rejected defects addressed
+
+- Watcher startup exception safety: `startWatching()` now builds all watcher objects before launching the debounce thread, closes any already-created watchers if factory construction throws, and rethrows without leaving a joinable thread.
+- Callback lifetime safety: watcher callbacks capture a shared `WatchRuntimeState`, not raw `this`; `stopWatching()` flips the state to stopping before closing watchers and joining the debounce thread, so late callbacks become no-ops independent of service lifetime.
+- Scan serialization: `scan()` is guarded by a service-local scan mutex, serializing manual scans and watcher-triggered scans so cache/snapshot publication cannot interleave.
+- SQLite stale pruning: `SQLiteScannerCache::saveRoot()` now prunes songs absent from the replacement `CachedRoot` inside the same writer transaction as upserts, lyrics replacement, and error replacement.
+- `.lrc` bounds: current parsing remains bounded by `LrcParseOptions` defaults (1 MiB max file, 10,000 max lines). This is an explicit bounded policy already enforced in `parseLrcFile`; no new service config knob was added in this forward fix to avoid broadening the rejected lifecycle/cache scope.
+
+### Regression coverage added
+
+- `seriona.scanner_watcher`: startup failure leaves no live callback into service; late callback after service reset is no-op; concurrent manual scans keep fake TagReader `maxConcurrentReads <= 1`.
+- `seriona.scanner_cache`: `saveRoot()` replacement with one retained song prunes the removed song without requiring a separate `pruneMissingSongs()` call.
+
+### Verification to rerun after fix
+
+- `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON` passed; only the known TagReader FetchContent CMP0135 developer warning appeared.
+- `cmake --build build` passed.
+- `ctest --test-dir build -R 'seriona.scanner_watcher|seriona.scanner_service|seriona.scanner_cache|seriona.scanner' --output-on-failure` passed: 10/10 scanner tests.
+- `ctest --test-dir build --output-on-failure` passed: 35/35 repository tests.

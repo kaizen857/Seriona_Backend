@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -194,6 +195,32 @@ public:
   }
 };
 
+struct WatchRuntimeState {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::vector<ScannerRoot> watchedRoots;
+  std::vector<std::string> pendingWatcherMessages;
+  bool stopping{true};
+  std::uint64_t dirtyGeneration{0};
+};
+
+void enqueueWatcherEvent(const std::shared_ptr<WatchRuntimeState>& state, const WatchEvent& event) {
+  std::scoped_lock lock{state->mutex};
+  if (state->stopping) {
+    return;
+  }
+  if (event.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(event.path)) {
+    state->pendingWatcherMessages.push_back(event.path.generic_string());
+  }
+  for (const auto& associated : event.associated) {
+    if (associated.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(associated.path)) {
+      state->pendingWatcherMessages.push_back(associated.path.generic_string());
+    }
+  }
+  ++state->dirtyGeneration;
+  state->changed.notify_one();
+}
+
 class OrchestratedFileScannerService final : public FileScannerService {
 public:
   explicit OrchestratedFileScannerService(FileScannerServiceDependencies dependencies)
@@ -227,6 +254,7 @@ public:
   }
 
   void scan(const std::vector<ScannerRoot>& roots, ScanMode) override {
+    std::lock_guard scanLock{scanMutex_};
     ScannerConfig config;
     ScannerEventSink sink;
     {
@@ -290,36 +318,56 @@ public:
     for (const auto& root : roots) {
       normalizedRoots.push_back(ScannerRoot{.path = rootPathFor(root), .recursive = root.recursive});
     }
+    auto state = std::make_shared<WatchRuntimeState>();
     {
-      std::scoped_lock lock{watcherMutex_};
-      watchedRoots_ = normalizedRoots;
-      watcherStopping_ = false;
-      dirtyGeneration_ = 0;
-      pendingWatcherMessages_.clear();
+      std::scoped_lock lock{state->mutex};
+      state->watchedRoots = normalizedRoots;
+      state->stopping = false;
     }
-    debounceThread_ = std::thread([this] { debounceLoop(); });
 
     std::vector<std::unique_ptr<FolderWatcher>> watchers;
     watchers.reserve(normalizedRoots.size());
-    for (const auto& root : normalizedRoots) {
-      watchers.push_back(watcherFactory_->watch(root.path, [this](const WatchEvent& event) { enqueueWatcherEvent(event); }));
+    try {
+      for (const auto& root : normalizedRoots) {
+        watchers.push_back(watcherFactory_->watch(root.path, [state](const WatchEvent& event) { enqueueWatcherEvent(state, event); }));
+      }
+    } catch (...) {
+      {
+        std::scoped_lock lock{state->mutex};
+        state->stopping = true;
+      }
+      state->changed.notify_all();
+      for (auto& watcher : watchers) {
+        if (watcher) {
+          watcher->close();
+        }
+      }
+      throw;
     }
     {
       std::scoped_lock lock{watcherMutex_};
+      watcherState_ = state;
       watchers_ = std::move(watchers);
     }
+    debounceThread_ = std::thread([this, state] { debounceLoop(state); });
   }
 
   void stopWatching() override {
     std::vector<std::unique_ptr<FolderWatcher>> watchers;
+    std::shared_ptr<WatchRuntimeState> state;
     {
       std::scoped_lock lock{watcherMutex_};
-      watcherStopping_ = true;
+      state = std::move(watcherState_);
       watchers = std::move(watchers_);
-      watchedRoots_.clear();
-      pendingWatcherMessages_.clear();
     }
-    watcherCv_.notify_all();
+    if (state) {
+      {
+        std::scoped_lock lock{state->mutex};
+        state->stopping = true;
+        state->pendingWatcherMessages.clear();
+      }
+      state->changed.notify_all();
+    }
     for (auto& watcher : watchers) {
       if (watcher) {
         watcher->close();
@@ -479,50 +527,33 @@ private:
     selectEffectiveLyrics(song);
   }
 
-  void enqueueWatcherEvent(const WatchEvent& event) {
-    std::scoped_lock lock{watcherMutex_};
-    if (watcherStopping_) {
-      return;
-    }
-    if (event.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(event.path)) {
-      pendingWatcherMessages_.push_back(event.path.generic_string());
-    }
-    for (const auto& associated : event.associated) {
-      if (associated.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(associated.path)) {
-        pendingWatcherMessages_.push_back(associated.path.generic_string());
-      }
-    }
-    ++dirtyGeneration_;
-    watcherCv_.notify_one();
-  }
-
-  void debounceLoop() {
+  void debounceLoop(const std::shared_ptr<WatchRuntimeState>& state) {
     std::uint64_t processedGeneration = 0;
     while (true) {
       std::vector<ScannerRoot> roots;
       std::vector<std::string> watcherMessages;
       {
-        std::unique_lock lock{watcherMutex_};
-        watcherCv_.wait(lock, [this, processedGeneration] {
-          return watcherStopping_ || dirtyGeneration_ != processedGeneration;
+        std::unique_lock lock{state->mutex};
+        state->changed.wait(lock, [&state, processedGeneration] {
+          return state->stopping || state->dirtyGeneration != processedGeneration;
         });
-        if (watcherStopping_) {
+        if (state->stopping) {
           return;
         }
-        auto observedGeneration = dirtyGeneration_;
-        watcherCv_.wait_for(lock, watcherDebounce_, [this, observedGeneration] {
-          return watcherStopping_ || dirtyGeneration_ != observedGeneration;
+        auto observedGeneration = state->dirtyGeneration;
+        state->changed.wait_for(lock, watcherDebounce_, [&state, observedGeneration] {
+          return state->stopping || state->dirtyGeneration != observedGeneration;
         });
-        if (watcherStopping_) {
+        if (state->stopping) {
           return;
         }
-        if (dirtyGeneration_ != observedGeneration) {
+        if (state->dirtyGeneration != observedGeneration) {
           continue;
         }
         processedGeneration = observedGeneration;
-        roots = watchedRoots_;
-        watcherMessages = std::move(pendingWatcherMessages_);
-        pendingWatcherMessages_.clear();
+        roots = state->watchedRoots;
+        watcherMessages = std::move(state->pendingWatcherMessages);
+        state->pendingWatcherMessages.clear();
       }
       publishWatcherMessages(watcherMessages);
       scan(roots, ScanMode::Incremental);
@@ -553,14 +584,11 @@ private:
   std::chrono::milliseconds watcherDebounce_{50};
   PlaylistTreeSnapshot snapshot_{};
   mutable std::mutex mutex_;
+  std::mutex scanMutex_;
   std::mutex watcherMutex_;
-  std::condition_variable watcherCv_;
-  std::vector<ScannerRoot> watchedRoots_;
   std::vector<std::unique_ptr<FolderWatcher>> watchers_;
-  std::vector<std::string> pendingWatcherMessages_;
+  std::shared_ptr<WatchRuntimeState> watcherState_;
   std::thread debounceThread_;
-  bool watcherStopping_{true};
-  std::uint64_t dirtyGeneration_{0};
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
 };

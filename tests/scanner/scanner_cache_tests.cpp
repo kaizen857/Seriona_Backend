@@ -176,6 +176,23 @@ TEST_CASE("sqlite scanner cache prunes deleted songs and checkpoints WAL") {
   CHECK(loaded->songs[0].metadata.trackId == "track-2");
 }
 
+TEST_CASE("sqlite scanner cache saveRoot prunes songs absent from replacement root") {
+  test::TempScannerRoot temp{"scanner-cache-save-prune"};
+  auto cache = openCache(temp.dbPath());
+  auto root = rootFixture(temp.path());
+  root.songs.push_back(songWithLyrics("Second", "track-2", "audio-hash-second"));
+  root.songs[1].metadata.filePath = "artist/second.flac";
+  cache.saveRoot(root);
+
+  root.songs.erase(root.songs.begin());
+  cache.saveRoot(root);
+  const auto loaded = cache.loadRoot(temp.path());
+
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->songs.size() == 1U);
+  CHECK(loaded->songs[0].metadata.trackId == "track-2");
+}
+
 TEST_CASE("sqlite scanner cache reports busy deterministically while writer transaction is held") {
   test::TempScannerRoot temp{"scanner-cache-busy"};
   auto first = openCache(temp.dbPath());
