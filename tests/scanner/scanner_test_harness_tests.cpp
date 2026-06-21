@@ -95,9 +95,10 @@ TEST_CASE("fake watcher represents audio lrc rename and warning events") {
   watcher.lrcCreated("music/renamed.lrc");
   watcher.lrcRenamed("music/renamed.lrc", "music/final.lrc");
   watcher.lrcDestroyed("music/final.lrc");
-  watcher.warning("music", "recursive watcher overflow");
+  watcher.audioWarning("music", "audio watcher overflow");
+  watcher.lrcWarning("music/final.lrc", "lyric watcher overflow");
 
-  CHECK(watcher.events().size() == 7U);
+  CHECK(watcher.events().size() == 8U);
   CHECK_NOTHROW(requireWatcherEvent(watcher.popNext(), FakeWatcherEvent::Type::Created,
                                     FakeWatcherEvent::PathKind::Audio, "music/new.flac"));
   CHECK_NOTHROW(requireWatcherEvent(watcher.popNext(), FakeWatcherEvent::Type::Modified,
@@ -121,10 +122,17 @@ TEST_CASE("fake watcher represents audio lrc rename and warning events") {
   CHECK_NOTHROW(requireWatcherEvent(watcher.popNext(), FakeWatcherEvent::Type::Destroyed,
                                     FakeWatcherEvent::PathKind::Lrc, "music/final.lrc"));
 
-  const auto warning = watcher.popNext();
-  CHECK(warning.type == FakeWatcherEvent::Type::Warning);
-  CHECK(warning.path == "music");
-  CHECK(warning.warning == "recursive watcher overflow");
+  const auto audioWarning = watcher.popNext();
+  CHECK(audioWarning.type == FakeWatcherEvent::Type::Warning);
+  CHECK(audioWarning.pathKind == FakeWatcherEvent::PathKind::Audio);
+  CHECK(audioWarning.path == "music");
+  CHECK(audioWarning.warning == "audio watcher overflow");
+
+  const auto lrcWarning = watcher.popNext();
+  CHECK(lrcWarning.type == FakeWatcherEvent::Type::Warning);
+  CHECK(lrcWarning.pathKind == FakeWatcherEvent::PathKind::Lrc);
+  CHECK(lrcWarning.path == "music/final.lrc");
+  CHECK(lrcWarning.warning == "lyric watcher overflow");
 }
 
 }

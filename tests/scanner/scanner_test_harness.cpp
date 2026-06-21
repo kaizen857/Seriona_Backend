@@ -32,6 +32,10 @@ FakeWatcherEvent renameEvent(FakeWatcherEvent::PathKind pathKind, std::filesyste
   return {FakeWatcherEvent::Type::Renamed, pathKind, std::move(newPath), std::move(oldPath), {}};
 }
 
+FakeWatcherEvent warningEvent(FakeWatcherEvent::PathKind pathKind, std::filesystem::path path, std::string message) {
+  return {FakeWatcherEvent::Type::Warning, pathKind, std::move(path), std::nullopt, std::move(message)};
+}
+
 }
 
 TempScannerRoot::TempScannerRoot(std::string name) : path_(uniqueRootPath(name)) {
@@ -188,9 +192,12 @@ void FakeWatcher::lrcRenamed(std::filesystem::path oldPath, std::filesystem::pat
   push(renameEvent(FakeWatcherEvent::PathKind::Lrc, std::move(oldPath), std::move(newPath)));
 }
 
-void FakeWatcher::warning(std::filesystem::path path, std::string message) {
-  push({FakeWatcherEvent::Type::Warning, FakeWatcherEvent::PathKind::Audio, std::move(path), std::nullopt,
-        std::move(message)});
+void FakeWatcher::audioWarning(std::filesystem::path path, std::string message) {
+  push(warningEvent(FakeWatcherEvent::PathKind::Audio, std::move(path), std::move(message)));
+}
+
+void FakeWatcher::lrcWarning(std::filesystem::path path, std::string message) {
+  push(warningEvent(FakeWatcherEvent::PathKind::Lrc, std::move(path), std::move(message)));
 }
 
 const std::deque<FakeWatcherEvent>& FakeWatcher::events() const noexcept {

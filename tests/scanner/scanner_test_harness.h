@@ -120,7 +120,8 @@ public:
   void lrcModified(std::filesystem::path path);
   void lrcDestroyed(std::filesystem::path path);
   void lrcRenamed(std::filesystem::path oldPath, std::filesystem::path newPath);
-  void warning(std::filesystem::path path, std::string message);
+  void audioWarning(std::filesystem::path path, std::string message);
+  void lrcWarning(std::filesystem::path path, std::string message);
 
   [[nodiscard]] const std::deque<FakeWatcherEvent>& events() const noexcept;
   [[nodiscard]] FakeWatcherEvent popNext();
