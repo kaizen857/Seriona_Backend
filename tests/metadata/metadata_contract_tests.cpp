@@ -1,5 +1,3 @@
-#include "metadata_module.h"
-
 #include <doctest/doctest.h>
 
 #include <cstring>

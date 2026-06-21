@@ -127,7 +127,6 @@ add_executable(seriona_scanner_contract_tests
 )
 add_executable(seriona_metadata_contract_tests
   metadata/metadata_contract_tests.cpp
-  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_module.cpp
 )
 add_executable(seriona_scanner_paths_tests
   scanner/scanner_paths_tests.cpp
@@ -278,7 +277,6 @@ target_include_directories(seriona_scanner_contract_tests PRIVATE
 )
 target_include_directories(seriona_metadata_contract_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
-  ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/src/metadata
 )
 target_include_directories(seriona_scanner_paths_tests PRIVATE
