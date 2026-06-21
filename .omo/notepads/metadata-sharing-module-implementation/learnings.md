@@ -13,3 +13,8 @@
 - Linux 依赖门控最好放在顶层 `CMakeLists.txt` 的 configure 阶段，模拟开关要和 scanner 的 `SERIONA_SCANNER_SIMULATE_MISSING_*` 保持同风格，便于不用卸包也能验证失败路径。
 - snapshot 到平台 DTO 的 mapper 需要把 `PlayerStateSnapshot` 里的公共字段显式分层：展示字段、时间线字段、控制能力字段可映射；`freshness.version`、`freshness.sampledAt`、`playback.errorCode`、`playback.errorMessage` 以及输出格式/错误摘要这类内部信息不应进入平台 payload。
 - MPRIS track object path 生成应使用仓库自定义前缀并保留一个明确的 no-track sentinel；只有空 track 才回退到 sentinel，其余 track id 都要生成非 `/org/mpris` 前缀的对象路径，避免和系统保留命名冲突。
+- 支持矩阵需要同时覆盖 track identity、file URI/path、title/artist/album/album artist/genre、track number、artwork、playback status、repeat、timeline、duration 和 capabilities；这些都应该在 mapper DTO 的结构层直接可见，不能只靠隐式约定。
+- Windows DTO 仍然不应承诺 volume/mute 支持，即使 MPRIS 侧暂时保留这些字段，也要让 Windows 平台输出保持明确的能力边界。
+- Windows capability export should explicitly force `canSetVolume = false`, so the DTO surface cannot be interpreted as a volume-support claim.
+- Synchronizer should keep static metadata and timeline cadence as separate dirty paths; cadence can be driven by second buckets while freshness fields only gate stale snapshots.
+- Metadata-only changes should not piggyback timeline emission; if a test needs to assert that, place the samples outside the 1-second cadence boundary.
