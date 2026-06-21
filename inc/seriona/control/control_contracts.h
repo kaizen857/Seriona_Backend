@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -54,13 +53,13 @@ struct DisplayMetadata {
   std::string genre;
 };
 
-struct ArtworkReference {
+struct ArtworkRef {
   std::optional<std::filesystem::path> localPath;
   std::optional<std::string> uri;
   std::optional<std::string> contentHash;
 };
 
-struct Timeline {
+struct PlaybackTimeline {
   std::chrono::milliseconds position{0};
   std::optional<std::chrono::milliseconds> duration;
   std::optional<std::chrono::milliseconds> buffered;
@@ -79,19 +78,29 @@ struct SnapshotFreshness {
   std::chrono::steady_clock::time_point sampledAt{};
 };
 
-struct CapabilitySet {
-  std::uint32_t bits{0};
+struct PlaybackCapabilities {
+  bool canPlay{false};
+  bool canPause{false};
+  bool canStop{false};
+  bool canSeek{false};
+  bool canSkipNext{false};
+  bool canSkipPrevious{false};
+  bool canSetRepeat{false};
+  bool canSetShuffle{false};
+  bool canSetVolume{false};
+  bool canSelectTrack{false};
 };
 
-struct PlayerSnapshot {
+struct PlayerStateSnapshot {
   SnapshotFreshness freshness{};
   std::optional<TrackIdentity> currentTrack;
   std::optional<DisplayMetadata> display;
-  std::optional<ArtworkReference> artwork;
+  std::optional<ArtworkRef> artwork;
   PlaybackSnapshot playback{};
   RepeatMode repeatMode{RepeatMode::Off};
-  CapabilitySet capabilities{};
-  Timeline timeline{};
+  bool shuffle{false};
+  PlaybackCapabilities capabilities{};
+  PlaybackTimeline timeline{};
   float volume{1.0F};
   bool muted{false};
 };
@@ -106,6 +115,7 @@ enum class MediaControlCommandKind {
   SetVolume,
   SetMuted,
   SetRepeatMode,
+  SetShuffle,
   SkipNext,
   SkipPrevious,
   SelectTrack,
@@ -118,19 +128,20 @@ struct MediaControlCommand {
   std::optional<float> volume;
   std::optional<bool> muted;
   std::optional<RepeatMode> repeatMode;
+  std::optional<bool> shuffle;
   std::optional<TrackIdentity> track;
 };
 
-using PlayerSnapshotCallback = std::function<void(const PlayerSnapshot&)>;
-using PlayerSnapshotSubscriptionCallback = PlayerSnapshotCallback;
+using PlayerStateSnapshotCallback = std::function<void(const PlayerStateSnapshot&)>;
+using PlayerStateSubscriptionCallback = PlayerStateSnapshotCallback;
 using MediaControlCommandSink = std::function<void(const MediaControlCommand&)>;
 
-struct PlayerSnapshotSubscription {
+struct SubscriptionHandle {
   std::size_t subscriptionId{0};
   std::function<void()> unsubscribe;
 };
 
-using PlayerSnapshotSubscriptionFactory = std::function<PlayerSnapshotSubscription(PlayerSnapshotCallback)>;
+using PlayerStateSubscriptionFactory = std::function<SubscriptionHandle(PlayerStateSnapshotCallback)>;
 using MediaControlCommandSinkFactory = std::function<MediaControlCommandSink()>;
 
 }
