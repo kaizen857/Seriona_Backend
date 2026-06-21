@@ -5,6 +5,8 @@
 - `seriona` 是纯 C++23 音乐播放器后端；不要在后端引入 Qt/QML/UI/MPRIS/SMTC。
 - 没有 README、CI、formatter、lint、pre-commit 或 OpenCode 配置可引用；以 CMake 文件和源码为准。
 - 面向用户的回答和新增项目文档使用中文。
+- 元数据共享模块的实现文件例外：仅 `src/metadata/` 下的平台适配实现文件可使用 MPRIS、SMTC、`sdbus-c++`、WinRT；这些标识不得泄漏到公共头文件、音频路径、扫描路径、实时音频路径或其他通用模块。
+- `.omo/evidence/metadata-sharing-module-implementation/` 允许作为本计划的已提交执行证据目录；除此之外，`.omo/` 仍然不是项目源码。
 
 ## 入口与模块
 - 目标清单在 `CMakeLists.txt`、`app/CMakeLists.txt`、`tests/CMakeLists.txt`；应用入口是 `app/main.cpp`，生成目标 `seriona`。

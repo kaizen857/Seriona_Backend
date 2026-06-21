@@ -72,11 +72,21 @@ add_library(seriona_scanner STATIC
   src/scanner/scanner_module.cpp
 )
 
+add_library(seriona_metadata STATIC
+  src/metadata/metadata_module.cpp
+)
+
 target_include_directories(seriona_scanner
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
+)
+
+target_include_directories(seriona_metadata
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/src/metadata
 )
 
 target_link_libraries(seriona_scanner
@@ -88,6 +98,7 @@ target_link_libraries(seriona_scanner
 )
 
 seriona_enable_warnings(seriona_scanner)
+seriona_enable_warnings(seriona_metadata)
 
 add_subdirectory(app)
 
