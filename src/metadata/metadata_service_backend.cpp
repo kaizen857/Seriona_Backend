@@ -8,6 +8,10 @@
 #include "metadata_mpris_private.h"
 #endif
 
+#ifdef _WIN32
+#include "metadata_windows_private.h"
+#endif
+
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -150,7 +154,11 @@ private:
           "metadata.backend.windows.host_missing",
           "windows metadata backend requires a platform host extension");
     }
+#ifdef _WIN32
+    return detail::makeWindowsMetadataServiceBackend();
+#else
     return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Windows, capabilities);
+#endif
   }
 
   if (options.backendKind == MetadataBackendKind::Linux) {

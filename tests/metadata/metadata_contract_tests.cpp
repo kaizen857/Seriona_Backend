@@ -111,3 +111,10 @@ TEST_CASE("metadata contract models missing Windows host handles as capability d
   CHECK_FALSE(result.changed);
   CHECK(result.errorCode == std::nullopt);
 }
+
+TEST_CASE("metadata contract keeps Windows SMTC names out of public headers") {
+  using WindowsBackend = seriona::metadata::MetadataBackendKind;
+
+  CHECK(WindowsBackend::Windows == seriona::metadata::MetadataBackendKind::Windows);
+  CHECK_FALSE(std::is_same_v<WindowsBackend, int>);
+}

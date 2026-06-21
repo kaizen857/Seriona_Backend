@@ -89,6 +89,12 @@ add_library(seriona_metadata STATIC
   src/metadata/metadata_mpris.cpp
 )
 
+if(WIN32)
+  target_sources(seriona_metadata PRIVATE
+    src/metadata/metadata_windows_private.cpp
+  )
+endif()
+
 target_include_directories(seriona_scanner
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>

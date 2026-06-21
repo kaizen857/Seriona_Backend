@@ -19,3 +19,4 @@
 - `update()` 在 stop 之后明确返回失败结果（带错误码和 message），而不是静默继续接受更新；这让后续 caller 能区分正常 idle 与已停止状态。
 - Linux MPRIS adapter keeps `sdbus-c++` private to `src/metadata/*.cpp`; tests use a fake bus seam and never require a live desktop D-Bus session.
 - `seriona.metadata_mpris_smoke` remains a fixed CTest entry so the MPRIS target stays anchored even when the richer test set changes.
+- Windows SMTC is added as a compile-isolated private scaffold: `_WIN32` selects the backend factory, Linux builds never see WinRT/SMTC headers, and the official flow shape is recorded in private helper text/types rather than runtime SDK calls.
