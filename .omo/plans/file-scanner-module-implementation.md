@@ -151,7 +151,7 @@ Your next move: 如果要开始实现，请显式发 `$start-work` 或“开始�
   QA scenarios (name the exact tool + invocation): happy: `ctest --test-dir build -R seriona.scanner_tagreader --output-on-failure`; failure: fake reader throws on one file among many and final scan includes other songs plus one error.
   Commit group suggestion only | feat(scanner): adapt TagReader metadata safely
 
-- [ ] 10. Scanner service full scan and hash-first startup reconciliation
+- [x] 10. Scanner service full scan and hash-first startup reconciliation
   What to do / Must NOT do: Implement `FileScannerService` orchestration for `scanRoot`, `refresh`, `cancel`, and `querySnapshot`; support directory and single-file roots; run traversal -> audio hash + `.lrc` sidecar hash -> cache compare -> metadata read for new/changed/missing audio -> sidecar `.lrc` parse for new/changed/missing lyrics -> effective lyrics selection -> single-writer cache update -> tree publish -> events. On root path match, unchanged audio hashes must load complete metadata and embedded lyrics from cache without calling TagReader; unchanged `.lrc` hashes must load external lyrics from cache; changed/new audio files call TagReader and update metadata/cache; changed/new/deleted `.lrc` files update only external lyrics rows, effective lyrics source, and song snapshot; deleted `.lrc` files must restore cached embedded lyrics or `None` without TagReader; deleted audio files are removed. Must NOT block forever on cancellation, emit unbounded progress events, or treat cache as authority when filesystem contradicts it.
   Parallelization: Wave 4 | Blocked by: 8, 9 | Blocks: 11, 12.
   References (executor has NO interview context - be exhaustive): `.omo/drafts/file-scanner-module.md:76`, `.omo/drafts/file-scanner-module.md:80`, `.omo/drafts/file-scanner-module.md:82`, `.omo/drafts/file-scanner-module.md:83`, `FILE_SCANNER_ANALYSIS.md:53`, `DESIGN.md:541`, `DESIGN.md:550`.
@@ -177,10 +177,10 @@ Your next move: 如果要开始实现，请显式发 `$start-work` 或“开始�
 
 ## Final verification wave
 > Runs in parallel after ALL todos. ALL must APPROVE. Surface results and wait for the user's explicit okay before declaring complete.
-- [ ] F1. Plan compliance audit: read implementation diff and confirm every todo acceptance criterion is evidenced; reject if any product code edits fall outside scanner/CMake/tests/docs scope or if `.omo/run-continuation` is included.
-- [ ] F2. Code quality review: review C++23 code for ownership cycles, data races, SQLite statement lifetime, exception safety, cancellation, backpressure, sidecar `.lrc` parser bounds/error handling, and public header dependency leaks.
-- [ ] F3. Real manual QA: run agent-executed full build/test commands and, if optional smoke is enabled and environment supports it, create a temp watched dir and verify create/modify/delete updates without user media/hardware.
-- [ ] F4. Scope fidelity: verify no Qt/QML/UI/MPRIS/SMTC/play queue/CUE parsing/lyrics download/cover download/FFmpeg playback logic entered scanner, and verify external `.lrc` support did not require TagReader/MusicTag sidecar path changes.
+- [x] F1. Plan compliance audit: read implementation diff and confirm every todo acceptance criterion is evidenced; reject if any product code edits fall outside scanner/CMake/tests/docs scope or if `.omo/run-continuation` is included.
+- [x] F2. Code quality review: review C++23 code for ownership cycles, data races, SQLite statement lifetime, exception safety, cancellation, backpressure, sidecar `.lrc` parser bounds/error handling, and public header dependency leaks.
+- [x] F3. Real manual QA: run agent-executed full build/test commands and, if optional smoke is enabled and environment supports it, create a temp watched dir and verify create/modify/delete updates without user media/hardware.
+- [x] F4. Scope fidelity: verify no Qt/QML/UI/MPRIS/SMTC/play queue/CUE parsing/lyrics download/cover download/FFmpeg playback logic entered scanner, and verify external `.lrc` support did not require TagReader/MusicTag sidecar path changes.
 
 ## Commit strategy
 - Commit lines in todos are grouping suggestions only, not permission to commit; prefer 6-8 atomic commits in this order if and only if the user explicitly requests commits: build foundation; public contracts/tests; pure scanner logic including `.lrc` sidecar detection; SQLite cache; TagReader adapter; service/watcher; integration verification/docs.

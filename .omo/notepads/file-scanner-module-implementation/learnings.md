@@ -75,7 +75,6 @@
 - Forward fix: scanner service publication must pass root-relative paths into `PlaylistTreeBuilder`; passing only `filename()` flattens nested directory roots and hides directory nodes.
 - Verification commands that build/link test executables and run CTest must run sequentially; parallel build + CTest can report a misleading "executable not found" while Ninja is still linking the target.
 
-
 ## 2026-06-21 task 11 scanner watcher runtime
 
 - `wtr::watch` exposes an RAII `watch` class whose constructor starts async watching and whose `close()` joins/stops the watcher; production scanner wraps this behind a private `FolderWatcher` seam to keep public scanner headers watcher-free.
@@ -89,7 +88,6 @@
 - App integration only needs `seriona` to link `seriona_scanner`; `app/main.cpp` remains audio-file playback only, preserving current CLI behavior while proving scanner is in the default build graph.
 - Scanner docs belong in a focused `docs/file-scanner.md` rather than `docs/audio-player.md`, because the domains and runtime constraints are separate.
 - No optional real-watcher smoke was added in task 12; default fake-watcher coverage plus full CTest keeps verification hardware/media independent.
-
 
 ## 2026-06-21 F2 scanner forward fix
 

@@ -17,6 +17,13 @@
 - Keep scanner test fakes and fixtures under `tests/scanner/` as a private test harness instead of exposing new production scanner seams before scanner logic exists.
 - Model fake TagReader as a test adapter with success, throw, and block/release behavior so future cancellation tests can deterministically control slow metadata reads.
 - Model fake watcher events with explicit audio versus `.lrc` path kind plus optional old path for rename events, preserving external lyric association cases without a real filesystem watcher.
+- Use distinct `audioWarning(...)` and `lrcWarning(...)` fake watcher helpers instead of one implicit warning method, making watcher-warning path kind explicit at call sites.
+
+## 2026-06-20 task 4 scanner paths and LRC
+
+- Add scanner-local `path_utils` and `lrc_parser` APIs under public scanner includes, keeping them standard-library-only and free of Qt/QML, audio device, TagReader, SQLite, and watcher headers.
+- Keep `.cue` files as ignored/unsupported records for future CUE support, and keep `.lrc` files as sidecar candidates only; they are never classified as audio candidates.
+- Default traversal does not follow symlinks; explicit `followSymlinks=true` can classify the symlink target as an audio candidate for future service policy wiring.
 
 ## 2026-06-21 task 10 scanner service orchestration
 
@@ -25,7 +32,6 @@
 - Treat TagReader failure for a new audio file as an error-only outcome, not a placeholder song; if old cached metadata exists, preserve that cached song while recording the error.
 - Use SQLite `saveRoot` as the single-writer reconciliation boundary after filesystem discovery/hash/metadata/LRC decisions are made in memory.
 - Forward fix: carry `treeRelativePath` beside each reconciled cached song so cache identity remains absolute-path based while playlist publication remains root-relative and hierarchical.
-
 
 ## 2026-06-21 task 11 scanner watcher runtime
 
@@ -39,7 +45,6 @@
 - Link `seriona` against `seriona_scanner` without including scanner headers or constructing scanner services in `app/main.cpp`; linkability is the integration proof, not a new CLI feature.
 - Keep scanner documentation separate from audio documentation and state CUE deferral, dependency policy, and external `.lrc` priority/cache invalidation explicitly.
 - Do not add a real watcher smoke test in default CTest; task 12 evidence records the existing fake-watcher scanner group and full repository tests instead.
-
 
 ## 2026-06-21 F2 scanner forward fix
 
