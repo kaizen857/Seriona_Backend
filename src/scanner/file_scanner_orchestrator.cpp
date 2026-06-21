@@ -43,7 +43,7 @@ namespace {
 [[nodiscard]] std::filesystem::path relativePathFor(const std::filesystem::path& root, const std::filesystem::path& path) {
   std::error_code error;
   auto relative = std::filesystem::relative(path, root, error);
-  if (error || relative.empty()) {
+  if (error || relative.empty() || relative == ".") {
     return path.filename();
   }
   return relative.lexically_normal();
@@ -153,7 +153,7 @@ public:
     }
 
     cache::SQLiteScannerCache cache{cache::ScannerCacheConfig{.databasePath = databasePath_}};
-    std::vector<cache::CachedSong> allSongs;
+    std::vector<RootResult::PublishedSong> allSongs;
     std::vector<ScannerError> allErrors;
     std::uint64_t discovered = 0;
     std::uint64_t skipped = 0;
@@ -170,14 +170,14 @@ public:
       for (const auto& error : rootResult.errors) {
         publishEvent(sink, ScannerEventType::ScanError, ++eventVersion_, error);
       }
-      for (const auto& song : rootResult.songs) {
-        publishEvent(sink, ScannerEventType::FileScanned, ++eventVersion_, song.metadata);
+      for (const auto& publishedSong : rootResult.songs) {
+        publishEvent(sink, ScannerEventType::FileScanned, ++eventVersion_, publishedSong.song.metadata);
       }
     }
 
     PlaylistTreeBuilder builder{"Library"};
-    for (const auto& song : allSongs) {
-      builder.addSong({.relativePath = song.metadata.filePath.filename(), .metadata = song.metadata});
+    for (const auto& publishedSong : allSongs) {
+      builder.addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
     }
     auto published = builder.publish();
     {
@@ -203,7 +203,12 @@ public:
 
 private:
   struct RootResult {
-    std::vector<cache::CachedSong> songs;
+    struct PublishedSong {
+      cache::CachedSong song;
+      std::filesystem::path treeRelativePath;
+    };
+
+    std::vector<PublishedSong> songs;
     std::vector<ScannerError> errors;
   };
 
@@ -238,13 +243,13 @@ private:
       ++discovered;
       auto song = reconcileAudio(entry.path, cachedRootPtr, result.errors, skipped, scanned);
       if (song.has_value()) {
-        result.songs.push_back(std::move(*song));
+        result.songs.push_back({.song = std::move(*song), .treeRelativePath = relativePathFor(rootPath, entry.path)});
       }
     }
 
-    for (auto& song : result.songs) {
-      reconcileLyrics(song, config, cachedRootPtr, result.errors, skipped);
-      updated.songs.push_back(song);
+    for (auto& publishedSong : result.songs) {
+      reconcileLyrics(publishedSong.song, config, cachedRootPtr, result.errors, skipped);
+      updated.songs.push_back(publishedSong.song);
     }
     for (const auto& error : result.errors) {
       updated.errors.push_back(error);

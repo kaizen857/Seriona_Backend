@@ -24,3 +24,4 @@
 - Implement task-10 scan orchestration synchronously over existing scanner primitives; watcher debounce/runtime incremental updates remain task 11.
 - Treat TagReader failure for a new audio file as an error-only outcome, not a placeholder song; if old cached metadata exists, preserve that cached song while recording the error.
 - Use SQLite `saveRoot` as the single-writer reconciliation boundary after filesystem discovery/hash/metadata/LRC decisions are made in memory.
+- Forward fix: carry `treeRelativePath` beside each reconciled cached song so cache identity remains absolute-path based while playlist publication remains root-relative and hierarchical.

@@ -94,3 +94,64 @@ Total Test time (real) =   0.18 sec
 - LSP diagnostics were attempted on modified scanner files and failed with `Connection closed` / `Not connected`, matching prior project learnings; CMake build and CTest are the hard verification source.
 - Pure LOC checks after splitting facade/orchestration: `src/scanner/file_scanner_service.cpp` = 34, `src/scanner/file_scanner_orchestrator.cpp` = 306, `src/scanner/file_scanner_service_internal.h` = 8, `tests/scanner/scanner_service_tests.cpp` = 209. The orchestrator is intentionally isolated; task 11 should split watcher/runtime logic before adding to it.
 - `build/_deps/catch2-build` and `build/_deps/catch2-subbuild` were removed as regenerated build-cache cleanup only after a generator-cache conflict; no source files were discarded.
+
+## Forward fix - preserve scanner snapshot hierarchy
+
+Phase 1 review found that task-10 publication flattened every song into `song.metadata.filePath.filename()`, so directory roots lost real `root -> directory -> song` hierarchy. The forward fix carries each scanned song with its path relative to the matched scanner root and passes that relative path into `PlaylistTreeBuilder::addSong(...)`. `PlaylistTreeBuilder` then creates parent directory nodes such as `dir:artists` and `dir:artists/album` automatically. Single-file roots normalize the root-relative `.` path back to the filename, so they still publish `root -> track:single.flac` with no synthetic directory.
+
+Additional service tests added:
+
+- `scanner service publishes nested directory hierarchy for directory roots`: creates `artists/album/nested.flac` plus `nested.lrc`, then asserts `dir:artists -> dir:artists/album -> track:artists/album/nested.flac` parent links and verifies no `.lrc` node exists.
+- `scanner service supports single file roots with same basename lrc`: additionally asserts the single-file snapshot contains only root + track and that the track parent is the root.
+
+### Forward-fix verification
+
+```text
+$ cmake -S . -B build -DSERIONA_BUILD_TESTS=ON
+CMake Warning (dev) at /usr/share/cmake/Modules/FetchContent.cmake:1386 (message):
+  The DOWNLOAD_EXTRACT_TIMESTAMP option was not given and policy CMP0135 is
+  not set.
+Call Stack (most recent call first):
+  /home/kaizen857/cppProject(app_and_lib)/TagReader/CMakeLists.txt:63 (FetchContent_Declare)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Configuring done (0.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+```
+
+```text
+$ cmake --build build
+ninja: no work to do.
+```
+
+```text
+$ ctest --test-dir build -R 'seriona.scanner_service|seriona.scanner' --output-on-failure
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
+    Start 26: seriona.scanner_test_harness
+1/9 Test #26: seriona.scanner_test_harness .....   Passed    0.01 sec
+    Start 27: seriona.scanner_contract
+2/9 Test #27: seriona.scanner_contract .........   Passed    0.03 sec
+    Start 28: seriona.scanner_paths
+3/9 Test #28: seriona.scanner_paths ............   Passed    0.00 sec
+    Start 29: seriona.scanner_hash
+4/9 Test #29: seriona.scanner_hash .............   Passed    0.00 sec
+    Start 30: seriona.scanner_tree
+5/9 Test #30: seriona.scanner_tree .............   Passed    0.00 sec
+    Start 31: seriona.scanner_scheduler
+6/9 Test #31: seriona.scanner_scheduler ........   Passed    0.02 sec
+    Start 32: seriona.scanner_cache
+7/9 Test #32: seriona.scanner_cache ............   Passed    0.03 sec
+    Start 33: seriona.scanner_tagreader
+8/9 Test #33: seriona.scanner_tagreader ........   Passed    0.02 sec
+    Start 34: seriona.scanner_service
+9/9 Test #34: seriona.scanner_service ..........   Passed    0.04 sec
+
+100% tests passed, 0 tests failed out of 9
+
+Total Test time (real) =   0.18 sec
+```
+
+### Forward-fix adversarial probe
+
+- Misleading success/failure output: running full build and CTest concurrently produced a transient `seriona.scanner_contract` "executable not found" failure while the test executable was still linking. Re-ran `cmake --build build` to completion first, then reran CTest sequentially; final targeted scanner CTest passed 9/9.

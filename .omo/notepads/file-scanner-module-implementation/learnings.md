@@ -72,3 +72,5 @@
 - Hash-first service tests use fake TagReader read counts as the observable cache-hit proof: unchanged scans and `.lrc`-only changes keep the count stable, while audio byte changes increment it once.
 - Deleted `.lrc` reconciliation must clear external lyric rows and reselect effective lyrics from cached embedded lyrics or `None` without calling TagReader.
 - A stale FetchContent generator cache under `build/_deps/catch2-*` can block reconfigure even when the top-level `build` directory is valid; deleting only those generated subbuild dirs was sufficient.
+- Forward fix: scanner service publication must pass root-relative paths into `PlaylistTreeBuilder`; passing only `filename()` flattens nested directory roots and hides directory nodes.
+- Verification commands that build/link test executables and run CTest must run sequentially; parallel build + CTest can report a misleading "executable not found" while Ninja is still linking the target.

@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -100,6 +101,16 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   const auto iterator = std::ranges::find(songs, path, &SongMetadata::filePath);
   if (iterator == songs.end()) {
     throw std::runtime_error("missing song in scanner service test");
+  }
+  return *iterator;
+}
+
+[[nodiscard]] const PlaylistNode& nodeById(const PlaylistTreeSnapshot& snapshot, std::string_view nodeId) {
+  const auto iterator = std::ranges::find_if(snapshot.nodes, [nodeId](const PlaylistNode& node) {
+    return node.nodeId == nodeId;
+  });
+  if (iterator == snapshot.nodes.end()) {
+    throw std::runtime_error("missing playlist node in scanner service test");
   }
   return *iterator;
 }
@@ -222,6 +233,38 @@ TEST_CASE("scanner service supports single file roots with same basename lrc") {
   CHECK(songs[0].filePath == audio);
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(songs[0].effectiveLyrics[0].text == "single external");
+
+  const auto snapshot = service->snapshot();
+  CHECK(snapshot.nodes.size() == 2U);
+  CHECK(nodeById(snapshot, "track:single.flac").parentNodeId == snapshot.rootNodeId);
+}
+
+TEST_CASE("scanner service publishes nested directory hierarchy for directory roots") {
+  test::TempScannerRoot temp{"scanner-service-hierarchy"};
+  const auto audio = test::writeAudioFixture(temp.path(), "artists/album/nested.flac");
+  writeText(temp.path() / "artists" / "album" / "nested.lrc", "[00:01.00]nested external\n");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Nested"));
+  auto service = makeService(temp, reader);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  const auto snapshot = service->snapshot();
+  const auto songs = songsIn(snapshot);
+
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].filePath == audio);
+  const auto& artists = nodeById(snapshot, "dir:artists");
+  const auto& album = nodeById(snapshot, "dir:artists/album");
+  const auto& track = nodeById(snapshot, "track:artists/album/nested.flac");
+  CHECK(artists.kind == PlaylistNodeKind::Directory);
+  CHECK(album.kind == PlaylistNodeKind::Directory);
+  CHECK(track.kind == PlaylistNodeKind::Track);
+  CHECK(artists.parentNodeId == snapshot.rootNodeId);
+  REQUIRE(album.parentNodeId.has_value());
+  CHECK(*album.parentNodeId == artists.nodeId);
+  REQUIRE(track.parentNodeId.has_value());
+  CHECK(*track.parentNodeId == album.nodeId);
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId.ends_with(".lrc"); }));
 }
 
 TEST_CASE("scanner service records failures malformed lrc cancellation and preserves cache") {
