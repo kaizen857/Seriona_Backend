@@ -50,6 +50,10 @@ struct MprisSnapshotRecord {
   bool canControl{false};
 };
 
+struct CommandSinkState {
+  std::optional<control::MediaControlCommandSink> sink{};
+};
+
 class IMprisObject {
 public:
   virtual ~IMprisObject() = default;
@@ -75,6 +79,7 @@ public:
   [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state);
   [[nodiscard]] MetadataSyncResult stop();
   [[nodiscard]] bool setPosition(const std::string& trackObjectPath, std::chrono::microseconds position);
+  [[nodiscard]] std::shared_ptr<CommandSinkState> commandSinkState() const noexcept { return commandSinkState_; }
 
   [[nodiscard]] const MprisObjectModel& model() const noexcept { return model_; }
   [[nodiscard]] const std::optional<MprisSnapshotRecord>& lastPublishedSnapshot() const noexcept { return lastPublishedSnapshot_; }
@@ -98,7 +103,7 @@ private:
 
   std::unique_ptr<IMprisBus> bus_{};
   std::unique_ptr<IMprisObject> object_{};
-  control::MediaControlCommandSink commandSink_{};
+  std::shared_ptr<CommandSinkState> commandSinkState_{std::make_shared<CommandSinkState>()};
   std::optional<PlatformMediaState> currentState_{};
   std::optional<MprisSnapshotRecord> lastPublishedSnapshot_{};
   bool started_{false};

@@ -53,3 +53,21 @@ TEST_CASE("metadata recording backend captures structured start update and stop 
   CHECK(hooks->records[1].result.changed);
   CHECK(hooks->records[2].kind == seriona::metadata::MetadataServiceRecordKind::Stop);
 }
+
+TEST_CASE("metadata recording backend unsubscribe remains safe after service destruction") {
+  const auto hooks = seriona::metadata::makeMetadataServiceTestHooks();
+  seriona::control::SubscriptionHandle handle{};
+
+  {
+    auto service = seriona::metadata::makeRecordingMetadataSharingService(
+        seriona::metadata::MetadataSharingOptions{}, hooks);
+    handle = service->registerCommandCallback(seriona::control::MediaControlCommandSink{});
+    REQUIRE(handle.unsubscribe);
+    CHECK(hooks->commandRegistrations == 1U);
+  }
+
+  handle.unsubscribe();
+  handle.unsubscribe();
+
+  CHECK(hooks->commandUnregistrations == 1U);
+}

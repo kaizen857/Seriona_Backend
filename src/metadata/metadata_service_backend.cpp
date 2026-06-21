@@ -22,6 +22,10 @@ namespace seriona::metadata {
 
 namespace {
 
+struct CommandSinkState {
+  std::optional<control::MediaControlCommandSink> sink{};
+};
+
 [[nodiscard]] MetadataSyncResult makeFailureResult(std::string code, std::string message) {
   MetadataSyncResult result{};
   result.accepted = false;
@@ -39,15 +43,16 @@ public:
   [[nodiscard]] MetadataBackendCapabilities capabilities() const override { return capabilities_; }
 
   [[nodiscard]] control::SubscriptionHandle registerCommandCallback(control::MediaControlCommandSink callback) override {
-    commandSink_ = std::move(callback);
+    commandSinkState_->sink = std::move(callback);
     const auto subscriptionId = nextSubscriptionId_++;
     auto active = std::make_shared<bool>(true);
-    return control::SubscriptionHandle{subscriptionId, [this, active]() mutable {
+    auto commandSinkState = commandSinkState_;
+    return control::SubscriptionHandle{subscriptionId, [commandSinkState, active]() mutable {
                                          if (!*active) {
                                            return;
                                          }
                                          *active = false;
-                                         commandSink_ = std::nullopt;
+                                         commandSinkState->sink = std::nullopt;
                                        }};
   }
 
@@ -74,7 +79,7 @@ public:
     }
 
     started_ = false;
-    commandSink_ = std::nullopt;
+    commandSinkState_->sink = std::nullopt;
     return makeAcceptedResult(PlatformMediaState{}, false);
   }
 
@@ -89,7 +94,7 @@ protected:
 
   MetadataBackendKind kind_;
   MetadataBackendCapabilities capabilities_;
-  std::optional<control::MediaControlCommandSink> commandSink_{};
+  std::shared_ptr<CommandSinkState> commandSinkState_{std::make_shared<CommandSinkState>()};
   std::size_t nextSubscriptionId_{1};
   bool started_{false};
 };

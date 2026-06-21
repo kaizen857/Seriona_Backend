@@ -253,3 +253,22 @@ TEST_CASE("metadata mpris adapter gates CanControl off when command support is a
   CHECK_FALSE(busRaw->object->published.back().canControl);
 #endif
 }
+
+TEST_CASE("metadata mpris backend unsubscribe remains safe after backend destruction") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  seriona::control::SubscriptionHandle handle{};
+
+  {
+    auto backend = seriona::metadata::detail::makeLinuxMetadataServiceBackend(std::move(bus));
+    handle = backend->registerCommandCallback(seriona::control::MediaControlCommandSink{});
+    REQUIRE(handle.unsubscribe);
+    CHECK(handle.subscriptionId != 0U);
+  }
+
+  handle.unsubscribe();
+  handle.unsubscribe();
+#endif
+}

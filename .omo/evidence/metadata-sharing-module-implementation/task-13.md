@@ -1,10 +1,13 @@
 # Task 13 Evidence
 
-- Linux configure command: `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON` — passed.
-- Configure note: CMake emitted a developer warning from `FetchContent.cmake` about `CMP0135` / `DOWNLOAD_EXTRACT_TIMESTAMP`; configuration still completed successfully.
-- Initial build command: `cmake --build build` — failed on the first run because `seriona_metadata` did not link `src/metadata/metadata_mpris_linux.cpp`, producing an undefined reference to `seriona::metadata::detail::makeLinuxMetadataServiceBackend(...)` from `metadata_service_backend.cpp`.
-- Fix applied: added `src/metadata/metadata_mpris_linux.cpp` to the `seriona_metadata` target in `CMakeLists.txt` so the Linux backend implementation is linked into the metadata library.
-- Rebuild command: `cmake --build build` — passed after the CMake fix.
-- Focused metadata test command: `ctest --test-dir build -R seriona.metadata --output-on-failure` — passed (`6/6` tests).
-- Full verification command: `ctest --test-dir build --output-on-failure` — passed (`41/41` tests).
-- Result: Linux metadata sharing verification is complete and recorded; no unrelated failures were changed.
+- Revalidated on current `HEAD` after `c8ffe67 fix(metadata): record validated metadata cleanup`.
+- `git log --oneline --grep metadata -10` shows the current metadata chain ending at `c8ffe67`, with the earlier feature commits still intact.
+- `git status --short` at verification time showed unrelated `.omo/` workspace files, but no product code changes were made for this evidence refresh.
+- `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON` — passed.
+- Configure note: CMake still prints the existing `FetchContent.cmake` `CMP0135` / `DOWNLOAD_EXTRACT_TIMESTAMP` developer warning, but configuration completes successfully.
+- `cmake --build build` — passed on the current verification run.
+- `ctest --test-dir build -R seriona.metadata --output-on-failure` — passed (`6/6` tests).
+- `ctest --test-dir build -R seriona.metadata_mpris_smoke --output-on-failure` — passed (`1/1` test).
+- `ctest --test-dir build --output-on-failure` — passed (`41/41` tests).
+- Historical note: the earlier full-verify blocker was the missing `src/metadata/metadata_mpris_linux.cpp` link in `seriona_metadata`; that issue is already fixed, and this refresh confirms the final-state evidence on current `HEAD`.
+- Result: Linux metadata sharing evidence now reflects the post-`c8ffe67` repository state and closes the stale task-13 gap.

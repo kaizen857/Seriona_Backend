@@ -116,7 +116,7 @@ LinuxMprisAdapter::LinuxMprisAdapter(std::unique_ptr<IMprisBus> bus)
   configureCommandModel();
 }
 
-void LinuxMprisAdapter::setCommandSink(control::MediaControlCommandSink sink) { commandSink_ = std::move(sink); }
+void LinuxMprisAdapter::setCommandSink(control::MediaControlCommandSink sink) { commandSinkState_->sink = std::move(sink); }
 
 void LinuxMprisAdapter::configureCommandModel() {
   commandHandlers_.play = [this]() { return dispatchCommand(control::MediaControlCommandKind::Play, std::nullopt); };
@@ -174,7 +174,7 @@ bool LinuxMprisAdapter::setPosition(const std::string& trackObjectPath, std::chr
   if (makeMprisTrackObjectPath(*currentState_->controlState.currentTrack) != trackObjectPath) {
     return false;
   }
-  if (!commandSink_ || !currentState_->controlState.capabilities.canSeek || position < std::chrono::microseconds{0}) {
+  if (!commandSinkState_->sink || !currentState_->controlState.capabilities.canSeek || position < std::chrono::microseconds{0}) {
     return false;
   }
 
@@ -182,7 +182,7 @@ bool LinuxMprisAdapter::setPosition(const std::string& trackObjectPath, std::chr
   command.kind = control::MediaControlCommandKind::SeekTo;
   command.position = std::chrono::duration_cast<std::chrono::milliseconds>(position);
   command.track = currentState_->controlState.currentTrack;
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
@@ -211,62 +211,62 @@ MprisSnapshotRecord LinuxMprisAdapter::toSnapshotRecord(const MetadataPlatformSn
 }
 
 bool LinuxMprisAdapter::dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position) {
-  if (!currentState_ || !commandSink_ || !commandAllowed(kind, currentState_->controlState.capabilities)) {
+  if (!currentState_ || !commandSinkState_->sink || !commandAllowed(kind, currentState_->controlState.capabilities)) {
     return false;
   }
 
   control::MediaControlCommand command{};
   command.kind = kind;
   command.position = position;
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
 bool LinuxMprisAdapter::dispatchSeekBy(std::chrono::microseconds delta) {
-  if (!currentState_ || !commandSink_ || !commandAllowed(control::MediaControlCommandKind::SeekBy, currentState_->controlState.capabilities) || delta < std::chrono::microseconds{0}) {
+  if (!currentState_ || !commandSinkState_->sink || !commandAllowed(control::MediaControlCommandKind::SeekBy, currentState_->controlState.capabilities) || delta < std::chrono::microseconds{0}) {
     return false;
   }
 
   control::MediaControlCommand command{};
   command.kind = control::MediaControlCommandKind::SeekBy;
   command.delta = std::chrono::duration_cast<std::chrono::milliseconds>(delta);
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
 bool LinuxMprisAdapter::dispatchSetVolume(float volume) {
-  if (!currentState_ || !commandSink_ || !commandAllowed(control::MediaControlCommandKind::SetVolume, currentState_->controlState.capabilities)) {
+  if (!currentState_ || !commandSinkState_->sink || !commandAllowed(control::MediaControlCommandKind::SetVolume, currentState_->controlState.capabilities)) {
     return false;
   }
 
   control::MediaControlCommand command{};
   command.kind = control::MediaControlCommandKind::SetVolume;
   command.volume = volume;
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
 bool LinuxMprisAdapter::dispatchSetRepeat(control::RepeatMode repeatMode) {
-  if (!currentState_ || !commandSink_ || !commandAllowed(control::MediaControlCommandKind::SetRepeatMode, currentState_->controlState.capabilities)) {
+  if (!currentState_ || !commandSinkState_->sink || !commandAllowed(control::MediaControlCommandKind::SetRepeatMode, currentState_->controlState.capabilities)) {
     return false;
   }
 
   control::MediaControlCommand command{};
   command.kind = control::MediaControlCommandKind::SetRepeatMode;
   command.repeatMode = repeatMode;
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
 bool LinuxMprisAdapter::dispatchSetShuffle(bool shuffle) {
-  if (!currentState_ || !commandSink_ || !commandAllowed(control::MediaControlCommandKind::SetShuffle, currentState_->controlState.capabilities)) {
+  if (!currentState_ || !commandSinkState_->sink || !commandAllowed(control::MediaControlCommandKind::SetShuffle, currentState_->controlState.capabilities)) {
     return false;
   }
 
   control::MediaControlCommand command{};
   command.kind = control::MediaControlCommandKind::SetShuffle;
   command.shuffle = shuffle;
-  commandSink_(command);
+  (*commandSinkState_->sink)(command);
   return true;
 }
 
@@ -277,35 +277,6 @@ void LinuxMprisAdapter::publishCurrentSnapshot() {
   const auto record = toSnapshotRecord(mapPlayerStateSnapshot(currentState_->controlState));
   object_->publish(record);
   lastPublishedSnapshot_ = record;
-}
-
-class LinuxMprisServiceBackend final : public MetadataServiceBackend {
-public:
-  explicit LinuxMprisServiceBackend(std::unique_ptr<IMprisBus> bus)
-      : adapter_(std::move(bus)) {}
-
-  [[nodiscard]] MetadataBackendKind kind() const override { return MetadataBackendKind::Linux; }
-  [[nodiscard]] MetadataBackendCapabilities capabilities() const override {
-    return MetadataBackendCapabilities{.canPublishMetadata = true,
-                                      .canPublishTimeline = true,
-                                      .canReceiveCommands = true,
-                                      .requiresPlatformExtension = false,
-                                      .hasPlatformExtension = false};
-  }
-  [[nodiscard]] control::SubscriptionHandle registerCommandCallback(control::MediaControlCommandSink callback) override {
-    adapter_.setCommandSink(std::move(callback));
-    return control::SubscriptionHandle{1U, [this]() { adapter_.setCommandSink({}); }};
-  }
-  [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state) override { return adapter_.start(state); }
-  [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state) override { return adapter_.update(state); }
-  [[nodiscard]] MetadataSyncResult stop() override { return adapter_.stop(); }
-
-private:
-  LinuxMprisAdapter adapter_;
-};
-
-std::unique_ptr<MetadataServiceBackend> makeLinuxMetadataServiceBackend(std::unique_ptr<IMprisBus> bus) {
-  return std::make_unique<LinuxMprisServiceBackend>(std::move(bus));
 }
 
 }

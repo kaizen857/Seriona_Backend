@@ -91,6 +91,7 @@ add_library(seriona_metadata STATIC
 
 if(UNIX AND NOT APPLE)
   target_sources(seriona_metadata PRIVATE
+    src/metadata/metadata_mpris_backend.cpp
     src/metadata/metadata_mpris_linux.cpp
   )
 endif()

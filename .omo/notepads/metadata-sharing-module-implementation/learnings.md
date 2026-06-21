@@ -28,3 +28,4 @@
 - Linux MPRIS command tests are easiest to keep deterministic when the fake object stores command handlers separately from the publish-only model; that lets the test trigger each handler directly and assert the emitted `MediaControlCommand` values without needing a live bus.
 - `SetPosition` coverage is more robust when the test derives the expected track object path from `makeMprisTrackObjectPath(...)` instead of hard-coding the path string, which keeps the command bridge aligned with the mapper's custom path policy.
 - Todo 11 only needs build graph wiring: `seriona` can consume `seriona_metadata` as a private link dependency without touching `app/main.cpp`, which keeps the startup path free of metadata lifecycle code.
+- 订阅注销的安全做法是把可注销的命令 sink 放进共享状态对象，让 `SubscriptionHandle` 只捕获这份状态而不是 backend 原始 `this`；这样 backend/service 先销毁时，后续 `unsubscribe()` 仍然可以安全幂等地退化为无操作。

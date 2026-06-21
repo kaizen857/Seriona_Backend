@@ -46,20 +46,21 @@ public:
     auto handle = backend_->registerCommandCallback(std::move(callback));
     auto originalUnsubscribe = std::move(handle.unsubscribe);
     auto active = std::make_shared<bool>(true);
-    handle.unsubscribe = [this, originalUnsubscribe = std::move(originalUnsubscribe), active]() mutable {
+    auto hooks = hooks_;
+    handle.unsubscribe = [hooks, originalUnsubscribe = std::move(originalUnsubscribe), active]() mutable {
       if (!*active) {
         return;
       }
       *active = false;
-      if (hooks_) {
-        ++hooks_->commandUnregistrations;
-        hooks_->records.push_back(MetadataServiceRecord{.kind = MetadataServiceRecordKind::UnregisterCommand,
-                                                        .state = {},
-                                                        .result = MetadataSyncResult{.accepted = true,
-                                                                                     .changed = false,
-                                                                                     .state = {},
-                                                                                     .errorCode = std::nullopt,
-                                                                                     .message = {}}});
+      if (hooks) {
+        ++hooks->commandUnregistrations;
+        hooks->records.push_back(MetadataServiceRecord{.kind = MetadataServiceRecordKind::UnregisterCommand,
+                                                       .state = {},
+                                                       .result = MetadataSyncResult{.accepted = true,
+                                                                                    .changed = false,
+                                                                                    .state = {},
+                                                                                    .errorCode = std::nullopt,
+                                                                                    .message = {}}});
       }
       if (originalUnsubscribe) {
         originalUnsubscribe();
