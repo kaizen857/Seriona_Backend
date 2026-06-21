@@ -7,3 +7,5 @@
 - 计划词汇优先：公共控制契约采用 `PlayerStateSnapshot` / `PlaybackCapabilities` / `PlaybackTimeline` / `ArtworkRef` / `SubscriptionHandle`，以减少后续 Todo 3-10 的映射歧义。
 - `SetShuffle` 属于合同级 command 能力，必须与 repeat/seek/volume 并列存在，方便后续 MPRIS 直接桥接。
 - metadata 服务契约应在 public header 中保持平台中立：用 `MetadataBackendKind` / `MetadataBackendCapabilities` / `PlatformMediaState` / `MetadataSyncResult` 描述能力与同步结果，平台差异通过 options/capabilities/opaque extension 承载，不新增 Windows 专属公共签名。
+- `seriona_metadata` 的构建拆分会提前预留 mapper/service/MPRIS 测试入口，即使实现仍是最小骨架，也要让 `ctest -R seriona.metadata` 跑到真实断言，而不是空壳。
+- Linux MPRIS 真实适配的 `sdbus-c++` 检查采用 configure gate；模拟缺失开关 `SERIONA_METADATA_SIMULATE_MISSING_SDBUS` 只用于测试依赖门，不会降级成 Noop。

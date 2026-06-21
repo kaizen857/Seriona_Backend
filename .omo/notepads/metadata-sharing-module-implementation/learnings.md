@@ -9,3 +9,5 @@
 - `MediaControlCommand` 需要显式覆盖 `SetShuffle`，否则后续 MPRIS 命令桥接会在合同层缺一个可表达的输入。
 - `MetadataSharingService` 适合直接复用控制层的 `MediaControlCommand` / `SubscriptionHandle` / `PlayerStateSnapshot` 语义；metadata 契约只需要补自己的 backend kind、capabilities、sync result 和平台扩展入口，不需要再发明一套独立命令/订阅模型。
 - 如果未来确实需要平台宿主句柄，应该放进 `MetadataSharingOptions` 的 opaque extension，而不是把 HWND/WinRT 之类平台名抬进核心 API。
+- metadata 的测试目标也应该像 scanner 一样拆成 `contract` / `mapper` / `service` / `mpris` 四层，并且都链接 `seriona_metadata`，这样 CTest 名称和二进制目标能直接对应后续实现层。
+- Linux 依赖门控最好放在顶层 `CMakeLists.txt` 的 configure 阶段，模拟开关要和 scanner 的 `SERIONA_SCANNER_SIMULATE_MISSING_*` 保持同风格，便于不用卸包也能验证失败路径。

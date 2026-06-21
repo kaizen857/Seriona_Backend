@@ -35,8 +35,13 @@ TEST_CASE("control snapshot defaults to no current track") {
 TEST_CASE("control command surface exposes shuffle and repeat semantics") {
   const seriona::control::MediaControlCommand command{
       .kind = seriona::control::MediaControlCommandKind::SetShuffle,
+      .position = std::nullopt,
+      .delta = std::nullopt,
+      .volume = std::nullopt,
+      .muted = std::nullopt,
       .repeatMode = seriona::control::RepeatMode::All,
       .shuffle = true,
+      .track = std::nullopt,
   };
 
   CHECK(command.kind == seriona::control::MediaControlCommandKind::SetShuffle);
@@ -71,12 +76,15 @@ TEST_CASE("metadata contract exposes stable service seams") {
 TEST_CASE("metadata contract models Linux Windows and Noop options without platform-only signatures") {
   const seriona::metadata::MetadataSharingOptions noopOptions{
       .backendKind = seriona::metadata::MetadataBackendKind::Noop,
+      .platformExtension = nullptr,
   };
   const seriona::metadata::MetadataSharingOptions linuxOptions{
       .backendKind = seriona::metadata::MetadataBackendKind::Linux,
+      .platformExtension = nullptr,
   };
   const seriona::metadata::MetadataSharingOptions windowsOptions{
       .backendKind = seriona::metadata::MetadataBackendKind::Windows,
+      .platformExtension = nullptr,
   };
 
   CHECK(noopOptions.backendKind == seriona::metadata::MetadataBackendKind::Noop);

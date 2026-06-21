@@ -6,6 +6,7 @@ option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
 option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
+option(SERIONA_METADATA_SIMULATE_MISSING_SDBUS "Simulate missing metadata sdbus-c++ dependency" OFF)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +52,13 @@ endif()
 
 pkg_check_modules(SERIONA_XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 
+if(UNIX AND NOT APPLE)
+  if(SERIONA_METADATA_SIMULATE_MISSING_SDBUS)
+    message(FATAL_ERROR "seriona_metadata dependency gate: sdbus-c++ is required for Linux MPRIS metadata sharing. Install externally, for example: sudo pacman -S sdbus-c++")
+  endif()
+  pkg_check_modules(SERIONA_SDBUS_CPP REQUIRED IMPORTED_TARGET sdbus-c++)
+endif()
+
 if(NOT TARGET TagReaderCore)
   set(SERIONA_BUILD_TESTING_BEFORE_TAGREADER ${BUILD_TESTING})
   set(BUILD_TESTING OFF CACHE BOOL "Build tests" FORCE)
@@ -74,6 +82,9 @@ add_library(seriona_scanner STATIC
 
 add_library(seriona_metadata STATIC
   src/metadata/metadata_module.cpp
+  src/metadata/metadata_mapper.cpp
+  src/metadata/metadata_service.cpp
+  src/metadata/metadata_mpris.cpp
 )
 
 target_include_directories(seriona_scanner
@@ -101,6 +112,10 @@ target_link_libraries(seriona_scanner
 
 seriona_enable_warnings(seriona_scanner)
 seriona_enable_warnings(seriona_metadata)
+
+if(TARGET PkgConfig::SERIONA_SDBUS_CPP)
+  target_link_libraries(seriona_metadata PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
+endif()
 
 add_subdirectory(app)
 
