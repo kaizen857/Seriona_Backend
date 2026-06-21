@@ -89,6 +89,12 @@ add_library(seriona_metadata STATIC
   src/metadata/metadata_mpris.cpp
 )
 
+if(UNIX AND NOT APPLE)
+  target_sources(seriona_metadata PRIVATE
+    src/metadata/metadata_mpris_linux.cpp
+  )
+endif()
+
 if(WIN32)
   target_sources(seriona_metadata PRIVATE
     src/metadata/metadata_windows_private.cpp
