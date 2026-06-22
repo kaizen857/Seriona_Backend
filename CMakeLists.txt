@@ -108,6 +108,7 @@ add_library(seriona_metadata STATIC
 
 add_library(seriona_control STATIC
   src/control/control_event_loop.cpp
+  src/control/control_state_reducer.cpp
   src/control/subscription_store.cpp
 )
 

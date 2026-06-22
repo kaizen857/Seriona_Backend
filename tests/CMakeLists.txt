@@ -151,7 +151,7 @@ add_executable(seriona_control_contract_tests
   control/control_test_harness.cpp
 )
 add_executable(seriona_media_controller_tests
-  control/control_contract_tests.cpp
+  control/media_controller_tests.cpp
   control/control_test_harness.cpp
 )
 add_executable(seriona_scanner_paths_tests
