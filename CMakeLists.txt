@@ -106,6 +106,11 @@ add_library(seriona_metadata STATIC
   src/metadata/metadata_mpris.cpp
 )
 
+add_library(seriona_control STATIC
+  src/control/control_event_loop.cpp
+  src/control/subscription_store.cpp
+)
+
 if(UNIX AND NOT APPLE)
   target_sources(seriona_metadata PRIVATE
     src/metadata/metadata_mpris_backend.cpp
@@ -134,6 +139,13 @@ target_include_directories(seriona_metadata
     ${PROJECT_SOURCE_DIR}/src/metadata
 )
 
+target_include_directories(seriona_control
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
 target_link_libraries(seriona_scanner
   PRIVATE
     SQLite3::SQLite3
@@ -142,8 +154,15 @@ target_link_libraries(seriona_scanner
     seriona_watcher_headers
 )
 
+target_link_libraries(seriona_control
+  PRIVATE
+    seriona_scanner
+    seriona_metadata
+)
+
 seriona_enable_warnings(seriona_scanner)
 seriona_enable_warnings(seriona_metadata)
+seriona_enable_warnings(seriona_control)
 
 if(TARGET PkgConfig::SERIONA_SDBUS_CPP)
   target_link_libraries(seriona_metadata PRIVATE PkgConfig::SERIONA_SDBUS_CPP)

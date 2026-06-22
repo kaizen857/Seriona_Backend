@@ -146,6 +146,14 @@ add_executable(seriona_metadata_mpris_tests
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris_linux.cpp
 )
+add_executable(seriona_control_contract_tests
+  control/control_contract_tests.cpp
+  control/control_test_harness.cpp
+)
+add_executable(seriona_media_controller_tests
+  control/control_contract_tests.cpp
+  control/control_test_harness.cpp
+)
 add_executable(seriona_scanner_paths_tests
   scanner/scanner_paths_tests.cpp
   scanner/scanner_test_harness.cpp
@@ -206,6 +214,8 @@ target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_recording_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_control_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_media_controller_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -321,6 +331,15 @@ target_include_directories(seriona_metadata_mpris_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/src/metadata
+)
+target_include_directories(seriona_control_contract_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_media_controller_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/control
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
@@ -439,6 +458,14 @@ target_link_libraries(seriona_metadata_service_recording_tests PRIVATE
 target_link_libraries(seriona_metadata_mpris_tests PRIVATE
   seriona_metadata
 )
+target_link_libraries(seriona_control_contract_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
+target_link_libraries(seriona_media_controller_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(seriona_metadata_mpris_tests PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
@@ -461,6 +488,8 @@ seriona_enable_warnings(seriona_output_format_negotiation_tests)
 seriona_enable_warnings(seriona_audio_player_seamless_tests)
 seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
+seriona_enable_warnings(seriona_control_contract_tests)
+seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
 seriona_enable_warnings(seriona_scanner_contract_tests)
 seriona_enable_warnings(seriona_metadata_contract_tests)
@@ -525,6 +554,8 @@ add_test(NAME seriona.metadata_service COMMAND seriona_metadata_service_tests)
 add_test(NAME seriona.metadata_service_recording COMMAND seriona_metadata_service_recording_tests)
 add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
 add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
+add_test(NAME seriona.control_contract COMMAND seriona_control_contract_tests)
+add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
 add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
 add_test(NAME seriona.scanner_tree COMMAND seriona_scanner_tree_tests)
