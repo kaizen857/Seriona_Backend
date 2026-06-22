@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "active_work_id": "file-scanner-module-implementation-bb2bbba0",
+  "active_work_id": "metadata-sharing-module-implementation-06818f21",
   "works": {
     "audio-player-module-3bdc4128": {
       "work_id": "audio-player-module-3bdc4128",
@@ -1046,70 +1046,310 @@
       },
       "ended_at": "2026-06-21T04:29:50.602Z",
       "elapsed_ms": 6051807
+    },
+    "metadata-sharing-module-implementation-3cd136dd": {
+      "work_id": "metadata-sharing-module-implementation-3cd136dd",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "active",
+      "started_at": "2026-06-21T08:07:11.269Z",
+      "updated_at": "2026-06-21T08:07:11.269Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "metadata-sharing-module-implementation-7d742c7c": {
+      "work_id": "metadata-sharing-module-implementation-7d742c7c",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "active",
+      "started_at": "2026-06-21T08:07:11.283Z",
+      "updated_at": "2026-06-21T11:31:03.555Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Update AGENTS metadata exception and add minimal metadata test scaffold",
+          "session_id": "opencode:ses_116c679eaffepHzUQKWZZW6iv6",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T08:10:30.401Z",
+          "status": "running",
+          "updated_at": "2026-06-21T08:21:56.222Z"
+        },
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "Define platform-neutral control snapshot contracts",
+          "session_id": "opencode:ses_116b9627dffey9fFffpEyBwBgU",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T08:28:37.739Z",
+          "status": "running",
+          "updated_at": "2026-06-21T08:33:03.226Z"
+        },
+        "todo:3": {
+          "task_key": "todo:3",
+          "task_label": "3",
+          "task_title": "Define metadata service contracts and factory seams",
+          "session_id": "opencode:ses_116ac87e9ffeQY6MDpkWJxkIzo",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T08:44:09.431Z",
+          "status": "running",
+          "updated_at": "2026-06-21T08:50:54.184Z"
+        },
+        "todo:4": {
+          "task_key": "todo:4",
+          "task_label": "4",
+          "task_title": "Expand metadata build targets and Linux MPRIS dependency gate",
+          "session_id": "opencode:ses_1169e9104ffesZ1qPjz6QN7Omk",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-21T08:58:32.761Z",
+          "started_at": "2026-06-21T08:58:32.761Z",
+          "status": "running"
+        },
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "Implement snapshot field filtering and platform DTO mapper",
+          "session_id": "opencode:ses_11696c3e9ffefj3aOHl5fJk1sR",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T09:07:17.233Z",
+          "status": "running",
+          "updated_at": "2026-06-21T09:19:30.386Z"
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "Implement synchronizer with split metadata/timeline dirty paths",
+          "session_id": "opencode:ses_11683dbb7ffeC90oZQgEXS6cG4",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T09:33:40.268Z",
+          "status": "running",
+          "updated_at": "2026-06-21T09:35:42.092Z"
+        },
+        "todo:7": {
+          "task_key": "todo:7",
+          "task_label": "7",
+          "task_title": "Implement Noop and recording backend service lifecycle",
+          "session_id": "opencode:ses_1167582d9ffeHfRlcI3Q51SHaO",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T09:56:46.620Z",
+          "status": "running",
+          "updated_at": "2026-06-21T10:15:08.965Z"
+        },
+        "todo:8": {
+          "task_key": "todo:8",
+          "task_label": "8",
+          "task_title": "Implement real Linux MPRIS adapter with fake D-Bus tests",
+          "session_id": "opencode:ses_116512ab9ffe6bHPSRUJrg88z5",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T10:44:25.132Z",
+          "status": "running",
+          "updated_at": "2026-06-21T10:46:50.296Z"
+        },
+        "todo:9": {
+          "task_key": "todo:9",
+          "task_label": "9",
+          "task_title": "Add Windows SMTC compile-isolated implementation skeleton",
+          "session_id": "opencode:ses_11634942cffeJ4VmskZHNz2WJw",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T10:54:09.326Z",
+          "status": "running",
+          "updated_at": "2026-06-21T10:55:35.547Z"
+        },
+        "todo:10": {
+          "task_key": "todo:10",
+          "task_label": "10",
+          "task_title": "Wire Linux MPRIS commands into unified control commands",
+          "session_id": "opencode:ses_1162c7a7effep8fERQo59UADJR",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-21T11:10:16.065Z",
+          "started_at": "2026-06-21T11:10:16.065Z",
+          "status": "running"
+        },
+        "todo:11": {
+          "task_key": "todo:11",
+          "task_label": "11",
+          "task_title": "Integrate metadata module into build and app link-only path",
+          "session_id": "opencode:ses_1161efdecffebrznH9edaAj4wo",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T11:13:04.941Z",
+          "status": "running",
+          "updated_at": "2026-06-21T11:14:07.941Z"
+        },
+        "todo:12": {
+          "task_key": "todo:12",
+          "task_label": "12",
+          "task_title": "Write Chinese metadata sharing documentation",
+          "session_id": "opencode:ses_1161bb06affeeMPct39mvIY2hV",
+          "agent": "Sisyphus-Junior",
+          "category": "writing",
+          "updated_at": "2026-06-21T11:18:32.352Z",
+          "started_at": "2026-06-21T11:18:32.352Z",
+          "status": "running"
+        },
+        "todo:13": {
+          "task_key": "todo:13",
+          "task_label": "13",
+          "task_title": "Run full Linux verification and close implementation evidence",
+          "session_id": "opencode:ses_11613c012ffejdwjxBHkUT0kGW",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-21T11:22:19.014Z",
+          "status": "running",
+          "updated_at": "2026-06-21T11:25:14.989Z"
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "Plan compliance audit: run `git status --short`, `git log --oneline --grep metadata`, inspect every `.omo/evidence/metadata-sharing-module-implementation/task-*.md`, and verify every todo acceptance criterion is evidenced, every Linux feature has a test pass before dependent work, every feature-level commit exists, and git write operations were limited to `git add`/`git commit`.",
+          "session_id": "opencode:ses_1161122fdffeDYgezJvdJCVvoW",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-06-21T11:31:03.556Z",
+          "started_at": "2026-06-21T11:31:03.556Z",
+          "status": "running"
+        }
+      }
+    },
+    "metadata-sharing-module-implementation-0cf264bd": {
+      "work_id": "metadata-sharing-module-implementation-0cf264bd",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "active",
+      "started_at": "2026-06-21T11:33:24.631Z",
+      "updated_at": "2026-06-21T11:33:24.631Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "metadata-sharing-module-implementation-1b0ff85d": {
+      "work_id": "metadata-sharing-module-implementation-1b0ff85d",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "active",
+      "started_at": "2026-06-21T11:33:24.641Z",
+      "updated_at": "2026-06-21T11:57:05.032Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "Plan compliance audit: run `git status --short`, `git log --oneline --grep metadata`, inspect every `.omo/evidence/metadata-sharing-module-implementation/task-*.md`, and verify every todo acceptance criterion is evidenced, every Linux feature has a test pass before dependent work, every feature-level commit exists, and git write operations were limited to `git add`/`git commit`.",
+          "session_id": "opencode:ses_115f815aaffezAjipSRzzhpfRr",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "started_at": "2026-06-21T11:36:10.709Z",
+          "status": "running",
+          "updated_at": "2026-06-21T11:57:05.033Z"
+        }
+      }
+    },
+    "metadata-sharing-module-implementation-2f0ed546": {
+      "work_id": "metadata-sharing-module-implementation-2f0ed546",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "active",
+      "started_at": "2026-06-21T12:11:18.112Z",
+      "updated_at": "2026-06-21T12:11:18.112Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "metadata-sharing-module-implementation-06818f21": {
+      "work_id": "metadata-sharing-module-implementation-06818f21",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+      "plan_name": "metadata-sharing-module-implementation",
+      "status": "completed",
+      "started_at": "2026-06-21T12:11:18.128Z",
+      "updated_at": "2026-06-21T12:15:52.335Z",
+      "session_ids": [
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+      ],
+      "session_origins": {
+        "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "Plan compliance audit: run `git status --short`, `git log --oneline --grep metadata`, inspect every `.omo/evidence/metadata-sharing-module-implementation/task-*.md`, and verify every todo acceptance criterion is evidenced, every Linux feature has a test pass before dependent work, every feature-level commit exists, and git write operations were limited to `git add`/`git commit`.",
+          "session_id": "opencode:ses_115f815aaffezAjipSRzzhpfRr",
+          "agent": "Sisyphus-Junior",
+          "category": "",
+          "started_at": "2026-06-21T12:12:32.481Z",
+          "status": "running",
+          "updated_at": "2026-06-21T12:15:00.658Z"
+        }
+      },
+      "ended_at": "2026-06-21T12:15:52.335Z",
+      "elapsed_ms": 274207
     }
   },
-  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/file-scanner-module-implementation.md",
-  "started_at": "2026-06-21T02:48:58.795Z",
+  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
+  "started_at": "2026-06-21T12:11:18.128Z",
   "status": "completed",
-  "updated_at": "2026-06-21T04:29:50.602Z",
+  "updated_at": "2026-06-21T12:15:52.335Z",
   "session_ids": [
     "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
   ],
   "session_origins": {
     "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
   },
-  "plan_name": "file-scanner-module-implementation",
+  "plan_name": "metadata-sharing-module-implementation",
   "task_sessions": {
-    "todo:10": {
-      "task_key": "todo:10",
-      "task_label": "10",
-      "task_title": "Scanner service full scan and hash-first startup reconciliation",
-      "session_id": "opencode:ses_117e936d7ffeRNCJCtKserYxh0",
-      "agent": "Sisyphus-Junior",
-      "category": "",
-      "started_at": "2026-06-21T03:13:00.645Z",
-      "status": "running",
-      "updated_at": "2026-06-21T03:22:45.538Z"
-    },
-    "todo:11": {
-      "task_key": "todo:11",
-      "task_label": "11",
-      "task_title": "wtr/watcher adapter, debounce, and runtime incremental updates",
-      "session_id": "opencode:ses_117ca4a35ffeFdKAJfiyIyuhwl",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "updated_at": "2026-06-21T03:47:28.230Z",
-      "started_at": "2026-06-21T03:47:28.229Z",
-      "status": "completed",
-      "ended_at": "2026-06-21T03:47:28.230Z",
-      "elapsed_ms": 1
-    },
-    "todo:12": {
-      "task_key": "todo:12",
-      "task_label": "12",
-      "task_title": "Integration hardening, optional smoke, docs, and full verification",
-      "session_id": "opencode:ses_117b3f930ffeF0OmCSJ0sOZtMh",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "updated_at": "2026-06-21T04:00:29.425Z",
-      "started_at": "2026-06-21T04:00:29.424Z",
-      "status": "completed",
-      "ended_at": "2026-06-21T04:00:29.425Z",
-      "elapsed_ms": 1
-    },
     "final-wave:f1": {
       "task_key": "final-wave:f1",
       "task_label": "F1",
-      "task_title": "Plan compliance audit: read implementation diff and confirm every todo acceptance criterion is evidenced; reject if any product code edits fall outside scanner/CMake/tests/docs scope or if `.omo/run-continuation` is included.",
-      "session_id": "opencode:ses_117a8a5dfffeAEBIRcUWhr5e6R",
+      "task_title": "Plan compliance audit: run `git status --short`, `git log --oneline --grep metadata`, inspect every `.omo/evidence/metadata-sharing-module-implementation/task-*.md`, and verify every todo acceptance criterion is evidenced, every Linux feature has a test pass before dependent work, every feature-level commit exists, and git write operations were limited to `git add`/`git commit`.",
+      "session_id": "opencode:ses_115f815aaffezAjipSRzzhpfRr",
       "agent": "Sisyphus-Junior",
-      "category": "unspecified-high",
-      "started_at": "2026-06-21T04:05:17.779Z",
+      "category": "",
+      "started_at": "2026-06-21T12:12:32.481Z",
       "status": "running",
-      "updated_at": "2026-06-21T04:28:10.282Z"
+      "updated_at": "2026-06-21T12:15:00.658Z"
     }
   },
   "agent": "atlas",
-  "ended_at": "2026-06-21T04:29:50.602Z",
-  "elapsed_ms": 6051807
+  "ended_at": "2026-06-21T12:15:52.335Z",
+  "elapsed_ms": 274207
 }
