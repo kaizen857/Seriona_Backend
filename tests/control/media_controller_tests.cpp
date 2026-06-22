@@ -95,6 +95,16 @@ scanner::ScannerEvent scanStartedEvent(std::uint64_t version) {
                                .payload = scanner::ScanProgress{}};
 }
 
+scanner::ScannerEvent scannerErrorEvent(std::string message, std::uint64_t version) {
+  return scanner::ScannerEvent{.type = scanner::ScannerEventType::ScanError,
+                               .monotonicVersion = version,
+                               .timestamp = {},
+                               .payload = scanner::ScannerError{.code = scanner::ScannerErrorCode::MetadataReadFailed,
+                                                                .message = std::move(message),
+                                                                .detail = {},
+                                                                .path = std::nullopt}};
+}
+
 audio::BackendEvent audioTrackChangedEvent(std::string id, std::string path, std::uint64_t version) {
   auto request = audio::TrackPlaybackRequest{.trackId = std::move(id),
                                              .filePath = std::filesystem::path{std::move(path)},
@@ -111,6 +121,30 @@ audio::BackendEvent audioTrackChangedEvent(std::string id, std::string path, std
                              .monotonicVersion = version,
                              .timestamp = {},
                              .payload = audio::TrackChanged{.request = std::move(request)}};
+}
+
+audio::BackendEvent audioPlaybackEndedEvent(std::string id, std::string path, std::uint64_t version,
+                                            std::chrono::milliseconds position = std::chrono::milliseconds{3000}) {
+  auto request = audio::TrackPlaybackRequest{.trackId = std::move(id),
+                                             .filePath = std::filesystem::path{std::move(path)},
+                                             .title = {},
+                                             .artist = {},
+                                             .offset = std::nullopt,
+                                             .duration = std::chrono::milliseconds{3000},
+                                             .sampleRate = std::nullopt,
+                                             .bitDepth = std::nullopt,
+                                             .channels = std::nullopt,
+                                             .format = std::nullopt};
+  return audio::BackendEvent{.type = audio::BackendEventType::PlaybackEnded,
+                             .sourceModule = audio::BackendSourceModule::AudioPlaybackService,
+                             .monotonicVersion = version,
+                             .timestamp = {},
+                             .payload = audio::PlaybackEnded{.request = request,
+                                                             .finalClock = audio::PlaybackClockSnapshot{.trackId = request.trackId,
+                                                                                                         .position = position,
+                                                                                                         .sampledAt = {},
+                                                                                                         .version = version,
+                                                                                                         .continuous = false}}};
 }
 
 MediaControlCommand command(MediaControlCommandKind kind) {
@@ -171,6 +205,121 @@ TEST_CASE("media controller facade drives fake audio load before play for play a
   CHECK(fixture.fakeAudio->playCalls() == 2U);
 }
 
+TEST_CASE("media controller facade rejects unplayable commands and publishes command notifications") {
+  ControllerFixture fixture{};
+  std::vector<ControlDomainNotification> notifications{};
+  fixture.controller->subscribeDomainNotifications([&](const ControlDomainNotification& notification) {
+    notifications.push_back(notification);
+  });
+  fixture.controller->start();
+
+  const auto playResult = fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  CHECK_FALSE(playResult.accepted);
+  CHECK(playResult.code == MediaControllerErrorCode::NoPlayableTrack);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+  CHECK(fixture.fakeAudio->playCalls() == 0U);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+  REQUIRE_FALSE(notifications.empty());
+  CHECK(notifications.back().kind == ControlDomainNotificationKind::CommandRejected);
+  CHECK(notifications.back().errorCode == MediaControllerErrorCode::NoPlayableTrack);
+
+  installLibrary(fixture);
+  auto invalidSelect = command(MediaControlCommandKind::SelectTrack);
+  invalidSelect.track = track("missing", "music/missing.flac");
+  const auto selectResult = fixture.controller->submitCommand(invalidSelect);
+
+  CHECK_FALSE(selectResult.accepted);
+  CHECK(selectResult.code == MediaControllerErrorCode::TrackNotInLibrary);
+  REQUIRE_FALSE(notifications.empty());
+  CHECK(notifications.back().kind == ControlDomainNotificationKind::CommandRejected);
+  CHECK(notifications.back().errorCode == MediaControllerErrorCode::TrackNotInLibrary);
+}
+
+TEST_CASE("media controller facade forwards seek volume mute and toggle commands through fake audio") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  auto seekPastDuration = command(MediaControlCommandKind::SeekTo);
+  seekPastDuration.position = std::chrono::milliseconds{4500};
+  const auto seekPastResult = fixture.controller->submitCommand(seekPastDuration);
+  CHECK(seekPastResult.accepted);
+  CHECK(fixture.fakeAudio->seekCalls() == 1U);
+  REQUIRE(fixture.fakeAudio->lastSeekPosition().has_value());
+  CHECK(*fixture.fakeAudio->lastSeekPosition() == std::chrono::milliseconds{3000});
+  CHECK(fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{3000});
+
+  auto seekBeforeStart = command(MediaControlCommandKind::SeekBy);
+  seekBeforeStart.delta = std::chrono::milliseconds{-5000};
+  const auto seekBeforeResult = fixture.controller->submitCommand(seekBeforeStart);
+  CHECK(seekBeforeResult.accepted);
+  CHECK(fixture.fakeAudio->seekCalls() == 2U);
+  REQUIRE(fixture.fakeAudio->lastSeekPosition().has_value());
+  CHECK(*fixture.fakeAudio->lastSeekPosition() == std::chrono::milliseconds{0});
+
+  auto setVolume = command(MediaControlCommandKind::SetVolume);
+  setVolume.volume = 1.75F;
+  const auto volumeResult = fixture.controller->submitCommand(setVolume);
+  CHECK(volumeResult.accepted);
+  CHECK(fixture.fakeAudio->setVolumeCalls() == 1U);
+  REQUIRE(fixture.fakeAudio->lastVolume().has_value());
+  CHECK(*fixture.fakeAudio->lastVolume() == 1.0F);
+  CHECK(fixture.controller->playerStateSnapshot().volume == 1.0F);
+
+  auto setMuted = command(MediaControlCommandKind::SetMuted);
+  setMuted.muted = true;
+  const auto mutedResult = fixture.controller->submitCommand(setMuted);
+  CHECK(mutedResult.accepted);
+  CHECK(fixture.fakeAudio->setMutedCalls() == 1U);
+  REQUIRE(fixture.fakeAudio->lastMuted().has_value());
+  CHECK(*fixture.fakeAudio->lastMuted());
+  CHECK(fixture.controller->playerStateSnapshot().muted);
+
+  const auto toggleResult = fixture.controller->submitCommand(command(MediaControlCommandKind::TogglePlayPause));
+  CHECK(toggleResult.accepted);
+  CHECK(fixture.fakeAudio->pauseCalls() == 1U);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
+}
+
+TEST_CASE("media controller facade applies skip repeat and playback-ended policies through fake audio") {
+  ControllerFixture fixture{};
+  std::size_t playbackEndedNotifications{0};
+  fixture.controller->subscribeDomainNotifications([&](const ControlDomainNotification& notification) {
+    if (notification.kind == ControlDomainNotificationKind::PlaybackEnded) {
+      ++playbackEndedNotifications;
+    }
+  });
+  fixture.controller->start();
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  const auto skipNextResult = fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+  CHECK(skipNextResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "b");
+
+  auto repeatAll = command(MediaControlCommandKind::SetRepeatMode);
+  repeatAll.repeatMode = RepeatMode::All;
+  CHECK(fixture.controller->submitCommand(repeatAll).accepted);
+  const auto wrapNextResult = fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+  CHECK(wrapNextResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
+
+  auto repeatOne = command(MediaControlCommandKind::SetRepeatMode);
+  repeatOne.repeatMode = RepeatMode::One;
+  CHECK(fixture.controller->submitCommand(repeatOne).accepted);
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a", "music/a.flac", 10));
+  fixture.controller->drainForTests();
+
+  CHECK(playbackEndedNotifications == 1U);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+}
+
 TEST_CASE("media controller facade scans library and publishes committed library snapshots") {
   ControllerFixture fixture{};
   control_test::LibraryStateSnapshotCollector librarySnapshots{};
@@ -195,6 +344,51 @@ TEST_CASE("media controller facade scans library and publishes committed library
   CHECK(librarySnapshots.last().version == 33U);
   REQUIRE(librarySnapshots.last().libraryTree.has_value());
   CHECK(librarySnapshots.last().libraryTree->version == 33U);
+}
+
+TEST_CASE("media controller facade ignores stale audio and scanner events") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("new", "music/new.flac")}, 30), 30));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  CHECK(fixture.controller->libraryStateSnapshot().libraryTree->nodes.size() == 2U);
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("old", "music/old.flac")}, 20), 20));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  CHECK(fixture.controller->libraryStateSnapshot().libraryTree->version == 30U);
+
+  fixture.fakeAudio->emit(audioTrackChangedEvent("fresh", "music/fresh.flac", 8));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "fresh");
+  fixture.fakeAudio->emit(audioTrackChangedEvent("stale", "music/stale.flac", 7));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "fresh");
+}
+
+TEST_CASE("media controller facade publishes scanner errors as library state and domain notifications") {
+  ControllerFixture fixture{};
+  std::vector<ControlDomainNotification> notifications{};
+  fixture.controller->subscribeDomainNotifications([&](const ControlDomainNotification& notification) {
+    notifications.push_back(notification);
+  });
+  fixture.controller->start();
+
+  fixture.fakeScanner->emit(scannerErrorEvent("metadata read failed", 5));
+  fixture.controller->drainForTests();
+
+  const auto librarySnapshot = fixture.controller->libraryStateSnapshot();
+  CHECK(librarySnapshot.version == 5U);
+  CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Error);
+  REQUIRE(librarySnapshot.lastError.has_value());
+  CHECK(librarySnapshot.lastError->message == "metadata read failed");
+  REQUIRE_FALSE(notifications.empty());
+  CHECK(notifications.back().kind == ControlDomainNotificationKind::LibraryScanError);
+  CHECK(notifications.back().errorCode == MediaControllerErrorCode::BackendRejected);
+  CHECK(notifications.back().scanStatus == LibraryScanStatus::Error);
 }
 
 TEST_CASE("media controller facade starts metadata and updates after committed player snapshot") {
