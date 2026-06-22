@@ -4,8 +4,16 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+
+#include "../audio/audio_contracts.h"
+#include "../scanner/scanner_contracts.h"
+
+namespace seriona::metadata {
+class MetadataSharingService;
+}
 
 namespace seriona::control {
 
@@ -105,6 +113,68 @@ struct PlayerStateSnapshot {
   bool muted{false};
 };
 
+enum class LibraryScanStatus {
+  Idle,
+  Scanning,
+  Completed,
+  Stopped,
+  Error,
+};
+
+struct LibraryStateSnapshot {
+  std::uint64_t version{0};
+  LibraryScanStatus scanStatus{LibraryScanStatus::Idle};
+  std::optional<scanner::PlaylistTreeSnapshot> libraryTree;
+  std::optional<scanner::ScanProgress> scanProgress;
+  std::optional<scanner::ScannerError> lastError;
+};
+
+enum class ControlDomainNotificationKind {
+  LibrarySnapshotUpdated,
+  LibraryScanStarted,
+  LibraryScanProgressUpdated,
+  LibraryScanCompleted,
+  LibraryScanStopped,
+  LibraryScanError,
+  PlaybackEnded,
+  PlaybackError,
+  OutputModeFallback,
+  CommandRejected,
+};
+
+enum class MediaControllerErrorCode {
+  None,
+  ControllerStopped,
+  NoPlayableTrack,
+  TrackNotInLibrary,
+  InvalidCommand,
+  BackendRejected,
+};
+
+struct ControlDomainNotification {
+  ControlDomainNotificationKind kind{ControlDomainNotificationKind::LibrarySnapshotUpdated};
+  MediaControllerErrorCode errorCode{MediaControllerErrorCode::None};
+  std::string message;
+  std::optional<LibraryScanStatus> scanStatus;
+};
+
+struct MediaControllerCommandResult {
+  bool accepted{false};
+  MediaControllerErrorCode code{MediaControllerErrorCode::None};
+  std::string message;
+};
+
+struct MediaControllerOptions {
+  bool runInlineForTests{false};
+  std::uint64_t shuffleSeed{0};
+};
+
+struct MediaControllerDependencies {
+  std::shared_ptr<audio::AudioPlaybackService> audio;
+  std::shared_ptr<scanner::FileScannerService> scanner;
+  std::unique_ptr<::seriona::metadata::MetadataSharingService> metadata;
+};
+
 enum class MediaControlCommandKind {
   Play,
   Pause,
@@ -136,6 +206,11 @@ using PlayerStateSnapshotCallback = std::function<void(const PlayerStateSnapshot
 using PlayerStateSubscriptionCallback = PlayerStateSnapshotCallback;
 using MediaControlCommandSink = std::function<void(const MediaControlCommand&)>;
 
+using LibraryStateSnapshotCallback = std::function<void(const LibraryStateSnapshot&)>;
+using LibraryStateSubscriptionCallback = LibraryStateSnapshotCallback;
+using ControlDomainNotificationCallback = std::function<void(const ControlDomainNotification&)>;
+using ControlDomainNotificationSubscriptionCallback = ControlDomainNotificationCallback;
+
 struct SubscriptionHandle {
   std::size_t subscriptionId{0};
   std::function<void()> unsubscribe;
@@ -143,5 +218,7 @@ struct SubscriptionHandle {
 
 using PlayerStateSubscriptionFactory = std::function<SubscriptionHandle(PlayerStateSnapshotCallback)>;
 using MediaControlCommandSinkFactory = std::function<MediaControlCommandSink()>;
+using LibraryStateSubscriptionFactory = std::function<SubscriptionHandle(LibraryStateSnapshotCallback)>;
+using ControlDomainNotificationSubscriptionFactory = std::function<SubscriptionHandle(ControlDomainNotificationCallback)>;
 
 }
