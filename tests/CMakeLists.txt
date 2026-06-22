@@ -338,7 +338,6 @@ target_include_directories(seriona_control_contract_tests PRIVATE
 )
 target_include_directories(seriona_media_controller_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
-  ${PROJECT_SOURCE_DIR}/src/control
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_paths_tests PRIVATE

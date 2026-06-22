@@ -72,6 +72,9 @@ public:
       return;
     }
 
+    dependencies_.audio->setEventSink({});
+    dependencies_.scanner->setEventSink({});
+
     if (metadataCommandSubscription_.unsubscribe) {
       metadataCommandSubscription_.unsubscribe();
       metadataCommandSubscription_ = {};
@@ -159,12 +162,28 @@ private:
   }
 
   void postAudioEvent(audio::BackendEvent event) {
-    auto posted = eventLoop_.post([this, event = std::move(event)] { handleAudioEvent(event); });
+    if (!isRunning()) {
+      return;
+    }
+
+    auto posted = eventLoop_.post([this, event = std::move(event)] {
+      if (isRunning()) {
+        handleAudioEvent(event);
+      }
+    });
     (void)posted;
   }
 
   void postScannerEvent(scanner::ScannerEvent event) {
-    auto posted = eventLoop_.post([this, event = std::move(event)] { handleScannerEvent(event); });
+    if (!isRunning()) {
+      return;
+    }
+
+    auto posted = eventLoop_.post([this, event = std::move(event)] {
+      if (isRunning()) {
+        handleScannerEvent(event);
+      }
+    });
     (void)posted;
   }
 
@@ -173,7 +192,11 @@ private:
       return;
     }
 
-    auto posted = eventLoop_.post([this, command = std::move(command)] { reduceCommand(command); });
+    auto posted = eventLoop_.post([this, command = std::move(command)] {
+      if (isRunning()) {
+        reduceCommand(command);
+      }
+    });
     (void)posted;
   }
 

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -227,6 +228,88 @@ TEST_CASE("media controller facade posts metadata commands onto the control exec
   fixture.controller->drainForTests();
   CHECK(fixture.fakeAudio->loadTrackCalls() == 1U);
   CHECK(fixture.fakeAudio->playCalls() == 1U);
+}
+
+TEST_CASE("media controller facade routes metadata pause like direct queued commands") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  fixture.fakeMetadata->emitCommand(command(MediaControlCommandKind::Pause));
+
+  CHECK(fixture.fakeAudio->pauseCalls() == 0U);
+  fixture.controller->drainForTests();
+  CHECK(fixture.fakeAudio->pauseCalls() == 1U);
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  CHECK(fixture.fakeMetadata->lastUpdatedState()->controlState.playback.state == PlaybackStatus::Paused);
+}
+
+TEST_CASE("media controller facade shutdown unregisters callbacks and drops late events") {
+  ControllerFixture fixture{};
+  control_test::PlayerStateSnapshotCollector playerSnapshots{};
+  control_test::LibraryStateSnapshotCollector librarySnapshots{};
+  std::size_t notificationDeliveries{0};
+  auto playerSubscription = fixture.controller->subscribePlayerState([&](const PlayerStateSnapshot& snapshot) { playerSnapshots.push(snapshot); });
+  auto librarySubscription = fixture.controller->subscribeLibraryState([&](const LibraryStateSnapshot& snapshot) { librarySnapshots.push(snapshot); });
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](const ControlDomainNotification&) { ++notificationDeliveries; });
+  fixture.controller->start();
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+  const auto playerSnapshotBeforeShutdown = fixture.controller->playerStateSnapshot();
+  const auto librarySnapshotBeforeShutdown = fixture.controller->libraryStateSnapshot();
+  const auto playerDeliveriesBeforeShutdown = playerSnapshots.count();
+  const auto libraryDeliveriesBeforeShutdown = librarySnapshots.count();
+  const auto notificationDeliveriesBeforeShutdown = notificationDeliveries;
+  const auto updateCallsBeforeShutdown = fixture.fakeMetadata->updateCalls();
+
+  playerSubscription.unsubscribe();
+  librarySubscription.unsubscribe();
+  notificationSubscription.unsubscribe();
+  fixture.controller->shutdown();
+
+  CHECK(fixture.fakeAudio->setEventSinkCalls() == 2U);
+  CHECK(fixture.fakeScanner->setEventSinkCalls() == 2U);
+  CHECK(fixture.fakeMetadata->commandUnregistrations() == 1U);
+  CHECK_FALSE(fixture.fakeMetadata->hasCommandCallback());
+  CHECK(fixture.fakeMetadata->stopCalls() == 1U);
+
+  fixture.fakeMetadata->emitCommand(command(MediaControlCommandKind::Pause));
+  fixture.fakeAudio->emit(audioTrackChangedEvent("late-audio", "music/late.flac", 99));
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("late", "music/late.flac")}, 99), 99));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->pauseCalls() == 0U);
+  CHECK(fixture.fakeMetadata->updateCalls() == updateCallsBeforeShutdown);
+  CHECK(playerSnapshots.count() == playerDeliveriesBeforeShutdown);
+  CHECK(librarySnapshots.count() == libraryDeliveriesBeforeShutdown);
+  CHECK(notificationDeliveries == notificationDeliveriesBeforeShutdown);
+  CHECK(fixture.controller->playerStateSnapshot().freshness.version == playerSnapshotBeforeShutdown.freshness.version);
+  CHECK(fixture.controller->libraryStateSnapshot().version == librarySnapshotBeforeShutdown.version);
+}
+
+TEST_CASE("media controller facade contains subscriber exceptions and updates metadata") {
+  ControllerFixture fixture{};
+  control_test::PlayerStateSnapshotCollector laterPlayerSnapshots{};
+  control_test::LibraryStateSnapshotCollector laterLibrarySnapshots{};
+  std::size_t laterNotifications{0};
+  fixture.controller->subscribePlayerState([](const PlayerStateSnapshot&) { throw std::runtime_error{"player subscriber"}; });
+  fixture.controller->subscribePlayerState([&](const PlayerStateSnapshot& snapshot) { laterPlayerSnapshots.push(snapshot); });
+  fixture.controller->subscribeLibraryState([](const LibraryStateSnapshot&) { throw std::runtime_error{"library subscriber"}; });
+  fixture.controller->subscribeLibraryState([&](const LibraryStateSnapshot& snapshot) { laterLibrarySnapshots.push(snapshot); });
+  fixture.controller->subscribeDomainNotifications([](const ControlDomainNotification&) { throw std::runtime_error{"notification subscriber"}; });
+  fixture.controller->subscribeDomainNotifications([&](const ControlDomainNotification&) { ++laterNotifications; });
+  fixture.controller->start();
+
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  CHECK(laterLibrarySnapshots.count() >= 2U);
+  CHECK(laterPlayerSnapshots.count() >= 2U);
+  CHECK(laterNotifications >= 1U);
+  CHECK(fixture.fakeMetadata->updateCalls() >= 1U);
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  CHECK(fixture.fakeMetadata->lastUpdatedState()->controlState.playback.state == PlaybackStatus::Playing);
 }
 
 TEST_CASE("media controller facade subscribers receive committed snapshots not raw sink payloads") {
