@@ -115,7 +115,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 > EVERY task MUST have: Agent Profile + Parallelization + QA Scenarios.
 > Commit statements below are feature-boundary guidance only. Do not commit merely because a task ended; commit when a user-visible/plan-visible feature is complete and verified.
 
-- [ ] 1. Extend control public contracts
+- [x] 1. Extend control public contracts
 
   **What to do**: Modify `inc/seriona/control/control_contracts.h` only. Add `LibraryScanStatus`, `LibraryStateSnapshot`, `ControlDomainNotificationKind`, `ControlDomainNotification`, `MediaControllerErrorCode`, `MediaControllerCommandResult`, `MediaControllerOptions`, `MediaControllerDependencies`, and callback/factory aliases for library snapshot and domain notification subscriptions. `MediaControllerErrorCode` values are exactly `None`, `ControllerStopped`, `NoPlayableTrack`, `TrackNotInLibrary`, `InvalidCommand`, `BackendRejected`. `MediaControllerCommandResult` fields are exactly `bool accepted`, `MediaControllerErrorCode code`, `std::string message`. `MediaControllerOptions` fields are exactly `bool runInlineForTests{false}` and `std::uint64_t shuffleSeed{0}`. `MediaControllerDependencies` fields are exactly `std::shared_ptr<audio::AudioPlaybackService> audio`, `std::shared_ptr<scanner::FileScannerService> scanner`, `std::unique_ptr<metadata::MetadataSharingService> metadata`. Keep existing `PlayerStateSnapshot`, `MediaControlCommand`, and `SubscriptionHandle` source-compatible. Use only standard library includes plus public audio/scanner/metadata/control headers; prefer value types and `std::optional`/`std::variant` over inheritance.
   **Must NOT do**: Do not include Qt/QML/platform headers, audio implementation headers, SQLite, TagReader, miniaudio, or metadata private headers.
@@ -157,7 +157,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `feat(control): define media controller contracts` | Files: [`inc/seriona/control/control_contracts.h`] | Rule: commit only when the complete public contract feature is implemented and verified.
 
-- [ ] 2. Add control fake harness and contract tests
+- [x] 2. Add control fake harness and contract tests
 
   **What to do**: Create `tests/control/control_test_harness.h/.cpp` with fake `AudioPlaybackService`, fake `FileScannerService`, fake `MetadataSharingService`, snapshot collectors, command collectors, and deterministic clock helpers. Create `tests/control/control_contract_tests.cpp` validating default-constructibility, value semantics, subscription handle unsubscribe behavior, and no platform-only types in public contracts. Fakes must expose counters for calls like `loadTrack`, `play`, `pause`, `scan`, `startWatching`, `update`, and captured callbacks.
   **Must NOT do**: Do not use real FFmpeg/miniaudio/audio hardware, real filesystem scanning, real SQLite, real DBus/SMTC, or sleeps for synchronization.
@@ -198,7 +198,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `test(control): add media controller fake harness` | Files: [`tests/control/control_test_harness.h`, `tests/control/control_test_harness.cpp`, `tests/control/control_contract_tests.cpp`] | Rule: commit only when the complete fake harness/contract-test feature is implemented and verified.
 
-- [ ] 3. Register seriona_control build and tests
+- [x] 3. Register seriona_control build and tests
 
   **What to do**: Update root `CMakeLists.txt` to add static library `seriona_control` using only files that already exist after Tasks 2 and 4: `src/control/control_event_loop.cpp` and `src/control/subscription_store.cpp`. Include `inc` publicly and `src` privately. Link `seriona_control` to `seriona_scanner` and `seriona_metadata`; do not link implementation-only audio objects because audio currently has no library target. Update `tests/CMakeLists.txt` with `seriona_control_contract_tests` and the initial `seriona_media_controller_tests` executable using only existing test files from Task 2 and any Task 4 event-loop tests, includes, definitions, links, and `add_test(NAME seriona.control_contract ...)`, `add_test(NAME seriona.control_controller ...)`. Later Tasks 5 and 6 must append their new source files to `seriona_control` and test target in the same task that creates those files.
   **Must NOT do**: Do not create or refactor an audio static library target; do not remove existing tests; do not change TagReader lookup.
@@ -240,7 +240,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `build(control): register media controller targets` | Files: [`CMakeLists.txt`, `tests/CMakeLists.txt`, `app/CMakeLists.txt` if required] | Rule: commit only when the complete build/CTest registration feature is implemented and verified.
 
-- [ ] 4. Implement serial event loop and subscription store
+- [x] 4. Implement serial event loop and subscription store
 
   **What to do**: Add `src/control/control_event_loop.h/.cpp` and `src/control/subscription_store.h/.cpp`. Event loop behavior is fixed: when `MediaControllerOptions::runInlineForTests == false`, `start()` creates one worker thread that serially drains posted work; when `runInlineForTests == true`, no worker thread is created and tests must call `drainForTests()` to execute queued work. It supports `bool post(std::function<void()>)`, `void drainForTests()`, `void stop()`, and destructor-safe shutdown. `post` after stop returns `false` and does not throw. Subscription store supports immediate initial snapshot delivery, monotonic subscription IDs, explicit unsubscribe, safe unsubscribe during callback, and exception containment: catch subscriber exceptions and convert to domain notification/error counter without breaking later subscribers.
   **Must NOT do**: Do not expose event loop in public API; do not use scanner/audio worker pools as control state executor; do not block audio/scanner callback threads.
@@ -284,7 +284,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `feat(control): add serial event loop and subscriptions` | Files: [`src/control/control_event_loop.h`, `src/control/control_event_loop.cpp`, `src/control/subscription_store.h`, `src/control/subscription_store.cpp`, `tests/control/media_controller_tests.cpp`] | Rule: commit only when the complete event-loop/subscription feature is implemented and verified.
 
-- [ ] 5. Implement state reducer and command semantics
+- [x] 5. Implement state reducer and command semantics
 
   **What to do**: Add `src/control/control_state_reducer.h/.cpp` and append `src/control/control_state_reducer.cpp` to `seriona_control` in `CMakeLists.txt` in this same task. Reducer owns `PlayerStateSnapshot`, `LibraryStateSnapshot`, repeat/shuffle/current-track selection state, last event versions per source, and recent domain notifications. Implement deterministic command semantics: `Play` without current track selects first playable track from current library if present else emits no-track notification and remains stopped; `SelectTrack` validates `TrackIdentity.trackId`/file path against current `PlaylistTreeSnapshot`; `SkipNext/Previous` use deterministic flattened tree order from current snapshot; repeat-one repeats current track; repeat-all wraps around flattened tree; shuffle uses injectable deterministic RNG seed for tests; `SeekBy` clamps to `[0,duration]` when duration known and never below zero; `SetVolume` clamps `[0.0F,1.0F]`; `SetMuted` updates snapshot and forwards audio command. Implement audio event reduction for `PlaybackStateChanged`, `TrackChanged`, `PlaybackPositionUpdated`, `PositionDiscontinuity`, `PlaybackEnded`, `OutputFormatChanged`, `OutputModeFallback`, `PlaybackError`. Implement scanner event reduction for scan started/progress/snapshot/completed/stopped/error.
   **Must NOT do**: Do not call audio/scanner services from reducer directly; reducer returns intents/commands to be executed by facade.
@@ -328,7 +328,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `feat(control): reduce commands into authoritative state` | Files: [`src/control/control_state_reducer.h`, `src/control/control_state_reducer.cpp`, `tests/control/media_controller_tests.cpp`, `CMakeLists.txt`, `tests/CMakeLists.txt` if test source list changes] | Rule: commit only when the complete command/state-reduction feature is implemented and verified.
 
-- [ ] 6. Implement MediaController facade and module adapters
+- [x] 6. Implement MediaController facade and module adapters
 
   **What to do**: Add `inc/seriona/control/media_controller.h`, `src/control/media_controller.cpp`, and `src/control/media_controller_module.h/.cpp`, then append `src/control/media_controller.cpp` and `src/control/media_controller_module.cpp` to `seriona_control` in `CMakeLists.txt` in this same task. Public facade API is fixed: `class MediaController`; constructor `explicit MediaController(MediaControllerDependencies dependencies, MediaControllerOptions options = {})`; factory `std::unique_ptr<MediaController> makeMediaController(MediaControllerDependencies dependencies, MediaControllerOptions options = {})`; methods `void start()`, `void shutdown()`, `MediaControllerCommandResult submitCommand(const MediaControlCommand& command)`, `MediaControllerCommandResult scanLibrary(std::vector<scanner::ScannerRoot> roots, scanner::ScanMode mode)`, `SubscriptionHandle subscribePlayerState(PlayerStateSnapshotCallback callback)`, `SubscriptionHandle subscribeLibraryState(LibraryStateSnapshotCallback callback)`, `SubscriptionHandle subscribeDomainNotifications(ControlDomainNotificationCallback callback)`, `PlayerStateSnapshot playerStateSnapshot() const`, `LibraryStateSnapshot libraryStateSnapshot() const`, `audio::BackendEventSink audioEventSink()`, `scanner::ScannerEventSink scannerEventSink()`, and `void drainForTests()`. Facade must install audio/scanner sinks that only post private events, set metadata command callback to same command queue, and invoke metadata `start/update/stop` from committed `PlayerStateSnapshot` changes. Use reducer intents to call audio/scanner services outside reducer but on control executor.
   **Must NOT do**: Do not expose scanner/audio/metadata implementation details in public control API; do not call subscriber callbacks while holding reducer/state locks; do not synchronously call metadata platform API from bottom-module callback threads.
@@ -373,7 +373,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `feat(control): implement media controller facade` | Files: [`inc/seriona/control/media_controller.h`, `src/control/media_controller.cpp`, `src/control/media_controller_module.h`, `src/control/media_controller_module.cpp`, `tests/control/media_controller_tests.cpp`, `CMakeLists.txt`, `tests/CMakeLists.txt` if test source list changes] | Rule: commit only when the complete facade/module-adapter feature is implemented and verified.
 
-- [ ] 7. Complete metadata command callback and shutdown lifecycle
+- [x] 7. Complete metadata command callback and shutdown lifecycle
 
   **What to do**: Extend facade tests/implementation to cover metadata-to-controller command callbacks and full lifecycle. `MetadataSharingService::registerCommandCallback` must receive a sink that posts `MediaControlCommand` into the same command queue as UI commands and returns quickly. `shutdown()` order: mark stopping, clear audio/scanner sinks where supported by setting empty sinks, unregister metadata command callback via `SubscriptionHandle`, call metadata `stop()`, drain/drop queued callbacks safely, stop event loop, then leave final snapshots queryable. Ensure audio/scanner events posted after shutdown are dropped without crash. Ensure subscriber exceptions are contained and do not prevent metadata update or later subscribers.
   **Must NOT do**: Do not block indefinitely waiting for fake or real services; do not rely on destructor order alone for unsubscription.
@@ -415,7 +415,7 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 
   **Commit**: FEATURE-BOUNDARY | Suggested Message: `feat(control): harden metadata callbacks and shutdown` | Files: [`src/control/media_controller.cpp`, `src/control/control_event_loop.cpp`, `tests/control/media_controller_tests.cpp`] | Rule: commit only when the complete metadata-callback/shutdown feature is implemented and verified.
 
-- [ ] 8. Finish end-to-end control verification and guardrails
+- [x] 8. Finish end-to-end control verification and guardrails
 
   **What to do**: Add/finish `tests/control/media_controller_tests.cpp` cases so every critical behavior has coverage. Add a static boundary test or documented command check that greps `inc/seriona/control`, `src/control`, and `tests/control` for forbidden platform/backend implementation terms. Run focused and broad verification. If full `cmake --build build` fails on pre-existing doctest include issue in scanner contract tests, record it separately and still require `seriona_control`, `seriona_control_contract_tests`, and `seriona_media_controller_tests` to build and pass.
   **Must NOT do**: Do not fix unrelated scanner/audio doctest include failures unless they block control targets; do not weaken tests to pass.
@@ -463,10 +463,10 @@ Wave 7: Task 8 end-to-end controller tests/static guardrails.
 > 4 review agents run in PARALLEL. ALL must APPROVE by agent-executed pass/fail criteria. Present consolidated results to user and get explicit "okay" before marking the work complete; this final user confirmation is a completion gate, not an implementation decision point.
 > **Do NOT auto-proceed after verification. Wait for user's explicit approval before marking work complete.**
 > **Never mark F1-F4 as checked before getting user's okay.** Rejection or user feedback -> fix -> re-run -> present again -> wait for okay.
-- [ ] F1. Plan Compliance Audit — oracle
-- [ ] F2. Code Quality Review — unspecified-high
-- [ ] F3. Real Manual QA — unspecified-high
-- [ ] F4. Scope Fidelity Check — deep
+- [x] F1. Plan Compliance Audit — oracle
+- [x] F2. Code Quality Review — unspecified-high
+- [x] F3. Real Manual QA — unspecified-high
+- [x] F4. Scope Fidelity Check — deep
 
 ## Commit Strategy
 - Commit after each completed feature, not after each task. A feature may span one or more tasks if that is the smallest coherent user-visible capability.

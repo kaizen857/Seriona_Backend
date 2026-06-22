@@ -1,0 +1,5 @@
+
+[2026-06-22 00:00 UTC] `cmake --build build --target seriona_metadata_contract_tests seriona_scanner_contract_tests` 受仓库既有的 doctest 头文件 include 路径问题阻塞：`#include <doctest/doctest.h>` 未能在当前 `-I third_party/doctest` 配置下解析，和本次控制层公共契约修改无关。
+[2026-06-22 00:00 UTC] Task 4 暂不能构建 `seriona_control` 或运行 `seriona.control_controller`，因为 Task 3 尚未允许修改 `CMakeLists.txt`/`tests/CMakeLists.txt` 注册新源文件；本任务只能做源文件级静态/语法友好验证。
+[2026-06-22 00:00 UTC] Task 6 发现 prior attempt 虽已把 `media_controller.cpp`/`media_controller_module.cpp` 放入根 `CMakeLists.txt`，但 `seriona_media_controller_tests` 仍混有大量 reducer-only 覆盖并依赖 `src/control` 私有 include；已改为 facade-only 集成测试以防目标在未真正执行 facade 时误通过。
+[2026-06-22 00:00 UTC] Task 8 full `cmake --build build` 仍被非控制目标既有 doctest include 路径问题阻塞：metadata contract/mapper/service/service_recording/mpris tests 与 scanner contract tests include `<doctest/doctest.h>`，当前目标只配置了 `-I third_party/doctest`；本次要求的 `seriona_control`、`seriona_control_contract_tests`、`seriona_media_controller_tests` 已单独构建通过，`ctest -R seriona.control` 也通过。

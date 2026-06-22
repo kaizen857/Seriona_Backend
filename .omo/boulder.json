@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "active_work_id": "metadata-sharing-module-implementation-06818f21",
+  "active_work_id": "media-controller-module-ab710546",
   "works": {
     "audio-player-module-3bdc4128": {
       "work_id": "audio-player-module-3bdc4128",
@@ -1323,33 +1323,298 @@
       },
       "ended_at": "2026-06-21T12:15:52.335Z",
       "elapsed_ms": 274207
+    },
+    "media-controller-module-a8748356": {
+      "work_id": "media-controller-module-a8748356",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T07:11:23.471Z",
+      "updated_at": "2026-06-22T07:11:23.471Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "media-controller-module-abbdf30e": {
+      "work_id": "media-controller-module-abbdf30e",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T07:11:23.481Z",
+      "updated_at": "2026-06-22T08:20:19.667Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Extend control public contracts",
+          "session_id": "opencode:ses_111d2db2effefdl52oRqvDdWE1",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-22T07:20:28.374Z",
+          "started_at": "2026-06-22T07:20:28.374Z",
+          "status": "running"
+        },
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "Add control fake harness and contract tests",
+          "session_id": "opencode:ses_111c650a0ffeMrrFvyI3ggQhPj",
+          "agent": "Sisyphus-Junior",
+          "category": "",
+          "started_at": "2026-06-22T07:25:08.732Z",
+          "status": "running",
+          "updated_at": "2026-06-22T08:08:12.604Z"
+        },
+        "todo:3": {
+          "task_key": "todo:3",
+          "task_label": "3",
+          "task_title": "Register seriona_control build and tests",
+          "session_id": "opencode:ses_1119baa47ffej4sb241zVoKDRV",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "started_at": "2026-06-22T08:12:23.733Z",
+          "status": "running",
+          "updated_at": "2026-06-22T08:20:19.668Z"
+        }
+      }
+    },
+    "media-controller-module-a0027061": {
+      "work_id": "media-controller-module-a0027061",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T09:06:57.386Z",
+      "updated_at": "2026-06-22T09:06:57.386Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "media-controller-module-dd5041f0": {
+      "work_id": "media-controller-module-dd5041f0",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T09:06:57.446Z",
+      "updated_at": "2026-06-22T09:06:57.446Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "media-controller-module-fd6b184c": {
+      "work_id": "media-controller-module-fd6b184c",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T09:07:34.883Z",
+      "updated_at": "2026-06-22T09:07:34.883Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "media-controller-module-b117a449": {
+      "work_id": "media-controller-module-b117a449",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T09:07:34.946Z",
+      "updated_at": "2026-06-22T09:55:54.072Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "Implement state reducer and command semantics",
+          "session_id": "opencode:ses_1115dcbc6ffeM7VcEKfjdA6Pdd",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "started_at": "2026-06-22T09:13:07.313Z",
+          "status": "running",
+          "updated_at": "2026-06-22T09:32:36.216Z"
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "Implement MediaController facade and module adapters",
+          "session_id": "opencode:ses_1114d396affewC6eTVzLWyor5l",
+          "agent": "Sisyphus-Junior",
+          "category": "",
+          "started_at": "2026-06-22T09:37:25.714Z",
+          "status": "running",
+          "updated_at": "2026-06-22T09:55:54.073Z"
+        }
+      }
+    },
+    "media-controller-module-5c6b6a89": {
+      "work_id": "media-controller-module-5c6b6a89",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "active",
+      "started_at": "2026-06-22T10:36:55.184Z",
+      "updated_at": "2026-06-22T10:36:55.184Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "media-controller-module-ab710546": {
+      "work_id": "media-controller-module-ab710546",
+      "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+      "plan_name": "media-controller-module",
+      "status": "completed",
+      "started_at": "2026-06-22T10:36:55.197Z",
+      "updated_at": "2026-06-22T11:18:35.157Z",
+      "session_ids": [
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+      ],
+      "session_origins": {
+        "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "Implement MediaController facade and module adapters",
+          "session_id": "opencode:ses_1111752b2ffe3kBkLEP7CY9wyE",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-06-22T10:43:57.173Z",
+          "started_at": "2026-06-22T10:43:57.173Z",
+          "status": "running"
+        },
+        "todo:7": {
+          "task_key": "todo:7",
+          "task_label": "7",
+          "task_title": "Complete metadata command callback and shutdown lifecycle",
+          "session_id": "opencode:ses_1110e58f3ffe30PjQiu5rePMiC",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "started_at": "2026-06-22T10:46:38.575Z",
+          "status": "running",
+          "updated_at": "2026-06-22T10:51:18.858Z"
+        },
+        "todo:8": {
+          "task_key": "todo:8",
+          "task_label": "8",
+          "task_title": "Finish end-to-end control verification and guardrails",
+          "session_id": "opencode:ses_11108412dffecJgMoBAGTSe7pu",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "started_at": "2026-06-22T10:53:36.329Z",
+          "status": "running",
+          "updated_at": "2026-06-22T10:59:13.807Z"
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "Plan Compliance Audit — oracle",
+          "session_id": "opencode:ses_110f5dedbffeo7GIyA3ccBk8xs",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "started_at": "2026-06-22T11:02:01.414Z",
+          "status": "running",
+          "updated_at": "2026-06-22T11:16:51.392Z"
+        }
+      },
+      "ended_at": "2026-06-22T11:18:35.157Z",
+      "elapsed_ms": 2499960
     }
   },
-  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/metadata-sharing-module-implementation.md",
-  "started_at": "2026-06-21T12:11:18.128Z",
+  "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
+  "started_at": "2026-06-22T10:36:55.197Z",
   "status": "completed",
-  "updated_at": "2026-06-21T12:15:52.335Z",
+  "updated_at": "2026-06-22T11:18:35.157Z",
   "session_ids": [
-    "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga"
+    "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
   ],
   "session_origins": {
-    "opencode:ses_117f00679ffe3Dt5ZYkrVS9Pga": "direct"
+    "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
   },
-  "plan_name": "metadata-sharing-module-implementation",
+  "plan_name": "media-controller-module",
   "task_sessions": {
+    "todo:6": {
+      "task_key": "todo:6",
+      "task_label": "6",
+      "task_title": "Implement MediaController facade and module adapters",
+      "session_id": "opencode:ses_1111752b2ffe3kBkLEP7CY9wyE",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-06-22T10:43:57.173Z",
+      "started_at": "2026-06-22T10:43:57.173Z",
+      "status": "running"
+    },
+    "todo:7": {
+      "task_key": "todo:7",
+      "task_label": "7",
+      "task_title": "Complete metadata command callback and shutdown lifecycle",
+      "session_id": "opencode:ses_1110e58f3ffe30PjQiu5rePMiC",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "started_at": "2026-06-22T10:46:38.575Z",
+      "status": "running",
+      "updated_at": "2026-06-22T10:51:18.858Z"
+    },
+    "todo:8": {
+      "task_key": "todo:8",
+      "task_label": "8",
+      "task_title": "Finish end-to-end control verification and guardrails",
+      "session_id": "opencode:ses_11108412dffecJgMoBAGTSe7pu",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "started_at": "2026-06-22T10:53:36.329Z",
+      "status": "running",
+      "updated_at": "2026-06-22T10:59:13.807Z"
+    },
     "final-wave:f1": {
       "task_key": "final-wave:f1",
       "task_label": "F1",
-      "task_title": "Plan compliance audit: run `git status --short`, `git log --oneline --grep metadata`, inspect every `.omo/evidence/metadata-sharing-module-implementation/task-*.md`, and verify every todo acceptance criterion is evidenced, every Linux feature has a test pass before dependent work, every feature-level commit exists, and git write operations were limited to `git add`/`git commit`.",
-      "session_id": "opencode:ses_115f815aaffezAjipSRzzhpfRr",
+      "task_title": "Plan Compliance Audit — oracle",
+      "session_id": "opencode:ses_110f5dedbffeo7GIyA3ccBk8xs",
       "agent": "Sisyphus-Junior",
-      "category": "",
-      "started_at": "2026-06-21T12:12:32.481Z",
+      "category": "unspecified-high",
+      "started_at": "2026-06-22T11:02:01.414Z",
       "status": "running",
-      "updated_at": "2026-06-21T12:15:00.658Z"
+      "updated_at": "2026-06-22T11:16:51.392Z"
     }
   },
   "agent": "atlas",
-  "ended_at": "2026-06-21T12:15:52.335Z",
-  "elapsed_ms": 274207
+  "ended_at": "2026-06-22T11:18:35.157Z",
+  "elapsed_ms": 2499960
 }
