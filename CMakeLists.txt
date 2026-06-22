@@ -60,11 +60,28 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(NOT TARGET TagReaderCore)
+  set(SERIONA_TAGREADER_CANDIDATES
+    "../TagReader"
+    "../../cppProject(app_and_lib)/TagReader"
+  )
+  set(SERIONA_TAGREADER_SOURCE_DIR "")
+  foreach(SERIONA_TAGREADER_CANDIDATE IN LISTS SERIONA_TAGREADER_CANDIDATES)
+    if(EXISTS "${PROJECT_SOURCE_DIR}/${SERIONA_TAGREADER_CANDIDATE}/CMakeLists.txt")
+      set(SERIONA_TAGREADER_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE}")
+      break()
+    endif()
+  endforeach()
+  if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
+    message(FATAL_ERROR "TagReaderCore is required. Place TagReader next to Seriona_Backend or provide it as the expected sibling checkout.")
+  endif()
+
   set(SERIONA_BUILD_TESTING_BEFORE_TAGREADER ${BUILD_TESTING})
   set(BUILD_TESTING OFF CACHE BOOL "Build tests" FORCE)
-  add_subdirectory("/home/kaizen857/cppProject(app_and_lib)/TagReader" "${PROJECT_BINARY_DIR}/tagreader" EXCLUDE_FROM_ALL)
+  add_subdirectory("${SERIONA_TAGREADER_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/tagreader" EXCLUDE_FROM_ALL)
   set(BUILD_TESTING ${SERIONA_BUILD_TESTING_BEFORE_TAGREADER} CACHE BOOL "Build tests" FORCE)
   unset(SERIONA_BUILD_TESTING_BEFORE_TAGREADER)
+  unset(SERIONA_TAGREADER_SOURCE_DIR)
+  unset(SERIONA_TAGREADER_CANDIDATES)
   set_property(DIRECTORY "${PROJECT_BINARY_DIR}/tagreader/test" PROPERTY TESTS "")
 endif()
 
