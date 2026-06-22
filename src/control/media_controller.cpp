@@ -60,16 +60,12 @@ public:
   }
 
   void shutdown() {
-    bool shouldStop = false;
+    bool shouldStopMetadata = false;
     {
       std::lock_guard lock{mutex_};
-      shouldStop = started_ && !stopping_;
+      shouldStopMetadata = started_ && !stopping_;
       stopping_ = true;
       started_ = false;
-    }
-
-    if (!shouldStop) {
-      return;
     }
 
     dependencies_.audio->setEventSink({});
@@ -79,8 +75,10 @@ public:
       metadataCommandSubscription_.unsubscribe();
       metadataCommandSubscription_ = {};
     }
-    const auto stopResult = dependencies_.metadata->stop();
-    (void)stopResult;
+    if (shouldStopMetadata) {
+      const auto stopResult = dependencies_.metadata->stop();
+      (void)stopResult;
+    }
     eventLoop_.stop();
   }
 

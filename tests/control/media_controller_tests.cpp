@@ -320,6 +320,30 @@ TEST_CASE("media controller facade applies skip repeat and playback-ended polici
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
 }
 
+TEST_CASE("media controller facade shuffle produces deterministic selected tracks") {
+  ControllerFixture first{};
+  ControllerFixture second{};
+  first.controller->start();
+  second.controller->start();
+  installLibrary(first, 20, 1);
+  installLibrary(second, 20, 1);
+  first.controller->submitCommand(command(MediaControlCommandKind::Play));
+  second.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  auto enableShuffle = command(MediaControlCommandKind::SetShuffle);
+  enableShuffle.shuffle = true;
+  CHECK(first.controller->submitCommand(enableShuffle).accepted);
+  CHECK(second.controller->submitCommand(enableShuffle).accepted);
+  const auto firstSkip = first.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+  const auto secondSkip = second.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+
+  CHECK(firstSkip.accepted);
+  CHECK(secondSkip.accepted);
+  REQUIRE(first.fakeAudio->lastLoadedTrack().has_value());
+  REQUIRE(second.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(first.fakeAudio->lastLoadedTrack()->trackId == second.fakeAudio->lastLoadedTrack()->trackId);
+}
+
 TEST_CASE("media controller facade scans library and publishes committed library snapshots") {
   ControllerFixture fixture{};
   control_test::LibraryStateSnapshotCollector librarySnapshots{};
@@ -480,6 +504,28 @@ TEST_CASE("media controller facade shutdown unregisters callbacks and drops late
   CHECK(notificationDeliveries == notificationDeliveriesBeforeShutdown);
   CHECK(fixture.controller->playerStateSnapshot().freshness.version == playerSnapshotBeforeShutdown.freshness.version);
   CHECK(fixture.controller->libraryStateSnapshot().version == librarySnapshotBeforeShutdown.version);
+}
+
+TEST_CASE("media controller facade clears constructor-installed sinks when destroyed before start") {
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+  {
+    auto controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                      .scanner = fakeScanner,
+                                                                      .metadata = std::move(metadataService)},
+                                         MediaControllerOptions{.runInlineForTests = true});
+    CHECK(fakeAudio->setEventSinkCalls() == 1U);
+    CHECK(fakeScanner->setEventSinkCalls() == 1U);
+  }
+
+  CHECK(fakeAudio->setEventSinkCalls() == 2U);
+  CHECK(fakeScanner->setEventSinkCalls() == 2U);
+
+  fakeAudio->emit(audioTrackChangedEvent("late-audio", "music/late.flac", 1));
+  fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("late", "music/late.flac")}, 1), 1));
+  CHECK(fakeAudio->emitEventCalls() == 1U);
+  CHECK(fakeScanner->emitEventCalls() == 1U);
 }
 
 TEST_CASE("media controller facade contains subscriber exceptions and updates metadata") {

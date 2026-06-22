@@ -107,15 +107,6 @@ add_library(seriona_metadata STATIC
 )
 
 add_library(seriona_control STATIC
-  src/audio/audio_playback_service.cpp
-  src/audio/buffer/pcm_buffer_queue.cpp
-  src/audio/clock/playback_clock.cpp
-  src/audio/device/audio_output_device.cpp
-  src/audio/device/miniaudio_output_device_backend.cpp
-  src/audio/events/audio_event_dispatcher.cpp
-  src/audio/ffmpeg/ffmpeg_audio_source.cpp
-  src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
-  src/audio/playback_state_machine.cpp
   src/control/control_event_loop.cpp
   src/control/control_state_reducer.cpp
   src/control/media_controller.cpp
@@ -170,8 +161,6 @@ target_link_libraries(seriona_control
   PRIVATE
     seriona_scanner
     seriona_metadata
-    seriona_third_party_headers
-    PkgConfig::SERIONA_FFMPEG
 )
 
 seriona_enable_warnings(seriona_scanner)
