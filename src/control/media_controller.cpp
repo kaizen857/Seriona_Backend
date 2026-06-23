@@ -9,6 +9,7 @@
 
 #include <future>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 
 namespace seriona::control {
@@ -139,7 +140,7 @@ private:
     if (options_.runInlineForTests) {
       auto promise = std::make_shared<std::promise<Result>>();
       auto future = promise->get_future();
-      if (!eventLoop_.post([promise, work = std::move(work)]() mutable { promise->set_value(work()); })) {
+      if (!eventLoop_.post([promise, work = std::move(work)]() mutable { completePromise(*promise, work); })) {
         return stoppedResult();
       }
       eventLoop_.drainForTests();
@@ -148,10 +149,24 @@ private:
 
     auto promise = std::make_shared<std::promise<Result>>();
     auto future = promise->get_future();
-    if (!eventLoop_.post([promise, work = std::move(work)]() mutable { promise->set_value(work()); })) {
+    if (!eventLoop_.post([promise, work = std::move(work)]() mutable { completePromise(*promise, work); })) {
       return stoppedResult();
     }
     return future.get();
+  }
+
+  template <typename Result, typename Work>
+  static void completePromise(std::promise<Result>& promise, Work& work) noexcept {
+    try {
+      if constexpr (std::is_void_v<Result>) {
+        work();
+        promise.set_value();
+      } else {
+        promise.set_value(work());
+      }
+    } catch (...) {
+      promise.set_exception(std::current_exception());
+    }
   }
 
   void installSinks() {

@@ -1,14 +1,18 @@
 #include "control_test_harness.h"
 
+#include "../../src/control/control_event_loop.h"
+
 #include <doctest.h>
 
 #include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <string>
+#include <thread>
 #include <type_traits>
 
 using namespace seriona::control;
@@ -172,6 +176,45 @@ TEST_CASE("subscription handle unsubscribe detaches callback exactly once") {
 
   fakeMetadata.emitCommand(test::makePauseCommand());
   CHECK(commands.count() == 1U);
+}
+
+TEST_CASE("control event loop can be stopped from posted work without terminating on destruction") {
+  ControlEventLoop loop{};
+  std::promise<void> stoppedFromWorker{};
+  const auto finished = stoppedFromWorker.get_future();
+
+  loop.start();
+  const auto posted = loop.post([&] {
+    loop.stop();
+    stoppedFromWorker.set_value();
+  });
+
+  REQUIRE(posted);
+  REQUIRE(finished.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+}
+
+TEST_CASE("control event loop external stop joins work that requested stop from worker") {
+  ControlEventLoop loop{};
+  std::promise<void> workerRequestedStop{};
+  auto stopRequested = workerRequestedStop.get_future();
+  std::promise<void> releaseWorker{};
+  auto releaseSignal = releaseWorker.get_future();
+
+  loop.start();
+  const auto posted = loop.post([&] {
+    loop.stop();
+    workerRequestedStop.set_value();
+    releaseSignal.wait();
+  });
+
+  REQUIRE(posted);
+  REQUIRE(stopRequested.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+
+  auto externalStop = std::async(std::launch::async, [&] { loop.stop(); });
+
+  CHECK(externalStop.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
+  releaseWorker.set_value();
+  CHECK(externalStop.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
 }
 
 TEST_CASE("public control headers avoid platform-only tokens") {

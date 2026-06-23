@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <future>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace seriona::control;
@@ -170,6 +172,15 @@ struct ControllerFixture {
                                                                  .scanner = fakeScanner,
                                                                  .metadata = std::move(metadataService)},
                                      MediaControllerOptions{.runInlineForTests = true});
+  }
+
+  explicit ControllerFixture(MediaControllerOptions options) {
+    auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+    fakeMetadata = metadataService.get();
+    controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                 .scanner = fakeScanner,
+                                                                 .metadata = std::move(metadataService)},
+                                     options);
   }
 };
 
@@ -584,6 +595,22 @@ TEST_CASE("media controller facade contains subscriber exceptions and updates me
   CHECK(fixture.fakeMetadata->updateCalls() >= 1U);
   REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
   CHECK(fixture.fakeMetadata->lastUpdatedState()->controlState.playback.state == PlaybackStatus::Playing);
+}
+
+TEST_CASE("media controller facade completes dispatch future when queued work throws") {
+  ControllerFixture fixture{MediaControllerOptions{.runInlineForTests = false}};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("a", "music/a.flac")}, 20), 1));
+  for (auto attempts = 0; attempts < 100 && !fixture.controller->libraryStateSnapshot().libraryTree.has_value(); ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  fixture.fakeAudio->loadTrackThrows(std::runtime_error{"load failed"});
+
+  auto commandResult = std::async(std::launch::async, [&] { return fixture.controller->submitCommand(command(MediaControlCommandKind::Play)); });
+
+  REQUIRE(commandResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  CHECK_THROWS_WITH_AS(static_cast<void>(commandResult.get()), "load failed", std::runtime_error);
 }
 
 TEST_CASE("media controller facade subscribers receive committed snapshots not raw sink payloads") {

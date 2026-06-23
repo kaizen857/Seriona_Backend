@@ -79,9 +79,15 @@ void ControlEventLoop::stop() noexcept {
   }
   workAvailable_.notify_all();
 
-  if (worker_.joinable() && workerThreadId != std::this_thread::get_id()) {
-    worker_.join();
+  if (!worker_.joinable()) {
+    return;
   }
+
+  if (workerThreadId == std::this_thread::get_id()) {
+    return;
+  }
+
+  worker_.join();
 }
 
 void ControlEventLoop::workerMain() noexcept {

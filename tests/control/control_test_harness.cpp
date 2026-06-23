@@ -54,6 +54,9 @@ void FakeAudioPlaybackService::configureOutput(const audio::AudioOutputConfig& c
 }
 
 void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& request) {
+  if (loadTrackException_) {
+    std::rethrow_exception(loadTrackException_);
+  }
   ++loadTrackCalls_;
   lastLoadedTrack_ = request;
 }
@@ -192,6 +195,14 @@ void FakeAudioPlaybackService::emit(audio::BackendEvent event) {
 
 void FakeAudioPlaybackService::setPlaybackClock(audio::PlaybackClockSnapshot clock) {
   clock_ = std::move(clock);
+}
+
+void FakeAudioPlaybackService::loadTrackThrows(std::exception_ptr exception) noexcept {
+  loadTrackException_ = std::move(exception);
+}
+
+void FakeAudioPlaybackService::loadTrackThrows(std::runtime_error exception) {
+  loadTrackException_ = std::make_exception_ptr(std::move(exception));
 }
 
 void FakeFileScannerService::setEventSink(scanner::ScannerEventSink sink) {

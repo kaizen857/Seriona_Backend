@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <exception>
 #include <optional>
 #include <string>
 #include <utility>
@@ -95,6 +96,8 @@ public:
 
   void emit(audio::BackendEvent event);
   void setPlaybackClock(audio::PlaybackClockSnapshot clock);
+  void loadTrackThrows(std::exception_ptr exception) noexcept;
+  void loadTrackThrows(std::runtime_error exception);
 
 private:
   audio::BackendEventSink eventSink_{};
@@ -119,6 +122,7 @@ private:
   std::optional<float> lastVolume_{};
   std::optional<bool> lastMuted_{};
   std::optional<std::string> lastSelectedOutputDevice_{};
+  std::exception_ptr loadTrackException_{};
 };
 
 class FakeFileScannerService final : public scanner::FileScannerService {
