@@ -107,6 +107,14 @@ void applyGain(void* output,
   }
 }
 
+void fillSilence(void* output, std::uint32_t frameCount, std::uint32_t bytesPerFrame) noexcept {
+  if (output == nullptr || frameCount == 0U || bytesPerFrame == 0U) {
+    return;
+  }
+
+  std::memset(output, 0, static_cast<std::size_t>(frameCount) * bytesPerFrame);
+}
+
 }
 
 AudioOutputDevice::AudioOutputDevice(std::unique_ptr<AudioOutputDeviceBackend> backend)
@@ -143,8 +151,8 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
     return false;
   }
 
-  pcmQueue_ = request.pcmQueue;
   currentFormat_ = backend_->currentFormat();
+  publishCallbackQueue(*request.pcmQueue, currentFormat_);
   callbackCount_.store(0U, std::memory_order_relaxed);
   requestedFrames_.store(0U, std::memory_order_relaxed);
   copiedFrames_.store(0U, std::memory_order_relaxed);
@@ -191,6 +199,7 @@ bool AudioOutputDevice::stop() {
     return false;
   }
 
+  deactivateCallbackQueue();
   started_ = false;
   return true;
 }
@@ -205,8 +214,8 @@ void AudioOutputDevice::uninitialize() noexcept {
     started_ = false;
   }
 
+  deactivateCallbackQueue();
   backend_->uninitialize();
-  pcmQueue_ = nullptr;
   currentFormat_ = {};
   lastError_.reset();
   initialized_ = false;
@@ -231,21 +240,52 @@ void AudioOutputDevice::setMuted(bool muted) noexcept { muted_.store(muted, std:
 
 void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept {
   auto* device = static_cast<AudioOutputDevice*>(userData);
-  if (device == nullptr || device->pcmQueue_ == nullptr) {
+  if (device == nullptr) {
     return;
   }
 
-  const auto result = device->pcmQueue_->read(output, frameCount);
+  auto& state = device->callbackState_;
+  const auto bytesPerFrame = state.bytesPerFrame.load(std::memory_order_acquire);
+  const auto channelCount = state.channelCount.load(std::memory_order_acquire);
+  const auto sampleFormat = state.sampleFormat.load(std::memory_order_acquire);
+  const auto generation = state.queueGeneration.load(std::memory_order_acquire);
+  auto* queue = state.pcmQueue.load(std::memory_order_acquire);
+
+  PcmBufferReadResult result{};
+  result.requestedFrames = frameCount;
+  if (queue != nullptr && state.active.load(std::memory_order_acquire)) {
+    result = queue->readIfGeneration(output, frameCount, generation);
+  } else {
+    result.silenceFrames = frameCount;
+    fillSilence(output, frameCount, bytesPerFrame);
+  }
+
   applyGain(output,
             result.copiedFrames,
-            device->currentFormat_.channelCount,
-            device->currentFormat_.sampleFormat,
+            channelCount,
+            sampleFormat,
             device->volume_.load(std::memory_order_acquire),
             device->muted_.load(std::memory_order_acquire));
   device->callbackCount_.fetch_add(1U, std::memory_order_relaxed);
   device->requestedFrames_.fetch_add(result.requestedFrames, std::memory_order_relaxed);
   device->copiedFrames_.fetch_add(result.copiedFrames, std::memory_order_relaxed);
   device->silenceFrames_.fetch_add(result.silenceFrames, std::memory_order_relaxed);
+}
+
+void AudioOutputDevice::publishCallbackQueue(PcmBufferQueue& queue, const AudioDeviceFormat& format) noexcept {
+  callbackState_.active.store(false, std::memory_order_release);
+  callbackState_.bytesPerFrame.store(bytesPerSample(format.sampleFormat) * format.channelCount, std::memory_order_release);
+  callbackState_.channelCount.store(format.channelCount, std::memory_order_release);
+  callbackState_.sampleFormat.store(format.sampleFormat, std::memory_order_release);
+  callbackState_.queueGeneration.store(queue.generation(), std::memory_order_release);
+  callbackState_.pcmQueue.store(&queue, std::memory_order_release);
+  callbackState_.active.store(true, std::memory_order_release);
+}
+
+void AudioOutputDevice::deactivateCallbackQueue() noexcept {
+  callbackState_.active.store(false, std::memory_order_release);
+  callbackState_.queueGeneration.fetch_add(1U, std::memory_order_acq_rel);
+  callbackState_.pcmQueue.store(nullptr, std::memory_order_release);
 }
 
 AudioOutputDeviceCounters AudioOutputDevice::counters() const noexcept {

@@ -30,6 +30,8 @@ struct PcmBufferReadResult {
   std::uint32_t silenceFrames{0};
 };
 
+using PcmBufferQueueGeneration = std::uint64_t;
+
 class PcmBufferQueue {
 public:
   explicit PcmBufferQueue(PcmBufferQueueConfig config);
@@ -41,9 +43,13 @@ public:
 
   [[nodiscard]] bool write(const void* source, std::uint32_t frameCount) noexcept;
   [[nodiscard]] PcmBufferReadResult read(void* destination, std::uint32_t frameCount) noexcept;
+  [[nodiscard]] PcmBufferReadResult readIfGeneration(void* destination,
+                                                     std::uint32_t frameCount,
+                                                     PcmBufferQueueGeneration generation) noexcept;
   void clearForSeek() noexcept;
   void resetCounters() noexcept;
 
+  [[nodiscard]] PcmBufferQueueGeneration generation() const noexcept;
   [[nodiscard]] std::uint32_t capacityFrames() const noexcept;
   [[nodiscard]] std::uint32_t bytesPerFrame() const noexcept;
   [[nodiscard]] std::uint32_t availableFrames() const noexcept;
@@ -52,6 +58,10 @@ public:
 private:
   [[nodiscard]] std::size_t usedBytes() const noexcept;
   [[nodiscard]] std::size_t capacityBytes() const noexcept;
+  [[nodiscard]] PcmBufferReadResult readReserved(void* destination,
+                                                 std::uint32_t frameCount,
+                                                 std::size_t requestedBytes,
+                                                 std::size_t copiedBytes) noexcept;
   void copyIntoRing(const std::uint8_t* source, std::size_t byteCount) noexcept;
   void copyOutOfRing(std::uint8_t* destination, std::size_t byteCount) noexcept;
 
@@ -70,6 +80,7 @@ private:
   std::atomic<std::uint64_t> silenceFrames_{0};
   std::atomic<std::uint64_t> clearedFrames_{0};
   std::atomic<std::uint64_t> clearCount_{0};
+  std::atomic<PcmBufferQueueGeneration> generation_{1};
 };
 
 }

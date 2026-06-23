@@ -47,11 +47,73 @@ PcmBufferReadResult PcmBufferQueue::read(void* destination, std::uint32_t frameC
 
   const auto availableBytes = usedBytes();
   const auto copiedBytes = std::min(requestedBytes, availableBytes);
+  usedBytes_.fetch_sub(copiedBytes, std::memory_order_release);
+  return readReserved(destination, frameCount, requestedBytes, copiedBytes);
+}
+
+PcmBufferReadResult PcmBufferQueue::readIfGeneration(void* destination,
+                                                     std::uint32_t frameCount,
+                                                     PcmBufferQueueGeneration generation) noexcept {
+  PcmBufferReadResult result{};
+  result.requestedFrames = frameCount;
+
+  const auto requestedBytes = static_cast<std::size_t>(frameCount) * bytesPerFrame_;
+  if (frameCount == 0U) {
+    return result;
+  }
+
+  if (destination == nullptr || bytesPerFrame_ == 0U) {
+    underrunCount_.fetch_add(1U, std::memory_order_relaxed);
+    silenceFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+    result.silenceFrames = frameCount;
+    return result;
+  }
+
+  if (generation != this->generation()) {
+    std::memset(destination, 0, requestedBytes);
+    underrunCount_.fetch_add(1U, std::memory_order_relaxed);
+    silenceFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+    result.silenceFrames = frameCount;
+    return result;
+  }
+
+  auto availableBytes = usedBytes_.load(std::memory_order_acquire);
+  std::size_t copiedBytes = 0;
+  do {
+    if (generation != this->generation()) {
+      std::memset(destination, 0, requestedBytes);
+      underrunCount_.fetch_add(1U, std::memory_order_relaxed);
+      silenceFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+      result.silenceFrames = frameCount;
+      return result;
+    }
+    copiedBytes = std::min(requestedBytes, availableBytes);
+  } while (!usedBytes_.compare_exchange_weak(availableBytes,
+                                            availableBytes - copiedBytes,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire));
+
+  if (generation != this->generation()) {
+    std::memset(destination, 0, requestedBytes);
+    underrunCount_.fetch_add(1U, std::memory_order_relaxed);
+    silenceFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+    result.silenceFrames = frameCount;
+    return result;
+  }
+
+  return readReserved(destination, frameCount, requestedBytes, copiedBytes);
+}
+
+PcmBufferReadResult PcmBufferQueue::readReserved(void* destination,
+                                                 std::uint32_t frameCount,
+                                                 std::size_t requestedBytes,
+                                                 std::size_t copiedBytes) noexcept {
+  PcmBufferReadResult result{};
+  result.requestedFrames = frameCount;
   auto* output = static_cast<std::uint8_t*>(destination);
 
   if (copiedBytes > 0U) {
     copyOutOfRing(output, copiedBytes);
-    usedBytes_.fetch_sub(copiedBytes, std::memory_order_release);
   }
 
   const auto silenceBytes = requestedBytes - copiedBytes;
@@ -68,6 +130,7 @@ PcmBufferReadResult PcmBufferQueue::read(void* destination, std::uint32_t frameC
 }
 
 void PcmBufferQueue::clearForSeek() noexcept {
+  generation_.fetch_add(1U, std::memory_order_acq_rel);
   const auto clearedBytes = usedBytes_.exchange(0U, std::memory_order_acq_rel);
   readOffset_.store(0U, std::memory_order_release);
   writeOffset_.store(0U, std::memory_order_release);
@@ -87,6 +150,10 @@ void PcmBufferQueue::resetCounters() noexcept {
   silenceFrames_.store(0U, std::memory_order_relaxed);
   clearedFrames_.store(0U, std::memory_order_relaxed);
   clearCount_.store(0U, std::memory_order_relaxed);
+}
+
+PcmBufferQueueGeneration PcmBufferQueue::generation() const noexcept {
+  return generation_.load(std::memory_order_acquire);
 }
 
 std::uint32_t PcmBufferQueue::capacityFrames() const noexcept { return capacityFrames_; }

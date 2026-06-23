@@ -122,4 +122,24 @@ TEST_CASE("pcm_buffer_queue clear for seek removes stale pcm and tracks cleared 
   CHECK(counters.clearedFrames == 3U);
 }
 
+TEST_CASE("pcm_buffer_queue read discards pcm when seek generation changes during read") {
+  PcmBufferQueue queue(queueConfig(4));
+  const std::array<StereoFrame, 2> stale{StereoFrame{7, 7, 7, 7}, StereoFrame{8, 8, 8, 8}};
+  std::array<StereoFrame, 2> output{StereoFrame{1, 1, 1, 1}, StereoFrame{1, 1, 1, 1}};
+
+  CHECK(queue.write(stale.data(), static_cast<std::uint32_t>(stale.size())));
+  const auto generation = queue.generation();
+  queue.clearForSeek();
+
+  const auto result = queue.readIfGeneration(output.data(), static_cast<std::uint32_t>(output.size()), generation);
+
+  CHECK(result.requestedFrames == 2U);
+  CHECK(result.copiedFrames == 0U);
+  CHECK(result.silenceFrames == 2U);
+  for (const auto& frame : output) {
+    CHECK(frame == StereoFrame{0, 0, 0, 0});
+  }
+  CHECK(queue.counters().consumedFrames == 0U);
+}
+
 }

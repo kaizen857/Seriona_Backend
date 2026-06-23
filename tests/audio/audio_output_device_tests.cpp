@@ -210,4 +210,51 @@ TEST_CASE("audio_output_device uninitialize stops started device first") {
   CHECK_FALSE(device.started());
 }
 
+TEST_CASE("audio_output_device callback after stop observes inactive generation and fills silence") {
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  AudioOutputDevice device(std::move(backend));
+  PcmBufferQueue queue(queueConfig(4));
+  const std::array<StereoFrame, 2> stale{StereoFrame{9, 9, 9, 9}, StereoFrame{8, 8, 8, 8}};
+  std::array<StereoFrame, 2> output{StereoFrame{1, 1, 1, 1}, StereoFrame{1, 1, 1, 1}};
+
+  CHECK(queue.write(stale.data(), static_cast<std::uint32_t>(stale.size())));
+  CHECK(device.initialize(openRequest(queue)));
+  CHECK(device.start());
+  CHECK(device.stop());
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+
+  for (const auto& frame : output) {
+    CHECK(frame == StereoFrame{0, 0, 0, 0});
+  }
+  const auto counters = device.counters();
+  CHECK(counters.callbackCount == 1U);
+  CHECK(counters.requestedFrames == 2U);
+  CHECK(counters.copiedFrames == 0U);
+  CHECK(counters.silenceFrames == 2U);
+  CHECK(queue.counters().consumedFrames == 0U);
+}
+
+TEST_CASE("audio_output_device callback after uninitialize has no queue lifetime dependency") {
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  AudioOutputDevice device(std::move(backend));
+  std::array<StereoFrame, 1> output{StereoFrame{3, 3, 3, 3}};
+
+  {
+    PcmBufferQueue queue(queueConfig(4));
+    const std::array<StereoFrame, 1> stale{StereoFrame{4, 4, 4, 4}};
+    CHECK(queue.write(stale.data(), static_cast<std::uint32_t>(stale.size())));
+    CHECK(device.initialize(openRequest(queue)));
+    device.uninitialize();
+  }
+
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+
+  CHECK(output[0] == StereoFrame{0, 0, 0, 0});
+  const auto counters = device.counters();
+  CHECK(counters.callbackCount == 1U);
+  CHECK(counters.requestedFrames == 1U);
+  CHECK(counters.copiedFrames == 0U);
+  CHECK(counters.silenceFrames == 1U);
+}
+
 }

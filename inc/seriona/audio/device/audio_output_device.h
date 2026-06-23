@@ -50,6 +50,15 @@ public:
   [[nodiscard]] virtual std::optional<AudioOutputDeviceError> lastError() const { return std::nullopt; }
 };
 
+struct AudioOutputDeviceCallbackState {
+  std::atomic<PcmBufferQueue*> pcmQueue{nullptr};
+  std::atomic<PcmBufferQueueGeneration> queueGeneration{0};
+  std::atomic<std::uint32_t> bytesPerFrame{0};
+  std::atomic<std::uint16_t> channelCount{0};
+  std::atomic<AudioSampleFormat> sampleFormat{AudioSampleFormat::Unknown};
+  std::atomic<bool> active{false};
+};
+
 class AudioOutputDevice {
 public:
   explicit AudioOutputDevice(std::unique_ptr<AudioOutputDeviceBackend> backend = nullptr);
@@ -77,8 +86,11 @@ public:
   [[nodiscard]] AudioOutputDeviceCounters counters() const noexcept;
 
 private:
+  void publishCallbackQueue(PcmBufferQueue& queue, const AudioDeviceFormat& format) noexcept;
+  void deactivateCallbackQueue() noexcept;
+
   std::unique_ptr<AudioOutputDeviceBackend> backend_;
-  PcmBufferQueue* pcmQueue_{nullptr};
+  AudioOutputDeviceCallbackState callbackState_{};
   std::atomic<std::uint64_t> callbackCount_{0};
   std::atomic<std::uint64_t> requestedFrames_{0};
   std::atomic<std::uint64_t> copiedFrames_{0};
