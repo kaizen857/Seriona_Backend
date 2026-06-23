@@ -70,6 +70,8 @@ public:
   [[nodiscard]] bool started() const noexcept;
   [[nodiscard]] AudioDeviceFormat currentFormat() const;
   [[nodiscard]] std::optional<AudioOutputDeviceError> lastError() const;
+  void setVolume(float linearGain) noexcept;
+  void setMuted(bool muted) noexcept;
 
   static void renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept;
   [[nodiscard]] AudioOutputDeviceCounters counters() const noexcept;
@@ -81,6 +83,9 @@ private:
   std::atomic<std::uint64_t> requestedFrames_{0};
   std::atomic<std::uint64_t> copiedFrames_{0};
   std::atomic<std::uint64_t> silenceFrames_{0};
+  std::atomic<float> volume_{1.0F};
+  std::atomic<bool> muted_{false};
+  AudioDeviceFormat currentFormat_{};
   std::optional<AudioOutputDeviceError> lastError_{};
   bool initialized_{false};
   bool started_{false};

@@ -141,6 +141,30 @@ TEST_CASE("audio_output_device callback fills silence on underrun") {
   CHECK(queue.counters().silenceFrames == 3U);
 }
 
+TEST_CASE("audio_output_device callback applies volume and mute without backend calls") {
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioOutputDevice device(std::move(backend));
+  PcmBufferQueue queue(queueConfig(4));
+  const std::array<StereoFrame, 2> input{StereoFrame{100, 0, 200, 0}, StereoFrame{50, 0, 150, 0}};
+  std::array<StereoFrame, 2> output{};
+
+  CHECK(queue.write(input.data(), static_cast<std::uint32_t>(input.size())));
+  CHECK(device.initialize(openRequest(queue)));
+  device.setVolume(0.5F);
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+
+  CHECK(output == std::array<StereoFrame, 2>{StereoFrame{50, 0, 100, 0}, StereoFrame{25, 0, 75, 0}});
+  CHECK(queue.write(input.data(), static_cast<std::uint32_t>(input.size())));
+  device.setMuted(true);
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+  for (const auto& frame : output) {
+    CHECK(frame == StereoFrame{0, 0, 0, 0});
+  }
+  CHECK(fake->startCalls == 0);
+  CHECK(fake->stopCalls == 0);
+}
+
 TEST_CASE("audio_output_device lifecycle runs through fake backend outside callback") {
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   auto* fake = backend.get();
