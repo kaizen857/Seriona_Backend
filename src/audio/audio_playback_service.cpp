@@ -8,17 +8,22 @@
 #include "seriona/audio/playback_state_machine.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace seriona::audio {
 namespace {
+
+constexpr auto kProgressPublishInterval = std::chrono::milliseconds{100};
 
 std::uint32_t bytesPerSample(AudioSampleFormat format) {
   switch (format) {
@@ -102,6 +107,7 @@ public:
   ~SingleTrackAudioPlaybackService() override {
     dispatcher_.clearEventSink();
     stateMachine_.clearEventSink();
+    stopProgressWorker();
     stopDevice();
     device_.uninitialize();
   }
@@ -111,6 +117,8 @@ public:
   void configureOutput(const AudioOutputConfig& config) override { config_ = config; }
 
   void loadTrack(const TrackPlaybackRequest& request) override {
+    stopProgressWorker();
+    std::lock_guard lock{progressMutex_};
     stopDevice();
     device_.uninitialize();
     queue_.reset();
@@ -177,6 +185,7 @@ public:
   }
 
   void prepareNext(const TrackPlaybackRequest& request) override {
+    std::lock_guard lock{progressMutex_};
     preloadSlot_.reset();
 
     PreloadSlot slot{};
@@ -217,6 +226,7 @@ public:
   }
 
   void play() override {
+    std::lock_guard lock{progressMutex_};
     if (!queue_ || !source_ || !pipeline_) {
       fail(PlaybackErrorCode::OpenFailed, "play requires a loaded track", "missing playback pipeline");
       return;
@@ -230,10 +240,13 @@ public:
     }
 
     stateMachine_.play();
+    startProgressWorker();
     publishPosition();
   }
 
   void pause() override {
+    stopProgressWorker();
+    std::lock_guard lock{progressMutex_};
     stopDevice();
     updateClockFromQueue();
     clock_.pause();
@@ -242,6 +255,7 @@ public:
   }
 
   void resume() override {
+    std::lock_guard lock{progressMutex_};
     if (!queue_) {
       fail(PlaybackErrorCode::OpenFailed, "resume requires a loaded track", "missing playback queue");
       return;
@@ -259,10 +273,13 @@ public:
     }
 
     stateMachine_.resume();
+    startProgressWorker();
     publishPosition();
   }
 
   void stop() override {
+    stopProgressWorker();
+    std::lock_guard lock{progressMutex_};
     stopDevice();
     updateClockFromQueue();
     clock_.pause();
@@ -275,6 +292,8 @@ public:
   }
 
   void seek(std::chrono::milliseconds position) override {
+    stopProgressWorker();
+    std::lock_guard lock{progressMutex_};
     if (!source_ || !pipeline_ || !queue_) {
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
       return;
@@ -316,15 +335,16 @@ public:
         failWithDeviceError("failed to restart audio output device after seek", "AudioOutputDeviceBackend::start returned false");
         return;
       }
+      startProgressWorker();
     } else {
       clock_.pause();
     }
     publishPosition();
   }
 
-  void setVolume(float linearGain) override { volume_ = std::clamp(linearGain, 0.0F, 1.0F); }
+  void setVolume(float linearGain) override { device_.setVolume(linearGain); }
 
-  void setMuted(bool muted) override { muted_ = muted; }
+  void setMuted(bool muted) override { device_.setMuted(muted); }
 
   void selectOutputDevice(const std::string& deviceId) override { config_.preferredDeviceId = deviceId; }
 
@@ -647,6 +667,7 @@ private:
   }
 
   void servicePlaybackProgress() {
+    std::lock_guard lock{progressMutex_};
     updateClockFromQueue();
     if (stateMachine_.state() == PlaybackState::Playing && !loadedToEnd_) {
       static_cast<void>(fillQueue());
@@ -667,8 +688,34 @@ private:
       clock_.pause();
       stateMachine_.naturalEnd();
       publishPosition();
+      stopProgressWorkerAsync();
+      return;
+    }
+    publishProgressIfDue();
+  }
+
+  void startProgressWorker() {
+    if (progressWorkerRunning_.load(std::memory_order_acquire)) {
+      return;
+    }
+    stopProgressWorker();
+    progressWorkerRunning_.store(true, std::memory_order_release);
+    progressWorker_ = std::thread{[this] {
+      while (progressWorkerRunning_.load(std::memory_order_acquire)) {
+        servicePlaybackProgress();
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      }
+    }};
+  }
+
+  void stopProgressWorker() {
+    progressWorkerRunning_.store(false, std::memory_order_release);
+    if (progressWorker_.joinable() && progressWorker_.get_id() != std::this_thread::get_id()) {
+      progressWorker_.join();
     }
   }
+
+  void stopProgressWorkerAsync() { progressWorkerRunning_.store(false, std::memory_order_release); }
 
   bool handoffToPreparedNext() {
     if (!preloadSlot_ || !preloadSlot_->ready || !preloadSlot_->seamlessEligible || !queue_ ||
@@ -728,7 +775,28 @@ private:
 
   void publishPosition() {
     updateClockFromQueue();
-    dispatcher_.dispatch(BackendEventType::PlaybackPositionUpdated, PlaybackPositionUpdated{clock_.snapshot()});
+    dispatchPosition(clock_.snapshot());
+  }
+
+  void publishProgressIfDue() {
+    if (stateMachine_.state() != PlaybackState::Playing) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto snapshot = clock_.snapshot();
+    if (lastPublishedPosition_.has_value() && snapshot.position == *lastPublishedPosition_) {
+      return;
+    }
+    if (lastProgressPublish_ != std::chrono::steady_clock::time_point{} && now - lastProgressPublish_ < kProgressPublishInterval) {
+      return;
+    }
+    dispatchPosition(snapshot);
+  }
+
+  void dispatchPosition(const PlaybackClockSnapshot& snapshot) {
+    lastProgressPublish_ = std::chrono::steady_clock::now();
+    lastPublishedPosition_ = snapshot.position;
+    dispatcher_.dispatch(BackendEventType::PlaybackPositionUpdated, PlaybackPositionUpdated{snapshot});
   }
 
   void updateClockFromQueue() {
@@ -755,6 +823,7 @@ private:
   }
 
   void fail(PlaybackErrorCode code, std::string message, std::string detail) {
+    stopProgressWorker();
     stopDevice();
     stateMachine_.fail(code, std::move(message), std::move(detail));
   }
@@ -803,10 +872,13 @@ private:
   FfmpegFilterTargetFormat currentTarget_{};
   std::optional<PendingFrameWrite> pendingFrameWrite_{};
   std::optional<PreloadSlot> preloadSlot_{};
-  float volume_{1.0F};
-  bool muted_{false};
   bool loadedToEnd_{false};
   bool hasCurrentTarget_{false};
+  std::chrono::steady_clock::time_point lastProgressPublish_{};
+  std::optional<std::chrono::milliseconds> lastPublishedPosition_{};
+  std::mutex progressMutex_{};
+  std::atomic<bool> progressWorkerRunning_{false};
+  std::thread progressWorker_{};
 };
 
 std::shared_ptr<AudioPlaybackService> makeAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend) {

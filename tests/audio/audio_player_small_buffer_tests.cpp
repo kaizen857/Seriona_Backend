@@ -11,6 +11,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -108,6 +109,11 @@ public:
     REQUIRE(userData != nullptr);
     callbackBuffer.assign(static_cast<std::size_t>(frames) * format.channelCount * 4U, 0U);
     AudioOutputDevice::renderCallback(userData, callbackBuffer.data(), frames);
+    if (std::any_of(callbackBuffer.begin(), callbackBuffer.end(), [](std::uint8_t value) { return value != 0U; })) {
+      ++nonSilentCallbacks;
+    } else {
+      ++silentCallbacks;
+    }
   }
 
   AudioDeviceFormat format{.deviceId = "small-buffer",
@@ -123,6 +129,8 @@ public:
   int initializeCalls{0};
   int startCalls{0};
   int stopCalls{0};
+  int nonSilentCallbacks{0};
+  int silentCallbacks{0};
   bool started{false};
 };
 
@@ -168,6 +176,64 @@ TEST_CASE("audio_player_small_buffer keeps playback running when decoded frames 
   CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
     return event.type == BackendEventType::PlaybackEnded;
   }));
+}
+
+TEST_CASE("audio_player_small_buffer refills playback without clock polling") {
+  const auto path = writeSineFixture("audio_player_small_buffer_no_poll.wav", kSampleRate);
+  auto backend = std::make_unique<SmallBufferBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+
+  AudioOutputConfig config{};
+  config.targetSampleRate = kSampleRate;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 1;
+  config.bufferDuration = 1ms;
+  player.configureOutput(config);
+
+  player.loadTrack(requestFor(path));
+  player.play();
+  for (int index = 0; index < 80; ++index) {
+    fake->consume(16U);
+    std::this_thread::sleep_for(2ms);
+  }
+
+  const auto clock = player.queryPlaybackClock();
+  CHECK(clock.position > 0ms);
+  CHECK(fake->nonSilentCallbacks > 10);
+  CHECK(fake->started);
+}
+
+TEST_CASE("audio_player_small_buffer publishes progress while playing without clock polling") {
+  const auto path = writeSineFixture("audio_player_small_buffer_progress_events.wav", kSampleRate * 2U);
+  auto backend = std::make_unique<SmallBufferBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  std::vector<BackendEvent> events;
+  player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
+
+  AudioOutputConfig config{};
+  config.targetSampleRate = kSampleRate;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 1;
+  config.bufferDuration = 1ms;
+  player.configureOutput(config);
+
+  player.loadTrack(requestFor(path));
+  player.play();
+  for (int index = 0; index < 120; ++index) {
+    fake->consume(16U);
+    std::this_thread::sleep_for(2ms);
+  }
+
+  std::vector<std::chrono::milliseconds> positions;
+  for (const auto& event : events) {
+    if (event.type == BackendEventType::PlaybackPositionUpdated) {
+      positions.push_back(std::get<PlaybackPositionUpdated>(event.payload).clock.position);
+    }
+  }
+  REQUIRE(positions.size() >= 3U);
+  CHECK(positions.back() > positions.front());
 }
 
 TEST_CASE("audio_player_small_buffer drains pending tail before playback ended") {
