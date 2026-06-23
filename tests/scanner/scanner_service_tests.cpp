@@ -6,13 +6,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -23,11 +26,32 @@ class FakeServiceMetadataReader final : public TagMetadataReader {
 public:
   void put(std::filesystem::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
   void fail(std::filesystem::path path, std::string message) { failures_[std::move(path)] = std::move(message); }
+  void blockUntilReleased() noexcept { blockReads_ = true; }
+  void release() {
+    {
+      std::lock_guard lock{mutex_};
+      released_ = true;
+    }
+    changed_.notify_all();
+  }
+  [[nodiscard]] bool waitForBlockedRead(std::chrono::milliseconds timeout) {
+    std::unique_lock lock{mutex_};
+    return changed_.wait_for(lock, timeout, [this] { return blocked_; });
+  }
 
   [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
                                     const std::filesystem::path& coverExportDir) override {
-    requestedPaths.push_back(path);
-    requestedCoverDirs.push_back(coverExportDir);
+    {
+      std::lock_guard lock{mutex_};
+      requestedPaths.push_back(path);
+      requestedCoverDirs.push_back(coverExportDir);
+    }
+    if (blockReads_) {
+      std::unique_lock lock{mutex_};
+      blocked_ = true;
+      changed_.notify_all();
+      changed_.wait(lock, [this] { return released_; });
+    }
     const auto failure = failures_.find(path);
     if (failure != failures_.end()) {
       throw std::runtime_error(failure->second);
@@ -41,7 +65,10 @@ public:
     return metadata;
   }
 
-  [[nodiscard]] std::size_t readCount() const noexcept { return requestedPaths.size(); }
+  [[nodiscard]] std::size_t readCount() const {
+    std::lock_guard lock{mutex_};
+    return requestedPaths.size();
+  }
 
   std::vector<std::filesystem::path> requestedPaths;
   std::vector<std::filesystem::path> requestedCoverDirs;
@@ -49,6 +76,11 @@ public:
 private:
   std::map<std::filesystem::path, RawTagMetadata> metadataByPath_;
   std::map<std::filesystem::path, std::string> failures_;
+  mutable std::mutex mutex_;
+  std::condition_variable changed_;
+  bool blockReads_{false};
+  bool blocked_{false};
+  bool released_{false};
 };
 
 [[nodiscard]] RawTagMetadata rawMetadata(std::string title, std::vector<RawTagLyricLine> lyrics = {}) {
@@ -88,6 +120,30 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   return songs;
 }
 
+template <typename Predicate>
+[[nodiscard]] PlaylistTreeSnapshot waitForSnapshot(const FileScannerService& service, Predicate predicate) {
+  for (auto attempts = 0; attempts < 100; ++attempts) {
+    auto snapshot = service.snapshot();
+    if (predicate(snapshot)) {
+      return snapshot;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return service.snapshot();
+}
+
+[[nodiscard]] PlaylistTreeSnapshot waitForSongs(const FileScannerService& service, std::size_t expectedCount) {
+  return waitForSnapshot(service, [expectedCount](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == expectedCount;
+  });
+}
+
+void waitForReaderCount(const FakeServiceMetadataReader& reader, std::size_t expectedCount) {
+  for (auto attempts = 0; attempts < 100 && reader.readCount() != expectedCount; ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+}
+
 [[nodiscard]] std::vector<ScannerError> errorsFrom(const std::vector<ScannerEvent>& events) {
   std::vector<ScannerError> errors;
   for (const auto& event : events) {
@@ -116,6 +172,37 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   return *iterator;
 }
 
+class ScannerEventLog {
+public:
+  void push(ScannerEvent event) {
+    std::lock_guard lock{mutex_};
+    events_.push_back(std::move(event));
+  }
+
+  [[nodiscard]] std::vector<ScannerError> errors() const {
+    std::lock_guard lock{mutex_};
+    return errorsFrom(events_);
+  }
+
+  [[nodiscard]] bool waitForEvent(ScannerEventType type, std::chrono::milliseconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      {
+        std::lock_guard lock{mutex_};
+        if (std::ranges::any_of(events_, [type](const ScannerEvent& event) { return event.type == type; })) {
+          return true;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return false;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::vector<ScannerEvent> events_;
+};
+
 TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged rereads") {
   test::TempScannerRoot temp{"scanner-service-cache-hit"};
   const auto first = test::writeAudioFixture(temp.path(), "song.flac");
@@ -127,7 +214,7 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   auto service = makeService(temp, reader);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  const auto firstSnapshot = service->snapshot();
+  const auto firstSnapshot = waitForSongs(*service, 2U);
   const auto firstSongs = songsIn(firstSnapshot);
 
   REQUIRE(firstSongs.size() == 2U);
@@ -138,7 +225,7 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   CHECK(firstSongs[1].effectiveLyrics[0].text == "external one");
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  const auto cachedSongs = songsIn(service->snapshot());
+  const auto cachedSongs = songsIn(waitForSongs(*service, 2U));
 
   REQUIRE(cachedSongs.size() == 2U);
   CHECK(reader->readCount() == 2U);
@@ -154,11 +241,15 @@ TEST_CASE("scanner service rereads changed audio and reparses only changed lrc")
   reader->put(audio, rawMetadata("Before", {RawTagLyricLine{std::chrono::milliseconds{300}, "embedded before"}}));
   auto service = makeService(temp, reader);
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForReaderCount(*reader, 1U);
   CHECK(reader->readCount() == 1U);
 
   writeText(temp.path() / "song.lrc", "[00:02.00]external two\n");
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  auto songs = songsIn(service->snapshot());
+  auto songs = songsIn(waitForSnapshot(*service, [](const PlaylistTreeSnapshot& snapshot) {
+    const auto currentSongs = songsIn(snapshot);
+    return currentSongs.size() == 1U && !currentSongs[0].effectiveLyrics.empty() && currentSongs[0].effectiveLyrics[0].text == "external two";
+  }));
 
   CHECK(reader->readCount() == 1U);
   REQUIRE(songs.size() == 1U);
@@ -169,7 +260,8 @@ TEST_CASE("scanner service rereads changed audio and reparses only changed lrc")
   writeText(audio, "changed audio bytes");
   reader->put(audio, rawMetadata("After", {RawTagLyricLine{std::chrono::milliseconds{400}, "embedded after"}}));
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  songs = songsIn(service->snapshot());
+  waitForReaderCount(*reader, 2U);
+  songs = songsIn(waitForSongs(*service, 1U));
 
   CHECK(reader->readCount() == 2U);
   REQUIRE(songs.size() == 1U);
@@ -189,12 +281,17 @@ TEST_CASE("scanner service handles new and deleted lrc without tagreader and pru
   reader->put(deletedAudio, rawMetadata("Deleted"));
   auto service = makeService(temp, reader);
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForReaderCount(*reader, 3U);
   CHECK(reader->readCount() == 3U);
 
   writeText(temp.path() / "embedded.lrc", "[00:01.00]external embedded\n");
   writeText(temp.path() / "plain.lrc", "[00:01.00]external plain\n");
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  auto songs = songsIn(service->snapshot());
+  auto songs = songsIn(waitForSnapshot(*service, [&embeddedAudio, &plainAudio](const PlaylistTreeSnapshot& snapshot) {
+    const auto currentSongs = songsIn(snapshot);
+    return currentSongs.size() == 3U && songByPath(currentSongs, embeddedAudio).effectiveLyricsSource == LyricsSource::ExternalLrc &&
+           songByPath(currentSongs, plainAudio).effectiveLyricsSource == LyricsSource::ExternalLrc;
+  }));
 
   CHECK(reader->readCount() == 3U);
   REQUIRE(songs.size() == 3U);
@@ -205,7 +302,8 @@ TEST_CASE("scanner service handles new and deleted lrc without tagreader and pru
   std::filesystem::remove(temp.path() / "plain.lrc");
   std::filesystem::remove(deletedAudio);
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  songs = songsIn(service->snapshot());
+  waitForReaderCount(*reader, 3U);
+  songs = songsIn(waitForSongs(*service, 2U));
 
   CHECK(reader->readCount() == 3U);
   REQUIRE(songs.size() == 2U);
@@ -227,7 +325,8 @@ TEST_CASE("scanner service supports single file roots with same basename lrc") {
   auto service = makeService(temp, reader);
 
   service->scan({ScannerRoot{.path = audio}}, ScanMode::Full);
-  const auto songs = songsIn(service->snapshot());
+  const auto snapshot = waitForSongs(*service, 1U);
+  const auto songs = songsIn(snapshot);
 
   CHECK(reader->readCount() == 1U);
   REQUIRE(songs.size() == 1U);
@@ -235,7 +334,6 @@ TEST_CASE("scanner service supports single file roots with same basename lrc") {
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(songs[0].effectiveLyrics[0].text == "single external");
 
-  const auto snapshot = service->snapshot();
   CHECK(snapshot.nodes.size() == 2U);
   CHECK(nodeById(snapshot, "track:single.flac").parentNodeId == snapshot.rootNodeId);
 }
@@ -249,7 +347,7 @@ TEST_CASE("scanner service publishes nested directory hierarchy for directory ro
   auto service = makeService(temp, reader);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  const auto snapshot = service->snapshot();
+  const auto snapshot = waitForSongs(*service, 1U);
   const auto songs = songsIn(snapshot);
 
   REQUIRE(songs.size() == 1U);
@@ -277,12 +375,12 @@ TEST_CASE("scanner service records failures malformed lrc cancellation and prese
   reader->put(good, rawMetadata("Good", {RawTagLyricLine{std::chrono::milliseconds{100}, "embedded good"}}));
   reader->fail(broken, "broken metadata");
   auto service = makeService(temp, reader);
-  std::vector<ScannerEvent> events;
-  service->setEventSink([&events](ScannerEvent event) { events.push_back(std::move(event)); });
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  auto songs = songsIn(service->snapshot());
-  auto errors = errorsFrom(events);
+  auto songs = songsIn(waitForSongs(*service, 1U));
+  auto errors = eventLog.errors();
 
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].title == "Good");
@@ -294,11 +392,41 @@ TEST_CASE("scanner service records failures malformed lrc cancellation and prese
   service->stop();
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   songs = songsIn(service->snapshot());
-  errors = errorsFrom(events);
+  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanStopped, std::chrono::seconds{1}));
+  errors = eventLog.errors();
 
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].title == "Good");
   CHECK(std::ranges::any_of(errors, [](const ScannerError& error) { return error.code == ScannerErrorCode::Cancelled; }));
+}
+
+TEST_CASE("scanner service returns from scan while scanner worker performs slow metadata reads") {
+  test::TempScannerRoot temp{"scanner-service-async-scan"};
+  const auto audio = test::writeAudioFixture(temp.path(), "slow.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Slow"));
+  reader->blockUntilReleased();
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto before = std::chrono::steady_clock::now();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  const auto elapsed = std::chrono::steady_clock::now() - before;
+
+  CHECK(elapsed < std::chrono::milliseconds{50});
+  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  CHECK(service->snapshot().nodes.empty());
+
+  reader->release();
+  for (auto attempts = 0; attempts < 100 && service->snapshot().nodes.empty(); ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].title == "Slow");
+  CHECK(eventLog.waitForEvent(ScannerEventType::ScanCompleted, std::chrono::seconds{1}));
 }
 
 }

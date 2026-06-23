@@ -88,11 +88,13 @@ public:
   }
 
   MediaControllerCommandResult scanLibrary(std::vector<scanner::ScannerRoot> roots, scanner::ScanMode mode) {
-    return dispatch<MediaControllerCommandResult>([this, roots = std::move(roots), mode]() mutable {
-      dependencies_.scanner->scan(roots, mode);
-      dependencies_.scanner->startWatching(roots);
-      return MediaControllerCommandResult{.accepted = true, .code = MediaControllerErrorCode::None, .message = {}};
-    });
+    if (!isRunning()) {
+      return stoppedResult();
+    }
+
+    dependencies_.scanner->scan(roots, mode);
+    dependencies_.scanner->startWatching(roots);
+    return MediaControllerCommandResult{.accepted = true, .code = MediaControllerErrorCode::None, .message = {}};
   }
 
   SubscriptionHandle subscribePlayerState(PlayerStateSnapshotCallback callback) {

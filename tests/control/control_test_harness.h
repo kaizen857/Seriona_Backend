@@ -6,10 +6,12 @@
 #include "seriona/scanner/scanner_contracts.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <exception>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -150,10 +152,17 @@ public:
 
   void emit(scanner::ScannerEvent event);
   void setSnapshot(scanner::PlaylistTreeSnapshot snapshot);
+  void blockScansUntilReleased() noexcept;
+  void releaseBlockedScans();
+  [[nodiscard]] bool waitForBlockedScan(std::chrono::milliseconds timeout);
 
 private:
+  void waitIfScanBlocked();
+
   scanner::ScannerEventSink eventSink_{};
   scanner::PlaylistTreeSnapshot snapshot_{};
+  std::mutex scanBlockMutex_{};
+  std::condition_variable scanBlockChanged_{};
   std::size_t setEventSinkCalls_{0};
   std::size_t configureCalls_{0};
   std::size_t scanCalls_{0};
@@ -165,6 +174,9 @@ private:
   std::optional<std::vector<scanner::ScannerRoot>> lastScannedRoots_{};
   std::optional<scanner::ScanMode> lastScanMode_{};
   std::optional<std::vector<scanner::ScannerRoot>> lastWatchingRoots_{};
+  bool blockScans_{false};
+  bool scanBlocked_{false};
+  bool releaseScans_{false};
 };
 
 class FakeMetadataSharingService final : public metadata::MetadataSharingService {

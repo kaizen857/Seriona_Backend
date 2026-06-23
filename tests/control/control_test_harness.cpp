@@ -219,6 +219,7 @@ void FakeFileScannerService::scan(const std::vector<scanner::ScannerRoot>& roots
   ++scanCalls_;
   lastScannedRoots_ = roots;
   lastScanMode_ = mode;
+  waitIfScanBlocked();
 }
 
 void FakeFileScannerService::startWatching(const std::vector<scanner::ScannerRoot>& roots) {
@@ -291,6 +292,34 @@ void FakeFileScannerService::emit(scanner::ScannerEvent event) {
 
 void FakeFileScannerService::setSnapshot(scanner::PlaylistTreeSnapshot snapshot) {
   snapshot_ = std::move(snapshot);
+}
+
+void FakeFileScannerService::blockScansUntilReleased() noexcept {
+  blockScans_ = true;
+}
+
+void FakeFileScannerService::releaseBlockedScans() {
+  {
+    std::lock_guard lock{scanBlockMutex_};
+    releaseScans_ = true;
+  }
+  scanBlockChanged_.notify_all();
+}
+
+bool FakeFileScannerService::waitForBlockedScan(std::chrono::milliseconds timeout) {
+  std::unique_lock lock{scanBlockMutex_};
+  return scanBlockChanged_.wait_for(lock, timeout, [this] { return scanBlocked_; });
+}
+
+void FakeFileScannerService::waitIfScanBlocked() {
+  if (!blockScans_) {
+    return;
+  }
+
+  std::unique_lock lock{scanBlockMutex_};
+  scanBlocked_ = true;
+  scanBlockChanged_.notify_all();
+  scanBlockChanged_.wait(lock, [this] { return releaseScans_; });
 }
 
 metadata::MetadataBackendKind FakeMetadataSharingService::backendKind() const {

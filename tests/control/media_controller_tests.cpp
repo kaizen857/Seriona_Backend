@@ -125,6 +125,18 @@ audio::BackendEvent audioTrackChangedEvent(std::string id, std::string path, std
                              .payload = audio::TrackChanged{.request = std::move(request)}};
 }
 
+audio::BackendEvent audioPositionUpdatedEvent(std::string id, std::chrono::milliseconds position, std::uint64_t version) {
+  return audio::BackendEvent{.type = audio::BackendEventType::PlaybackPositionUpdated,
+                             .sourceModule = audio::BackendSourceModule::AudioPlaybackService,
+                             .monotonicVersion = version,
+                             .timestamp = {},
+                             .payload = audio::PlaybackPositionUpdated{.clock = audio::PlaybackClockSnapshot{.trackId = std::move(id),
+                                                                                                               .position = position,
+                                                                                                               .sampledAt = {},
+                                                                                                               .version = version,
+                                                                                                               .continuous = true}}};
+}
+
 audio::BackendEvent audioPlaybackEndedEvent(std::string id, std::string path, std::uint64_t version,
                                             std::chrono::milliseconds position = std::chrono::milliseconds{3000}) {
   auto request = audio::TrackPlaybackRequest{.trackId = std::move(id),
@@ -385,6 +397,47 @@ TEST_CASE("media controller facade scans library and publishes committed library
   CHECK(librarySnapshots.last().version == 33U);
   REQUIRE(librarySnapshots.last().libraryTree.has_value());
   CHECK(librarySnapshots.last().libraryTree->version == 33U);
+}
+
+TEST_CASE("media controller facade does not run scanner work on the control executor") {
+  ControllerFixture fixture{MediaControllerOptions{.runInlineForTests = false}};
+  fixture.fakeScanner->blockScansUntilReleased();
+  fixture.controller->start();
+  installLibrary(fixture);
+  for (auto attempts = 0; attempts < 100 && !fixture.controller->libraryStateSnapshot().libraryTree.has_value(); ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+  for (auto attempts = 0; attempts < 100 && fixture.fakeAudio->playCalls() == 0U; ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  REQUIRE(fixture.fakeAudio->playCalls() == 1U);
+
+  const std::vector<scanner::ScannerRoot> roots{{.path = std::filesystem::path{"music"}, .recursive = true}};
+  auto scanResult = std::async(std::launch::async, [&] {
+    return fixture.controller->scanLibrary(roots, scanner::ScanMode::Full);
+  });
+  REQUIRE(fixture.fakeScanner->waitForBlockedScan(std::chrono::seconds{1}));
+
+  fixture.fakeAudio->emit(audioPositionUpdatedEvent("a", std::chrono::milliseconds{1250}, 8));
+  auto pauseResult = std::async(std::launch::async, [&] {
+    return fixture.controller->submitCommand(command(MediaControlCommandKind::Pause));
+  });
+
+  REQUIRE(scanResult.wait_for(std::chrono::seconds{1}) == std::future_status::timeout);
+  REQUIRE(pauseResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  CHECK(pauseResult.get().accepted);
+  for (auto attempts = 0; attempts < 100 && fixture.controller->playerStateSnapshot().timeline.position != std::chrono::milliseconds{1250}; ++attempts) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  CHECK(fixture.fakeAudio->pauseCalls() == 1U);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
+  CHECK(fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{1250});
+
+  fixture.fakeScanner->releaseBlockedScans();
+  REQUIRE(scanResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  CHECK(scanResult.get().accepted);
 }
 
 TEST_CASE("media controller facade exposes first scanned track while stopped") {

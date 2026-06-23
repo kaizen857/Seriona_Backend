@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <mutex>
@@ -241,7 +242,10 @@ public:
     }
   }
 
-  ~OrchestratedFileScannerService() override { stopWatching(); }
+  ~OrchestratedFileScannerService() override {
+    stopWatching();
+    stopScanWorker();
+  }
 
   void setEventSink(ScannerEventSink sink) override {
     std::scoped_lock lock{mutex_};
@@ -253,7 +257,30 @@ public:
     config_ = config;
   }
 
-  void scan(const std::vector<ScannerRoot>& roots, ScanMode) override {
+  void scan(const std::vector<ScannerRoot>& roots, ScanMode mode) override {
+    bool submitted = false;
+    {
+      std::lock_guard lock{scanQueueMutex_};
+      if (!scanWorkerStopping_ && scanQueue_.size() < 16U) {
+        scanQueue_.push_back(ScanRequest{.roots = roots, .mode = mode});
+        submitted = true;
+      }
+    }
+    scanQueueChanged_.notify_one();
+    if (!submitted) {
+      ScannerEventSink sink;
+      {
+        std::scoped_lock lock{mutex_};
+        sink = sink_;
+      }
+      publishEvent(sink, ScannerEventType::ScanError, ++eventVersion_, ScannerError{.code = ScannerErrorCode::CacheUnavailable,
+                                                                                     .message = "scanner scan queue is full",
+                                                                                     .detail = {},
+                                                                                     .path = std::nullopt});
+    }
+  }
+
+  void runScan(const std::vector<ScannerRoot>& roots, ScanMode) {
     std::lock_guard scanLock{scanMutex_};
     ScannerConfig config;
     ScannerEventSink sink;
@@ -575,6 +602,40 @@ private:
     }
   }
 
+  struct ScanRequest {
+    std::vector<ScannerRoot> roots;
+    ScanMode mode{ScanMode::Incremental};
+  };
+
+  void scanWorkerLoop() {
+    while (true) {
+      ScanRequest request;
+      {
+        std::unique_lock lock{scanQueueMutex_};
+        scanQueueChanged_.wait(lock, [this] { return scanWorkerStopping_ || !scanQueue_.empty(); });
+        if (scanWorkerStopping_ && scanQueue_.empty()) {
+          return;
+        }
+        request = std::move(scanQueue_.front());
+        scanQueue_.pop_front();
+      }
+      runScan(request.roots, request.mode);
+    }
+  }
+
+  void stopScanWorker() {
+    {
+      std::lock_guard lock{scanQueueMutex_};
+      scanWorkerStopping_ = true;
+      scanQueue_.clear();
+    }
+    cancellationRequested_.store(true);
+    scanQueueChanged_.notify_all();
+    if (scanWorker_.joinable()) {
+      scanWorker_.join();
+    }
+  }
+
   ScannerEventSink sink_{};
   ScannerConfig config_{};
   std::shared_ptr<TagMetadataReader> metadataReader_;
@@ -585,12 +646,17 @@ private:
   PlaylistTreeSnapshot snapshot_{};
   mutable std::mutex mutex_;
   std::mutex scanMutex_;
+  std::mutex scanQueueMutex_;
   std::mutex watcherMutex_;
+  std::condition_variable scanQueueChanged_;
+  std::deque<ScanRequest> scanQueue_;
   std::vector<std::unique_ptr<FolderWatcher>> watchers_;
   std::shared_ptr<WatchRuntimeState> watcherState_;
+  std::thread scanWorker_{[this] { scanWorkerLoop(); }};
   std::thread debounceThread_;
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
+  bool scanWorkerStopping_{false};
 };
 
 }
