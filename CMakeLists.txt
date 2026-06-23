@@ -32,6 +32,29 @@ target_include_directories(seriona_watcher_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/watcher/include>
 )
 
+add_library(seriona_audio STATIC
+  src/audio/audio_playback_service.cpp
+  src/audio/buffer/pcm_buffer_queue.cpp
+  src/audio/clock/playback_clock.cpp
+  src/audio/device/audio_output_device.cpp
+  src/audio/device/miniaudio_output_device_backend.cpp
+  src/audio/events/audio_event_dispatcher.cpp
+  src/audio/ffmpeg/ffmpeg_audio_source.cpp
+  src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
+  src/audio/playback_state_machine.cpp
+)
+
+target_include_directories(seriona_audio
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+)
+
+target_link_libraries(seriona_audio
+  PUBLIC
+    seriona_third_party_headers
+    PkgConfig::SERIONA_FFMPEG
+)
+
 function(seriona_enable_warnings target_name)
   if(MSVC)
     target_compile_options(${target_name} PRIVATE /W4 /permissive-)
@@ -159,10 +182,12 @@ target_link_libraries(seriona_scanner
 
 target_link_libraries(seriona_control
   PRIVATE
+    seriona_audio
     seriona_scanner
     seriona_metadata
 )
 
+seriona_enable_warnings(seriona_audio)
 seriona_enable_warnings(seriona_scanner)
 seriona_enable_warnings(seriona_metadata)
 seriona_enable_warnings(seriona_control)
