@@ -22,7 +22,7 @@ public:
   [[nodiscard]] control::SubscriptionHandle registerCommandCallback(control::MediaControlCommandSink callback) override {
     adapter_.setCommandSink(std::move(callback));
     auto commandSinkState = adapter_.commandSinkState();
-    return control::SubscriptionHandle{1U, [commandSinkState]() { commandSinkState->sink = std::nullopt; }};
+    return control::SubscriptionHandle{1U, [commandSinkState]() { commandSinkState->clear(); }};
   }
   [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state) override { return adapter_.start(state); }
   [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state) override { return adapter_.update(state); }

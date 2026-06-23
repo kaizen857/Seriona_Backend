@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -51,7 +52,13 @@ struct MprisSnapshotRecord {
 };
 
 struct CommandSinkState {
-  std::optional<control::MediaControlCommandSink> sink{};
+  void set(control::MediaControlCommandSink sink);
+  void clear();
+  [[nodiscard]] std::optional<control::MediaControlCommandSink> snapshot() const;
+
+private:
+  mutable std::mutex mutex_{};
+  std::optional<control::MediaControlCommandSink> sink_{};
 };
 
 class IMprisObject {
@@ -94,7 +101,8 @@ private:
 
   void ensureStarted();
   void configureCommandModel();
-  void publishCurrentSnapshot();
+  void publishCurrentSnapshot(const PlatformMediaState& state);
+  [[nodiscard]] std::optional<PlatformMediaState> currentStateSnapshot() const;
   [[nodiscard]] bool dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position = std::nullopt);
   [[nodiscard]] bool dispatchSeekBy(std::chrono::microseconds delta);
   [[nodiscard]] bool dispatchSetVolume(float volume);
@@ -104,6 +112,7 @@ private:
   std::unique_ptr<IMprisBus> bus_{};
   std::unique_ptr<IMprisObject> object_{};
   std::shared_ptr<CommandSinkState> commandSinkState_{std::make_shared<CommandSinkState>()};
+  mutable std::mutex stateMutex_{};
   std::optional<PlatformMediaState> currentState_{};
   std::optional<MprisSnapshotRecord> lastPublishedSnapshot_{};
   bool started_{false};

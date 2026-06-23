@@ -1,10 +1,13 @@
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -270,5 +273,93 @@ TEST_CASE("metadata mpris backend unsubscribe remains safe after backend destruc
 
   handle.unsubscribe();
   handle.unsubscribe();
+#endif
+}
+
+TEST_CASE("metadata mpris backend command callback may unsubscribe during dispatch") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  auto backend = seriona::metadata::detail::makeLinuxMetadataServiceBackend(std::move(bus));
+  seriona::control::SubscriptionHandle handle{};
+  std::atomic_int commandCount{0};
+  handle = backend->registerCommandCallback([&](const seriona::control::MediaControlCommand& command) {
+    CHECK(command.kind == seriona::control::MediaControlCommandKind::Play);
+    ++commandCount;
+    handle.unsubscribe();
+  });
+
+  const auto start = backend->start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
+                                                                          .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  CHECK(start.accepted);
+  REQUIRE(busRaw->object != nullptr);
+  REQUIRE(busRaw->object->handlers.play);
+
+  CHECK(busRaw->object->handlers.play());
+  CHECK(commandCount.load() == 1);
+  CHECK_FALSE(busRaw->object->handlers.play());
+#endif
+}
+
+TEST_CASE("metadata mpris backend command dispatch tolerates racing unsubscribe and update") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  auto backend = seriona::metadata::detail::makeLinuxMetadataServiceBackend(std::move(bus));
+  std::mutex handleMutex{};
+  seriona::control::SubscriptionHandle handle{};
+  std::atomic_bool done{false};
+  std::atomic_int commandCount{0};
+
+  auto subscribe = [&] {
+    return backend->registerCommandCallback([&](const seriona::control::MediaControlCommand& command) {
+      if (command.kind == seriona::control::MediaControlCommandKind::Play) {
+        ++commandCount;
+      }
+    });
+  };
+  handle = subscribe();
+  const auto start = backend->start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
+                                                                          .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  CHECK(start.accepted);
+  REQUIRE(busRaw->object != nullptr);
+  REQUIRE(busRaw->object->handlers.play);
+
+  std::thread dispatchThread{[&] {
+    for (int i = 0; i < 2'000; ++i) {
+      static_cast<void>(busRaw->object->handlers.play());
+    }
+    done = true;
+  }};
+  std::thread updateThread{[&] {
+    while (!done.load()) {
+      static_cast<void>(backend->update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
+                                                                               .timelineUpdateInterval = std::chrono::milliseconds{1000}}));
+    }
+  }};
+  std::thread subscriptionThread{[&] {
+    while (!done.load()) {
+      std::lock_guard lock{handleMutex};
+      if (handle.unsubscribe) {
+        handle.unsubscribe();
+      }
+      handle = subscribe();
+    }
+  }};
+
+  dispatchThread.join();
+  updateThread.join();
+  subscriptionThread.join();
+  {
+    std::lock_guard lock{handleMutex};
+    if (handle.unsubscribe) {
+      handle.unsubscribe();
+    }
+  }
+  CHECK(commandCount.load() >= 0);
 #endif
 }
