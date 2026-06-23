@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 
 namespace seriona::audio {
 
@@ -26,6 +27,7 @@ private:
   [[nodiscard]] BackendEvent prepare(BackendEventType type, PlaybackEvent payload);
   [[nodiscard]] BackendEvent prepare(BackendEvent event);
 
+  mutable std::mutex mutex_{};
   BackendEventSink sink_{};
   BackendSourceModule sourceModule_{BackendSourceModule::AudioPlaybackService};
   std::uint64_t eventVersion_{0};

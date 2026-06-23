@@ -105,9 +105,9 @@ public:
   }
 
   ~SingleTrackAudioPlaybackService() override {
+    stopProgressWorker();
     dispatcher_.clearEventSink();
     stateMachine_.clearEventSink();
-    stopProgressWorker();
     stopDevice();
     device_.uninitialize();
   }

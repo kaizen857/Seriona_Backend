@@ -4,14 +4,18 @@
 #include <doctest.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -273,6 +277,61 @@ TEST_CASE("audio_shutdown_lifecycle clear sink blocks events through stop and de
   }
 
   CHECK(recorder->stopCalls >= 1);
+  CHECK(recorder->uninitializeCalls == 1);
+  CHECK(recorder->backendDestroyed);
+}
+
+TEST_CASE("audio_shutdown_lifecycle waits for progress worker before clearing sinks") {
+  const auto recorder = std::make_shared<LifecycleRecorder>();
+  auto backend = std::make_unique<LifecycleAudioOutputDeviceBackend>(recorder);
+  auto* fake = backend.get();
+
+  std::mutex mutex;
+  std::condition_variable sinkEntered;
+  std::condition_variable releaseSink;
+  bool progressSinkEntered = false;
+  bool allowSinkReturn = false;
+  bool destructorReturned = false;
+  std::atomic<bool> armProgressSink{false};
+
+  auto player = std::make_unique<AudioPlayer>(makeAudioPlaybackService(std::move(backend)));
+  player->setEventSink([&](BackendEvent event) {
+    if (!armProgressSink.load(std::memory_order_acquire) || event.type != BackendEventType::PlaybackPositionUpdated) {
+      return;
+    }
+
+    std::unique_lock lock{mutex};
+    progressSinkEntered = true;
+    sinkEntered.notify_one();
+    releaseSink.wait(lock, [&] { return allowSinkReturn; });
+  });
+  player->configureOutput(outputConfig());
+  player->loadTrack(request(sineFixture("audio_shutdown_lifecycle_progress_before_sink_clear.wav", kSampleRate), "progress-clear"));
+  player->play();
+  armProgressSink.store(true, std::memory_order_release);
+  fake->consumeFrames(1024U);
+
+  {
+    std::unique_lock lock{mutex};
+    REQUIRE(sinkEntered.wait_for(lock, 2s, [&] { return progressSinkEntered; }));
+  }
+
+  std::thread destroyer{[&] {
+    player.reset();
+    std::lock_guard lock{mutex};
+    destructorReturned = true;
+  }};
+
+  {
+    std::unique_lock lock{mutex};
+    CHECK_FALSE(releaseSink.wait_for(lock, 25ms, [&] { return destructorReturned; }));
+    allowSinkReturn = true;
+  }
+  releaseSink.notify_one();
+  destroyer.join();
+
+  CHECK(destructorReturned);
+  CHECK(recorder->stopCalls == 1);
   CHECK(recorder->uninitializeCalls == 1);
   CHECK(recorder->backendDestroyed);
 }

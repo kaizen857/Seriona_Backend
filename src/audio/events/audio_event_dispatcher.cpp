@@ -1,5 +1,6 @@
 #include "seriona/audio/events/audio_event_dispatcher.h"
 
+#include <mutex>
 #include <utility>
 
 namespace seriona::audio {
@@ -7,31 +8,56 @@ namespace seriona::audio {
 AudioEventDispatcher::AudioEventDispatcher(BackendSourceModule sourceModule)
     : sourceModule_(sourceModule) {}
 
-void AudioEventDispatcher::setEventSink(BackendEventSink sink) { sink_ = std::move(sink); }
+void AudioEventDispatcher::setEventSink(BackendEventSink sink) {
+  std::lock_guard lock{mutex_};
+  sink_ = std::move(sink);
+}
 
-void AudioEventDispatcher::clearEventSink() { sink_ = {}; }
+void AudioEventDispatcher::clearEventSink() {
+  std::lock_guard lock{mutex_};
+  sink_ = {};
+}
 
 void AudioEventDispatcher::shutdown() { clearEventSink(); }
 
 void AudioEventDispatcher::dispatch(BackendEventType type, PlaybackEvent payload) {
-  if (!sink_) {
-    return;
+  BackendEventSink sink;
+  BackendEvent event;
+  {
+    std::lock_guard lock{mutex_};
+    if (!sink_) {
+      return;
+    }
+    sink = sink_;
+    event = prepare(type, std::move(payload));
   }
 
-  sink_(prepare(type, std::move(payload)));
+  sink(std::move(event));
 }
 
 void AudioEventDispatcher::dispatch(BackendEvent event) {
-  if (!sink_) {
-    return;
+  BackendEventSink sink;
+  {
+    std::lock_guard lock{mutex_};
+    if (!sink_) {
+      return;
+    }
+    sink = sink_;
+    event = prepare(std::move(event));
   }
 
-  sink_(prepare(std::move(event)));
+  sink(std::move(event));
 }
 
-std::uint64_t AudioEventDispatcher::nextVersion() const { return eventVersion_ + 1; }
+std::uint64_t AudioEventDispatcher::nextVersion() const {
+  std::lock_guard lock{mutex_};
+  return eventVersion_ + 1;
+}
 
-bool AudioEventDispatcher::hasEventSink() const { return static_cast<bool>(sink_); }
+bool AudioEventDispatcher::hasEventSink() const {
+  std::lock_guard lock{mutex_};
+  return static_cast<bool>(sink_);
+}
 
 BackendEvent AudioEventDispatcher::prepare(BackendEventType type, PlaybackEvent payload) {
   BackendEvent event{};

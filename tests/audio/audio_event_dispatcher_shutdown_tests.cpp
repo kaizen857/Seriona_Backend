@@ -2,6 +2,9 @@
 
 #include <doctest.h>
 
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -52,6 +55,56 @@ TEST_CASE("audio_event_dispatcher shutdown is idempotent and blocks delivery") {
   CHECK(sink.events.empty());
   CHECK_FALSE(dispatcher.hasEventSink());
   CHECK(dispatcher.nextVersion() == 1);
+}
+
+TEST_CASE("audio_event_dispatcher supports concurrent set clear and dispatch") {
+  AudioEventDispatcher dispatcher;
+  std::mutex eventsMutex;
+  std::vector<BackendEvent> events;
+  std::atomic<bool> start{false};
+  std::atomic<bool> done{false};
+
+  auto sink = [&eventsMutex, &events](BackendEvent event) {
+    std::lock_guard lock{eventsMutex};
+    events.push_back(std::move(event));
+  };
+
+  std::thread sinkMutator{[&] {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int index = 0; index < 2000; ++index) {
+      dispatcher.setEventSink(sink);
+      dispatcher.clearEventSink();
+    }
+    dispatcher.setEventSink(sink);
+    done.store(true, std::memory_order_release);
+  }};
+
+  std::thread dispatcherThread{[&] {
+    start.store(true, std::memory_order_release);
+    while (!done.load(std::memory_order_acquire)) {
+      dispatcher.dispatch(BackendEventType::PlaybackStateChanged, PlaybackStateChanged{PlaybackState::Playing});
+    }
+  }};
+
+  sinkMutator.join();
+  dispatcherThread.join();
+  dispatcher.shutdown();
+
+  std::vector<std::uint64_t> versions;
+  {
+    std::lock_guard lock{eventsMutex};
+    versions.reserve(events.size());
+    for (const auto& event : events) {
+      versions.push_back(event.monotonicVersion);
+    }
+  }
+
+  for (std::size_t index = 1; index < versions.size(); ++index) {
+    CHECK(versions[index] > versions[index - 1]);
+  }
+  CHECK_FALSE(dispatcher.hasEventSink());
 }
 
 }

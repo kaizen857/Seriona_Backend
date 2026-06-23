@@ -1,0 +1,10 @@
+# Learnings - seriona-vibe-bug-refactor
+
+- Task 1: CTest names for the targeted audio tests are `seriona.pcm_buffer_queue` and `seriona.audio_output_device`; the plan/user underscore regex does not match current `tests/CMakeLists.txt` names.
+- Task 1: Generation-aware queue reads must reserve bytes with CAS and recheck generation around reservation; reusing plain `read()` can race `clearForSeek()` and corrupt `usedBytes_` accounting.
+- Task 1: `AudioOutputDevice::renderCallback()` can remain RT-safe by reading an atomic callback state snapshot and treating inactive or stale queue state as silence.
+- Task 2: Dispatcher tests should use dotted CTest regex names (`seriona.audio_event_dispatcher*`); concurrent clear/dispatch on the old unsynchronized `std::function` reliably surfaced as `std::bad_function_call`.
+- Task 2: To test progress-worker shutdown ordering deterministically, the fake backend can call `AudioOutputDevice::renderCallback()` once after arming the sink so the worker observes queue counters and publishes `PlaybackPositionUpdated`.
+- Task 4: `seriona_media_controller_tests` builds as a binary, but the current CTest registry did not match `seriona\.(media_controller|control_contract)` or `seriona.*media`; run `./build/tests/seriona_media_controller_tests` directly when validating media-controller regressions until CTest registration is fixed.
+- Task 2 redo: A fresh red proof can be re-established from a partially fixed tree by temporarily restoring the old production-only dispatcher/destructor behavior while keeping the regression tests intact; the dotted CTest regex then fails in `seriona.audio_event_dispatcher` and `seriona.audio_event_dispatcher_shutdown`.
+- Task 3: When resuming interrupted metadata edits, verify header/implementation signatures first; a partial `publishCurrentSnapshot(const PlatformMediaState&)` declaration left `metadata_mpris_linux.cpp` defining/calling the old zero-arg form and broke the targeted build before runtime regressions could run.
