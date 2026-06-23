@@ -68,6 +68,7 @@ private:
   ControlReduction reject(MediaControllerErrorCode code, std::string message);
   void markPlayerChanged(ControlReduction& reduction, std::chrono::steady_clock::time_point sampledAt = {});
   void addNotification(ControlReduction& reduction, ControlDomainNotification notification);
+  void selectFirstTrackWhenIdle(ControlReduction& reduction);
   void selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback);
   void stopPlayback(ControlReduction& reduction);
 

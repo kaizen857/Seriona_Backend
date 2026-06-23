@@ -281,6 +281,12 @@ TEST_CASE("media controller facade forwards seek volume mute and toggle commands
   CHECK(toggleResult.accepted);
   CHECK(fixture.fakeAudio->pauseCalls() == 1U);
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
+
+  const auto resumeResult = fixture.controller->submitCommand(command(MediaControlCommandKind::TogglePlayPause));
+  CHECK(resumeResult.accepted);
+  CHECK(fixture.fakeAudio->resumeCalls() == 1U);
+  CHECK(fixture.fakeAudio->playCalls() == 1U);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
 }
 
 TEST_CASE("media controller facade applies skip repeat and playback-ended policies through fake audio") {
@@ -368,6 +374,34 @@ TEST_CASE("media controller facade scans library and publishes committed library
   CHECK(librarySnapshots.last().version == 33U);
   REQUIRE(librarySnapshots.last().libraryTree.has_value());
   CHECK(librarySnapshots.last().libraryTree->version == 33U);
+}
+
+TEST_CASE("media controller facade exposes first scanned track while stopped") {
+  ControllerFixture fixture{};
+  control_test::PlayerStateSnapshotCollector playerSnapshots{};
+  fixture.controller->subscribePlayerState([&](const PlayerStateSnapshot& snapshot) { playerSnapshots.push(snapshot); });
+  fixture.controller->start();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("a", "music/a.flac"), song("b", "music/b.flac")}, 33), 2));
+  fixture.controller->drainForTests();
+
+  const auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+  CHECK(fixture.fakeAudio->playCalls() == 0U);
+  REQUIRE(playerSnapshots.count() >= 2U);
+  REQUIRE(playerSnapshots.last().currentTrack.has_value());
+  CHECK(playerSnapshots.last().currentTrack->trackId == "a");
+
+  const auto toggleResult = fixture.controller->submitCommand(command(MediaControlCommandKind::TogglePlayPause));
+
+  CHECK(toggleResult.accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 1U);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
+  CHECK(fixture.fakeAudio->playCalls() == 1U);
 }
 
 TEST_CASE("media controller facade ignores stale audio and scanner events") {

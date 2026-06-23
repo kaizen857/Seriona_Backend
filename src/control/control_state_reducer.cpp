@@ -171,7 +171,13 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   switch (command.kind) {
   case MediaControlCommandKind::Play:
     if (selectedTrack_.has_value()) {
-      reduction.intents.push_back(makeIntent(ControlIntentKind::Play));
+      if (player_.playback.state == PlaybackStatus::Stopped) {
+        if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
+          selectTrack(reduction, *track, true);
+          return reduction;
+        }
+      }
+      reduction.intents.push_back(makeIntent(player_.playback.state == PlaybackStatus::Paused ? ControlIntentKind::Resume : ControlIntentKind::Play));
       player_.playback.state = PlaybackStatus::Playing;
       markPlayerChanged(reduction);
       return reduction;
@@ -192,8 +198,15 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     stopPlayback(reduction);
     return reduction;
   case MediaControlCommandKind::TogglePlayPause:
-    reduction.intents.push_back(makeIntent(player_.playback.state == PlaybackStatus::Playing ? ControlIntentKind::Pause
-                                                                                              : ControlIntentKind::Play));
+    if (player_.playback.state == PlaybackStatus::Stopped && selectedTrack_.has_value()) {
+      if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
+        selectTrack(reduction, *track, true);
+        return reduction;
+      }
+    }
+    reduction.intents.push_back(makeIntent(player_.playback.state == PlaybackStatus::Playing   ? ControlIntentKind::Pause
+                                            : player_.playback.state == PlaybackStatus::Paused ? ControlIntentKind::Resume
+                                                                                                : ControlIntentKind::Play));
     player_.playback.state = player_.playback.state == PlaybackStatus::Playing ? PlaybackStatus::Paused : PlaybackStatus::Playing;
     markPlayerChanged(reduction);
     return reduction;
@@ -385,6 +398,7 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
     if (const auto* snapshot = std::get_if<scanner::PlaylistTreeSnapshot>(&event.payload)) {
       library_.libraryTree = *snapshot;
       library_.version = snapshot->version;
+      selectFirstTrackWhenIdle(reduction);
     }
     addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibrarySnapshotUpdated,
                                                     "Library snapshot updated",
@@ -568,6 +582,25 @@ void ControlStateReducer::addNotification(ControlReduction& reduction, ControlDo
     recentNotifications_.erase(recentNotifications_.begin());
   }
   reduction.notifications.push_back(std::move(notification));
+}
+
+void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) {
+  if (selectedTrack_.has_value() || player_.playback.state == PlaybackStatus::Playing || player_.playback.state == PlaybackStatus::Loading) {
+    return;
+  }
+  const auto track = firstPlayableTrack();
+  if (!track.has_value()) {
+    return;
+  }
+  selectedTrack_ = track->identity;
+  player_.currentTrack = track->identity;
+  player_.display = displayFromRequest(track->request);
+  player_.timeline.position = track->request.offset.value_or(std::chrono::milliseconds{0});
+  player_.timeline.duration = track->request.duration;
+  player_.playback.state = PlaybackStatus::Stopped;
+  player_.playback.errorCode.reset();
+  player_.playback.errorMessage.reset();
+  markPlayerChanged(reduction);
 }
 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {

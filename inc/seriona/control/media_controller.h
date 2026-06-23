@@ -37,5 +37,6 @@ private:
 
 [[nodiscard]] std::unique_ptr<MediaController> makeMediaController(MediaControllerDependencies dependencies,
                                                                    MediaControllerOptions options = {});
+[[nodiscard]] std::unique_ptr<MediaController> makeProductionMediaController(MediaControllerOptions options = {});
 
 }
