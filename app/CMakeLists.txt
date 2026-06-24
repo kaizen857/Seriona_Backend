@@ -2,6 +2,7 @@ add_executable(seriona
   main.cpp
   terminal_controller.cpp
   terminal_io.cpp
+  ${PROJECT_SOURCE_DIR}/src/app/runtime_paths.cpp
 )
 
 set_target_properties(seriona PROPERTIES

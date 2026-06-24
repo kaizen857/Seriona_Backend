@@ -21,6 +21,8 @@ pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
   libswresample
 )
 
+find_package(spdlog CONFIG REQUIRED)
+
 add_library(seriona_third_party_headers INTERFACE)
 target_include_directories(seriona_third_party_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/doctest>
@@ -54,6 +56,8 @@ target_link_libraries(seriona_audio
     seriona_third_party_headers
     PkgConfig::SERIONA_FFMPEG
 )
+
+target_link_libraries(seriona_audio PRIVATE spdlog::spdlog)
 
 function(seriona_enable_warnings target_name)
   if(MSVC)
@@ -178,6 +182,7 @@ target_link_libraries(seriona_scanner
     PkgConfig::SERIONA_XXHASH
     TagReaderCore
     seriona_watcher_headers
+    spdlog::spdlog
 )
 
 target_link_libraries(seriona_control
@@ -185,12 +190,15 @@ target_link_libraries(seriona_control
     seriona_audio
     seriona_scanner
     seriona_metadata
+    spdlog::spdlog
 )
 
 seriona_enable_warnings(seriona_audio)
 seriona_enable_warnings(seriona_scanner)
 seriona_enable_warnings(seriona_metadata)
 seriona_enable_warnings(seriona_control)
+
+target_link_libraries(seriona_metadata PRIVATE spdlog::spdlog)
 
 if(TARGET PkgConfig::SERIONA_SDBUS_CPP)
   target_link_libraries(seriona_metadata PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
