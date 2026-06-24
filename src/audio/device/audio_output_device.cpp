@@ -262,12 +262,12 @@ void AudioOutputDevice::setVolume(float linearGain) noexcept {
     return;
   }
   const auto clamped = std::clamp(linearGain, 0.0F, 1.0F);
-  spdlog::info("device volume set to {:.2f}", clamped);
+        spdlog::debug("device volume set to {:.2f}", clamped);
   volume_.store(clamped, std::memory_order_release);
 }
 
 void AudioOutputDevice::setMuted(bool muted) noexcept {
-  spdlog::info("device mute set to {}", muted);
+    spdlog::debug("device mute set to {}", muted);
   muted_.store(muted, std::memory_order_release);
 }
 

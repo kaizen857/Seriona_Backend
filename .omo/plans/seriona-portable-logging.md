@@ -173,13 +173,13 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
 
 ## Final verification wave
 > Runs in parallel after ALL todos. ALL must APPROVE. Surface results and wait for the user's explicit okay before declaring complete.
-- [ ] F1. Plan compliance audit
+- [x] F1. Plan compliance audit
   Verify every todo has an evidence file, matching commit, accepted QA, and no skipped acceptance criteria. Review `.omo/plans/seriona-portable-logging.md`, `.omo/evidence/task-*seriona-portable-logging.md`, `git log --oneline -20`, and `git status`.
-- [ ] F2. Code quality review
+- [x] F2. Code quality review
   Read implementation diffs for over-design, public API leakage, excessive logging, hot-path violations, exception safety, and CMake target hygiene. Must specifically inspect logging bootstrap, app startup, scanner path plumbing, and audio realtime files.
-- [ ] F3. Real manual QA
+- [x] F3. Real manual QA
   Re-run live smoke from `build/` with a real music folder, inspect `build/SerionaData/`, validate log contents, validate MPRIS still works, and ensure no process remains.
-- [ ] F4. Scope fidelity
+- [x] F4. Scope fidelity
   Confirm no Qt/QML/UI/config-framework work was added, no internal module names appear in portable data root names, and the implementation treats the backend as one product with one logger.
 
 ## Commit strategy
