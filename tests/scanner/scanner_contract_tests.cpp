@@ -1,4 +1,5 @@
 #include "seriona/scanner/file_scanner_service.h"
+#include "seriona/scanner/tag_reader_metadata_adapter.h"
 
 #include <doctest/doctest.h>
 
@@ -43,6 +44,9 @@ public:
   bool watchingStopped_{false};
   bool stopped_{false};
 };
+
+template <typename T>
+concept HasCachedSongMember = requires(T mapped) { mapped.cachedSong; };
 
 }
 
@@ -212,4 +216,12 @@ TEST_CASE("scanner factory is declared with service ownership") {
   using namespace seriona::scanner;
 
   static_assert(std::is_same_v<decltype(makeFileScannerService()), std::shared_ptr<FileScannerService>>);
+}
+
+TEST_CASE("tag reader adapter public boundary does not expose sqlite cache dto types") {
+  using namespace seriona::scanner;
+
+  static_assert(!HasCachedSongMember<MappedTagMetadata>);
+  static_assert(std::is_same_v<decltype(MappedTagMetadata::metadata), SongMetadata>);
+  static_assert(std::is_same_v<decltype(MappedTagMetadata::embeddedLyrics), std::vector<LyricLine>>);
 }

@@ -42,8 +42,8 @@ namespace {
   return std::chrono::duration_cast<std::chrono::milliseconds>(value);
 }
 
-[[nodiscard]] cache::CachedUserStats userStatsFrom(const RawTagMetadata& raw) {
-  cache::CachedUserStats stats{};
+[[nodiscard]] TagUserStats userStatsFrom(const RawTagMetadata& raw) {
+  TagUserStats stats{};
   stats.playCount = raw.playCount;
   if (raw.rating != 0U) {
     stats.rating = raw.rating;
@@ -109,11 +109,10 @@ RawTagMetadata ProductionTagMetadataReader::read(const std::filesystem::path& pa
 
 MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
                                     std::string contentHash,
-                                    std::optional<cache::CachedUserStats> cachedUserStats,
+                                    std::optional<TagUserStats> cachedUserStats,
                                     bool externalLyricsOverrideActive) {
   MappedTagMetadata result{};
-  auto& cached = result.cachedSong;
-  auto& metadata = cached.metadata;
+  auto& metadata = result.metadata;
   metadata.trackId = raw.filePath.generic_string();
   metadata.filePath = raw.filePath;
   metadata.title = raw.title;
@@ -134,12 +133,12 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
   metadata.offset = toMilliseconds(raw.offset);
   metadata.duration = toMilliseconds(raw.duration);
   metadata.logicalTrackId = raw.filePath.generic_string();
-  cached.embeddedLyrics = mapLyrics(raw.embeddedLyrics);
-  if (!externalLyricsOverrideActive && !cached.embeddedLyrics.empty()) {
+  result.embeddedLyrics = mapLyrics(raw.embeddedLyrics);
+  if (!externalLyricsOverrideActive && !result.embeddedLyrics.empty()) {
     metadata.effectiveLyricsSource = LyricsSource::EmbeddedTag;
-    metadata.effectiveLyrics = cached.embeddedLyrics;
+    metadata.effectiveLyrics = result.embeddedLyrics;
   }
-  cached.userStats = cachedUserStats.value_or(userStatsFrom(raw));
+  result.userStats = cachedUserStats.value_or(userStatsFrom(raw));
   result.composer = raw.composer;
   result.coverPath = raw.coverPath;
   result.bitRate = raw.bitRate;

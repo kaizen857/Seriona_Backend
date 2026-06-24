@@ -5,6 +5,7 @@
 #include <doctest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <sqlite3.h>
@@ -66,6 +67,12 @@ namespace {
 
 [[nodiscard]] SQLiteScannerCache openCache(const std::filesystem::path& dbPath) {
   return SQLiteScannerCache{ScannerCacheConfig{.databasePath = dbPath, .busyTimeout = std::chrono::milliseconds{25}}};
+}
+
+[[nodiscard]] SQLiteScannerCache openCacheWithPolicy(const std::filesystem::path& dbPath, CacheMaintenancePolicy policy) {
+  return SQLiteScannerCache{ScannerCacheConfig{.databasePath = dbPath,
+                                               .busyTimeout = std::chrono::milliseconds{25},
+                                               .maintenancePolicy = policy}};
 }
 
 TEST_CASE("sqlite scanner cache migrates schema and enables WAL pragmas") {
@@ -202,6 +209,42 @@ TEST_CASE("sqlite scanner cache reports busy deterministically while writer tran
   CHECK_THROWS_AS(second.saveRoot(rootFixture(temp.path())), std::runtime_error);
 
   transaction.commit();
+}
+
+TEST_CASE("sqlite scanner cache reports capacity and checkpoint policy decisions without large fixtures") {
+  test::TempScannerRoot temp{"scanner-cache-policy"};
+  auto cache = openCacheWithPolicy(temp.dbPath(), CacheMaintenancePolicy{.softDatabaseBytes = 0,
+                                                                         .hardDatabaseBytes = 1,
+                                                                         .passiveCheckpointWalBytes = 0,
+                                                                         .maxCachedRoots = 8});
+  cache.saveRoot(rootFixture(temp.path()));
+
+  const auto decision = cache.maintenanceDecision();
+
+  CHECK(decision.databaseBytes > 0U);
+  CHECK(decision.checkpointRecommended);
+  CHECK(decision.cleanupRecommended);
+  CHECK(decision.vacuumRecommended);
+}
+
+TEST_CASE("sqlite scanner cache maintenance checkpoints and prunes roots by policy") {
+  test::TempScannerRoot first{"scanner-cache-policy-first"};
+  test::TempScannerRoot second{"scanner-cache-policy-second"};
+  const auto dbPath = first.dbPath();
+  auto cache = openCacheWithPolicy(dbPath, CacheMaintenancePolicy{.softDatabaseBytes = 0,
+                                                                  .hardDatabaseBytes = 1,
+                                                                  .passiveCheckpointWalBytes = 0,
+                                                                  .maxCachedRoots = 1});
+  cache.saveRoot(rootFixture(first.path()));
+  cache.saveRoot(rootFixture(second.path()));
+
+  const auto result = cache.maintainCache();
+
+  CHECK(result.checkpoint.has_value());
+  CHECK(result.checkpoint->resultCode == SQLITE_OK);
+  CHECK(result.rootsRemoved == 1U);
+  CHECK_FALSE(cache.loadRoot(first.path()).has_value());
+  CHECK(cache.loadRoot(second.path()).has_value());
 }
 
 }

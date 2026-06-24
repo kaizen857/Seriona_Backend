@@ -92,6 +92,23 @@ namespace {
   return *iterator;
 }
 
+[[nodiscard]] TagUserStats tagUserStatsFrom(const cache::CachedUserStats& stats) {
+  return {.playCount = stats.playCount, .rating = stats.rating, .lastPlayed = stats.lastPlayed};
+}
+
+[[nodiscard]] cache::CachedUserStats cachedUserStatsFrom(const TagUserStats& stats) {
+  return {.playCount = stats.playCount, .rating = stats.rating, .lastPlayed = stats.lastPlayed};
+}
+
+[[nodiscard]] cache::CachedSong cachedSongFrom(MappedTagMetadata mapped) {
+  cache::CachedSong song{};
+  song.metadata = std::move(mapped.metadata);
+  song.embeddedLyrics = std::move(mapped.embeddedLyrics);
+  song.externalLyrics = std::move(mapped.externalLyrics);
+  song.userStats = cachedUserStatsFrom(mapped.userStats);
+  return song;
+}
+
 void selectEffectiveLyrics(cache::CachedSong& song) {
   if (!song.externalLyrics.empty()) {
     song.metadata.effectiveLyricsSource = LyricsSource::ExternalLrc;
@@ -494,10 +511,9 @@ private:
     try {
       auto raw = metadataReader_->read(audioPath, coverExportDir_);
       raw.filePath = audioPath;
-      auto mapped = mapRawTagMetadata(raw, hash.hash.value_or({}), cachedSong.transform([](const cache::CachedSong& song) {
-                                      return song.userStats;
-                                    }), false)
-                        .cachedSong;
+      auto mapped = cachedSongFrom(mapRawTagMetadata(raw, hash.hash.value_or({}), cachedSong.transform([](const cache::CachedSong& song) {
+                                                return tagUserStatsFrom(song.userStats);
+                                              }), false));
       mapped.metadata.filePath = audioPath;
       mapped.metadata.sourceFilePath = audioPath;
       mapped.metadata.trackId = audioPath.generic_string();

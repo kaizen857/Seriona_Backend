@@ -70,51 +70,51 @@ private:
 
 TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initial stats") {
   const auto mapped = mapRawTagMetadata(rawTagFixture(), "content-hash", std::nullopt, false);
-  const auto& song = mapped.cachedSong;
+  const auto& metadata = mapped.metadata;
 
-  CHECK(song.metadata.title == "Title");
-  CHECK(song.metadata.genre == "Genre");
-  CHECK(song.metadata.artist == "Artist");
-  CHECK(song.metadata.album == "Album");
-  CHECK(song.metadata.albumArtist == "Album Artist");
+  CHECK(metadata.title == "Title");
+  CHECK(metadata.genre == "Genre");
+  CHECK(metadata.artist == "Artist");
+  CHECK(metadata.album == "Album");
+  CHECK(metadata.albumArtist == "Album Artist");
   CHECK(mapped.composer == "Composer");
-  CHECK(song.metadata.year == 2026U);
-  CHECK(song.metadata.trackNumber == 7U);
-  CHECK(song.metadata.discNumber == 2U);
-  CHECK(song.metadata.filePath == std::filesystem::path{"music/song.flac"});
+  CHECK(metadata.year == 2026U);
+  CHECK(metadata.trackNumber == 7U);
+  CHECK(metadata.discNumber == 2U);
+  CHECK(metadata.filePath == std::filesystem::path{"music/song.flac"});
   CHECK(mapped.coverPath == std::filesystem::path{"covers/song.png"});
-  CHECK(song.metadata.duration == std::chrono::milliseconds{1234});
-  CHECK(song.metadata.offset == std::chrono::milliseconds{9});
-  CHECK(song.metadata.fileMtime == std::filesystem::file_time_type{std::chrono::nanoseconds{42}});
-  CHECK(song.metadata.sampleRate == 48000U);
-  CHECK(song.metadata.bitDepth == 24U);
+  CHECK(metadata.duration == std::chrono::milliseconds{1234});
+  CHECK(metadata.offset == std::chrono::milliseconds{9});
+  CHECK(metadata.fileMtime == std::filesystem::file_time_type{std::chrono::nanoseconds{42}});
+  CHECK(metadata.sampleRate == 48000U);
+  CHECK(metadata.bitDepth == 24U);
   CHECK(mapped.bitRate == 320000U);
-  CHECK(song.metadata.channels == 2U);
+  CHECK(metadata.channels == 2U);
   CHECK(mapped.format == "flac");
-  CHECK(song.metadata.effectiveLyricsSource == LyricsSource::EmbeddedTag);
-  REQUIRE(song.embeddedLyrics.size() == 2U);
-  CHECK(song.embeddedLyrics[0].timestamp == std::chrono::milliseconds{1});
-  CHECK(song.embeddedLyrics[0].text == "embedded one");
-  CHECK(song.metadata.effectiveLyrics[1].text == "embedded two");
-  CHECK(song.userStats.playCount == 5U);
-  CHECK(song.userStats.rating == 4U);
-  CHECK(song.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{777}});
+  CHECK(metadata.effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  REQUIRE(mapped.embeddedLyrics.size() == 2U);
+  CHECK(mapped.embeddedLyrics[0].timestamp == std::chrono::milliseconds{1});
+  CHECK(mapped.embeddedLyrics[0].text == "embedded one");
+  CHECK(metadata.effectiveLyrics[1].text == "embedded two");
+  CHECK(mapped.userStats.playCount == 5U);
+  CHECK(mapped.userStats.rating == 4U);
+  CHECK(mapped.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{777}});
 }
 
 TEST_CASE("tagreader adapter preserves cached user stats and respects external lrc override") {
-  cache::CachedUserStats cachedStats{};
+  TagUserStats cachedStats{};
   cachedStats.playCount = 99;
   cachedStats.rating = 1;
   cachedStats.lastPlayed = std::chrono::system_clock::time_point{std::chrono::milliseconds{12345}};
 
   const auto mapped = mapRawTagMetadata(rawTagFixture(), "content-hash", cachedStats, true);
 
-  CHECK(mapped.cachedSong.userStats.playCount == 99U);
-  CHECK(mapped.cachedSong.userStats.rating == 1U);
-  CHECK(mapped.cachedSong.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{12345}});
-  CHECK(mapped.cachedSong.metadata.effectiveLyricsSource == LyricsSource::None);
-  CHECK(mapped.cachedSong.metadata.effectiveLyrics.empty());
-  REQUIRE(mapped.cachedSong.embeddedLyrics.size() == 2U);
+  CHECK(mapped.userStats.playCount == 99U);
+  CHECK(mapped.userStats.rating == 1U);
+  CHECK(mapped.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{12345}});
+  CHECK(mapped.metadata.effectiveLyricsSource == LyricsSource::None);
+  CHECK(mapped.metadata.effectiveLyrics.empty());
+  REQUIRE(mapped.embeddedLyrics.size() == 2U);
 }
 
 TEST_CASE("tagreader batch reader captures per-file exceptions and continues") {
@@ -127,7 +127,7 @@ TEST_CASE("tagreader batch reader captures per-file exceptions and continues") {
   CHECK(failures.empty());
   CHECK(successReader.requestedPaths[0] == std::filesystem::path{"first.flac"});
   CHECK(successReader.requestedCoverDirs[0] == std::filesystem::path{"covers"});
-  CHECK(successes[0].metadata.cachedSong.metadata.contentHash == "hash:first.flac");
+  CHECK(successes[0].metadata.metadata.contentHash == "hash:first.flac");
 
   FakeTagMetadataReader failingReader{{rawTagFixture()}};
   failingReader.throwOnRead = true;

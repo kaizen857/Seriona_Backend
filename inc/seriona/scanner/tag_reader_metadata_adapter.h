@@ -1,6 +1,6 @@
 #pragma once
 
-#include "seriona/scanner/cache/sqlite_scanner_cache.h"
+#include "seriona/scanner/scanner_contracts.h"
 
 #include <chrono>
 #include <cstdint>
@@ -43,8 +43,17 @@ struct RawTagMetadata {
   std::chrono::system_clock::time_point lastPlayed{};
 };
 
+struct TagUserStats {
+  std::uint64_t playCount{0};
+  std::optional<std::uint32_t> rating;
+  std::optional<std::chrono::system_clock::time_point> lastPlayed;
+};
+
 struct MappedTagMetadata {
-  cache::CachedSong cachedSong;
+  SongMetadata metadata;
+  std::vector<LyricLine> embeddedLyrics;
+  std::vector<LyricLine> externalLyrics;
+  TagUserStats userStats;
   std::string composer;
   std::filesystem::path coverPath;
   std::uint32_t bitRate{0};
@@ -74,7 +83,7 @@ public:
 
 [[nodiscard]] MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
                                                   std::string contentHash,
-                                                  std::optional<cache::CachedUserStats> cachedUserStats,
+                                                  std::optional<TagUserStats> cachedUserStats,
                                                   bool externalLyricsOverrideActive);
 [[nodiscard]] std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
                                                                  const std::vector<std::filesystem::path>& paths,

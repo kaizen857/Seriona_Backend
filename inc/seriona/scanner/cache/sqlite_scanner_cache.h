@@ -15,7 +15,15 @@ namespace seriona::scanner::cache {
 struct ScannerCacheConfig {
   std::filesystem::path databasePath;
   std::chrono::milliseconds busyTimeout{500};
+  struct CacheMaintenancePolicy {
+    std::uintmax_t softDatabaseBytes{256ULL * 1024ULL * 1024ULL};
+    std::uintmax_t hardDatabaseBytes{512ULL * 1024ULL * 1024ULL};
+    std::uintmax_t passiveCheckpointWalBytes{4ULL * 1024ULL * 1024ULL};
+    std::uint32_t maxCachedRoots{8};
+  } maintenancePolicy{};
 };
+
+using CacheMaintenancePolicy = ScannerCacheConfig::CacheMaintenancePolicy;
 
 struct CachedDirectory {
   std::filesystem::path relativePath;
@@ -50,6 +58,23 @@ struct CacheCheckpointResult {
   int checkpointedFrames{0};
 };
 
+struct CacheMaintenanceDecision {
+  std::uintmax_t databaseBytes{0};
+  std::uintmax_t walBytes{0};
+  std::uint32_t cachedRoots{0};
+  bool checkpointRecommended{false};
+  bool cleanupRecommended{false};
+  bool vacuumRecommended{false};
+};
+
+struct CacheMaintenanceResult {
+  CacheMaintenanceDecision before{};
+  CacheMaintenanceDecision after{};
+  std::optional<CacheCheckpointResult> checkpoint;
+  std::uint32_t rootsRemoved{0};
+  bool vacuumed{false};
+};
+
 class SQLiteScannerCache {
 public:
   class WriterTransaction {
@@ -81,10 +106,15 @@ public:
   void saveRoot(const CachedRoot& root);
   void updateUserStats(const std::filesystem::path& rootPath, const std::string& trackId, CachedUserStats stats);
   void pruneMissingSongs(const std::filesystem::path& rootPath, const std::vector<std::string>& retainedTrackIds);
+  [[nodiscard]] CacheMaintenanceDecision maintenanceDecision() const;
+  [[nodiscard]] CacheMaintenanceResult maintainCache();
   [[nodiscard]] CacheCheckpointResult checkpointPassive();
   [[nodiscard]] WriterTransaction beginWriter();
 
 private:
+  [[nodiscard]] std::uint32_t pruneOldestRoots(std::uint32_t maxCachedRoots);
+  std::filesystem::path databasePath_;
+  CacheMaintenancePolicy maintenancePolicy_{};
   void* db_{nullptr};
   mutable std::mutex writerMutex_;
 };

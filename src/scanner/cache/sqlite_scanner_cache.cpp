@@ -23,6 +23,16 @@ constexpr int kSchemaVersion = 1;
 
 [[nodiscard]] std::string pathText(const std::filesystem::path& path) { return path.generic_string(); }
 
+[[nodiscard]] std::uintmax_t fileBytes(const std::filesystem::path& path) {
+  std::error_code error;
+  const auto bytes = std::filesystem::file_size(path, error);
+  return error ? 0U : bytes;
+}
+
+[[nodiscard]] std::filesystem::path walPathFor(const std::filesystem::path& databasePath) {
+  return std::filesystem::path{databasePath.generic_string() + "-wal"};
+}
+
 [[nodiscard]] std::int64_t fileTimeToNs(const std::filesystem::file_time_type time) {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
 }
@@ -535,6 +545,8 @@ SQLiteScannerCache::SQLiteScannerCache(ScannerCacheConfig config) {
   if (!config.databasePath.parent_path().empty()) {
     std::filesystem::create_directories(config.databasePath.parent_path());
   }
+  databasePath_ = config.databasePath;
+  maintenancePolicy_ = config.maintenancePolicy;
   sqlite3* db = nullptr;
   if (sqlite3_open_v2(pathText(config.databasePath).c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
     std::string message = db == nullptr ? "failed to open scanner cache" : sqlite3_errmsg(db);
@@ -629,6 +641,37 @@ void SQLiteScannerCache::pruneMissingSongs(const std::filesystem::path& rootPath
   transaction.commit();
 }
 
+CacheMaintenanceDecision SQLiteScannerCache::maintenanceDecision() const {
+  CacheMaintenanceDecision decision{};
+  decision.databaseBytes = fileBytes(databasePath_);
+  decision.walBytes = fileBytes(walPathFor(databasePath_));
+  decision.cachedRoots = static_cast<std::uint32_t>(scalarInt(asDb(db_), "SELECT COUNT(*) FROM roots;"));
+  decision.checkpointRecommended = decision.walBytes >= maintenancePolicy_.passiveCheckpointWalBytes;
+  decision.cleanupRecommended = decision.databaseBytes >= maintenancePolicy_.softDatabaseBytes ||
+                                decision.cachedRoots > maintenancePolicy_.maxCachedRoots;
+  decision.vacuumRecommended = decision.databaseBytes >= maintenancePolicy_.hardDatabaseBytes;
+  return decision;
+}
+
+CacheMaintenanceResult SQLiteScannerCache::maintainCache() {
+  CacheMaintenanceResult result{};
+  result.before = maintenanceDecision();
+  if (result.before.checkpointRecommended) {
+    result.checkpoint = checkpointPassive();
+  }
+  if (result.before.cleanupRecommended) {
+    result.rootsRemoved = pruneOldestRoots(maintenancePolicy_.maxCachedRoots);
+  }
+  if (result.before.vacuumRecommended) {
+    auto transaction = beginWriter();
+    transaction.commit();
+    exec(asDb(db_), "VACUUM;");
+    result.vacuumed = true;
+  }
+  result.after = maintenanceDecision();
+  return result;
+}
+
 CacheCheckpointResult SQLiteScannerCache::checkpointPassive() {
   CacheCheckpointResult result{};
   result.resultCode = sqlite3_wal_checkpoint_v2(asDb(db_), nullptr, SQLITE_CHECKPOINT_PASSIVE, &result.logFrames,
@@ -637,5 +680,29 @@ CacheCheckpointResult SQLiteScannerCache::checkpointPassive() {
 }
 
 SQLiteScannerCache::WriterTransaction SQLiteScannerCache::beginWriter() { return WriterTransaction{*this}; }
+
+std::uint32_t SQLiteScannerCache::pruneOldestRoots(const std::uint32_t maxCachedRoots) {
+  auto transaction = beginWriter();
+  Statement count{asDb(db_), "SELECT COUNT(*) FROM roots;"};
+  const auto rootCount = count.stepRow() ? static_cast<std::uint32_t>(count.int64Column(0)) : 0U;
+  if (rootCount <= maxCachedRoots) {
+    transaction.commit();
+    return 0U;
+  }
+  const auto rootsToRemove = rootCount - maxCachedRoots;
+  Statement select{asDb(db_), "SELECT id FROM roots ORDER BY updated_at_ms ASC, id ASC LIMIT ?1;"};
+  select.bind(1, static_cast<std::int64_t>(rootsToRemove));
+  std::vector<std::int64_t> rootIds;
+  while (select.stepRow()) {
+    rootIds.push_back(select.int64Column(0));
+  }
+  for (const auto rootId : rootIds) {
+    Statement remove{asDb(db_), "DELETE FROM roots WHERE id=?1;"};
+    remove.bind(1, rootId);
+    remove.stepDone();
+  }
+  transaction.commit();
+  return static_cast<std::uint32_t>(rootIds.size());
+}
 
 }
