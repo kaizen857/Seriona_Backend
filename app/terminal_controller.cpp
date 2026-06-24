@@ -192,15 +192,19 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   const auto runtimePaths = resolveRuntimePaths({});
   runtimePaths.ensureDirectoriesExist();
 
+  std::cerr << "seriona: data root: " << runtimePaths.dataRoot.string() << '\n';
+
+  const auto timestampedLogPath = seriona::logging::prepareLogFile(runtimePaths.dataRoot / "logs");
+
   try {
-    seriona::logging::initialize(spdlog::level::off, runtimePaths.logFile.string());
+    seriona::logging::initialize(spdlog::level::off, timestampedLogPath.string());
   } catch (const std::exception& e) {
     std::cerr << "seriona: logging initialization failed: " << e.what() << '\n';
   }
 
   spdlog::info("seriona starting");
   spdlog::info("  executable root: {}", runtimePaths.dataRoot.string());
-  spdlog::info("  log file:        {}", runtimePaths.logFile.string());
+  spdlog::info("  log file:        {}", timestampedLogPath.string());
   spdlog::info("  database:        {}", runtimePaths.databasePath.string());
   spdlog::info("  artwork dir:     {}", runtimePaths.artworkDir.string());
   spdlog::info("  music scan root: {}", musicPath.string());

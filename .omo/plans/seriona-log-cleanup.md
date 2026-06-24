@@ -76,7 +76,7 @@ Your next move: run `$start-work .omo/plans/seriona-log-cleanup.md`, or ask for 
   QA scenarios (name the exact tool + invocation): Happy: all test cases above pass. Failure: test creates 80MB total, limit 50MB, asserts 30MB+ deleted and only newest file remains. Evidence `.omo/evidence/task-2-seriona-log-cleanup.md`.
   Commit: Y | `test(logging): cover per-session log cleanup`
 
-- [ ] 3. Integrate prepareLogFile into app startup
+- [x] 3. Integrate prepareLogFile into app startup
   What to do / Must NOT do: In `app/terminal_controller.cpp`, replace the hardcoded `runtimePaths.logFile` usage with a call to `prepareLogFile(runtimePaths.dataRoot / "logs", 50)` to get a timestamped log path, then pass that to `seriona::logging::initialize()`. The `ensureDirectoriesExist()` call already creates the logs dir — ensure it runs before `prepareLogFile`. Must NOT change any other file. Must NOT change the shutdown sequence.
   Parallelization: Wave 2 | Blocked by: 1, 2 | Blocks: final wave
   References (executor has NO interview context - be exhaustive): `app/terminal_controller.cpp:190-200` (startup section with `logging::initialize` call). `prepareLogFile` signature: `std::filesystem::path prepareLogFile(const std::filesystem::path& logDir, std::uintmax_t maxTotalBytes)`. Default: 50 MB = 52428800.
