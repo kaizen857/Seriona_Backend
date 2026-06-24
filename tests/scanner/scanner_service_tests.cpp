@@ -241,7 +241,7 @@ TEST_CASE("scanner service rereads changed audio and reparses only changed lrc")
   reader->put(audio, rawMetadata("Before", {RawTagLyricLine{std::chrono::milliseconds{300}, "embedded before"}}));
   auto service = makeService(temp, reader);
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  waitForReaderCount(*reader, 1U);
+  static_cast<void>(waitForSongs(*service, 1U));
   CHECK(reader->readCount() == 1U);
 
   writeText(temp.path() / "song.lrc", "[00:02.00]external two\n");
@@ -260,8 +260,10 @@ TEST_CASE("scanner service rereads changed audio and reparses only changed lrc")
   writeText(audio, "changed audio bytes");
   reader->put(audio, rawMetadata("After", {RawTagLyricLine{std::chrono::milliseconds{400}, "embedded after"}}));
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  waitForReaderCount(*reader, 2U);
-  songs = songsIn(waitForSongs(*service, 1U));
+  songs = songsIn(waitForSnapshot(*service, [](const PlaylistTreeSnapshot& snapshot) {
+    const auto currentSongs = songsIn(snapshot);
+    return currentSongs.size() == 1U && currentSongs[0].title == "After";
+  }));
 
   CHECK(reader->readCount() == 2U);
   REQUIRE(songs.size() == 1U);

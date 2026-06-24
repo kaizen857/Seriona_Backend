@@ -196,6 +196,7 @@ TEST_CASE("scanner watcher debounces create modify destroy rename into hash-firs
   auto service = makeWatcherService(temp, reader, watchers);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
   service->startWatching({ScannerRoot{.path = temp.path()}});
   REQUIRE(watchers->states.size() == 1U);
   CHECK(watchers->states[0]->root == temp.path());
@@ -232,6 +233,7 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   auto service = makeWatcherService(temp, reader, watchers);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
   service->startWatching({ScannerRoot{.path = temp.path()}});
   REQUIRE(watchers->states.size() == 1U);
   CHECK(reader->readCount() == 1U);
@@ -275,6 +277,7 @@ TEST_CASE("scanner watcher warning error and overflow messages force root reconc
   });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
   service->startWatching({ScannerRoot{.path = temp.path()}});
   const auto second = test::writeAudioFixture(temp.path(), "second.flac");
   reader->put(second, rawMetadata("Second"));
@@ -303,6 +306,7 @@ TEST_CASE("scanner watcher stop closes watcher and ignores later callbacks") {
   auto service = makeWatcherService(temp, reader, watchers);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
   service->startWatching({ScannerRoot{.path = temp.path()}});
   REQUIRE(watchers->states.size() == 1U);
   auto watcherState = watchers->states[0];
@@ -328,6 +332,7 @@ TEST_CASE("scanner watcher startup failure leaves no live callback into service"
   auto service = makeWatcherService(temp, reader, watchers);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
   CHECK_THROWS_AS(service->startWatching({ScannerRoot{.path = temp.path()}}), std::runtime_error);
   REQUIRE(watchers->states.size() == 1U);
   const auto callback = watchers->states[0]->callback;
