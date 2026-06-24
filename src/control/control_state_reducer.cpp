@@ -83,6 +83,21 @@ constexpr std::size_t kRecentNotificationLimit = 32;
                                      .format = {}};
 }
 
+[[nodiscard]] DisplayMetadata displayFromSong(const scanner::SongMetadata& song) {
+  return DisplayMetadata{.title = song.title,
+                         .artist = song.artist,
+                         .album = song.album,
+                         .albumArtist = song.albumArtist,
+                         .genre = song.genre};
+}
+
+[[nodiscard]] std::optional<ArtworkRef> artworkFromSong(const scanner::SongMetadata& song) {
+  if (!song.artworkPath.has_value() || song.artworkPath->empty()) {
+    return std::nullopt;
+  }
+  return ArtworkRef{.localPath = *song.artworkPath, .uri = {}, .contentHash = song.contentHash.empty() ? std::optional<std::string>{} : std::optional<std::string>{song.contentHash}};
+}
+
 [[nodiscard]] TrackIdentity identityFromRequest(const audio::TrackPlaybackRequest& request) {
   return TrackIdentity{.trackId = request.trackId, .filePath = request.filePath, .sourceId = {}, .libraryId = {}};
 }
@@ -112,6 +127,10 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   auto intent = makeIntent(ControlIntentKind::Seek);
   intent.position = position;
   return intent;
+}
+
+[[nodiscard]] bool isStableSeekVisibleState(PlaybackStatus state) noexcept {
+  return state == PlaybackStatus::Playing || state == PlaybackStatus::Paused;
 }
 
 [[nodiscard]] ControlIntent makeVolumeIntent(float volume) {
@@ -214,6 +233,9 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     if (!command.position.has_value()) {
       return reject(MediaControllerErrorCode::InvalidCommand, "SeekTo requires an absolute position");
     }
+    if (isStableSeekVisibleState(player_.playback.state)) {
+      visibleStateDuringSeek_ = player_.playback.state;
+    }
     player_.timeline.position = clampPosition(*command.position);
     reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
     markPlayerChanged(reduction);
@@ -221,6 +243,9 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   case MediaControlCommandKind::SeekBy:
     if (!command.delta.has_value()) {
       return reject(MediaControllerErrorCode::InvalidCommand, "SeekBy requires a delta");
+    }
+    if (isStableSeekVisibleState(player_.playback.state)) {
+      visibleStateDuringSeek_ = player_.playback.state;
     }
     player_.timeline.position = clampPosition(player_.timeline.position + *command.delta);
     reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
@@ -312,16 +337,30 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
       [&](const auto& payload) {
         using Payload = std::decay_t<decltype(payload)>;
         if constexpr (std::is_same_v<Payload, audio::PlaybackStateChanged>) {
-          player_.playback.state = mapPlaybackState(payload.state);
+          const auto mappedState = mapPlaybackState(payload.state);
+          if (visibleStateDuringSeek_.has_value() && mappedState == PlaybackStatus::Loading) {
+            player_.playback.state = *visibleStateDuringSeek_;
+          } else {
+            player_.playback.state = mappedState;
+            if (mappedState == PlaybackStatus::Playing || mappedState == PlaybackStatus::Stopped || mappedState == PlaybackStatus::Error) {
+              visibleStateDuringSeek_.reset();
+            }
+          }
           if (player_.playback.state != PlaybackStatus::Error) {
             player_.playback.errorCode.reset();
             player_.playback.errorMessage.reset();
           }
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::TrackChanged>) {
-          selectedTrack_ = identityFromRequest(payload.request);
+          const auto identity = identityFromRequest(payload.request);
+          selectedTrack_ = identity;
           player_.currentTrack = selectedTrack_;
-          player_.display = displayFromRequest(payload.request);
+          if (const auto track = findPlayableTrack(identity); track.has_value()) {
+            player_.display = track->display;
+            player_.artwork = track->artwork;
+          } else {
+            player_.display = displayFromRequest(payload.request);
+          }
           player_.timeline.position = payload.request.offset.value_or(std::chrono::milliseconds{0});
           player_.timeline.duration = payload.request.duration;
           markPlayerChanged(reduction, event.timestamp);
@@ -332,6 +371,7 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           player_.timeline.position = clampPosition(payload.after.position);
           markPlayerChanged(reduction, payload.after.sampledAt);
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
+          visibleStateDuringSeek_.reset();
           player_.timeline.position = clampPosition(payload.finalClock.position);
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
           if (player_.repeatMode == RepeatMode::One) {
@@ -350,6 +390,7 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::OutputModeFallback, payload.reason));
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackError>) {
+          visibleStateDuringSeek_.reset();
           player_.playback.state = PlaybackStatus::Error;
           player_.playback.errorCode = playbackErrorCode(payload.code);
           player_.playback.errorMessage = payload.message;
@@ -448,7 +489,10 @@ std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::playableTra
   const auto& tree = *library_.libraryTree;
   const auto appendTrack = [&](const scanner::PlaylistNode& node) {
     if (isTrackNode(node)) {
-      tracks.push_back(PlayableTrack{.identity = identityFromSong(*node.song), .request = requestFromSong(*node.song)});
+      tracks.push_back(PlayableTrack{.identity = identityFromSong(*node.song),
+                                     .request = requestFromSong(*node.song),
+                                     .display = displayFromSong(*node.song),
+                                     .artwork = artworkFromSong(*node.song)});
     }
   };
 
@@ -594,7 +638,8 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
   }
   selectedTrack_ = track->identity;
   player_.currentTrack = track->identity;
-  player_.display = displayFromRequest(track->request);
+  player_.display = track->display;
+  player_.artwork = track->artwork;
   player_.timeline.position = track->request.offset.value_or(std::chrono::milliseconds{0});
   player_.timeline.duration = track->request.duration;
   player_.playback.state = PlaybackStatus::Stopped;
@@ -604,9 +649,11 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
 }
 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
+  visibleStateDuringSeek_.reset();
   selectedTrack_ = track.identity;
   player_.currentTrack = track.identity;
-  player_.display = displayFromRequest(track.request);
+  player_.display = track.display;
+  player_.artwork = track.artwork;
   player_.timeline.position = track.request.offset.value_or(std::chrono::milliseconds{0});
   player_.timeline.duration = track.request.duration;
   player_.playback.state = startPlayback ? PlaybackStatus::Playing : PlaybackStatus::Stopped;
@@ -620,6 +667,7 @@ void ControlStateReducer::selectTrack(ControlReduction& reduction, const Playabl
 }
 
 void ControlStateReducer::stopPlayback(ControlReduction& reduction) {
+  visibleStateDuringSeek_.reset();
   player_.playback.state = PlaybackStatus::Stopped;
   player_.timeline.position = std::chrono::milliseconds{0};
   markPlayerChanged(reduction);

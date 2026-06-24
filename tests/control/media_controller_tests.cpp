@@ -48,7 +48,31 @@ scanner::SongMetadata song(std::string id, std::string path, std::chrono::millis
                                .sourceFilePath = {},
                                .offset = std::nullopt,
                                .duration = duration,
-                               .logicalTrackId = {}};
+                               .logicalTrackId = {},
+                               .artworkPath = std::nullopt};
+}
+
+scanner::SongMetadata songWithArtwork(std::string id, std::string path, std::filesystem::path artworkPath) {
+  auto metadata = song(std::move(id), std::move(path));
+  metadata.artworkPath = std::move(artworkPath);
+  metadata.contentHash = "artwork-hash";
+  return metadata;
+}
+
+scanner::SongMetadata songWithDisplayMetadata(std::string id,
+                                              std::string path,
+                                              std::string title,
+                                              std::string artist,
+                                              std::string album,
+                                              std::string albumArtist,
+                                              std::string genre) {
+  auto metadata = song(std::move(id), std::move(path));
+  metadata.title = std::move(title);
+  metadata.artist = std::move(artist);
+  metadata.album = std::move(album);
+  metadata.albumArtist = std::move(albumArtist);
+  metadata.genre = std::move(genre);
+  return metadata;
 }
 
 scanner::PlaylistNode rootNode(std::vector<std::string> children) {
@@ -137,6 +161,14 @@ audio::BackendEvent audioPositionUpdatedEvent(std::string id, std::chrono::milli
                                                                                                                .sampledAt = {},
                                                                                                                .version = version,
                                                                                                                .continuous = true}}};
+}
+
+audio::BackendEvent audioPlaybackStateChangedEvent(audio::PlaybackState state, std::uint64_t version) {
+  return audio::BackendEvent{.type = audio::BackendEventType::PlaybackStateChanged,
+                             .sourceModule = audio::BackendSourceModule::AudioPlaybackService,
+                             .monotonicVersion = version,
+                             .timestamp = {},
+                             .payload = audio::PlaybackStateChanged{.state = state}};
 }
 
 audio::BackendEvent audioPlaybackEndedEvent(std::string id, std::string path, std::uint64_t version,
@@ -347,6 +379,30 @@ TEST_CASE("media controller facade forwards seek volume mute and toggle commands
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
 }
 
+TEST_CASE("media controller keeps visible playback state stable during seek while playing") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  installLibrary(fixture);
+  fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  auto seek = command(MediaControlCommandKind::SeekTo);
+  seek.position = std::chrono::milliseconds{1500};
+  REQUIRE(fixture.controller->submitCommand(seek).accepted);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+
+  fixture.fakeAudio->emit(audioPlaybackStateChangedEvent(audio::PlaybackState::Loading, 40));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  CHECK(fixture.fakeMetadata->lastUpdatedState()->controlState.playback.state == PlaybackStatus::Playing);
+
+  fixture.fakeAudio->emit(audioPlaybackStateChangedEvent(audio::PlaybackState::Playing, 41));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  CHECK(fixture.fakeMetadata->lastUpdatedState()->controlState.playback.state == PlaybackStatus::Playing);
+}
+
 TEST_CASE("media controller facade applies skip repeat and playback-ended policies through fake audio") {
   ControllerFixture fixture{};
   std::atomic_size_t playbackEndedNotifications{0};
@@ -383,6 +439,113 @@ TEST_CASE("media controller facade applies skip repeat and playback-ended polici
   CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
   notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller propagates scanner artwork to player snapshot metadata") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({songWithArtwork("a", "music/a.flac", "/tmp/seriona-cover-a.png")}, 21), 21));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/tmp/seriona-cover-a.png"});
+  CHECK(snapshot.artwork->contentHash == std::string{"artwork-hash"});
+}
+
+TEST_CASE("media controller preserves scanner display metadata for platform snapshots") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({songWithDisplayMetadata("riot",
+                                                                                      "music/R・I・O・T.flac",
+                                                                                      "R·I·O·T",
+                                                                                      "RAISE A SUILEN",
+                                                                                      "R・I・O・T",
+                                                                                      "RAISE A SUILEN",
+                                                                                      "Rock")},
+                                                       22),
+                                               22));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->title == "R·I·O·T");
+  CHECK(snapshot.display->artist == "RAISE A SUILEN");
+  CHECK(snapshot.display->album == "R・I・O・T");
+  CHECK(snapshot.display->albumArtist == "RAISE A SUILEN");
+  CHECK(snapshot.display->genre == "Rock");
+
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  const auto& publishedSnapshot = fixture.fakeMetadata->lastUpdatedState()->controlState;
+  REQUIRE(publishedSnapshot.display.has_value());
+  CHECK(publishedSnapshot.display->album == "R・I・O・T");
+}
+
+TEST_CASE("media controller does not replace scanner album with parent directory name") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  constexpr auto kFolderAlbum = "[M3-44] ARForest - The Unfinished [FLAC]";
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({songWithDisplayMetadata("arforest-01",
+                                                                                      std::string{"music/"} + kFolderAlbum + "/01 - Abandoned Creation.flac",
+                                                                                      "Abandoned Creation",
+                                                                                      "ARForest",
+                                                                                      "The Unfinished",
+                                                                                      "ARForest",
+                                                                                      "Soundtrack")},
+                                                       23),
+                                               23));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->album == "The Unfinished");
+  CHECK(snapshot.display->album != kFolderAlbum);
+
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  const auto& publishedSnapshot = fixture.fakeMetadata->lastUpdatedState()->controlState;
+  REQUIRE(publishedSnapshot.display.has_value());
+  CHECK(publishedSnapshot.display->album == "The Unfinished");
+  CHECK(publishedSnapshot.display->album != kFolderAlbum);
+}
+
+TEST_CASE("media controller preserves scanner display metadata after audio track changed event") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  constexpr auto kFolderAlbum = "[M3-44] ARForest - The Unfinished [FLAC]";
+  const auto path = std::string{"music/"} + kFolderAlbum + "/01 - Abandoned Creation.flac";
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({songWithDisplayMetadata("arforest-01",
+                                                                                      path,
+                                                                                      "Abandoned Creation",
+                                                                                      "ARForest",
+                                                                                      "The Unfinished",
+                                                                                      "ARForest",
+                                                                                      "Soundtrack")},
+                                                       24),
+                                               24));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  fixture.fakeAudio->emit(audioTrackChangedEvent("arforest-01", path, 25));
+  fixture.controller->drainForTests();
+
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->title == "Abandoned Creation");
+  CHECK(snapshot.display->artist == "ARForest");
+  CHECK(snapshot.display->album == "The Unfinished");
+  CHECK(snapshot.display->album != kFolderAlbum);
+
+  REQUIRE(fixture.fakeMetadata->lastUpdatedState().has_value());
+  const auto& publishedSnapshot = fixture.fakeMetadata->lastUpdatedState()->controlState;
+  REQUIRE(publishedSnapshot.display.has_value());
+  CHECK(publishedSnapshot.display->album == "The Unfinished");
+  CHECK(publishedSnapshot.display->album != kFolderAlbum);
 }
 
 TEST_CASE("media controller facade shuffle produces deterministic selected tracks") {

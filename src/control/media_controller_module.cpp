@@ -38,6 +38,14 @@ private:
   return std::make_shared<NoopAudioPlaybackService>();
 }
 
+[[nodiscard]] metadata::MetadataSharingOptions makeProductionMetadataOptions() {
+  metadata::MetadataSharingOptions options{};
+#if defined(__linux__) && !defined(__APPLE__)
+  options.backendKind = metadata::MetadataBackendKind::Linux;
+#endif
+  return options;
+}
+
 }
 
 MediaControllerDependencies makeDefaultMediaControllerDependencies() {
@@ -52,7 +60,7 @@ MediaControllerDependencies makeProductionMediaControllerDependencies() {
   MediaControllerDependencies dependencies{};
   dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend());
   dependencies.scanner = scanner::makeFileScannerService();
-  dependencies.metadata = metadata::makeMetadataSharingService(metadata::MetadataSharingOptions{});
+  dependencies.metadata = metadata::makeMetadataSharingService(makeProductionMetadataOptions());
   return dependencies;
 }
 

@@ -1,6 +1,7 @@
 #include "control_test_harness.h"
 
 #include "../../src/control/control_event_loop.h"
+#include "../../src/control/media_controller_module.h"
 
 #include <doctest.h>
 
@@ -159,6 +160,17 @@ TEST_CASE("control test harness records fake playback scanner and metadata activ
   CHECK(fakeMetadata.lastStartedState().has_value());
   CHECK(fakeMetadata.lastUpdatedState().has_value());
   CHECK(fakeMetadata.lastStopResult().has_value());
+}
+
+TEST_CASE("production controller dependencies enable platform metadata backend") {
+  auto dependencies = makeProductionMediaControllerDependencies();
+
+  REQUIRE(dependencies.metadata != nullptr);
+#if defined(__linux__) && !defined(__APPLE__)
+  CHECK(dependencies.metadata->backendKind() == metadata::MetadataBackendKind::Linux);
+#else
+  CHECK(dependencies.metadata->backendKind() == metadata::MetadataBackendKind::Noop);
+#endif
 }
 
 TEST_CASE("subscription handle unsubscribe detaches callback exactly once") {

@@ -55,6 +55,8 @@ private:
   struct PlayableTrack {
     TrackIdentity identity{};
     audio::TrackPlaybackRequest request{};
+    DisplayMetadata display{};
+    std::optional<ArtworkRef> artwork{};
   };
 
   [[nodiscard]] std::vector<PlayableTrack> playableTracks() const;
@@ -75,6 +77,7 @@ private:
   PlayerStateSnapshot player_{};
   LibraryStateSnapshot library_{};
   std::optional<TrackIdentity> selectedTrack_{};
+  std::optional<PlaybackStatus> visibleStateDuringSeek_{};
   std::uint64_t lastAudioPlayerVersion_{0};
   std::uint64_t lastAudioServiceVersion_{0};
   std::uint64_t lastScannerVersion_{0};

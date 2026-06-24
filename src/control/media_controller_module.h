@@ -5,6 +5,7 @@
 namespace seriona::control {
 
 [[nodiscard]] MediaControllerDependencies makeDefaultMediaControllerDependencies();
+[[nodiscard]] MediaControllerDependencies makeProductionMediaControllerDependencies();
 void normalizeMediaControllerDependencies(MediaControllerDependencies& dependencies);
 
 }
