@@ -152,6 +152,7 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   }
 
   currentFormat_ = backend_->currentFormat();
+  currentQueue_ = request.pcmQueue;
   publishCallbackQueue(*request.pcmQueue, currentFormat_);
   callbackCount_.store(0U, std::memory_order_relaxed);
   requestedFrames_.store(0U, std::memory_order_relaxed);
@@ -182,6 +183,9 @@ bool AudioOutputDevice::start() {
     return false;
   }
 
+  if (currentQueue_ != nullptr) {
+    publishCallbackQueue(*currentQueue_, currentFormat_);
+  }
   started_ = true;
   return true;
 }
@@ -204,6 +208,13 @@ bool AudioOutputDevice::stop() {
   return true;
 }
 
+void AudioOutputDevice::rebindQueue(PcmBufferQueue& queue) noexcept {
+  currentQueue_ = &queue;
+  if (initialized_) {
+    publishCallbackQueue(queue, currentFormat_);
+  }
+}
+
 void AudioOutputDevice::uninitialize() noexcept {
   if (!initialized_) {
     return;
@@ -217,6 +228,7 @@ void AudioOutputDevice::uninitialize() noexcept {
   deactivateCallbackQueue();
   backend_->uninitialize();
   currentFormat_ = {};
+  currentQueue_ = nullptr;
   lastError_.reset();
   initialized_ = false;
 }

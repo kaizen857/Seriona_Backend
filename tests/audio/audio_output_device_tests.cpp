@@ -234,6 +234,54 @@ TEST_CASE("audio_output_device callback after stop observes inactive generation 
   CHECK(queue.counters().consumedFrames == 0U);
 }
 
+TEST_CASE("audio_output_device resume republishes callback queue after stop") {
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioOutputDevice device(std::move(backend));
+  PcmBufferQueue queue(queueConfig(8));
+  const std::array<StereoFrame, 2> input{StereoFrame{1, 2, 3, 4}, StereoFrame{5, 6, 7, 8}};
+  std::array<StereoFrame, 2> output{};
+
+  CHECK(device.initialize(openRequest(queue)));
+  CHECK(device.start());
+  CHECK(device.stop());
+  CHECK(queue.write(input.data(), static_cast<std::uint32_t>(input.size())));
+  CHECK(device.start());
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+
+  CHECK(output == input);
+  CHECK(fake->startCalls == 2);
+  CHECK(fake->stopCalls == 1);
+  CHECK(queue.counters().consumedFrames == 2U);
+}
+
+TEST_CASE("audio_output_device can rebind callback queue before restart") {
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioOutputDevice device(std::move(backend));
+  PcmBufferQueue staleQueue(queueConfig(8));
+  PcmBufferQueue freshQueue(queueConfig(8));
+  const std::array<StereoFrame, 1> stale{StereoFrame{9, 9, 9, 9}};
+  const std::array<StereoFrame, 1> fresh{StereoFrame{1, 2, 3, 4}};
+  std::array<StereoFrame, 1> output{};
+
+  CHECK(staleQueue.write(stale.data(), static_cast<std::uint32_t>(stale.size())));
+  CHECK(freshQueue.write(fresh.data(), static_cast<std::uint32_t>(fresh.size())));
+  CHECK(device.initialize(openRequest(staleQueue)));
+  CHECK(device.start());
+  CHECK(device.stop());
+
+  device.rebindQueue(freshQueue);
+  CHECK(device.start());
+  AudioOutputDevice::renderCallback(&device, output.data(), static_cast<std::uint32_t>(output.size()));
+
+  CHECK(output == fresh);
+  CHECK(fake->startCalls == 2);
+  CHECK(fake->stopCalls == 1);
+  CHECK(staleQueue.counters().consumedFrames == 0U);
+  CHECK(freshQueue.counters().consumedFrames == 1U);
+}
+
 TEST_CASE("audio_output_device callback after uninitialize has no queue lifetime dependency") {
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   AudioOutputDevice device(std::move(backend));

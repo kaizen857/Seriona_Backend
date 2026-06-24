@@ -400,6 +400,7 @@ private:
     }
 
     stopDevice();
+    device_.rebindQueue(*queue_);
     previousQueue.reset();
     previousPipeline.reset();
     previousSource.reset();

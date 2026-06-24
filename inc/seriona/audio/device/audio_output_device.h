@@ -74,6 +74,7 @@ public:
   [[nodiscard]] bool start();
   [[nodiscard]] bool stop();
   void uninitialize() noexcept;
+  void rebindQueue(PcmBufferQueue& queue) noexcept;
 
   [[nodiscard]] bool initialized() const noexcept;
   [[nodiscard]] bool started() const noexcept;
@@ -98,6 +99,7 @@ private:
   std::atomic<float> volume_{1.0F};
   std::atomic<bool> muted_{false};
   AudioDeviceFormat currentFormat_{};
+  PcmBufferQueue* currentQueue_{nullptr};
   std::optional<AudioOutputDeviceError> lastError_{};
   bool initialized_{false};
   bool started_{false};
