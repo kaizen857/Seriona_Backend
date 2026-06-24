@@ -1,5 +1,12 @@
 #include "subscription_store.h"
 
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace seriona::control {
@@ -8,6 +15,130 @@ namespace {
 
 void discardUnhandledException(const std::exception_ptr& exception) noexcept {
   (void)exception;
+}
+
+class SubscriptionDeliveryWorker {
+public:
+  SubscriptionDeliveryWorker() : worker_([this] { run(); }) {}
+
+  ~SubscriptionDeliveryWorker() { stop(); }
+
+  SubscriptionDeliveryWorker(const SubscriptionDeliveryWorker&) = delete;
+  SubscriptionDeliveryWorker& operator=(const SubscriptionDeliveryWorker&) = delete;
+
+  void submit(std::function<void()> delivery) {
+    {
+      std::lock_guard lock{mutex_};
+      if (stopping_) {
+        return;
+      }
+      deliveries_.push_back(std::move(delivery));
+    }
+    ready_.notify_one();
+  }
+
+  void waitUntilIdle() {
+    if (std::this_thread::get_id() == worker_.get_id()) {
+      return;
+    }
+    auto barrier = std::make_shared<std::promise<void>>();
+    auto finished = barrier->get_future();
+    submit([barrier] { barrier->set_value(); });
+    finished.wait();
+  }
+
+  void stop() noexcept {
+    {
+      std::lock_guard lock{mutex_};
+      stopping_ = true;
+      deliveries_.clear();
+    }
+    ready_.notify_one();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+private:
+  void run() {
+    while (true) {
+      std::function<void()> delivery;
+      {
+        std::unique_lock lock{mutex_};
+        ready_.wait(lock, [this] { return stopping_ || !deliveries_.empty(); });
+        if (stopping_ && deliveries_.empty()) {
+          return;
+        }
+        delivery = std::move(deliveries_.front());
+        deliveries_.pop_front();
+      }
+      delivery();
+    }
+  }
+
+  std::mutex mutex_{};
+  std::condition_variable ready_{};
+  std::deque<std::function<void()>> deliveries_{};
+  std::thread worker_{};
+  bool stopping_{false};
+};
+
+std::mutex& deliveryRegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<const void*, std::shared_ptr<SubscriptionDeliveryWorker>>& deliveryRegistry() {
+  static std::unordered_map<const void*, std::shared_ptr<SubscriptionDeliveryWorker>> registry;
+  return registry;
+}
+
+std::shared_ptr<SubscriptionDeliveryWorker> deliveryWorkerFor(const void* key) {
+  std::lock_guard lock{deliveryRegistryMutex()};
+  auto& worker = deliveryRegistry()[key];
+  if (!worker) {
+    worker = std::make_shared<SubscriptionDeliveryWorker>();
+  }
+  return worker;
+}
+
+void removeDeliveryWorker(const void* key) noexcept {
+  try {
+    std::shared_ptr<SubscriptionDeliveryWorker> worker;
+    {
+      std::lock_guard lock{deliveryRegistryMutex()};
+      auto found = deliveryRegistry().find(key);
+      if (found == deliveryRegistry().end()) {
+        return;
+      }
+      worker = std::move(found->second);
+      deliveryRegistry().erase(found);
+    }
+    if (worker) {
+      worker->stop();
+    }
+  } catch (...) {
+    discardUnhandledException(std::current_exception());
+  }
+}
+
+void waitForDeliveryWorkerIdle(const void* key) noexcept {
+  try {
+    std::shared_ptr<SubscriptionDeliveryWorker> worker;
+    {
+      std::lock_guard lock{deliveryRegistryMutex()};
+      const auto found = deliveryRegistry().find(key);
+      if (found == deliveryRegistry().end()) {
+        return;
+      }
+      worker = found->second;
+    }
+    if (worker) {
+      worker->waitUntilIdle();
+    }
+  } catch (...) {
+    discardUnhandledException(std::current_exception());
+  }
 }
 
 }
@@ -21,6 +152,7 @@ SubscriptionStore<Snapshot>::SubscriptionStore(SubscriptionExceptionReporter exc
 template <typename Snapshot>
 SubscriptionStore<Snapshot>::~SubscriptionStore() {
   clear();
+  removeDeliveryWorker(state_.get());
 }
 
 template <typename Snapshot>
@@ -38,12 +170,15 @@ SubscriptionHandle SubscriptionStore<Snapshot>::subscribe(Callback callback, std
   }
 
   SubscriptionHandle handle{.subscriptionId = subscriptionId,
-                            .unsubscribe = [weakState = std::weak_ptr<State>{state}, subscriptionId] {
-                              if (const auto lockedState = weakState.lock()) {
-                                std::lock_guard lock{lockedState->mutex};
-                                lockedState->subscribers.erase(subscriptionId);
-                              }
-                            }};
+	                            .unsubscribe = [weakState = std::weak_ptr<State>{state}, subscriptionId] {
+	                              if (const auto lockedState = weakState.lock()) {
+	                                {
+	                                  std::lock_guard lock{lockedState->mutex};
+	                                  lockedState->subscribers.erase(subscriptionId);
+	                                }
+	                                waitForDeliveryWorkerIdle(lockedState.get());
+	                              }
+	                            }};
 
   if (initialSnapshot) {
     invokeSubscriber(subscriptionId, *initialSnapshot);
@@ -54,29 +189,62 @@ SubscriptionHandle SubscriptionStore<Snapshot>::subscribe(Callback callback, std
 
 template <typename Snapshot>
 void SubscriptionStore<Snapshot>::unsubscribe(std::size_t subscriptionId) noexcept {
-  try {
-    std::lock_guard lock{state_->mutex};
-    state_->subscribers.erase(subscriptionId);
-  } catch (...) {
+	  try {
+	    {
+	      std::lock_guard lock{state_->mutex};
+	      state_->subscribers.erase(subscriptionId);
+	    }
+	    waitForDeliveryWorkerIdle(state_.get());
+	  } catch (...) {
     discardUnhandledException(std::current_exception());
   }
 }
 
 template <typename Snapshot>
 void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
-  std::vector<std::size_t> subscriptionIds;
+  std::vector<std::pair<std::size_t, Callback>> deliveries;
   {
     std::lock_guard lock{state_->mutex};
-    subscriptionIds.reserve(state_->subscribers.size());
+    deliveries.reserve(state_->subscribers.size());
     for (const auto& [subscriptionId, subscriber] : state_->subscribers) {
       if (subscriber.active) {
-        subscriptionIds.push_back(subscriptionId);
+        deliveries.emplace_back(subscriptionId, subscriber.callback);
       }
     }
   }
 
-  for (const auto subscriptionId : subscriptionIds) {
-    invokeSubscriber(subscriptionId, snapshot);
+  const auto worker = deliveryWorkerFor(state_.get());
+  for (const auto& [subscriptionId, callback] : deliveries) {
+    const auto snapshotCopy = snapshot;
+    const auto weakState = std::weak_ptr<State>{state_};
+    worker->submit([subscriptionId, callback, snapshotCopy, weakState] {
+      const auto lockedState = weakState.lock();
+      if (!lockedState) {
+        return;
+      }
+      {
+        std::lock_guard lock{lockedState->mutex};
+        const auto found = lockedState->subscribers.find(subscriptionId);
+        if (found == lockedState->subscribers.end() || !found->second.active) {
+          return;
+        }
+      }
+      try {
+        callback(snapshotCopy);
+      } catch (...) {
+        SubscriptionExceptionReporter reporter;
+        SubscriptionExceptionReport report{.subscriptionId = subscriptionId};
+        report.exception = std::current_exception();
+        {
+          std::lock_guard lock{lockedState->mutex};
+          report.totalExceptionCount = ++lockedState->exceptionCount;
+          reporter = lockedState->exceptionReporter;
+        }
+        if (reporter) {
+          reporter(report);
+        }
+      }
+    });
   }
 }
 
@@ -120,11 +288,37 @@ void SubscriptionStore<Snapshot>::invokeSubscriber(std::size_t subscriptionId, c
     return;
   }
 
-  try {
-    callback(snapshot);
-  } catch (...) {
-    reportException(subscriptionId, std::current_exception());
-  }
+  const auto worker = deliveryWorkerFor(state_.get());
+  const auto snapshotCopy = snapshot;
+  const auto weakState = std::weak_ptr<State>{state_};
+  worker->submit([subscriptionId, callback, snapshotCopy, weakState] {
+    const auto lockedState = weakState.lock();
+    if (!lockedState) {
+      return;
+    }
+    {
+      std::lock_guard lock{lockedState->mutex};
+      const auto found = lockedState->subscribers.find(subscriptionId);
+      if (found == lockedState->subscribers.end() || !found->second.active) {
+        return;
+      }
+    }
+    try {
+      callback(snapshotCopy);
+    } catch (...) {
+      SubscriptionExceptionReporter reporter;
+      SubscriptionExceptionReport report{.subscriptionId = subscriptionId};
+      report.exception = std::current_exception();
+      {
+        std::lock_guard lock{lockedState->mutex};
+        report.totalExceptionCount = ++lockedState->exceptionCount;
+        reporter = lockedState->exceptionReporter;
+      }
+      if (reporter) {
+        reporter(report);
+      }
+    }
+  });
 }
 
 template <typename Snapshot>

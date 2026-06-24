@@ -202,13 +202,13 @@ struct MediaControlCommand {
   std::optional<TrackIdentity> track;
 };
 
-using PlayerStateSnapshotCallback = std::function<void(const PlayerStateSnapshot&)>;
+using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;
 using PlayerStateSubscriptionCallback = PlayerStateSnapshotCallback;
 using MediaControlCommandSink = std::function<void(const MediaControlCommand&)>;
 
-using LibraryStateSnapshotCallback = std::function<void(const LibraryStateSnapshot&)>;
+using LibraryStateSnapshotCallback = std::function<void(LibraryStateSnapshot)>;
 using LibraryStateSubscriptionCallback = LibraryStateSnapshotCallback;
-using ControlDomainNotificationCallback = std::function<void(const ControlDomainNotification&)>;
+using ControlDomainNotificationCallback = std::function<void(ControlDomainNotification)>;
 using ControlDomainNotificationSubscriptionCallback = ControlDomainNotificationCallback;
 
 struct SubscriptionHandle {

@@ -61,6 +61,12 @@ TEST_CASE("control public contracts remain value types") {
   expectValueSemantics<SubscriptionHandle>();
 }
 
+TEST_CASE("snapshot subscription callbacks take owned values") {
+  CHECK(std::is_same_v<PlayerStateSnapshotCallback, std::function<void(PlayerStateSnapshot)>>);
+  CHECK(std::is_same_v<LibraryStateSnapshotCallback, std::function<void(LibraryStateSnapshot)>>);
+  CHECK(std::is_same_v<ControlDomainNotificationCallback, std::function<void(ControlDomainNotification)>>);
+}
+
 TEST_CASE("control test harness records fake playback scanner and metadata activity") {
   test::DeterministicClock clock{};
   test::FakeAudioPlaybackService fakeAudio{};
