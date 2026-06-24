@@ -195,6 +195,7 @@ LoadResult loadWith(std::vector<SupportedFormat> supportedFormats,
   player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
   player.configureOutput(outputConfig);
   player.loadTrack(request(path, std::move(trackId)));
+  static_cast<void>(player.queryPlaybackClock());
   return LoadResult{std::move(events), fake->requests};
 }
 

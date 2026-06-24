@@ -218,6 +218,7 @@ TEST_CASE("audio_player_seamless_mix hands prepared next track off without reope
   player.loadTrack(request(firstPath, "first"));
   player.prepareNext(request(secondPath, "second"));
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   fake->consumeFrames(960U);
   const auto afterHandoff = player.queryPlaybackClock();
 
@@ -249,6 +250,7 @@ TEST_CASE("audio_player_direct_preload prepares next track but does not claim se
   player.loadTrack(request(firstPath, "direct-first"));
   player.prepareNext(request(secondPath, "direct-second"));
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   fake->consumeFrames(960U);
   const auto endedClock = player.queryPlaybackClock();
 
@@ -297,6 +299,7 @@ TEST_CASE("audio_player_preload_failure emits error without queue policy") {
   player.loadTrack(request(firstPath, "current"));
   player.prepareNext(request(std::filesystem::current_path() / "missing-preload.wav", "missing-next"));
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   fake->consumeFrames(960U);
   const auto endedClock = player.queryPlaybackClock();
 

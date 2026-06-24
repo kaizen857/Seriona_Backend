@@ -36,3 +36,11 @@
 - Escape hatches: no `unwrap`/`expect` equivalents or warning suppressions added.
 - Defensive layer: worker shutdown uses queue contract and join; no redundant post-action verification added in production code.
 - Tests: new regressions fail before implementation and pass after worker/transactional seek changes.
+
+## Task 10 full-suite audio regression follow-up
+- Reproduction command: `ctest --test-dir build -R 'seriona\.(output_format_negotiation|output_format_negotiation_failure|audio_player_seamless_mix|audio_player_direct_preload|audio_player_preload_failure)' --output-on-failure`.
+- Red result before the fix: 5/5 selected tests failed. Format negotiation observed `requests.size() == 0` and no output events; seamless/direct/preload tests failed in `SeamlessFakeAudioOutputDeviceBackend::consumeFrames()` because `userData == nullptr`.
+- Root cause: the production worker/enqueue behavior from Task 6 is correct, but these pre-existing tests still assumed `configureOutput()`, `loadTrack()`, `prepareNext()`, and `play()` synchronously mutated the fake backend before the next assertion or render callback.
+- Fix: add `AudioPlayer::queryPlaybackClock()` as an existing command-queue barrier before reading fake backend state or manually invoking `consumeFrames()`. Assertions still verify the original real behavior: negotiation requests/events, seamless handoff, direct preload non-handoff, preload error, and track events.
+- Verification: `cmake --build build --target seriona_output_format_negotiation_tests seriona_audio_player_seamless_tests seriona_audio_player_single_track_tests seriona_audio_player_small_buffer_tests seriona_audio_error_matrix_tests seriona_audio_shutdown_lifecycle_tests` exited 0 with `ninja: no work to do.`.
+- Verification: `ctest --test-dir build -R 'seriona\.(output_format_negotiation|output_format_negotiation_failure|audio_player_seamless_mix|audio_player_direct_preload|audio_player_preload_failure|audio_player_single_track|audio_player_small_buffer|audio_error_matrix|audio_shutdown_lifecycle)' --output-on-failure` exited 0; 9/9 tests passed.
