@@ -147,7 +147,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: logging level test validates all five levels including critical. Failure: inject impossible logger path or top-level exception path and verify critical/fallback behavior exactly as designed. Evidence `.omo/evidence/task-9-seriona-portable-logging.md`.
   Commit: Y | `feat(logging): cover critical failures`
 
-- [ ] 10. Update test/CMake integration for logging and portable storage
+- [x] 10. Update test/CMake integration for logging and portable storage
   What to do / Must NOT do: Add/adjust test targets for logging bootstrap/runtime paths, and update existing tests for new portable naming if needed. Keep tests deterministic by using temporary directories, not the real build output except live smoke. Ensure direct test executables link spdlog only when they compile logging code directly.
   Parallelization: Wave 3 | Blocked by: 1-9 | Blocks: 11, 12
   References (executor has NO interview context - be exhaustive): `tests/CMakeLists.txt:1`, `tests/CMakeLists.txt:121`, `tests/CMakeLists.txt:131`, `tests/CMakeLists.txt:144`, `tests/CMakeLists.txt:149`, `tests/CMakeLists.txt:153`, `tests/scanner/scanner_test_harness.h`, `tests/scanner/scanner_test_harness.cpp`, `tests/scanner/scanner_cache_tests.cpp`, `tests/scanner/scanner_service_tests.cpp`, `tests/scanner/scanner_watcher_tests.cpp`, `tests/scanner/scanner_tagreader_tests.cpp`, `tests/metadata/metadata_mpris_tests.cpp`, `tests/control/media_controller_tests.cpp`.
@@ -155,7 +155,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.(logging|runtime_paths|scanner|metadata|control)' --output-on-failure`. Failure: grep/assertion in tests rejects `/tmp/seriona/scanner-cache.sqlite` as a production default. Evidence `.omo/evidence/task-10-seriona-portable-logging.md`.
   Commit: Y | `test(logging): cover portable observability`
 
-- [ ] 11. Run full validation and static guardrails
+- [x] 11. Run full validation and static guardrails
   What to do / Must NOT do: Build and test the complete project, then run static searches to enforce realtime no-log constraints and module-neutral runtime names. Do not fix unrelated failures except those introduced by this plan; document existing flaky failures separately if they recur.
   Parallelization: Wave 3 | Blocked by: 10 | Blocks: 12
   References (executor has NO interview context - be exhaustive): `AGENTS.md` build commands; realtime constraints in `AGENTS.md`; no-log anchors `src/audio/device/audio_output_device.cpp:253`, `src/audio/buffer/pcm_buffer_queue.cpp`, `src/audio/device/miniaudio_output_device_backend.cpp`.
@@ -163,7 +163,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: commands above. Failure: intentionally list and fail if forbidden files contain `spdlog::` or `SPDLOG_`. Evidence `.omo/evidence/task-11-seriona-portable-logging.md`.
   Commit: Y | `chore(logging): verify observability guardrails`
 
-- [ ] 12. Live portable smoke and documentation note
+- [x] 12. Live portable smoke and documentation note
   What to do / Must NOT do: Run the built app from `build/` against a real music folder, verify `build/SerionaData/logs/seriona.log`, `build/SerionaData/library.sqlite`, and `build/SerionaData/artwork/` are created/used, and verify logs include startup, scan, play, MPRIS, seek, and shutdown. Add a concise user-facing note to project docs only if a suitable doc exists (`DESIGN.md` is acceptable if it already documents runtime architecture; do not inflate README if it is intentionally just a title unless the executor judges a short section is useful and records why).
   Parallelization: Wave 3 | Blocked by: 10, 11 | Blocks: final wave
   References (executor has NO interview context - be exhaustive): `app/CMakeLists.txt:7`, `app/terminal_controller.cpp:181`, real smoke folders from prior QA: `/home/kaizen857/Music/CloudMusic(for MP4)/R・I・O・T/` and `/home/kaizen857/Music/CloudMusic(for MP4)/[M3-44] ARForest - The Unfinished [FLAC]`; `DESIGN.md` logging/runtime sections.
