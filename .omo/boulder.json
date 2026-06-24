@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "active_work_id": "media-controller-module-ab710546",
+  "active_work_id": "seriona-vibe-bug-refactor-6b7f31a9",
   "works": {
     "audio-player-module-3bdc4128": {
       "work_id": "audio-player-module-3bdc4128",
@@ -1555,66 +1555,277 @@
       },
       "ended_at": "2026-06-22T11:18:35.157Z",
       "elapsed_ms": 2499960
+    },
+    "seriona-vibe-bug-refactor-2412df74": {
+      "work_id": "seriona-vibe-bug-refactor-2412df74",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-vibe-bug-refactor.md",
+      "plan_name": "seriona-vibe-bug-refactor",
+      "status": "active",
+      "started_at": "2026-06-23T15:16:31.824Z",
+      "updated_at": "2026-06-23T15:16:31.824Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "seriona-vibe-bug-refactor-8b7ecd00": {
+      "work_id": "seriona-vibe-bug-refactor-8b7ecd00",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-vibe-bug-refactor.md",
+      "plan_name": "seriona-vibe-bug-refactor",
+      "status": "active",
+      "started_at": "2026-06-23T15:16:31.843Z",
+      "updated_at": "2026-06-23T15:50:39.949Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:0": {
+          "task_key": "todo:0",
+          "task_label": "0",
+          "task_title": "Preflight: snapshot worktree and build baseline without source edits",
+          "session_id": "opencode:ses_10af08cf8ffeya4WAXsHOn8xev",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-low",
+          "updated_at": "2026-06-23T15:20:10.610Z",
+          "started_at": "2026-06-23T15:20:10.610Z",
+          "status": "running"
+        },
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Phase 1: make audio callback queue lifetime generation-safe",
+          "session_id": "opencode:ses_10aed6a15ffekHTxIx7ru2vOH5",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-23T15:38:20.963Z",
+          "started_at": "2026-06-23T15:38:20.963Z",
+          "status": "running"
+        },
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "Phase 2: make AudioEventDispatcher sink thread-safe and lock-outside-call",
+          "session_id": "opencode:ses_10adbfe90ffeOzt3uDj4fyIPBi",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-23T15:50:39.949Z",
+          "started_at": "2026-06-23T15:50:39.949Z",
+          "status": "running"
+        }
+      }
+    },
+    "seriona-vibe-bug-refactor-abb22b24": {
+      "work_id": "seriona-vibe-bug-refactor-abb22b24",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-vibe-bug-refactor.md",
+      "plan_name": "seriona-vibe-bug-refactor",
+      "status": "active",
+      "started_at": "2026-06-23T23:05:47.778Z",
+      "updated_at": "2026-06-23T23:05:47.778Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "seriona-vibe-bug-refactor-6b7f31a9": {
+      "work_id": "seriona-vibe-bug-refactor-6b7f31a9",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-vibe-bug-refactor.md",
+      "plan_name": "seriona-vibe-bug-refactor",
+      "status": "completed",
+      "started_at": "2026-06-23T23:05:47.826Z",
+      "updated_at": "2026-06-24T01:36:59.492Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "Phase 2: make AudioEventDispatcher sink thread-safe and lock-outside-call",
+          "session_id": "opencode:ses_1093bd266ffeztex0ZaiUZIk6u",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-low",
+          "started_at": "2026-06-23T23:13:53.600Z",
+          "status": "running",
+          "updated_at": "2026-06-23T23:16:18.515Z"
+        },
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "Phase 2/4 bridge: move scanner work out of ControlEventLoop",
+          "session_id": "opencode:ses_109225083ffeWRADF95QVDF3pT",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-low",
+          "started_at": "2026-06-23T23:42:19.991Z",
+          "status": "running",
+          "updated_at": "2026-06-23T23:44:41.487Z"
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "Phase 3: introduce audio command worker and transactional seek",
+          "session_id": "opencode:ses_10904ef78ffeEEr5b1Nyclp4VG",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-low",
+          "started_at": "2026-06-24T00:14:00.068Z",
+          "status": "running",
+          "updated_at": "2026-06-24T00:16:07.269Z"
+        },
+        "todo:7": {
+          "task_key": "todo:7",
+          "task_label": "7",
+          "task_title": "Phase 4: make metadata snapshot updates asynchronous from control",
+          "session_id": "opencode:ses_108fe72dcffedfKN42QrSXb9bq",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "started_at": "2026-06-24T00:20:09.995Z",
+          "status": "running",
+          "updated_at": "2026-06-24T00:42:51.096Z"
+        },
+        "todo:9": {
+          "task_key": "todo:9",
+          "task_label": "9",
+          "task_title": "Phase 4: make snapshot subscriptions value-safe and nonblocking",
+          "session_id": "opencode:ses_108e8f842ffeDtjmhTC20atEMT",
+          "agent": "Sisyphus-Junior",
+          "category": "",
+          "started_at": "2026-06-24T00:45:06.122Z",
+          "status": "running",
+          "updated_at": "2026-06-24T01:17:41.368Z"
+        },
+        "todo:10": {
+          "task_key": "todo:10",
+          "task_label": "10",
+          "task_title": "Final integration: verify full architecture contract and no scope drift",
+          "session_id": "opencode:ses_108bf1c22ffe9HHCwfxPY4g7Nx",
+          "agent": "Sisyphus-Junior",
+          "category": "writing",
+          "started_at": "2026-06-24T01:19:44.650Z",
+          "status": "running",
+          "updated_at": "2026-06-24T01:32:49.576Z"
+        },
+        "final-wave:f1": {
+          "task_key": "final-wave:f1",
+          "task_label": "F1",
+          "task_title": "Plan compliance audit: read `.omo/plans/seriona-vibe-bug-refactor.md`, all `.omo/evidence/task-*`, and `git log --oneline -10`; verify every completed code task has a matching evidence file, passing task-specific tests, and one atomic commit using only allowed Git write commands.",
+          "session_id": "opencode:ses_108bca977ffeMFJYtR8NI1Dfpb",
+          "agent": "Sisyphus-Junior",
+          "category": "writing",
+          "updated_at": "2026-06-24T01:34:56.263Z",
+          "started_at": "2026-06-24T01:34:56.263Z",
+          "status": "running"
+        }
+      },
+      "ended_at": "2026-06-24T01:36:59.492Z",
+      "elapsed_ms": 9071666
     }
   },
-  "active_plan": "/home/kaizen857/cppProject/Seriona_Backend/.omo/plans/media-controller-module.md",
-  "started_at": "2026-06-22T10:36:55.197Z",
+  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-vibe-bug-refactor.md",
+  "started_at": "2026-06-23T23:05:47.826Z",
   "status": "completed",
-  "updated_at": "2026-06-22T11:18:35.157Z",
+  "updated_at": "2026-06-24T01:36:59.492Z",
   "session_ids": [
-    "opencode:ses_1134d217bffeUcgnmg9eu7kRe0"
+    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
   ],
   "session_origins": {
-    "opencode:ses_1134d217bffeUcgnmg9eu7kRe0": "direct"
+    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
   },
-  "plan_name": "media-controller-module",
+  "plan_name": "seriona-vibe-bug-refactor",
   "task_sessions": {
+    "todo:2": {
+      "task_key": "todo:2",
+      "task_label": "2",
+      "task_title": "Phase 2: make AudioEventDispatcher sink thread-safe and lock-outside-call",
+      "session_id": "opencode:ses_1093bd266ffeztex0ZaiUZIk6u",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "started_at": "2026-06-23T23:13:53.600Z",
+      "status": "running",
+      "updated_at": "2026-06-23T23:16:18.515Z"
+    },
+    "todo:5": {
+      "task_key": "todo:5",
+      "task_label": "5",
+      "task_title": "Phase 2/4 bridge: move scanner work out of ControlEventLoop",
+      "session_id": "opencode:ses_109225083ffeWRADF95QVDF3pT",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "started_at": "2026-06-23T23:42:19.991Z",
+      "status": "running",
+      "updated_at": "2026-06-23T23:44:41.487Z"
+    },
     "todo:6": {
       "task_key": "todo:6",
       "task_label": "6",
-      "task_title": "Implement MediaController facade and module adapters",
-      "session_id": "opencode:ses_1111752b2ffe3kBkLEP7CY9wyE",
+      "task_title": "Phase 3: introduce audio command worker and transactional seek",
+      "session_id": "opencode:ses_10904ef78ffeEEr5b1Nyclp4VG",
       "agent": "Sisyphus-Junior",
-      "category": "unspecified-high",
-      "updated_at": "2026-06-22T10:43:57.173Z",
-      "started_at": "2026-06-22T10:43:57.173Z",
-      "status": "running"
+      "category": "unspecified-low",
+      "started_at": "2026-06-24T00:14:00.068Z",
+      "status": "running",
+      "updated_at": "2026-06-24T00:16:07.269Z"
     },
     "todo:7": {
       "task_key": "todo:7",
       "task_label": "7",
-      "task_title": "Complete metadata command callback and shutdown lifecycle",
-      "session_id": "opencode:ses_1110e58f3ffe30PjQiu5rePMiC",
+      "task_title": "Phase 4: make metadata snapshot updates asynchronous from control",
+      "session_id": "opencode:ses_108fe72dcffedfKN42QrSXb9bq",
       "agent": "Sisyphus-Junior",
       "category": "unspecified-high",
-      "started_at": "2026-06-22T10:46:38.575Z",
+      "started_at": "2026-06-24T00:20:09.995Z",
       "status": "running",
-      "updated_at": "2026-06-22T10:51:18.858Z"
+      "updated_at": "2026-06-24T00:42:51.096Z"
     },
-    "todo:8": {
-      "task_key": "todo:8",
-      "task_label": "8",
-      "task_title": "Finish end-to-end control verification and guardrails",
-      "session_id": "opencode:ses_11108412dffecJgMoBAGTSe7pu",
+    "todo:9": {
+      "task_key": "todo:9",
+      "task_label": "9",
+      "task_title": "Phase 4: make snapshot subscriptions value-safe and nonblocking",
+      "session_id": "opencode:ses_108e8f842ffeDtjmhTC20atEMT",
       "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "started_at": "2026-06-22T10:53:36.329Z",
+      "category": "",
+      "started_at": "2026-06-24T00:45:06.122Z",
       "status": "running",
-      "updated_at": "2026-06-22T10:59:13.807Z"
+      "updated_at": "2026-06-24T01:17:41.368Z"
+    },
+    "todo:10": {
+      "task_key": "todo:10",
+      "task_label": "10",
+      "task_title": "Final integration: verify full architecture contract and no scope drift",
+      "session_id": "opencode:ses_108bf1c22ffe9HHCwfxPY4g7Nx",
+      "agent": "Sisyphus-Junior",
+      "category": "writing",
+      "started_at": "2026-06-24T01:19:44.650Z",
+      "status": "running",
+      "updated_at": "2026-06-24T01:32:49.576Z"
     },
     "final-wave:f1": {
       "task_key": "final-wave:f1",
       "task_label": "F1",
-      "task_title": "Plan Compliance Audit — oracle",
-      "session_id": "opencode:ses_110f5dedbffeo7GIyA3ccBk8xs",
+      "task_title": "Plan compliance audit: read `.omo/plans/seriona-vibe-bug-refactor.md`, all `.omo/evidence/task-*`, and `git log --oneline -10`; verify every completed code task has a matching evidence file, passing task-specific tests, and one atomic commit using only allowed Git write commands.",
+      "session_id": "opencode:ses_108bca977ffeMFJYtR8NI1Dfpb",
       "agent": "Sisyphus-Junior",
-      "category": "unspecified-high",
-      "started_at": "2026-06-22T11:02:01.414Z",
-      "status": "running",
-      "updated_at": "2026-06-22T11:16:51.392Z"
+      "category": "writing",
+      "updated_at": "2026-06-24T01:34:56.263Z",
+      "started_at": "2026-06-24T01:34:56.263Z",
+      "status": "running"
     }
   },
   "agent": "atlas",
-  "ended_at": "2026-06-22T11:18:35.157Z",
-  "elapsed_ms": 2499960
+  "ended_at": "2026-06-24T01:36:59.492Z",
+  "elapsed_ms": 9071666
 }
