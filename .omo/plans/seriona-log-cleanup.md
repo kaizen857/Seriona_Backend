@@ -68,7 +68,7 @@ Your next move: run `$start-work .omo/plans/seriona-log-cleanup.md`, or ask for 
   QA scenarios (name the exact tool + invocation): Happy: create temp dir with 3 log files totaling 60MB, call prepareLogFile(logDir, 50MB), verify oldest file deleted and returned path is timestamped. Failure: unwritable directory → stderr message, no crash. Empty directory → returns timestamped path, no error. Evidence `.omo/evidence/task-1-seriona-log-cleanup.md`.
   Commit: Y | `feat(logging): add per-session log file with folder cleanup`
 
-- [ ] 2. Add cleanup and timestamp tests
+- [x] 2. Add cleanup and timestamp tests
   What to do / Must NOT do: Add test cases to `tests/logging/logging_tests.cpp` covering: (A) directory over 50MB → oldest file deleted, total now under limit; (B) directory under 50MB → no files deleted; (C) empty directory → no error, timestamped path returned; (D) rotated files (`.log.1`, `.log.2`) included in size calculation and deleted; (E) non-log files ignored in size/deletion; (F) timestamped filename matches expected pattern. Must NOT test spdlog logger creation or log content. Must NOT create a new test file — extend existing `logging_tests.cpp`.
   Parallelization: Wave 1 | Blocked by: 1 | Blocks: 3
   References (executor has NO interview context - be exhaustive): `tests/logging/logging_tests.cpp:1-66`, `tests/logging/CMakeLists.txt` (test target `seriona_logging_tests`). Use doctest fixtures with temp directories via `<filesystem>`.
