@@ -286,9 +286,9 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   control::MediaControlCommand stopCommand{};
   stopCommand.kind = control::MediaControlCommandKind::Stop;
   static_cast<void>(controller->submitCommand(stopCommand));
+  controller->shutdown();
   spdlog::info("seriona shutting down");
   spdlog::shutdown();
-  controller->shutdown();
   playerSubscription.unsubscribe();
   librarySubscription.unsubscribe();
   notificationSubscription.unsubscribe();
