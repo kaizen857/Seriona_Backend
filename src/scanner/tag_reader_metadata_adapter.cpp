@@ -130,6 +130,7 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
   metadata.fileMtime = raw.lastModified;
   metadata.contentHash = std::move(contentHash);
   metadata.sourceFilePath = raw.filePath;
+  metadata.artworkPath = raw.coverPath.empty() ? std::optional<std::filesystem::path>{std::filesystem::path{}} : std::optional<std::filesystem::path>{raw.coverPath};
   metadata.offset = toMilliseconds(raw.offset);
   metadata.duration = toMilliseconds(raw.duration);
   metadata.logicalTrackId = raw.filePath.generic_string();

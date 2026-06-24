@@ -83,6 +83,7 @@ TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initi
   CHECK(metadata.discNumber == 2U);
   CHECK(metadata.filePath == std::filesystem::path{"music/song.flac"});
   CHECK(mapped.coverPath == std::filesystem::path{"covers/song.png"});
+  CHECK(metadata.artworkPath == std::filesystem::path{"covers/song.png"});
   CHECK(metadata.duration == std::chrono::milliseconds{1234});
   CHECK(metadata.offset == std::chrono::milliseconds{9});
   CHECK(metadata.fileMtime == std::filesystem::file_time_type{std::chrono::nanoseconds{42}});

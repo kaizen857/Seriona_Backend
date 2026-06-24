@@ -503,7 +503,8 @@ private:
       errors.push_back(scannerErrorFrom(error));
     }
     const auto cachedSong = cachedSongByPath(cachedRoot, audioPath);
-    if (hash.hash.has_value() && cachedSong.has_value() && cachedSong->metadata.contentHash == *hash.hash) {
+    if (hash.hash.has_value() && cachedSong.has_value() && cachedSong->metadata.contentHash == *hash.hash &&
+        cachedSong->metadata.artworkPath.has_value()) {
       ++skipped;
       return cachedSong;
     }
@@ -516,6 +517,9 @@ private:
                                               }), false));
       mapped.metadata.filePath = audioPath;
       mapped.metadata.sourceFilePath = audioPath;
+      if (mapped.metadata.artworkPath.has_value() && !mapped.metadata.artworkPath->empty() && mapped.metadata.artworkPath->is_relative()) {
+        mapped.metadata.artworkPath = std::filesystem::absolute(*mapped.metadata.artworkPath);
+      }
       mapped.metadata.trackId = audioPath.generic_string();
       mapped.metadata.logicalTrackId = audioPath.generic_string();
       if (hash.hash.has_value()) {
