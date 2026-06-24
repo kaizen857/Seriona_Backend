@@ -17,6 +17,7 @@ target_include_directories(seriona PRIVATE
 
 target_link_libraries(seriona PRIVATE
   seriona_control
+  $<$<CONFIG:Release>:PkgConfig::SERIONA_FFMPEG>
 )
 
 seriona_enable_warnings(seriona)

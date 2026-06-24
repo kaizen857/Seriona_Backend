@@ -12,6 +12,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_compile_definitions($<$<CONFIG:Release>:SERIONA_RELEASE_BUILD>)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
   libavformat

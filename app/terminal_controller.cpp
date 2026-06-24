@@ -12,6 +12,13 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+
+#ifdef SERIONA_RELEASE_BUILD
+extern "C" {
+#include <libavutil/log.h>
+}
+#endif
+
 #include <optional>
 #include <string>
 #include <utility>
@@ -194,10 +201,18 @@ int runTerminalController(const std::filesystem::path& musicPath) {
 
   std::cerr << "seriona: data root: " << runtimePaths.dataRoot.string() << '\n';
 
+#ifdef SERIONA_RELEASE_BUILD
+  av_log_set_level(AV_LOG_ERROR);
+#endif
+
   const auto timestampedLogPath = seriona::logging::prepareLogFile(runtimePaths.dataRoot / "logs");
 
   try {
-    seriona::logging::initialize(spdlog::level::off, timestampedLogPath.string());
+    seriona::logging::initialize(spdlog::level::off, timestampedLogPath.string()
+#ifdef SERIONA_RELEASE_BUILD
+                                 , spdlog::level::warn
+#endif
+    );
   } catch (const std::exception& e) {
     std::cerr << "seriona: logging initialization failed: " << e.what() << '\n';
   }

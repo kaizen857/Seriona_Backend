@@ -10,7 +10,8 @@ namespace seriona {
 namespace logging {
 
 void initialize(spdlog::level::level_enum console_level,
-                const std::string& log_file_path);
+                const std::string& log_file_path,
+                spdlog::level::level_enum logger_level = spdlog::level::trace);
 
 std::filesystem::path prepareLogFile(
     const std::filesystem::path& logDir,

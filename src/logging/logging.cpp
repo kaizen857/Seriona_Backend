@@ -14,7 +14,8 @@ namespace seriona {
 namespace logging {
 
 void initialize(spdlog::level::level_enum console_level,
-                const std::string& log_file_path) {
+                const std::string& log_file_path,
+                spdlog::level::level_enum logger_level) {
     constexpr const char* pattern =
         "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v";
 
@@ -43,7 +44,7 @@ void initialize(spdlog::level::level_enum console_level,
 
     auto logger = std::make_shared<spdlog::logger>("seriona", sinks.begin(),
                                                    sinks.end());
-    logger->set_level(spdlog::level::trace);
+    logger->set_level(logger_level);
     logger->flush_on(spdlog::level::err);
     spdlog::set_default_logger(std::move(logger));
 }
