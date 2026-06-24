@@ -13,9 +13,12 @@
 #endif
 
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace seriona::metadata {
@@ -132,18 +135,137 @@ public:
   MetadataSharingServiceImpl(MetadataBackendKind kind, std::unique_ptr<MetadataServiceBackend> backend)
       : kind_(kind), backend_(std::move(backend)) {}
 
+  ~MetadataSharingServiceImpl() override {
+    const auto result = stopBackendIfNeeded();
+    (void)result;
+  }
+
   [[nodiscard]] MetadataBackendKind backendKind() const override { return kind_; }
   [[nodiscard]] MetadataBackendCapabilities capabilities() const override { return backend_->capabilities(); }
   [[nodiscard]] control::SubscriptionHandle registerCommandCallback(control::MediaControlCommandSink callback) override {
     return backend_->registerCommandCallback(std::move(callback));
   }
-  [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state) override { return backend_->start(state); }
-  [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state) override { return backend_->update(state); }
-  [[nodiscard]] MetadataSyncResult stop() override { return backend_->stop(); }
+
+  [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state) override {
+    bool alreadyStarted = false;
+    {
+      std::lock_guard lock{mutex_};
+      alreadyStarted = started_ && !stopping_;
+    }
+
+    if (alreadyStarted) {
+      std::lock_guard backendLock{backendMutex_};
+      return backend_->start(state);
+    }
+
+    MetadataSyncResult result{};
+    {
+      std::lock_guard backendLock{backendMutex_};
+      result = backend_->start(state);
+    }
+    if (!result.accepted) {
+      return result;
+    }
+
+    std::lock_guard lock{mutex_};
+    started_ = true;
+    stopping_ = false;
+    if (!worker_.joinable()) {
+      worker_ = std::thread{[this] { runWorker(); }};
+    }
+    return result;
+  }
+
+  [[nodiscard]] MetadataSyncResult update(const PlatformMediaState& state) override {
+    {
+      std::lock_guard lock{mutex_};
+      if (!started_ || stopping_) {
+        return makeFailureResult("metadata.backend.stopped", "metadata backend update requested after stop");
+      }
+      pendingUpdate_ = state;
+    }
+    changed_.notify_one();
+    return MetadataSyncResult{.accepted = true,
+                              .changed = true,
+                              .state = state,
+                              .errorCode = std::nullopt,
+                              .message = {}};
+  }
+
+  [[nodiscard]] MetadataSyncResult stop() override {
+    return stopBackendIfNeeded();
+  }
 
 private:
+  [[nodiscard]] MetadataSyncResult stopBackendIfNeeded() {
+    const auto shouldStopBackend = stopWorker();
+    if (!shouldStopBackend) {
+      return MetadataSyncResult{.accepted = true,
+                                .changed = false,
+                                .state = PlatformMediaState{},
+                                .errorCode = std::nullopt,
+                                .message = {}};
+    }
+
+    std::lock_guard backendLock{backendMutex_};
+    return backend_->stop();
+  }
+
+  [[nodiscard]] bool stopWorker() {
+    bool shouldStopBackend = false;
+    {
+      std::lock_guard lock{mutex_};
+      shouldStopBackend = started_;
+      started_ = false;
+      stopping_ = true;
+    }
+    changed_.notify_one();
+
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+
+    {
+      std::lock_guard lock{mutex_};
+      pendingUpdate_.reset();
+      stopping_ = false;
+    }
+    return shouldStopBackend;
+  }
+
+  void runWorker() {
+    while (true) {
+      auto state = nextUpdate();
+      if (!state) {
+        return;
+      }
+
+      std::lock_guard backendLock{backendMutex_};
+      const auto result = backend_->update(*state);
+      (void)result;
+    }
+  }
+
+  [[nodiscard]] std::optional<PlatformMediaState> nextUpdate() {
+    std::unique_lock lock{mutex_};
+    changed_.wait(lock, [this] { return pendingUpdate_.has_value() || stopping_; });
+    if (pendingUpdate_.has_value()) {
+      auto state = pendingUpdate_;
+      pendingUpdate_.reset();
+      return state;
+    }
+    return std::nullopt;
+  }
+
   MetadataBackendKind kind_;
   std::unique_ptr<MetadataServiceBackend> backend_;
+  std::mutex mutex_{};
+  std::mutex backendMutex_{};
+  std::condition_variable changed_{};
+  std::thread worker_{};
+  std::optional<PlatformMediaState> pendingUpdate_{};
+  bool started_{false};
+  bool stopping_{false};
 };
 
 }

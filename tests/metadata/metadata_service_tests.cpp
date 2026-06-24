@@ -1,13 +1,16 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "seriona/control/control_contracts.h"
 #include "seriona/metadata/metadata_contracts.h"
+#include "metadata_service_backend.h"
 #include "metadata_service_testing.h"
 #include "metadata_synchronizer.h"
 
@@ -80,6 +83,74 @@ struct CommandRecorder {
   seriona::control::MediaControlCommandSink sink() {
     return [this](const seriona::control::MediaControlCommand& command) { commands.push_back(command); };
   }
+};
+
+class BlockingUpdateBackend final : public seriona::metadata::MetadataServiceBackend {
+public:
+  [[nodiscard]] seriona::metadata::MetadataBackendKind kind() const override {
+    return seriona::metadata::MetadataBackendKind::Noop;
+  }
+
+  [[nodiscard]] seriona::metadata::MetadataBackendCapabilities capabilities() const override { return {}; }
+
+  [[nodiscard]] seriona::control::SubscriptionHandle registerCommandCallback(seriona::control::MediaControlCommandSink) override {
+    return seriona::control::SubscriptionHandle{1U, [] {}};
+  }
+
+  [[nodiscard]] seriona::metadata::MetadataSyncResult start(const seriona::metadata::PlatformMediaState& state) override {
+    return accepted(state, true);
+  }
+
+  [[nodiscard]] seriona::metadata::MetadataSyncResult update(const seriona::metadata::PlatformMediaState& state) override {
+    {
+      std::lock_guard lock{mutex_};
+      ++updateCalls_;
+      lastUpdatedState_ = state;
+    }
+    changed_.notify_all();
+
+    std::unique_lock lock{mutex_};
+    changed_.wait(lock, [this] { return releaseUpdates_; });
+    return accepted(state, true);
+  }
+
+  [[nodiscard]] seriona::metadata::MetadataSyncResult stop() override {
+    releaseBlockedUpdates();
+    return accepted(seriona::metadata::PlatformMediaState{}, false);
+  }
+
+  void releaseBlockedUpdates() {
+    {
+      std::lock_guard lock{mutex_};
+      releaseUpdates_ = true;
+    }
+    changed_.notify_all();
+  }
+
+  [[nodiscard]] bool waitForUpdateCalls(std::size_t calls, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{mutex_};
+    return changed_.wait_for(lock, timeout, [this, calls] { return updateCalls_ >= calls; });
+  }
+
+  [[nodiscard]] std::optional<seriona::metadata::PlatformMediaState> lastUpdatedState() const {
+    std::lock_guard lock{mutex_};
+    return lastUpdatedState_;
+  }
+
+private:
+  [[nodiscard]] static seriona::metadata::MetadataSyncResult accepted(const seriona::metadata::PlatformMediaState& state, bool changed) {
+    return seriona::metadata::MetadataSyncResult{.accepted = true,
+                                                .changed = changed,
+                                                .state = state,
+                                                .errorCode = std::nullopt,
+                                                .message = {}};
+  }
+
+  mutable std::mutex mutex_{};
+  std::condition_variable changed_{};
+  std::optional<seriona::metadata::PlatformMediaState> lastUpdatedState_{};
+  std::size_t updateCalls_{0};
+  bool releaseUpdates_{false};
 };
 
 }
@@ -261,9 +332,8 @@ TEST_CASE("metadata service reports update after stop as rejected") {
   CHECK_FALSE(updateAfterStop.accepted);
   CHECK_FALSE(updateAfterStop.changed);
   CHECK(updateAfterStop.errorCode.has_value());
-  REQUIRE(hooks->records.size() >= 3U);
-  CHECK(hooks->records.back().kind == seriona::metadata::MetadataServiceRecordKind::Update);
-  CHECK(hooks->records.back().state.controlState.freshness.version == 1U);
+  REQUIRE(hooks->records.size() == 2U);
+  CHECK(hooks->records.back().kind == seriona::metadata::MetadataServiceRecordKind::Stop);
 }
 
 TEST_CASE("metadata service registers and unregisters command callbacks") {
@@ -299,4 +369,47 @@ TEST_CASE("metadata service reports backend start failure explicitly") {
   REQUIRE(hooks->records.size() == 1U);
   CHECK(hooks->records[0].kind == seriona::metadata::MetadataServiceRecordKind::Start);
   CHECK_FALSE(hooks->records[0].result.accepted);
+}
+
+TEST_CASE("metadata service queues slow backend updates and keeps the latest snapshot") {
+  auto backend = std::make_unique<BlockingUpdateBackend>();
+  auto* blockingBackend = backend.get();
+  auto service = seriona::metadata::makeMetadataSharingServiceFromBackend(seriona::metadata::MetadataBackendKind::Noop, std::move(backend));
+  ServiceFixture fixture{};
+  CHECK(service->start(fixture.state).accepted);
+  auto firstState = fixture.state;
+  firstState.controlState = buildSnapshot(SnapshotFixture{.version = 2U,
+                                                          .position = std::chrono::milliseconds{1000},
+                                                          .status = seriona::control::PlaybackStatus::Playing});
+  auto middleState = fixture.state;
+  middleState.controlState = buildSnapshot(SnapshotFixture{.version = 3U,
+                                                           .position = std::chrono::milliseconds{2000},
+                                                           .status = seriona::control::PlaybackStatus::Playing,
+                                                           .title = std::string{"Middle"}});
+  auto latestState = fixture.state;
+  latestState.controlState = buildSnapshot(SnapshotFixture{.version = 4U,
+                                                           .position = std::chrono::milliseconds{3000},
+                                                           .status = seriona::control::PlaybackStatus::Paused,
+                                                           .title = std::string{"Latest"}});
+
+  const auto firstUpdate = service->update(firstState);
+  REQUIRE(blockingBackend->waitForUpdateCalls(1U, std::chrono::seconds{1}));
+  const auto beforeLatest = Clock::now();
+  const auto queuedMiddle = service->update(middleState);
+  const auto queuedLatest = service->update(latestState);
+  const auto queueElapsed = Clock::now() - beforeLatest;
+
+  CHECK(firstUpdate.accepted);
+  CHECK(queuedMiddle.accepted);
+  CHECK(queuedLatest.accepted);
+  CHECK(queueElapsed < std::chrono::milliseconds{100});
+
+  blockingBackend->releaseBlockedUpdates();
+  REQUIRE(blockingBackend->waitForUpdateCalls(2U, std::chrono::seconds{1}));
+  service->stop();
+
+  const auto finalState = blockingBackend->lastUpdatedState();
+  REQUIRE(finalState.has_value());
+  CHECK(finalState->controlState.freshness.version == 4U);
+  CHECK(finalState->controlState.playback.state == seriona::control::PlaybackStatus::Paused);
 }
