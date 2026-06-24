@@ -91,7 +91,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.runtime_paths' --output-on-failure`. Failure: relative/empty executable path fallback test produces a deterministic current-directory based data root or a documented error path. Evidence `.omo/evidence/task-2-seriona-portable-logging.md`.
   Commit: Y | `feat(app): add portable runtime paths`
 
-- [ ] 3. Thread portable paths through production controller/scanner assembly
+- [x] 3. Thread portable paths through production controller/scanner assembly
   What to do / Must NOT do: Extend production app/controller assembly so `runTerminalController()` or the app entrypoint passes runtime paths into `makeProductionMediaController()` and scanner dependencies. Use existing scanner dependency fields `databasePath` and `coverExportDir`. Remove production reliance on temp defaults for the app path, but keep safe defaults for unit tests or explicit dependency-free construction. Must not expose scanner-specific path names in public user-facing data directory names.
   Parallelization: Wave 1 | Blocked by: 2 | Blocks: 4, 7, 10, 12
   References (executor has NO interview context - be exhaustive): `src/scanner/file_scanner_service_internal.h:53`, `src/scanner/file_scanner_orchestrator.cpp:30`, `src/scanner/file_scanner_orchestrator.cpp:34`, `src/scanner/file_scanner_orchestrator.cpp:244`, `src/scanner/file_scanner_orchestrator.cpp:316`, `src/scanner/file_scanner_orchestrator.cpp:513`, `src/control/media_controller_module.cpp:51`, `src/control/media_controller_module.h`, `app/terminal_controller.cpp:190`.
@@ -99,7 +99,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.(control_contract|scanner_service)' --output-on-failure`. Failure: empty supplied paths still use safe defaults and do not crash tests. Evidence `.omo/evidence/task-3-seriona-portable-logging.md`.
   Commit: Y | `fix(scanner): use portable runtime storage`
 
-- [ ] 4. Initialize logging at app startup and shut it down cleanly
+- [x] 4. Initialize logging at app startup and shut it down cleanly
   What to do / Must NOT do: Initialize logging before controller construction in app startup using the portable log file path. Log startup args, resolved data root, log file path, database path, artwork path, scan root, and shutdown. If logging initialization fails, print a concise terminal error and continue with console-only fallback or return a clear startup error; choose the least surprising implementation and document it in evidence. Must not let logger setup throw uncaught exceptions out of `main`.
   Parallelization: Wave 1 | Blocked by: 1, 2, 3 | Blocks: 10, 12
   References (executor has NO interview context - be exhaustive): `app/main.cpp:14`, `app/terminal_controller.cpp:181`, `app/terminal_controller.cpp:201`, `app/terminal_controller.cpp:203`, `app/terminal_controller.cpp:220`, spdlog docs for `spdlog::set_default_logger`, `flush_on`, and `flush_every`.

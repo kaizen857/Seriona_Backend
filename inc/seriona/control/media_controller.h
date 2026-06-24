@@ -2,6 +2,7 @@
 
 #include "seriona/control/control_contracts.h"
 
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -36,7 +37,11 @@ private:
 };
 
 [[nodiscard]] std::unique_ptr<MediaController> makeMediaController(MediaControllerDependencies dependencies,
-                                                                   MediaControllerOptions options = {});
+                                                                    MediaControllerOptions options = {});
 [[nodiscard]] std::unique_ptr<MediaController> makeProductionMediaController(MediaControllerOptions options = {});
+[[nodiscard]] std::unique_ptr<MediaController> makeProductionMediaController(
+    MediaControllerOptions options,
+    std::filesystem::path databasePath,
+    std::filesystem::path coverExportDir);
 
 }

@@ -3,6 +3,7 @@
 #include "seriona/audio/audio_playback_service.h"
 #include "seriona/control/media_controller.h"
 #include "seriona/metadata/metadata_contracts.h"
+#include "scanner/file_scanner_service_internal.h"
 #include "seriona/scanner/file_scanner_service.h"
 
 #include <chrono>
@@ -56,16 +57,28 @@ MediaControllerDependencies makeDefaultMediaControllerDependencies() {
   return dependencies;
 }
 
-MediaControllerDependencies makeProductionMediaControllerDependencies() {
+MediaControllerDependencies makeProductionMediaControllerDependencies(
+    std::filesystem::path databasePath,
+    std::filesystem::path coverExportDir) {
   MediaControllerDependencies dependencies{};
   dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend());
-  dependencies.scanner = scanner::makeFileScannerService();
+  scanner::FileScannerServiceDependencies scannerDeps{};
+  scannerDeps.databasePath = std::move(databasePath);
+  scannerDeps.coverExportDir = std::move(coverExportDir);
+  dependencies.scanner = scanner::makeFileScannerService(std::move(scannerDeps));
   dependencies.metadata = metadata::makeMetadataSharingService(makeProductionMetadataOptions());
   return dependencies;
 }
 
 std::unique_ptr<MediaController> makeProductionMediaController(MediaControllerOptions options) {
   return makeMediaController(makeProductionMediaControllerDependencies(), options);
+}
+
+std::unique_ptr<MediaController> makeProductionMediaController(
+    MediaControllerOptions options,
+    std::filesystem::path databasePath,
+    std::filesystem::path coverExportDir) {
+  return makeMediaController(makeProductionMediaControllerDependencies(std::move(databasePath), std::move(coverExportDir)), options);
 }
 
 void normalizeMediaControllerDependencies(MediaControllerDependencies& dependencies) {

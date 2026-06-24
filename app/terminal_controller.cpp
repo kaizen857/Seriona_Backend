@@ -2,7 +2,10 @@
 
 #include "terminal_io.h"
 
+#include "seriona/app/runtime_paths.h"
 #include "seriona/control/media_controller.h"
+
+#include "logging/logging.h"
 
 #include <algorithm>
 #include <chrono>
@@ -185,9 +188,27 @@ int runTerminalController(const std::filesystem::path& musicPath) {
     return 1;
   }
 
+  const auto runtimePaths = resolveRuntimePaths({});
+  runtimePaths.ensureDirectoriesExist();
+
+  try {
+    seriona::logging::initialize(spdlog::level::info, runtimePaths.logFile.string());
+  } catch (const std::exception& e) {
+    std::cerr << "seriona: logging initialization failed: " << e.what() << '\n';
+  }
+
+  spdlog::info("seriona starting");
+  spdlog::info("  executable root: {}", runtimePaths.dataRoot.string());
+  spdlog::info("  log file:        {}", runtimePaths.logFile.string());
+  spdlog::info("  database:        {}", runtimePaths.databasePath.string());
+  spdlog::info("  artwork dir:     {}", runtimePaths.artworkDir.string());
+  spdlog::info("  music scan root: {}", musicPath.string());
+
   TerminalState state{};
   std::mutex outputMutex;
-  auto controller = control::makeProductionMediaController();
+  auto controller = control::makeProductionMediaController(control::MediaControllerOptions{},
+                                                             runtimePaths.databasePath,
+                                                             runtimePaths.artworkDir);
   auto playerSubscription = controller->subscribePlayerState([&](const control::PlayerStateSnapshot& snapshot) {
     updatePlayerState(state, outputMutex, snapshot);
   });
@@ -199,13 +220,18 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   });
 
   controller->start();
+  spdlog::info("media controller started");
   printControls();
   const auto scanResult = controller->scanLibrary({scanner::ScannerRoot{.path = musicPath, .recursive = true}}, scanner::ScanMode::Full);
   if (!scanResult.accepted) {
+    spdlog::warn("library scan rejected: {}", scanResult.message);
     std::cerr << "\nseriona: failed to scan library: " << scanResult.message << '\n';
+    spdlog::info("seriona shutting down");
+    spdlog::shutdown();
     controller->shutdown();
     return 1;
   }
+  spdlog::info("library scan accepted: {}", scanResult.message);
   renderStatus(state, outputMutex);
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -233,6 +259,8 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   control::MediaControlCommand stopCommand{};
   stopCommand.kind = control::MediaControlCommandKind::Stop;
   static_cast<void>(controller->submitCommand(stopCommand));
+  spdlog::info("seriona shutting down");
+  spdlog::shutdown();
   controller->shutdown();
   playerSubscription.unsubscribe();
   librarySubscription.unsubscribe();

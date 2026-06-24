@@ -3,6 +3,7 @@ add_executable(seriona
   terminal_controller.cpp
   terminal_io.cpp
   ${PROJECT_SOURCE_DIR}/src/app/runtime_paths.cpp
+  ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
 )
 
 set_target_properties(seriona PROPERTIES
@@ -11,6 +12,7 @@ set_target_properties(seriona PROPERTIES
 
 target_include_directories(seriona PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
 )
 
 target_link_libraries(seriona PRIVATE
