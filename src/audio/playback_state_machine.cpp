@@ -82,9 +82,13 @@ void PlaybackStateMachine::stop() {
 }
 
 void PlaybackStateMachine::seek(std::chrono::milliseconds position) {
+  static_cast<void>(beginSeek(position));
+}
+
+std::uint64_t PlaybackStateMachine::beginSeek(std::chrono::milliseconds position) {
   if (state_ != PlaybackState::Ready && state_ != PlaybackState::Playing && state_ != PlaybackState::Paused) {
     emitError(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "illegal transition");
-    return;
+    return generation_;
   }
 
   ++generation_;
@@ -93,6 +97,30 @@ void PlaybackStateMachine::seek(std::chrono::milliseconds position) {
   pendingSeekAfter_ = makeClock(position, wasContinuous);
   clock_ = *pendingSeekAfter_;
   changeState(PlaybackState::Loading);
+  return generation_;
+}
+
+void PlaybackStateMachine::cancelSeek(PlaybackErrorCode code, std::string message, std::string detail) {
+  if (!pendingSeekBefore_ || !pendingSeekAfter_ || state_ != PlaybackState::Loading) {
+    emitError(code, std::move(message), std::move(detail));
+    return;
+  }
+
+  const auto previous = *pendingSeekBefore_;
+  const auto rollbackState = previous.continuous ? PlaybackState::Playing : PlaybackState::Ready;
+  clock_ = previous;
+  pendingSeekBefore_.reset();
+  pendingSeekAfter_.reset();
+  changeState(rollbackState);
+  emitError(code, std::move(message), std::move(detail));
+}
+
+void PlaybackStateMachine::completeSeek(std::uint64_t generation) {
+  if (generation != generation_) {
+    return;
+  }
+
+  completeSeek();
 }
 
 void PlaybackStateMachine::completeSeek() {

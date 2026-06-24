@@ -23,7 +23,10 @@ public:
   void pause();
   void resume();
   void stop();
+  [[nodiscard]] std::uint64_t beginSeek(std::chrono::milliseconds position);
   void seek(std::chrono::milliseconds position);
+  void cancelSeek(PlaybackErrorCode code, std::string message, std::string detail = {});
+  void completeSeek(std::uint64_t generation);
   void completeSeek();
   void naturalEnd();
   void shutdown();

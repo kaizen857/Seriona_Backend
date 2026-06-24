@@ -308,6 +308,7 @@ std::vector<BackendEvent> loadEvents(const std::filesystem::path& path,
   player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
   player.configureOutput(config);
   player.loadTrack(request(path, std::move(trackId)));
+  static_cast<void>(player.queryPlaybackClock());
   return events;
 }
 
@@ -357,9 +358,11 @@ TEST_CASE("audio_error_matrix maps device unavailable init and start failures") 
   player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
   player.configureOutput(outputConfig());
   player.loadTrack(request(path, "device-start"));
+  static_cast<void>(player.queryPlaybackClock());
   CHECK(eventsOf(events, BackendEventType::PlaybackError).empty());
 
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
 
   CHECK(fake->startCalls == 1);
   const auto startError = requirePlaybackError(events, PlaybackErrorCode::DeviceUnavailable);
@@ -378,6 +381,7 @@ TEST_CASE("audio_error_matrix maps decode, underrun, and seek failures") {
   std::vector<BackendEvent> seekEvents;
   seekPlayer.setEventSink([&seekEvents](BackendEvent event) { seekEvents.push_back(std::move(event)); });
   seekPlayer.seek(500ms);
+  static_cast<void>(seekPlayer.queryPlaybackClock());
   const auto seekError = requirePlaybackError(seekEvents, PlaybackErrorCode::SeekFailed);
   checkUsefulError(seekError, PlaybackErrorCode::SeekFailed);
   CHECK(seekError.detail.find("missing playback pipeline") != std::string::npos);
@@ -390,7 +394,9 @@ TEST_CASE("audio_error_matrix maps decode, underrun, and seek failures") {
   player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
   player.configureOutput(outputConfig());
   player.loadTrack(request(underrunPath, "underrun"));
+  static_cast<void>(player.queryPlaybackClock());
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   fake->consumeFrames(960U);
   const auto clock = player.queryPlaybackClock();
 

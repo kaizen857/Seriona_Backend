@@ -10,7 +10,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -102,23 +106,68 @@ public:
   explicit SingleTrackAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend)
       : device_(std::move(backend)), dispatcher_(BackendSourceModule::AudioPlaybackService) {
     stateMachine_.setEventSink([this](BackendEvent event) { dispatcher_.dispatch(std::move(event)); });
+    audioWorker_ = std::thread{[this] { runAudioWorker(); }};
   }
 
   ~SingleTrackAudioPlaybackService() override {
-    stopProgressWorker();
+    stopAudioWorker();
     dispatcher_.clearEventSink();
     stateMachine_.clearEventSink();
-    stopDevice();
-    device_.uninitialize();
   }
 
   void setEventSink(BackendEventSink sink) override { dispatcher_.setEventSink(std::move(sink)); }
 
-  void configureOutput(const AudioOutputConfig& config) override { config_ = config; }
+  void configureOutput(const AudioOutputConfig& config) override {
+    enqueueCommand([this, config] { config_ = config; });
+  }
 
   void loadTrack(const TrackPlaybackRequest& request) override {
+    enqueueCommand([this, request] { loadTrackOnWorker(request); });
+  }
+
+  void prepareNext(const TrackPlaybackRequest& request) override {
+    enqueueCommand([this, request] { prepareNextOnWorker(request); });
+  }
+
+  void play() override { enqueueCommand([this] { playOnWorker(); }); }
+
+  void pause() override { enqueueCommand([this] { pauseOnWorker(); }); }
+
+  void resume() override { enqueueCommand([this] { resumeOnWorker(); }); }
+
+  void stop() override { enqueueCommand([this] { stopOnWorker(); }); }
+
+  void seek(std::chrono::milliseconds position) override {
+    enqueueCommand([this, position] { seekOnWorker(position); });
+  }
+
+  void setVolume(float linearGain) override { enqueueCommand([this, linearGain] { device_.setVolume(linearGain); }); }
+
+  void setMuted(bool muted) override { enqueueCommand([this, muted] { device_.setMuted(muted); }); }
+
+  void selectOutputDevice(const std::string& deviceId) override {
+    enqueueCommand([this, deviceId] { config_.preferredDeviceId = deviceId; });
+  }
+
+  PlaybackClockSnapshot queryPlaybackClock() const override {
+    auto promise = std::make_shared<std::promise<PlaybackClockSnapshot>>();
+    auto future = promise->get_future();
+    auto* self = const_cast<SingleTrackAudioPlaybackService*>(this);
+    self->enqueueCommand([self, promise] {
+      self->servicePlaybackProgress();
+      promise->set_value(self->clock_.snapshot());
+    });
+    if (future.wait_for(std::chrono::seconds{2}) == std::future_status::ready) {
+      return future.get();
+    }
+
+    std::lock_guard lock{snapshotMutex_};
+    return lastClockSnapshot_;
+  }
+
+private:
+  void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     stopProgressWorker();
-    std::lock_guard lock{progressMutex_};
     stopDevice();
     device_.uninitialize();
     queue_.reset();
@@ -184,8 +233,7 @@ public:
     publishPosition();
   }
 
-  void prepareNext(const TrackPlaybackRequest& request) override {
-    std::lock_guard lock{progressMutex_};
+  void prepareNextOnWorker(const TrackPlaybackRequest& request) {
     preloadSlot_.reset();
 
     PreloadSlot slot{};
@@ -225,8 +273,7 @@ public:
     preloadSlot_ = std::move(slot);
   }
 
-  void play() override {
-    std::lock_guard lock{progressMutex_};
+  void playOnWorker() {
     if (!queue_ || !source_ || !pipeline_) {
       fail(PlaybackErrorCode::OpenFailed, "play requires a loaded track", "missing playback pipeline");
       return;
@@ -244,9 +291,8 @@ public:
     publishPosition();
   }
 
-  void pause() override {
+  void pauseOnWorker() {
     stopProgressWorker();
-    std::lock_guard lock{progressMutex_};
     stopDevice();
     updateClockFromQueue();
     clock_.pause();
@@ -254,8 +300,7 @@ public:
     publishPosition();
   }
 
-  void resume() override {
-    std::lock_guard lock{progressMutex_};
+  void resumeOnWorker() {
     if (!queue_) {
       fail(PlaybackErrorCode::OpenFailed, "resume requires a loaded track", "missing playback queue");
       return;
@@ -277,9 +322,8 @@ public:
     publishPosition();
   }
 
-  void stop() override {
+  void stopOnWorker() {
     stopProgressWorker();
-    std::lock_guard lock{progressMutex_};
     stopDevice();
     updateClockFromQueue();
     clock_.pause();
@@ -291,9 +335,8 @@ public:
     publishPosition();
   }
 
-  void seek(std::chrono::milliseconds position) override {
+  void seekOnWorker(std::chrono::milliseconds position) {
     stopProgressWorker();
-    std::lock_guard lock{progressMutex_};
     if (!source_ || !pipeline_ || !queue_) {
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
       return;
@@ -304,30 +347,66 @@ public:
       return;
     }
 
-    stopDevice();
     updateClockFromQueue();
     const bool shouldResume = stateMachine_.state() == PlaybackState::Playing;
-    stateMachine_.seek(position);
-    if (const auto error = source_->seek(position)) {
-      fail(error->code, error->message, error->detail);
+    const auto seekGeneration = stateMachine_.beginSeek(position);
+
+    auto nextSource = std::make_unique<FfmpegAudioSource>();
+    if (const auto error = nextSource->open(currentRequest_.filePath)) {
+      stateMachine_.cancelSeek(error->code, error->message, error->detail);
+      publishPosition();
+      return;
+    }
+    if (const auto error = nextSource->seek(position)) {
+      stateMachine_.cancelSeek(error->code, error->message, error->detail);
+      publishPosition();
       return;
     }
 
-    pipeline_->reset();
-    if (const auto error = pipeline_->configure(currentTarget_)) {
-      fail(error->code, error->message, error->detail);
+    auto nextPipeline = std::make_unique<FfmpegFilterPipeline>();
+    if (const auto error = nextPipeline->configure(currentTarget_)) {
+      stateMachine_.cancelSeek(error->code, error->message, error->detail);
+      publishPosition();
       return;
     }
-    queue_->clearForSeek();
-    observedQueueCounters_ = queue_->counters();
+
+    const auto sampleBytes = bytesPerSample(currentTarget_.sampleFormat);
+    auto nextQueue = std::make_unique<PcmBufferQueue>(
+        PcmBufferQueueConfig{bufferFrameCount(currentTarget_.sampleRate, config_.bufferDuration),
+                             currentTarget_.channelCount * sampleBytes});
+
+    auto previousSource = std::move(source_);
+    auto previousPipeline = std::move(pipeline_);
+    auto previousQueue = std::move(queue_);
+    auto previousPendingFrameWrite = std::move(pendingFrameWrite_);
+    const bool previousLoadedToEnd = loadedToEnd_;
+    source_ = std::move(nextSource);
+    pipeline_ = std::move(nextPipeline);
+    queue_ = std::move(nextQueue);
     pendingFrameWrite_.reset();
-    clock_.seek(position);
+    observedQueueCounters_ = queue_->counters();
     loadedToEnd_ = false;
+
     if (!fillQueue()) {
+      source_ = std::move(previousSource);
+      pipeline_ = std::move(previousPipeline);
+      queue_ = std::move(previousQueue);
+      pendingFrameWrite_ = std::move(previousPendingFrameWrite);
+      loadedToEnd_ = previousLoadedToEnd;
+      observedQueueCounters_ = queue_ ? queue_->counters() : PcmBufferQueueCounters{};
+      stateMachine_.cancelSeek(PlaybackErrorCode::SeekFailed, "seek failed", "failed to fill PCM queue after seek");
+      publishPosition();
       return;
     }
 
-    stateMachine_.completeSeek();
+    stopDevice();
+    previousQueue.reset();
+    previousPipeline.reset();
+    previousSource.reset();
+
+    observedQueueCounters_ = queue_->counters();
+    clock_.seek(position);
+    stateMachine_.completeSeek(seekGeneration);
     if (shouldResume) {
       clock_.resume();
       if (!device_.start()) {
@@ -341,19 +420,6 @@ public:
     }
     publishPosition();
   }
-
-  void setVolume(float linearGain) override { device_.setVolume(linearGain); }
-
-  void setMuted(bool muted) override { device_.setMuted(muted); }
-
-  void selectOutputDevice(const std::string& deviceId) override { config_.preferredDeviceId = deviceId; }
-
-  PlaybackClockSnapshot queryPlaybackClock() const override {
-    const_cast<SingleTrackAudioPlaybackService*>(this)->servicePlaybackProgress();
-    return clock_.snapshot();
-  }
-
-private:
   struct PendingFrameWrite {
     FfmpegAudioFrame frame{};
     std::uint32_t writtenFrames{0};
@@ -383,6 +449,62 @@ private:
     AudioDeviceFormat deviceFormat{};
     std::string fallbackReason{};
   };
+
+  using AudioCommand = std::function<void()>;
+
+  void enqueueCommand(AudioCommand command) {
+    {
+      std::lock_guard lock{commandMutex_};
+      if (audioWorkerStopping_) {
+        return;
+      }
+      commands_.push_back(std::move(command));
+    }
+    commandAvailable_.notify_one();
+  }
+
+  void stopAudioWorker() {
+    {
+      std::lock_guard lock{commandMutex_};
+      audioWorkerStopping_ = true;
+    }
+    commandAvailable_.notify_one();
+    if (audioWorker_.joinable()) {
+      audioWorker_.join();
+    }
+  }
+
+  void runAudioWorker() {
+    for (;;) {
+      std::optional<AudioCommand> command;
+      {
+        std::unique_lock lock{commandMutex_};
+        if (commands_.empty() && progressWorkerRunning_.load(std::memory_order_acquire) && !audioWorkerStopping_) {
+          commandAvailable_.wait_for(lock, std::chrono::milliseconds{2});
+        } else {
+          commandAvailable_.wait(lock, [&] {
+            return audioWorkerStopping_ || !commands_.empty() || progressWorkerRunning_.load(std::memory_order_acquire);
+          });
+        }
+        if (!commands_.empty()) {
+          command = std::move(commands_.front());
+          commands_.pop_front();
+        } else if (audioWorkerStopping_) {
+          break;
+        }
+      }
+
+      if (command) {
+        (*command)();
+      } else if (progressWorkerRunning_.load(std::memory_order_acquire)) {
+        servicePlaybackProgress();
+      }
+    }
+
+    stopProgressWorker();
+    stopDevice();
+    device_.uninitialize();
+  }
 
   FfmpegFilterTargetFormat requestedTarget(const FfmpegAudioStreamInfo& streamInfo) const {
     return FfmpegFilterTargetFormat{config_.targetSampleRate.value_or(streamInfo.sampleRate),
@@ -667,7 +789,6 @@ private:
   }
 
   void servicePlaybackProgress() {
-    std::lock_guard lock{progressMutex_};
     updateClockFromQueue();
     if (stateMachine_.state() == PlaybackState::Playing && !loadedToEnd_) {
       static_cast<void>(fillQueue());
@@ -700,20 +821,10 @@ private:
     }
     stopProgressWorker();
     progressWorkerRunning_.store(true, std::memory_order_release);
-    progressWorker_ = std::thread{[this] {
-      while (progressWorkerRunning_.load(std::memory_order_acquire)) {
-        servicePlaybackProgress();
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
-      }
-    }};
+    commandAvailable_.notify_one();
   }
 
-  void stopProgressWorker() {
-    progressWorkerRunning_.store(false, std::memory_order_release);
-    if (progressWorker_.joinable() && progressWorker_.get_id() != std::this_thread::get_id()) {
-      progressWorker_.join();
-    }
-  }
+  void stopProgressWorker() { progressWorkerRunning_.store(false, std::memory_order_release); }
 
   void stopProgressWorkerAsync() { progressWorkerRunning_.store(false, std::memory_order_release); }
 
@@ -796,6 +907,10 @@ private:
   void dispatchPosition(const PlaybackClockSnapshot& snapshot) {
     lastProgressPublish_ = std::chrono::steady_clock::now();
     lastPublishedPosition_ = snapshot.position;
+    {
+      std::lock_guard lock{snapshotMutex_};
+      lastClockSnapshot_ = snapshot;
+    }
     dispatcher_.dispatch(BackendEventType::PlaybackPositionUpdated, PlaybackPositionUpdated{snapshot});
   }
 
@@ -876,9 +991,14 @@ private:
   bool hasCurrentTarget_{false};
   std::chrono::steady_clock::time_point lastProgressPublish_{};
   std::optional<std::chrono::milliseconds> lastPublishedPosition_{};
-  std::mutex progressMutex_{};
+  mutable std::mutex snapshotMutex_{};
+  PlaybackClockSnapshot lastClockSnapshot_{};
+  std::mutex commandMutex_{};
+  std::condition_variable commandAvailable_{};
+  std::deque<AudioCommand> commands_{};
+  bool audioWorkerStopping_{false};
+  std::thread audioWorker_{};
   std::atomic<bool> progressWorkerRunning_{false};
-  std::thread progressWorker_{};
 };
 
 std::shared_ptr<AudioPlaybackService> makeAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend) {

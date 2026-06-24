@@ -2,6 +2,7 @@
 
 #include <doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -150,6 +151,44 @@ TEST_CASE("playback_state_machine cancellation clears stale seek before stop") {
   }
   CHECK(sink.events.back().type == BackendEventType::PlaybackError);
   CHECK(std::get<PlaybackError>(sink.events.back().payload).code == PlaybackErrorCode::SeekFailed);
+}
+
+TEST_CASE("playback_state_machine seek rollback restores previous ready state") {
+  PlaybackStateMachine machine;
+  FakeSink sink;
+  machine.setEventSink(sink.callback());
+
+  machine.loadTrack(request());
+  machine.completeLoad();
+  machine.seek(10s);
+  machine.cancelSeek(PlaybackErrorCode::SeekFailed, "seek failed", "simulated seek failure");
+
+  CHECK(machine.state() == PlaybackState::Ready);
+  CHECK(machine.hasPendingSeek() == false);
+  CHECK(machine.clock().position == 0ms);
+  CHECK(machine.clock().continuous == false);
+
+  CHECK(sink.events.back().type == BackendEventType::PlaybackError);
+  CHECK(std::get<PlaybackError>(sink.events.back().payload).code == PlaybackErrorCode::SeekFailed);
+}
+
+TEST_CASE("playback_state_machine stale seek completion is ignored after newer stop") {
+  PlaybackStateMachine machine;
+  FakeSink sink;
+  machine.setEventSink(sink.callback());
+
+  machine.loadTrack(request());
+  machine.completeLoad();
+  machine.play();
+  const auto seekGeneration = machine.beginSeek(10s);
+  machine.stop();
+  machine.completeSeek(seekGeneration);
+
+  CHECK(machine.state() == PlaybackState::Stopped);
+  CHECK(machine.hasPendingSeek() == false);
+  CHECK(std::none_of(sink.events.begin(), sink.events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PositionDiscontinuity;
+  }));
 }
 
 TEST_CASE("playback_state_machine clear sink prevents delivery after shutdown") {

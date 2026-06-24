@@ -165,7 +165,9 @@ TEST_CASE("audio_player_small_buffer keeps playback running when decoded frames 
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   for (int index = 0; index < 40; ++index) {
     fake->consume(16U);
     static_cast<void>(player.queryPlaybackClock());
@@ -192,7 +194,9 @@ TEST_CASE("audio_player_small_buffer refills playback without clock polling") {
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   for (int index = 0; index < 80; ++index) {
     fake->consume(16U);
     std::this_thread::sleep_for(2ms);
@@ -220,7 +224,9 @@ TEST_CASE("audio_player_small_buffer publishes progress while playing without cl
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
   for (int index = 0; index < 120; ++index) {
     fake->consume(16U);
     std::this_thread::sleep_for(2ms);
@@ -252,7 +258,9 @@ TEST_CASE("audio_player_small_buffer drains pending tail before playback ended")
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.play();
+  static_cast<void>(player.queryPlaybackClock());
 
   auto clock = player.queryPlaybackClock();
   for (int index = 0; index < 4000 && std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
@@ -285,9 +293,12 @@ TEST_CASE("audio_player_resume_from_stopped_does_not_start_device") {
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.stop();
+  static_cast<void>(player.queryPlaybackClock());
   const int startsBeforeResume = fake->startCalls;
   player.resume();
+  static_cast<void>(player.queryPlaybackClock());
 
   CHECK(fake->startCalls == startsBeforeResume);
   CHECK_FALSE(fake->started);
@@ -312,9 +323,12 @@ TEST_CASE("audio_player_seek_from_stopped_reports_one_error_without_clock_mutati
   player.configureOutput(config);
 
   player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
   player.stop();
+  static_cast<void>(player.queryPlaybackClock());
   const auto beforeSeek = player.queryPlaybackClock();
   player.seek(500ms);
+  static_cast<void>(player.queryPlaybackClock());
   const auto afterSeek = player.queryPlaybackClock();
   const auto errorCount = std::count_if(events.begin(), events.end(), [](const BackendEvent& event) {
     return event.type == BackendEventType::PlaybackError &&

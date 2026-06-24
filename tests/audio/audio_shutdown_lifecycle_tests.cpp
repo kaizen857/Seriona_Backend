@@ -237,7 +237,9 @@ TEST_CASE("audio_shutdown_lifecycle stops device before service destroys queue")
     AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
     player.configureOutput(outputConfig());
     player.loadTrack(request(sineFixture("audio_shutdown_lifecycle_stop_before_destroy.wav", kSampleRate), "shutdown"));
+    static_cast<void>(player.queryPlaybackClock());
     player.play();
+    static_cast<void>(player.queryPlaybackClock());
 
     CHECK(recorder->initializeCalls == 1);
     CHECK(recorder->startCalls == 1);
@@ -264,14 +266,17 @@ TEST_CASE("audio_shutdown_lifecycle clear sink blocks events through stop and de
     player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
     player.configureOutput(outputConfig());
     player.loadTrack(request(sineFixture("audio_shutdown_lifecycle_sink_clear.wav", 480U), "sink-clear"));
+    static_cast<void>(player.queryPlaybackClock());
     const auto deliveredBeforeClear = events.size();
     REQUIRE(deliveredBeforeClear > 0U);
 
     player.setEventSink(BackendEventSink{});
     player.play();
+    static_cast<void>(player.queryPlaybackClock());
     fake->consumeFrames(960U);
     static_cast<void>(player.queryPlaybackClock());
     player.stop();
+    static_cast<void>(player.queryPlaybackClock());
 
     CHECK(events.size() == deliveredBeforeClear);
   }
@@ -307,7 +312,9 @@ TEST_CASE("audio_shutdown_lifecycle waits for progress worker before clearing si
   });
   player->configureOutput(outputConfig());
   player->loadTrack(request(sineFixture("audio_shutdown_lifecycle_progress_before_sink_clear.wav", kSampleRate), "progress-clear"));
+  static_cast<void>(player->queryPlaybackClock());
   player->play();
+  static_cast<void>(player->queryPlaybackClock());
   armProgressSink.store(true, std::memory_order_release);
   fake->consumeFrames(1024U);
 
