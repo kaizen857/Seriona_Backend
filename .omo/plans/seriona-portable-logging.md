@@ -107,7 +107,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: run `./build/seriona '/home/kaizen857/Music/CloudMusic(for MP4)/R・I・O・T/'` in tmux, wait 2 seconds, verify log file exists and contains startup/data-root entries, then kill session. Failure: simulate invalid music path and verify error log is emitted. Evidence `.omo/evidence/task-4-seriona-portable-logging.md`.
   Commit: Y | `feat(app): initialize portable logging`
 
-- [ ] 5. Add audio logs outside realtime paths
+- [x] 5. Add audio logs outside realtime paths
   What to do / Must NOT do: Add logs around audio service lifecycle, load/play/pause/resume/seek/stop commands, output format negotiation, device init/start/stop/rebind failures, FFmpeg open/read/seek/filter errors, underrun summary events, and fallback decisions. Must not log inside `AudioOutputDevice::renderCallback()`, miniaudio data callback, PCM queue read/write, or tight clock hot paths.
   Parallelization: Wave 2 | Blocked by: 1 | Blocks: 10, 11
   References (executor has NO interview context - be exhaustive): `AGENTS.md` realtime constraints; `src/audio/audio_playback_service.cpp:104`, `src/audio/audio_playback_service.cpp:935`, `src/audio/audio_playback_service.cpp:941`, `src/audio/audio_playback_service.cpp:957`, `src/audio/device/audio_output_device.cpp:133`, `src/audio/device/audio_output_device.cpp:253`, `src/audio/device/miniaudio_output_device_backend.cpp:45`, `src/audio/ffmpeg/ffmpeg_audio_source.cpp:167`, `src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp:182`, `src/audio/buffer/pcm_buffer_queue.cpp:13`.
@@ -115,7 +115,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.(audio_output_device|audio_player_single_track|audio_player_small_buffer|audio_error_matrix|ffmpeg_audio_source|ffmpeg_filter_pipeline)' --output-on-failure`. Failure: run an existing missing/corrupt fixture test and verify an `error` log line is emitted to the test log file if the logging harness captures it. Evidence `.omo/evidence/task-5-seriona-portable-logging.md`.
   Commit: Y | `feat(audio): log playback lifecycle`
 
-- [ ] 6. Add control and app command logs
+- [x] 6. Add control and app command logs
   What to do / Must NOT do: Log command acceptance/rejection, visible playback state changes, seek suppression decisions, subscription lifecycle, event-loop start/stop, queued task failures, and domain notifications. Keep logs at boundaries and meaningful decisions; do not log every position tick or every subscriber callback invocation.
   Parallelization: Wave 2 | Blocked by: 1, 2 | Blocks: 10, 11
   References (executor has NO interview context - be exhaustive): `src/control/media_controller.cpp:32`, `src/control/control_event_loop.cpp:20`, `src/control/control_state_reducer.cpp:187`, `src/control/control_state_reducer.cpp:326`, `src/control/control_state_reducer.cpp:412`, `src/control/media_controller_module.cpp:51`, `app/terminal_controller.cpp:98`, `app/terminal_controller.cpp:181`.
@@ -123,7 +123,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.(control_contract|control_controller)' --output-on-failure`. Failure: submit invalid command in an existing control test path and assert/log evidence contains `warn` rejection. Evidence `.omo/evidence/task-6-seriona-portable-logging.md`.
   Commit: Y | `feat(control): log command decisions`
 
-- [ ] 7. Add scanner and cache logs with portable path coverage
+- [x] 7. Add scanner and cache logs with portable path coverage
   What to do / Must NOT do: Log scanner configuration, roots, scan start/finish summaries, cache open/migration/maintenance/checkpoint, cache unavailable, path classification warnings, hash traversal summaries, TagReader per-file failures, LRC parse failures, watcher start/stop/debounce, and artwork export path. Avoid logging raw lyrics text or excessive per-file debug unless guarded by `debug` and summarized by default.
   Parallelization: Wave 2 | Blocked by: 1, 2, 3 | Blocks: 10, 11, 12
   References (executor has NO interview context - be exhaustive): `src/scanner/file_scanner_service.cpp:9`, `src/scanner/file_scanner_orchestrator.cpp:242`, `src/scanner/file_scanner_orchestrator.cpp:293`, `src/scanner/file_scanner_orchestrator.cpp:618`, `src/scanner/cache/sqlite_scanner_cache.cpp:556`, `src/scanner/cache/sqlite_scanner_cache.cpp:668`, `src/scanner/path_utils.cpp:145`, `src/scanner/hash_utils.cpp:136`, `src/scanner/lrc_parser.cpp:98`, `src/scanner/tag_reader_metadata_adapter.cpp:105`, `src/scanner/scan_scheduler.cpp:29`, `tests/scanner/scanner_test_harness.cpp`, `tests/scanner/scanner_service_tests.cpp`.
@@ -131,7 +131,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.scanner' --output-on-failure`. Failure: scanner test with broken metadata logs a `warn`/`error` without failing unrelated successful files. Evidence `.omo/evidence/task-7-seriona-portable-logging.md`.
   Commit: Y | `feat(scanner): log scan and cache flow`
 
-- [ ] 8. Add metadata and MPRIS logs
+- [x] 8. Add metadata and MPRIS logs
   What to do / Must NOT do: Log backend selection, service start/update/stop, no-op/failure backend paths, synchronizer suppression/emission decisions at debug level without logging every position-only tick, Linux MPRIS bus/object export, property publish summaries, command dispatch/rejection, SetPosition validation, and stop/shutdown. Keep platform-specific details inside `src/metadata/` only.
   Parallelization: Wave 2 | Blocked by: 1 | Blocks: 10, 11
   References (executor has NO interview context - be exhaustive): `src/metadata/metadata_service.cpp:8`, `src/metadata/metadata_service_backend.cpp:40`, `src/metadata/metadata_synchronizer.cpp:136`, `src/metadata/metadata_mpris_linux.cpp:173`, `src/metadata/metadata_mpris_linux.cpp:417`, `src/metadata/metadata_mpris_linux.cpp:437`, `src/metadata/metadata_windows_private.cpp:25`, `AGENTS.md` metadata private boundary.
@@ -139,7 +139,7 @@ Your next move: run `$start-work .omo/plans/seriona-portable-logging.md`, or ask
   QA scenarios (name the exact tool + invocation): Happy: `ctest --test-dir build -R 'seriona.(metadata_mapper|metadata_service|metadata_mpris|metadata_contract)' --output-on-failure`. Failure: invalid MPRIS track id/unsupported backend logs warning/error without changing return semantics. Evidence `.omo/evidence/task-8-seriona-portable-logging.md`.
   Commit: Y | `feat(metadata): log platform sync flow`
 
-- [ ] 9. Add critical-level coverage for process-level unrecoverable failures only
+- [x] 9. Add critical-level coverage for process-level unrecoverable failures only
   What to do / Must NOT do: Ensure at least one legitimate `critical` path exists for process-level startup/build/runtime unrecoverable failures, such as logging bootstrap impossible to recover if implementation chooses fatal startup behavior, or a top-level uncaught exception guard. Do not downgrade normal backend failures into `critical`; most playback/scan errors are `error` or `warn`.
   Parallelization: Wave 2 | Blocked by: 1, 2 | Blocks: 10, 11
   References (executor has NO interview context - be exhaustive): `app/main.cpp:14`, `app/terminal_controller.cpp:181`, spdlog docs for `critical`; user requested levels `debug` through `critical`.

@@ -1,5 +1,7 @@
 #include "control_state_reducer.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <cmath>
 #include <string>
@@ -21,6 +23,44 @@ constexpr std::size_t kRecentNotificationLimit = 32;
                               .canSetShuffle = true,
                               .canSetVolume = true,
                               .canSelectTrack = true};
+}
+
+[[nodiscard]] std::string errorCodeText(MediaControllerErrorCode code) {
+  switch (code) {
+  case MediaControllerErrorCode::None:
+    return "none";
+  case MediaControllerErrorCode::ControllerStopped:
+    return "controller_stopped";
+  case MediaControllerErrorCode::NoPlayableTrack:
+    return "no_playable_track";
+  case MediaControllerErrorCode::TrackNotInLibrary:
+    return "track_not_in_library";
+  case MediaControllerErrorCode::InvalidCommand:
+    return "invalid_command";
+  case MediaControllerErrorCode::BackendRejected:
+    return "backend_rejected";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] std::string playbackStatusName(PlaybackStatus status) {
+  switch (status) {
+  case PlaybackStatus::Stopped:
+    return "stopped";
+  case PlaybackStatus::Playing:
+    return "playing";
+  case PlaybackStatus::Paused:
+    return "paused";
+  case PlaybackStatus::Loading:
+    return "loading";
+  case PlaybackStatus::Seeking:
+    return "seeking";
+  case PlaybackStatus::Buffering:
+    return "buffering";
+  case PlaybackStatus::Error:
+    return "error";
+  }
+  return "unknown";
 }
 
 [[nodiscard]] PlaybackStatus mapPlaybackState(audio::PlaybackState state) noexcept {
@@ -193,16 +233,19 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       if (player_.playback.state == PlaybackStatus::Stopped) {
         if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
           selectTrack(reduction, *track, true);
+          spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
           return reduction;
         }
       }
       reduction.intents.push_back(makeIntent(player_.playback.state == PlaybackStatus::Paused ? ControlIntentKind::Resume : ControlIntentKind::Play));
       player_.playback.state = PlaybackStatus::Playing;
+      spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
       markPlayerChanged(reduction);
       return reduction;
     }
     if (const auto track = firstPlayableTrack(); track.has_value()) {
       selectTrack(reduction, *track, true);
+      spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
       return reduction;
     }
     stopPlayback(reduction);
@@ -210,16 +253,19 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   case MediaControlCommandKind::Pause:
     reduction.intents.push_back(makeIntent(ControlIntentKind::Pause));
     player_.playback.state = PlaybackStatus::Paused;
+    spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Paused));
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::Stop:
     reduction.intents.push_back(makeIntent(ControlIntentKind::Stop));
     stopPlayback(reduction);
+    spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Stopped));
     return reduction;
   case MediaControlCommandKind::TogglePlayPause:
     if (player_.playback.state == PlaybackStatus::Stopped && selectedTrack_.has_value()) {
       if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
         selectTrack(reduction, *track, true);
+        spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
         return reduction;
       }
     }
@@ -227,6 +273,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
                                             : player_.playback.state == PlaybackStatus::Paused ? ControlIntentKind::Resume
                                                                                                 : ControlIntentKind::Play));
     player_.playback.state = player_.playback.state == PlaybackStatus::Playing ? PlaybackStatus::Paused : PlaybackStatus::Playing;
+    spdlog::debug("state: {}", playbackStatusName(player_.playback.state));
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::SeekTo:
@@ -235,6 +282,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     }
     if (isStableSeekVisibleState(player_.playback.state)) {
       visibleStateDuringSeek_ = player_.playback.state;
+      spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
     }
     player_.timeline.position = clampPosition(*command.position);
     reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
@@ -246,6 +294,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     }
     if (isStableSeekVisibleState(player_.playback.state)) {
       visibleStateDuringSeek_ = player_.playback.state;
+      spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
     }
     player_.timeline.position = clampPosition(player_.timeline.position + *command.delta);
     reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
@@ -339,9 +388,11 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
         if constexpr (std::is_same_v<Payload, audio::PlaybackStateChanged>) {
           const auto mappedState = mapPlaybackState(payload.state);
           if (visibleStateDuringSeek_.has_value() && mappedState == PlaybackStatus::Loading) {
+            spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
             player_.playback.state = *visibleStateDuringSeek_;
           } else {
             player_.playback.state = mappedState;
+            spdlog::debug("state: {}", playbackStatusName(mappedState));
             if (mappedState == PlaybackStatus::Playing || mappedState == PlaybackStatus::Stopped || mappedState == PlaybackStatus::Error) {
               visibleStateDuringSeek_.reset();
             }
@@ -390,6 +441,7 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::OutputModeFallback, payload.reason));
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackError>) {
+          spdlog::warn("playback error ({}): {}", playbackErrorCode(payload.code), payload.message);
           visibleStateDuringSeek_.reset();
           player_.playback.state = PlaybackStatus::Error;
           player_.playback.errorCode = playbackErrorCode(payload.code);
@@ -607,6 +659,7 @@ ControlReduction ControlStateReducer::accept() {
 }
 
 ControlReduction ControlStateReducer::reject(MediaControllerErrorCode code, std::string message) {
+  spdlog::warn("command rejected ({}): {}", errorCodeText(code), message);
   auto reduction = ControlReduction{.result = MediaControllerCommandResult{.accepted = false, .code = code, .message = message}};
   addNotification(reduction, makeErrorNotification(ControlDomainNotificationKind::CommandRejected, code, std::move(message)));
   return reduction;
@@ -659,6 +712,7 @@ void ControlStateReducer::selectTrack(ControlReduction& reduction, const Playabl
   player_.playback.state = startPlayback ? PlaybackStatus::Playing : PlaybackStatus::Stopped;
   player_.playback.errorCode.reset();
   player_.playback.errorMessage.reset();
+  spdlog::debug("state: {}", playbackStatusName(player_.playback.state));
   reduction.intents.push_back(makeTrackIntent(track.request));
   if (startPlayback) {
     reduction.intents.push_back(makeIntent(ControlIntentKind::Play));
@@ -670,6 +724,7 @@ void ControlStateReducer::stopPlayback(ControlReduction& reduction) {
   visibleStateDuringSeek_.reset();
   player_.playback.state = PlaybackStatus::Stopped;
   player_.timeline.position = std::chrono::milliseconds{0};
+  spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Stopped));
   markPlayerChanged(reduction);
 }
 

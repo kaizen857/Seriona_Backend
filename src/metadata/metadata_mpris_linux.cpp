@@ -1,5 +1,7 @@
 #include "metadata_mpris_private.h"
 
+#include "spdlog/spdlog.h"
+
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <cstdint>
@@ -336,13 +338,18 @@ public:
       try {
         connection_->leaveEventLoop();
       } catch (const sdbus::Error& error) {
-        (void)error;
+        spdlog::error("MPRIS DBus error: {}", error.what());
       }
     }
   }
 
   void requestName(std::string_view name) override {
-    connection_->requestName(sdbus::ServiceName{std::string{name}});
+    try {
+      connection_->requestName(sdbus::ServiceName{std::string{name}});
+    } catch (const sdbus::Error& error) {
+      spdlog::error("MPRIS DBus error: {}", error.what());
+      throw;
+    }
     if (!eventLoopStarted_) {
       connection_->enterEventLoopAsync();
       eventLoopStarted_ = true;
@@ -429,6 +436,7 @@ MetadataSyncResult LinuxMprisAdapter::start(const PlatformMediaState& state) {
   }
   bus_->requestName(kMprisBusName);
   bus_->addObjectManager(kMprisObjectPath);
+  spdlog::info("MPRIS object exported on session bus");
   started_ = true;
   publishCurrentSnapshot(state);
   return MetadataSyncResult{.accepted = true, .changed = true, .state = state, .errorCode = std::nullopt, .message = {}};
@@ -447,6 +455,7 @@ MetadataSyncResult LinuxMprisAdapter::update(const PlatformMediaState& state) {
 }
 
 MetadataSyncResult LinuxMprisAdapter::stop() {
+  spdlog::debug("metadata mpris backend stopping");
   started_ = false;
   {
     std::lock_guard lock{stateMutex_};
@@ -459,10 +468,12 @@ MetadataSyncResult LinuxMprisAdapter::stop() {
 bool LinuxMprisAdapter::setPosition(const std::string& trackObjectPath, std::chrono::microseconds position) {
   const auto state = currentStateSnapshot();
   if (!state || !state->controlState.currentTrack) {
+    spdlog::debug("MPRIS SetPosition rejected: no current track");
     return false;
   }
   const auto& controlState = state->controlState;
   if (makeMprisTrackObjectPath(*controlState.currentTrack) != trackObjectPath) {
+    spdlog::warn("MPRIS SetPosition rejected: invalid track id {}", trackObjectPath);
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
@@ -505,10 +516,12 @@ MprisSnapshotRecord LinuxMprisAdapter::toSnapshotRecord(const MetadataPlatformSn
 bool LinuxMprisAdapter::dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position) {
   const auto state = currentStateSnapshot();
   if (!state || !commandAllowed(kind, state->controlState.capabilities)) {
+    spdlog::debug("MPRIS command rejected: not permitted by capabilities");
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
   if (!sink) {
+    spdlog::debug("MPRIS command rejected: no command sink");
     return false;
   }
 
@@ -522,10 +535,12 @@ bool LinuxMprisAdapter::dispatchCommand(control::MediaControlCommandKind kind, s
 bool LinuxMprisAdapter::dispatchSeekBy(std::chrono::microseconds delta) {
   const auto state = currentStateSnapshot();
   if (!state || !commandAllowed(control::MediaControlCommandKind::SeekBy, state->controlState.capabilities) || delta < std::chrono::microseconds{0}) {
+    spdlog::debug("MPRIS SeekBy rejected: not permitted by capabilities or invalid delta");
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
   if (!sink) {
+    spdlog::debug("MPRIS command rejected: no command sink");
     return false;
   }
 
@@ -539,10 +554,12 @@ bool LinuxMprisAdapter::dispatchSeekBy(std::chrono::microseconds delta) {
 bool LinuxMprisAdapter::dispatchSetVolume(float volume) {
   const auto state = currentStateSnapshot();
   if (!state || !commandAllowed(control::MediaControlCommandKind::SetVolume, state->controlState.capabilities)) {
+    spdlog::debug("MPRIS SetVolume rejected: not permitted by capabilities");
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
   if (!sink) {
+    spdlog::debug("MPRIS command rejected: no command sink");
     return false;
   }
 
@@ -556,10 +573,12 @@ bool LinuxMprisAdapter::dispatchSetVolume(float volume) {
 bool LinuxMprisAdapter::dispatchSetRepeat(control::RepeatMode repeatMode) {
   const auto state = currentStateSnapshot();
   if (!state || !commandAllowed(control::MediaControlCommandKind::SetRepeatMode, state->controlState.capabilities)) {
+    spdlog::debug("MPRIS SetRepeatMode rejected: not permitted by capabilities");
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
   if (!sink) {
+    spdlog::debug("MPRIS command rejected: no command sink");
     return false;
   }
 
@@ -573,10 +592,12 @@ bool LinuxMprisAdapter::dispatchSetRepeat(control::RepeatMode repeatMode) {
 bool LinuxMprisAdapter::dispatchSetShuffle(bool shuffle) {
   const auto state = currentStateSnapshot();
   if (!state || !commandAllowed(control::MediaControlCommandKind::SetShuffle, state->controlState.capabilities)) {
+    spdlog::debug("MPRIS SetShuffle rejected: not permitted by capabilities");
     return false;
   }
   const auto sink = commandSinkState_->snapshot();
   if (!sink) {
+    spdlog::debug("MPRIS command rejected: no command sink");
     return false;
   }
 
@@ -597,7 +618,11 @@ void LinuxMprisAdapter::publishCurrentSnapshot(const PlatformMediaState& state) 
     return;
   }
   const auto record = toSnapshotRecord(mapPlayerStateSnapshot(state.controlState));
-  object_->publish(record, shouldEmitPropertiesChangedSignal(lastPublishedSnapshot_, record));
+  const auto emitProps = shouldEmitPropertiesChangedSignal(lastPublishedSnapshot_, record);
+  if (emitProps) {
+    spdlog::debug("MPRIS property publish: properties changed");
+  }
+  object_->publish(record, emitProps);
   lastPublishedSnapshot_ = record;
 }
 

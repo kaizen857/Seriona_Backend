@@ -1,5 +1,7 @@
 #include "terminal_controller.h"
 
+#include "spdlog/spdlog.h"
+
 #include <filesystem>
 #include <iostream>
 
@@ -23,5 +25,15 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  return seriona::app::runTerminalController(musicPath);
+  try {
+    return seriona::app::runTerminalController(musicPath);
+  } catch (const std::exception& e) {
+    spdlog::critical("unrecoverable exception: {}", e.what());
+    spdlog::shutdown();
+    return 1;
+  } catch (...) {
+    spdlog::critical("unrecoverable unknown exception");
+    spdlog::shutdown();
+    return 1;
+  }
 }

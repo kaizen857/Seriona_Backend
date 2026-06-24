@@ -12,6 +12,8 @@
 #include "metadata_windows_private.h"
 #endif
 
+#include "spdlog/spdlog.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -138,6 +140,7 @@ public:
   ~MetadataSharingServiceImpl() override {
     const auto result = stopBackendIfNeeded();
     (void)result;
+    spdlog::debug("metadata backend stopped");
   }
 
   [[nodiscard]] MetadataBackendKind backendKind() const override { return kind_; }
@@ -147,6 +150,7 @@ public:
   }
 
   [[nodiscard]] MetadataSyncResult start(const PlatformMediaState& state) override {
+    spdlog::debug("metadata backend start");
     bool alreadyStarted = false;
     {
       std::lock_guard lock{mutex_};
@@ -155,7 +159,9 @@ public:
 
     if (alreadyStarted) {
       std::lock_guard backendLock{backendMutex_};
-      return backend_->start(state);
+      const auto result = backend_->start(state);
+      spdlog::debug("metadata backend start ok (already started)");
+      return result;
     }
 
     MetadataSyncResult result{};
@@ -164,6 +170,7 @@ public:
       result = backend_->start(state);
     }
     if (!result.accepted) {
+      spdlog::warn("metadata backend start failed: {} - {}", result.errorCode.value_or(""), result.message);
       return result;
     }
 
@@ -173,6 +180,7 @@ public:
     if (!worker_.joinable()) {
       worker_ = std::thread{[this] { runWorker(); }};
     }
+    spdlog::debug("metadata backend start ok");
     return result;
   }
 
@@ -180,6 +188,7 @@ public:
     {
       std::lock_guard lock{mutex_};
       if (!started_ || stopping_) {
+        spdlog::warn("metadata backend update rejected: backend stopped");
         return makeFailureResult("metadata.backend.stopped", "metadata backend update requested after stop");
       }
       pendingUpdate_ = state;
@@ -193,6 +202,7 @@ public:
   }
 
   [[nodiscard]] MetadataSyncResult stop() override {
+    spdlog::debug("metadata backend stopping");
     return stopBackendIfNeeded();
   }
 
@@ -242,7 +252,9 @@ private:
 
       std::lock_guard backendLock{backendMutex_};
       const auto result = backend_->update(*state);
-      (void)result;
+      if (!result.accepted) {
+        spdlog::warn("metadata backend update failed: {} - {}", result.errorCode.value_or(""), result.message);
+      }
     }
   }
 
@@ -273,8 +285,9 @@ private:
 [[nodiscard]] std::unique_ptr<MetadataServiceBackend> makeMetadataServiceBackendFromOptions(const MetadataSharingOptions& options) {
   if (options.backendKind == MetadataBackendKind::Windows) {
     const auto capabilities = MetadataBackendCapabilities{.requiresPlatformExtension = true,
-                                                          .hasPlatformExtension = options.platformExtension != nullptr};
+                                                           .hasPlatformExtension = options.platformExtension != nullptr};
     if (options.platformExtension == nullptr) {
+      spdlog::info("metadata backend: windows (unavailable - host extension missing)");
       return std::make_unique<UnavailableMetadataServiceBackend>(
           MetadataBackendKind::Windows,
           capabilities,
@@ -282,20 +295,25 @@ private:
           "windows metadata backend requires a platform host extension");
     }
 #ifdef _WIN32
+    spdlog::info("metadata backend: windows (native)");
     return detail::makeWindowsMetadataServiceBackend();
 #else
+    spdlog::info("metadata backend: windows (noop - cross-compiled)");
     return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Windows, capabilities);
 #endif
   }
 
   if (options.backendKind == MetadataBackendKind::Linux) {
 #if defined(__linux__) && !defined(__APPLE__)
+    spdlog::info("metadata backend: linux/mpris");
     return detail::makeLinuxMetadataServiceBackend();
 #else
+    spdlog::info("metadata backend: linux (noop - unsupported platform)");
     return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Noop, MetadataBackendCapabilities{});
 #endif
   }
 
+  spdlog::info("metadata backend: noop");
   return std::make_unique<NoopMetadataServiceBackend>(MetadataBackendKind::Noop, MetadataBackendCapabilities{});
 }
 

@@ -6,6 +6,8 @@
 #include "scanner/file_scanner_service_internal.h"
 #include "seriona/scanner/file_scanner_service.h"
 
+#include "spdlog/spdlog.h"
+
 #include <chrono>
 #include <memory>
 #include <string>
@@ -39,17 +41,31 @@ private:
   return std::make_shared<NoopAudioPlaybackService>();
 }
 
+[[nodiscard]] const char* backendKindText(metadata::MetadataBackendKind kind) {
+  switch (kind) {
+  case metadata::MetadataBackendKind::Noop:
+    return "noop";
+  case metadata::MetadataBackendKind::Linux:
+    return "linux";
+  case metadata::MetadataBackendKind::Windows:
+    return "windows";
+  }
+  return "unknown";
+}
+
 [[nodiscard]] metadata::MetadataSharingOptions makeProductionMetadataOptions() {
   metadata::MetadataSharingOptions options{};
 #if defined(__linux__) && !defined(__APPLE__)
   options.backendKind = metadata::MetadataBackendKind::Linux;
 #endif
+  spdlog::info("selected {} metadata backend", backendKindText(options.backendKind));
   return options;
 }
 
 }
 
 MediaControllerDependencies makeDefaultMediaControllerDependencies() {
+  spdlog::info("selected noop audio backend (default)");
   MediaControllerDependencies dependencies{};
   dependencies.audio = makeNoopAudioPlaybackService();
   dependencies.scanner = scanner::makeFileScannerService();
@@ -60,6 +76,7 @@ MediaControllerDependencies makeDefaultMediaControllerDependencies() {
 MediaControllerDependencies makeProductionMediaControllerDependencies(
     std::filesystem::path databasePath,
     std::filesystem::path coverExportDir) {
+  spdlog::info("selected production audio backend (miniaudio)");
   MediaControllerDependencies dependencies{};
   dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend());
   scanner::FileScannerServiceDependencies scannerDeps{};
@@ -84,12 +101,14 @@ std::unique_ptr<MediaController> makeProductionMediaController(
 void normalizeMediaControllerDependencies(MediaControllerDependencies& dependencies) {
   if (!dependencies.audio) {
     dependencies.audio = makeNoopAudioPlaybackService();
+    spdlog::info("selected noop audio backend (missing dependency)");
   }
   if (!dependencies.scanner) {
     dependencies.scanner = scanner::makeFileScannerService();
   }
   if (!dependencies.metadata) {
     dependencies.metadata = metadata::makeMetadataSharingService(metadata::MetadataSharingOptions{});
+    spdlog::info("selected noop metadata backend (missing dependency)");
   }
 }
 

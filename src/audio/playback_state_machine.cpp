@@ -1,8 +1,28 @@
 #include "seriona/audio/playback_state_machine.h"
 
+#include "spdlog/spdlog.h"
+
 #include <utility>
 
 namespace seriona::audio {
+
+namespace {
+
+const char* stateName(PlaybackState state) {
+  switch (state) {
+  case PlaybackState::Idle: return "Idle";
+  case PlaybackState::Loading: return "Loading";
+  case PlaybackState::Ready: return "Ready";
+  case PlaybackState::Playing: return "Playing";
+  case PlaybackState::Paused: return "Paused";
+  case PlaybackState::Draining: return "Draining";
+  case PlaybackState::Stopped: return "Stopped";
+  case PlaybackState::Error: return "Error";
+  }
+  return "Unknown";
+}
+
+} // namespace
 
 void PlaybackStateMachine::setEventSink(BackendEventSink sink) { sink_ = std::move(sink); }
 
@@ -169,7 +189,9 @@ void PlaybackStateMachine::changeState(PlaybackState nextState) {
     return;
   }
 
+  const auto previous = state_;
   state_ = nextState;
+  spdlog::debug("playback state: {} -> {}", stateName(previous), stateName(nextState));
   emit(BackendEventType::PlaybackStateChanged, PlaybackStateChanged{nextState});
 }
 
@@ -189,6 +211,7 @@ void PlaybackStateMachine::emitPlaybackEnded() {
 }
 
 void PlaybackStateMachine::emitError(PlaybackErrorCode code, std::string message, std::string detail) {
+  spdlog::error("playback error (code={}): {} - {}", static_cast<int>(code), message, detail);
   emit(BackendEventType::PlaybackError,
        PlaybackError{code, std::move(message), std::move(detail), clock_});
 }

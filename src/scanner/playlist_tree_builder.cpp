@@ -1,5 +1,7 @@
 #include "seriona/scanner/playlist_tree_builder.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <map>
 #include <memory>
@@ -219,6 +221,9 @@ PlaylistTreeSnapshot PlaylistTreeBuilder::publish() {
     }
     return lhs.nodeId < rhs.nodeId;
   });
+  const auto treeStats = impl_->nodes.at(".").stats;
+  spdlog::debug("playlist tree published: {} nodes, {} songs, {}ms total duration", snapshot.nodes.size(),
+                treeStats.songCount, treeStats.totalDuration.count());
   return snapshot;
 }
 

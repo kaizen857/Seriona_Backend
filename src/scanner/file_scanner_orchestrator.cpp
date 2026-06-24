@@ -1,5 +1,7 @@
 #include "file_scanner_service_internal.h"
 
+#include "spdlog/spdlog.h"
+
 #include "seriona/scanner/cache/sqlite_scanner_cache.h"
 #include "seriona/scanner/hash_utils.h"
 #include "seriona/scanner/lrc_parser.h"
@@ -257,6 +259,8 @@ public:
     if (coverExportDir_.empty()) {
       coverExportDir_ = defaultCoverExportDir();
     }
+    spdlog::info("scanner configured: database={} artwork={}", databasePath_.generic_string(),
+                 coverExportDir_.generic_string());
   }
 
   ~OrchestratedFileScannerService() override {
@@ -285,6 +289,7 @@ public:
     }
     scanQueueChanged_.notify_one();
     if (!submitted) {
+      spdlog::error("scanner scan queue is full (capacity 16)");
       ScannerEventSink sink;
       {
         std::scoped_lock lock{mutex_};
@@ -307,6 +312,7 @@ public:
       sink = sink_;
     }
     const auto scanVersion = ++eventVersion_;
+    spdlog::info("scan started: {} roots", roots.size());
     publishEvent(sink, ScannerEventType::ScanStarted, scanVersion, ScanProgress{});
     if (cancellationRequested_.exchange(false)) {
       publishCancelled(sink, scanVersion);
@@ -325,6 +331,7 @@ public:
         publishCancelled(sink, scanVersion);
         return;
       }
+      spdlog::debug("scanning root: {}", root.path.generic_string());
       auto rootResult = reconcileRoot(root, config, cache, discovered, skipped, scanned);
       allErrors.insert(allErrors.end(), rootResult.errors.begin(), rootResult.errors.end());
       allSongs.insert(allSongs.end(), rootResult.songs.begin(), rootResult.songs.end());
@@ -350,6 +357,8 @@ public:
     progress.filesScanned = scanned;
     progress.filesSkipped = skipped;
     progress.errors = allErrors.size();
+    spdlog::info("scan complete: {} discovered, {} scanned, {} skipped, {} errors", discovered, scanned, skipped,
+                 allErrors.size());
     publishEvent(sink, ScannerEventType::ProgressUpdated, ++eventVersion_, progress);
     publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
     publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
@@ -527,6 +536,7 @@ private:
       }
       return mapped;
     } catch (const std::exception& error) {
+      spdlog::warn("TagReader metadata read failed for {}", audioPath.generic_string());
       errors.push_back({.code = ScannerErrorCode::MetadataReadFailed,
                         .message = "TagReader metadata read failed",
                         .detail = error.what(),

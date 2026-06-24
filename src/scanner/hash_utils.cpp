@@ -1,5 +1,7 @@
 #include "seriona/scanner/hash_utils.h"
 
+#include "spdlog/spdlog.h"
+
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -118,6 +120,7 @@ using Xxh3State = std::unique_ptr<XXH3_state_t, Xxh3StateDeleter>;
     if (error) {
       errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::PermissionDenied, root,
                                      "failed to continue directory hash traversal", error.message()));
+      spdlog::debug("hash traversal: skipped entry in {} ({})", root.generic_string(), error.message());
       error.clear();
       continue;
     }
@@ -126,6 +129,7 @@ using Xxh3State = std::unique_ptr<XXH3_state_t, Xxh3StateDeleter>;
   if (error) {
     errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::PermissionDenied, root,
                                    "failed to start directory hash traversal", error.message()));
+    spdlog::warn("hash traversal: failed to start in {} ({})", root.generic_string(), error.message());
   }
   std::ranges::sort(children, {}, [](const std::filesystem::directory_entry& entry) {
     return entry.path().filename().generic_u8string();
@@ -148,16 +152,19 @@ using Xxh3State = std::unique_ptr<XXH3_state_t, Xxh3StateDeleter>;
   if (error || !std::filesystem::exists(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "directory hash path disappeared", error.message()));
+    spdlog::warn("dir hash: path disappeared: {} ({})", path.generic_string(), error.message());
     return result;
   }
   if (std::filesystem::is_symlink(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
                                           "directory hash skipped symlink"));
+    spdlog::debug("dir hash: skipped symlink: {}", path.generic_string());
     return result;
   }
   if (!std::filesystem::is_directory(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
                                           "directory hash requires a directory"));
+    spdlog::error("dir hash: not a directory: {}", path.generic_string());
     return result;
   }
 
@@ -196,6 +203,7 @@ using Xxh3State = std::unique_ptr<XXH3_state_t, Xxh3StateDeleter>;
     } else {
       result.errors.push_back(makeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, childPath,
                                             "directory hash skipped unsupported child"));
+      spdlog::debug("dir hash: skipped unsupported child: {}", childPath.generic_string());
       continue;
     }
 
@@ -230,11 +238,13 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (error || !std::filesystem::exists(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "file hash path disappeared", error.message()));
+    spdlog::warn("file hash: path disappeared: {} ({})", path.generic_string(), error.message());
     return result;
   }
   if (!std::filesystem::is_regular_file(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
                                           "file hash requires a regular file"));
+    spdlog::debug("file hash: not a regular file: {}", path.generic_string());
     return result;
   }
 
@@ -242,6 +252,7 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (!input) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "failed to open file for hashing"));
+    spdlog::error("file hash: failed to open {} for hashing", path.generic_string());
     return result;
   }
 
@@ -271,19 +282,26 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (!input.eof()) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "failed while reading file for hashing"));
+    spdlog::error("file hash: read error for {}", path.generic_string());
     return result;
   }
 
   result.hash = canonicalHex(XXH3_128bits_digest(state.get()));
+  spdlog::debug("file hash complete: {} -> {}", path.generic_string(), *result.hash);
   return result;
 }
 
 FileHashResult hashLyricsSidecar(const std::filesystem::path& path, const HashOptions& options) {
-  return hashFileContent(path, options);
+  auto result = hashFileContent(path, options);
+  spdlog::debug("lrc hash complete: {} -> {}", path.generic_string(), result.hash.value_or("none"));
+  return result;
 }
 
 DirectoryHashResult hashDirectoryMerkle(const std::filesystem::path& root, const HashOptions& options) {
-  return hashDirectoryRecursive(root, root, options);
+  auto result = hashDirectoryRecursive(root, root, options);
+  spdlog::debug("dir hash complete: {} errors={} hash={}", root.generic_string(), result.errors.size(),
+                result.hash.value_or("none"));
+  return result;
 }
 
 }

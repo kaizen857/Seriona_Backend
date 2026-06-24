@@ -1,5 +1,7 @@
 #include "seriona/audio/audio_playback_service.h"
 
+#include "spdlog/spdlog.h"
+
 #include "seriona/audio/buffer/pcm_buffer_queue.h"
 #include "seriona/audio/clock/playback_clock.h"
 #include "seriona/audio/events/audio_event_dispatcher.h"
@@ -167,6 +169,7 @@ public:
 
 private:
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
+    spdlog::info("loading track '{}'", request.filePath.string());
     stopProgressWorker();
     stopDevice();
     device_.uninitialize();
@@ -183,15 +186,19 @@ private:
     stateMachine_.loadTrack(request);
 
     if (const auto error = source_->open(request.filePath)) {
+      spdlog::error("track load failed (open): {} - {}", error->message, error->detail);
       fail(error->code, error->message, error->detail);
       return;
     }
 
     const auto& streamInfo = source_->streamInfo();
+    spdlog::debug("source stream: {}Hz {}ch {}", streamInfo.sampleRate, streamInfo.channelCount,
+                  sampleFormatName(streamInfo.sampleFormat));
     std::string negotiationFailure;
     std::optional<AudioOutputDeviceError> negotiationDeviceError;
     const auto negotiation = negotiateOutput(streamInfo, negotiationFailure, negotiationDeviceError);
     if (!negotiation) {
+      spdlog::error("track load failed (negotiation): {}", negotiationFailure);
       if (negotiationDeviceError) {
         fail(negotiationDeviceError->code, negotiationDeviceError->message, negotiationDeviceError->detail);
         return;
@@ -204,8 +211,13 @@ private:
     }
     currentTarget_ = negotiation->target;
     hasCurrentTarget_ = true;
+    spdlog::debug("output negotiated: {}Hz {}ch {} mode={}",
+                  currentTarget_.sampleRate, currentTarget_.channelCount,
+                  sampleFormatName(currentTarget_.sampleFormat),
+                  outputModeName(negotiation->effectiveConfig.outputMode));
 
     if (const auto error = pipeline_->configure(currentTarget_)) {
+      spdlog::error("track load failed (pipeline): {} - {}", error->message, error->detail);
       device_.uninitialize();
       queue_.reset();
       fail(error->code, error->message, error->detail);
@@ -216,6 +228,7 @@ private:
     observedQueueCounters_ = {};
 
     if (!negotiation->fallbackReason.empty()) {
+      spdlog::warn("output mode fallback: {}", negotiation->fallbackReason);
       dispatcher_.dispatch(BackendEventType::OutputModeFallback,
                            OutputModeFallback{config_,
                                               negotiation->effectiveConfig,
@@ -229,6 +242,8 @@ private:
       return;
     }
 
+    spdlog::info("track loaded: {}Hz {}ch {}", currentTarget_.sampleRate,
+                 currentTarget_.channelCount, sampleFormatName(currentTarget_.sampleFormat));
     stateMachine_.completeLoad();
     publishPosition();
   }
@@ -274,13 +289,16 @@ private:
   }
 
   void playOnWorker() {
+    spdlog::info("play");
     if (!queue_ || !source_ || !pipeline_) {
+      spdlog::error("play failed: no loaded track");
       fail(PlaybackErrorCode::OpenFailed, "play requires a loaded track", "missing playback pipeline");
       return;
     }
 
     clock_.resume();
     if (!device_.start()) {
+      spdlog::error("play failed: device start returned false");
       clock_.pause();
       failWithDeviceError("failed to start audio output device", "AudioOutputDeviceBackend::start returned false");
       return;
@@ -292,6 +310,7 @@ private:
   }
 
   void pauseOnWorker() {
+    spdlog::info("pause");
     stopProgressWorker();
     stopDevice();
     updateClockFromQueue();
@@ -301,7 +320,9 @@ private:
   }
 
   void resumeOnWorker() {
+    spdlog::info("resume");
     if (!queue_) {
+      spdlog::error("resume failed: no queue");
       fail(PlaybackErrorCode::OpenFailed, "resume requires a loaded track", "missing playback queue");
       return;
     }
@@ -312,6 +333,7 @@ private:
 
     clock_.resume();
     if (!device_.start()) {
+      spdlog::error("resume failed: device start returned false");
       clock_.pause();
       failWithDeviceError("failed to resume audio output device", "AudioOutputDeviceBackend::start returned false");
       return;
@@ -323,6 +345,7 @@ private:
   }
 
   void stopOnWorker() {
+    spdlog::info("stop");
     stopProgressWorker();
     stopDevice();
     updateClockFromQueue();
@@ -336,8 +359,10 @@ private:
   }
 
   void seekOnWorker(std::chrono::milliseconds position) {
+    spdlog::info("seek to {}ms", position.count());
     stopProgressWorker();
     if (!source_ || !pipeline_ || !queue_) {
+      spdlog::error("seek failed: no pipeline");
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
       return;
     }
@@ -353,11 +378,13 @@ private:
 
     auto nextSource = std::make_unique<FfmpegAudioSource>();
     if (const auto error = nextSource->open(currentRequest_.filePath)) {
+      spdlog::error("seek failed (open): {} - {}", error->message, error->detail);
       stateMachine_.cancelSeek(error->code, error->message, error->detail);
       publishPosition();
       return;
     }
     if (const auto error = nextSource->seek(position)) {
+      spdlog::error("seek failed (ffmpeg seek): {} - {}", error->message, error->detail);
       stateMachine_.cancelSeek(error->code, error->message, error->detail);
       publishPosition();
       return;
@@ -365,6 +392,7 @@ private:
 
     auto nextPipeline = std::make_unique<FfmpegFilterPipeline>();
     if (const auto error = nextPipeline->configure(currentTarget_)) {
+      spdlog::error("seek failed (pipeline): {} - {}", error->message, error->detail);
       stateMachine_.cancelSeek(error->code, error->message, error->detail);
       publishPosition();
       return;
@@ -388,6 +416,7 @@ private:
     loadedToEnd_ = false;
 
     if (!fillQueue()) {
+      spdlog::error("seek failed (fillQueue)");
       source_ = std::move(previousSource);
       pipeline_ = std::move(previousPipeline);
       queue_ = std::move(previousQueue);
@@ -411,6 +440,7 @@ private:
     if (shouldResume) {
       clock_.resume();
       if (!device_.start()) {
+        spdlog::error("seek failed: device restart returned false");
         clock_.pause();
         failWithDeviceError("failed to restart audio output device after seek", "AudioOutputDeviceBackend::start returned false");
         return;
@@ -419,6 +449,7 @@ private:
     } else {
       clock_.pause();
     }
+    spdlog::debug("seek completed to {}ms", position.count());
     publishPosition();
   }
   struct PendingFrameWrite {
@@ -939,6 +970,7 @@ private:
   }
 
   void fail(PlaybackErrorCode code, std::string message, std::string detail) {
+    spdlog::error("playback error (code={}): {} - {}", static_cast<int>(code), message, detail);
     stopProgressWorker();
     stopDevice();
     stateMachine_.fail(code, std::move(message), std::move(detail));
@@ -947,14 +979,19 @@ private:
   void failWithDeviceError(std::string fallbackMessage, std::string fallbackDetail) {
     const auto error = device_.lastError();
     if (error) {
+      spdlog::error("playback device error (code={}): {} - {}", static_cast<int>(error->code),
+                    error->message, error->detail);
       fail(error->code, error->message, error->detail);
       return;
     }
 
+    spdlog::error("playback device error: {} - {}", fallbackMessage, fallbackDetail);
     fail(PlaybackErrorCode::DeviceUnavailable, std::move(fallbackMessage), std::move(fallbackDetail));
   }
 
   void emitBufferUnderrun(std::uint64_t silenceFrames, std::uint64_t underrunCount) {
+    spdlog::warn("buffer underrun: {} silence frames, {} underrun(s)",
+                 silenceFrames, underrunCount);
     std::ostringstream detail;
     detail << "audio callback requested " << silenceFrames << " silence frames across " << underrunCount
            << " underrun read(s)";

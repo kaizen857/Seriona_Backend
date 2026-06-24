@@ -1,5 +1,7 @@
 #include "seriona/audio/ffmpeg_audio_source.h"
 
+#include "spdlog/spdlog.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -168,8 +170,10 @@ class FfmpegAudioSource::Impl {
 public:
   std::optional<FfmpegAudioSourceError> open(const std::filesystem::path& path) {
     reset();
+    spdlog::debug("ffmpeg source opening '{}'", path.string());
 
     if (!std::filesystem::exists(path)) {
+      spdlog::error("ffmpeg source open failed: file not found '{}'", path.string());
       return makeError(PlaybackErrorCode::OpenFailed, "audio file does not exist", path.string());
     }
 
@@ -177,17 +181,23 @@ public:
     const auto pathString = path.string();
     int result = avformat_open_input(&rawFormat, pathString.c_str(), nullptr, nullptr);
     if (result < 0) {
+      spdlog::error("ffmpeg source open failed: avformat_open_input returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to open audio container", result);
     }
     format_.reset(rawFormat);
 
     result = avformat_find_stream_info(format_.get(), nullptr);
     if (result < 0) {
+      spdlog::error("ffmpeg source open failed: avformat_find_stream_info returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to read stream information", result);
     }
 
     const int bestStream = av_find_best_stream(format_.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (bestStream < 0) {
+      spdlog::error("ffmpeg source open failed: no audio stream found ({})",
+                    ffmpegErrorDetail(bestStream));
       return makeError(PlaybackErrorCode::UnsupportedFormat, "audio stream not found", bestStream);
     }
     audioStreamIndex_ = bestStream;
@@ -195,34 +205,49 @@ public:
     const auto* stream = format_->streams[audioStreamIndex_];
     const auto* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
     if (decoder == nullptr) {
-      return makeError(PlaybackErrorCode::UnsupportedFormat, "audio decoder not found", "codec id " + std::to_string(stream->codecpar->codec_id));
+      spdlog::error("ffmpeg source open failed: no decoder for codec id {}",
+                    static_cast<int>(stream->codecpar->codec_id));
+      return makeError(PlaybackErrorCode::UnsupportedFormat, "audio decoder not found",
+                       "codec id " + std::to_string(stream->codecpar->codec_id));
     }
 
     codec_.reset(avcodec_alloc_context3(decoder));
     if (!codec_) {
-      return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to allocate audio decoder", "avcodec_alloc_context3 returned null");
+      spdlog::error("ffmpeg source open failed: avcodec_alloc_context3 returned null");
+      return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to allocate audio decoder",
+                       "avcodec_alloc_context3 returned null");
     }
 
     result = avcodec_parameters_to_context(codec_.get(), stream->codecpar);
     if (result < 0) {
+      spdlog::error("ffmpeg source open failed: avcodec_parameters_to_context returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to configure audio decoder", result);
     }
 
     result = avcodec_open2(codec_.get(), decoder, nullptr);
     if (result < 0) {
+      spdlog::error("ffmpeg source open failed: avcodec_open2 returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::UnsupportedFormat, "failed to open audio decoder", result);
     }
 
     packet_.reset(av_packet_alloc());
     frame_.reset(av_frame_alloc());
     if (!packet_ || !frame_) {
-      return makeError(PlaybackErrorCode::DecodeFailed, "failed to allocate decode buffers", "av_packet_alloc or av_frame_alloc returned null");
+      spdlog::error("ffmpeg source open failed: failed to allocate decode buffers");
+      return makeError(PlaybackErrorCode::DecodeFailed, "failed to allocate decode buffers",
+                       "av_packet_alloc or av_frame_alloc returned null");
     }
 
     info_.sampleRate = static_cast<std::uint32_t>(std::max(0, codec_->sample_rate));
     info_.channelCount = channelCount(*codec_);
     info_.sampleFormat = mapSampleFormat(codec_->sample_fmt);
     info_.duration = streamDuration(*format_, *stream);
+    spdlog::info("ffmpeg source opened '{}': {}Hz {}ch fmt={} dur={}ms", path.string(),
+                 info_.sampleRate, info_.channelCount,
+                 static_cast<int>(info_.sampleFormat),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(info_.duration).count());
     return std::nullopt;
   }
 
@@ -242,15 +267,20 @@ public:
 
       const int readResult = av_read_frame(format_.get(), packet_.get());
       if (readResult == AVERROR_EOF) {
+        spdlog::debug("ffmpeg source reached EOF, draining decoder");
         draining_ = true;
         const int sendResult = avcodec_send_packet(codec_.get(), nullptr);
         if (sendResult < 0 && sendResult != AVERROR_EOF) {
+          spdlog::error("ffmpeg source drain failed: avcodec_send_packet returned {} ({})",
+                        sendResult, ffmpegErrorDetail(sendResult));
           return FfmpegAudioReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "failed to drain audio decoder", sendResult)};
         }
         continue;
       }
 
       if (readResult < 0) {
+        spdlog::error("ffmpeg source read failed: av_read_frame returned {} ({})",
+                      readResult, ffmpegErrorDetail(readResult));
         return FfmpegAudioReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "failed to read audio packet", readResult)};
       }
 
@@ -265,6 +295,8 @@ public:
         continue;
       }
       if (sendResult < 0) {
+        spdlog::error("ffmpeg source send failed: avcodec_send_packet returned {} ({})",
+                      sendResult, ffmpegErrorDetail(sendResult));
         return FfmpegAudioReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "failed to send audio packet", sendResult)};
       }
     }
@@ -279,6 +311,8 @@ public:
     const auto timestamp = av_rescale_q(position.count(), AVRational{1, 1'000}, stream->time_base);
     const int result = av_seek_frame(format_.get(), audioStreamIndex_, timestamp, AVSEEK_FLAG_BACKWARD);
     if (result < 0) {
+      spdlog::error("ffmpeg source seek to {}ms failed: av_seek_frame returned {} ({})",
+                    position.count(), result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::SeekFailed, "failed to seek audio stream", result);
     }
 
@@ -305,6 +339,8 @@ private:
       return FfmpegAudioReadResult{std::nullopt, true, std::nullopt};
     }
     if (result < 0) {
+      spdlog::error("ffmpeg source decode failed: avcodec_receive_frame returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return FfmpegAudioReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "failed to receive audio frame", result)};
     }
 

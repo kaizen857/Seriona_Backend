@@ -1,5 +1,7 @@
 #include "seriona/audio/ffmpeg_filter_pipeline.h"
 
+#include "spdlog/spdlog.h"
+
 extern "C" {
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersink.h>
@@ -183,6 +185,7 @@ class FfmpegFilterPipeline::Impl {
 public:
   std::optional<FfmpegFilterPipelineError> configure(FfmpegFilterTargetFormat target) {
     if (const auto error = validateTarget(target)) {
+      spdlog::error("filter pipeline configure failed: {} - {}", error->message, error->detail);
       clearGraph();
       target_ = {};
       configured_ = false;
@@ -192,6 +195,9 @@ public:
     clearGraph();
     target_ = target;
     configured_ = true;
+    spdlog::debug("filter pipeline configured: target {}Hz {}ch fmt={}",
+                  target.sampleRate, target.channelCount,
+                  static_cast<int>(target.sampleFormat));
     return std::nullopt;
   }
 
@@ -227,6 +233,8 @@ public:
 
     const int result = av_buffersrc_add_frame_flags(source_, avFrame.get(), AV_BUFFERSRC_FLAG_KEEP_REF);
     if (result < 0) {
+      spdlog::error("filter pipeline push failed: av_buffersrc_add_frame_flags returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::DecodeFailed, "failed to push frame into filter graph", result);
     }
     sinkDrained_ = false;
@@ -246,8 +254,11 @@ public:
       return std::nullopt;
     }
 
+    spdlog::debug("filter pipeline signaling end of input");
     const int result = av_buffersrc_add_frame_flags(source_, nullptr, 0);
     if (result < 0 && result != AVERROR_EOF) {
+      spdlog::error("filter pipeline drain failed: av_buffersrc_add_frame_flags returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::DecodeFailed, "failed to drain filter graph", result);
     }
     inputClosed_ = true;
@@ -276,6 +287,8 @@ public:
       return FfmpegFilterReadResult{std::nullopt, true, std::nullopt};
     }
     if (result < 0) {
+      spdlog::error("filter pipeline read failed: av_buffersink_get_frame returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return FfmpegFilterReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "failed to read filtered frame", result)};
     }
 
@@ -295,9 +308,12 @@ public:
 private:
   std::optional<FfmpegFilterPipelineError> buildGraph(FrameSignature input) {
     clearGraph();
+    spdlog::debug("filter pipeline building graph: input {}Hz {}ch fmt={}",
+                  input.sampleRate, input.channelCount, static_cast<int>(input.sampleFormat));
 
     graph_.reset(avfilter_graph_alloc());
     if (!graph_) {
+      spdlog::error("filter pipeline build failed: avfilter_graph_alloc returned null");
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "failed to allocate filter graph", "avfilter_graph_alloc returned null");
     }
 
@@ -305,6 +321,7 @@ private:
     const AVFilter* aformat = avfilter_get_by_name("aformat");
     const AVFilter* abuffersink = avfilter_get_by_name("abuffersink");
     if (abuffer == nullptr || aformat == nullptr || abuffersink == nullptr) {
+      spdlog::error("filter pipeline build failed: required filters unavailable");
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "required FFmpeg audio filters are unavailable", "abuffer, aformat, or abuffersink not found");
     }
 
@@ -318,26 +335,35 @@ private:
 
     int result = avfilter_graph_create_filter(&sink_, abuffersink, "seriona_abuffersink", nullptr, nullptr, graph_.get());
     if (result < 0) {
+      spdlog::error("filter pipeline build failed: avfilter_graph_create_filter (sink) returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "failed to create filter sink", result);
     }
 
     result = avfilter_link(source_, 0, format_, 0);
     if (result < 0) {
+      spdlog::error("filter pipeline build failed: avfilter_link (source) returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "failed to link filter source", result);
     }
     result = avfilter_link(format_, 0, sink_, 0);
     if (result < 0) {
+      spdlog::error("filter pipeline build failed: avfilter_link (sink) returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "failed to link filter sink", result);
     }
 
     result = avfilter_graph_config(graph_.get(), nullptr);
     if (result < 0) {
+      spdlog::error("filter pipeline build failed: avfilter_graph_config returned {} ({})",
+                    result, ffmpegErrorDetail(result));
       return makeError(PlaybackErrorCode::FormatNegotiationFailed, "failed to configure filter graph", result);
     }
 
     input_ = input;
     inputClosed_ = false;
     sinkDrained_ = false;
+    spdlog::debug("filter pipeline graph built successfully");
     return std::nullopt;
   }
 

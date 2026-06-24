@@ -1,5 +1,7 @@
 #include "metadata_mapper.h"
 
+#include "spdlog/spdlog.h"
+
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
@@ -145,7 +147,11 @@ namespace {
 }
 
 MetadataPlatformSnapshotDto mapPlayerStateSnapshot(const control::PlayerStateSnapshot& snapshot) {
-  return MetadataPlatformSnapshotDto{.mpris = mapMprisSnapshot(snapshot), .windows = mapWindowsSnapshot(snapshot)};
+  spdlog::debug("metadata mapper: mapping player state snapshot");
+  auto result = MetadataPlatformSnapshotDto{.mpris = mapMprisSnapshot(snapshot), .windows = mapWindowsSnapshot(snapshot)};
+  spdlog::debug("metadata mapper: snapshot mapped (track={})",
+                result.mpris.track.trackId.empty() ? "none" : result.mpris.track.trackId);
+  return result;
 }
 
 std::string makeMprisTrackObjectPath(const control::TrackIdentity& track) {

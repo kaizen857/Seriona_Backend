@@ -1,5 +1,7 @@
 #include "seriona/scanner/path_utils.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <cctype>
 #include <iterator>
@@ -161,17 +163,20 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
       result.kind = PathEntryKind::Missing;
       result.errors.push_back(makeError(ScannerErrorCode::RootUnavailable, canonicalPath, "scanner path does not exist",
                                         error.message()));
+      spdlog::warn("scanner root unavailable: {} ({})", canonicalPath.generic_string(), error.message());
       return result;
     }
     result.kind = error == std::errc::permission_denied ? PathEntryKind::PermissionDenied : PathEntryKind::Error;
     result.errors.push_back(makeError(result.kind == PathEntryKind::PermissionDenied ? ScannerErrorCode::PermissionDenied
-                                                                                     : ScannerErrorCode::RootUnavailable,
+                                                                                      : ScannerErrorCode::RootUnavailable,
                                       canonicalPath, "failed to stat scanner path", error.message()));
+    spdlog::warn("scanner path access failed: {} ({})", canonicalPath.generic_string(), error.message());
     return result;
   }
   if (!std::filesystem::exists(status)) {
     result.kind = PathEntryKind::Missing;
     result.errors.push_back(makeError(ScannerErrorCode::RootUnavailable, canonicalPath, "scanner path does not exist"));
+    spdlog::warn("scanner root unavailable: {}", canonicalPath.generic_string());
     return result;
   }
   if (std::filesystem::is_symlink(status) && !config.followSymlinks) {
@@ -184,8 +189,9 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
   if (error) {
     result.kind = error == std::errc::permission_denied ? PathEntryKind::PermissionDenied : PathEntryKind::Error;
     result.errors.push_back(makeError(result.kind == PathEntryKind::PermissionDenied ? ScannerErrorCode::PermissionDenied
-                                                                                     : ScannerErrorCode::RootUnavailable,
+                                                                                      : ScannerErrorCode::RootUnavailable,
                                       canonicalPath, "failed to resolve scanner path", error.message()));
+    spdlog::warn("scanner path resolve failed: {} ({})", canonicalPath.generic_string(), error.message());
     return result;
   }
 
@@ -218,6 +224,7 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
 
   result.kind = PathEntryKind::Unsupported;
   result.errors.push_back(makeError(ScannerErrorCode::UnsupportedFile, canonicalPath, "unsupported scanner file extension"));
+  spdlog::debug("unsupported file skipped: {}", canonicalPath.generic_string());
   return result;
 }
 

@@ -1,5 +1,7 @@
 #include "seriona/scanner/cache/sqlite_scanner_cache.h"
 
+#include "spdlog/spdlog.h"
+
 #include <sqlite3.h>
 
 #include <algorithm>
@@ -291,15 +293,19 @@ void migrateFromVersion1(sqlite3* db) {
 
 void migrate(sqlite3* db) {
   const auto version = scalarInt(db, "PRAGMA user_version;");
+  spdlog::debug("scanner cache schema version: {}", version);
   if (version == 0) {
+    spdlog::info("creating scanner cache schema (version {})", kSchemaVersion);
     createSchema(db);
     return;
   }
   if (version == 1) {
+    spdlog::info("migrating scanner cache schema from version 1 to {}", kSchemaVersion);
     migrateFromVersion1(db);
     return;
   }
   if (version != kSchemaVersion) {
+    spdlog::error("unsupported scanner cache schema version: {} (expected {})", version, kSchemaVersion);
     throw std::runtime_error("unsupported scanner cache schema version");
   }
   createSchema(db);
@@ -559,9 +565,11 @@ SQLiteScannerCache::SQLiteScannerCache(ScannerCacheConfig config) {
   }
   databasePath_ = config.databasePath;
   maintenancePolicy_ = config.maintenancePolicy;
+  spdlog::info("opening scanner cache: {}", pathText(config.databasePath));
   sqlite3* db = nullptr;
   if (sqlite3_open_v2(pathText(config.databasePath).c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
-    std::string message = db == nullptr ? "failed to open scanner cache" : sqlite3_errmsg(db);
+    const std::string message = db == nullptr ? "failed to open scanner cache" : sqlite3_errmsg(db);
+    spdlog::error("failed to open scanner cache: {}", message);
     sqlite3_close(db);
     throw std::runtime_error(message);
   }
@@ -668,6 +676,9 @@ CacheMaintenanceDecision SQLiteScannerCache::maintenanceDecision() const {
 CacheMaintenanceResult SQLiteScannerCache::maintainCache() {
   CacheMaintenanceResult result{};
   result.before = maintenanceDecision();
+  spdlog::debug("cache maintenance: db={} wal={} roots={} checkpoint={} cleanup={} vacuum={}",
+                result.before.databaseBytes, result.before.walBytes, result.before.cachedRoots,
+                result.before.checkpointRecommended, result.before.cleanupRecommended, result.before.vacuumRecommended);
   if (result.before.checkpointRecommended) {
     result.checkpoint = checkpointPassive();
   }
@@ -688,6 +699,8 @@ CacheCheckpointResult SQLiteScannerCache::checkpointPassive() {
   CacheCheckpointResult result{};
   result.resultCode = sqlite3_wal_checkpoint_v2(asDb(db_), nullptr, SQLITE_CHECKPOINT_PASSIVE, &result.logFrames,
                                                 &result.checkpointedFrames);
+  spdlog::debug("wal checkpoint passive: rc={} log_frames={} ckpt_frames={}", result.resultCode, result.logFrames,
+                result.checkpointedFrames);
   return result;
 }
 

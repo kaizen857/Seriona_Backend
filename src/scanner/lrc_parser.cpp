@@ -1,5 +1,7 @@
 #include "seriona/scanner/lrc_parser.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <charconv>
 #include <fstream>
@@ -100,6 +102,7 @@ LrcParseResult parseLrcText(std::string text, const LrcParseOptions& options,
   LrcParseResult result;
   if (text.size() > options.maxBytes) {
     result.errors.push_back(makeError(LrcParseErrorCode::FileTooLarge, path, 0U, 0U, "lrc file exceeds scanner limit"));
+    spdlog::warn("lrc parse: file exceeds size limit ({})", path.has_value() ? path->generic_string() : "<text>");
     return result;
   }
 
@@ -131,6 +134,7 @@ LrcParseResult parseLrcText(std::string text, const LrcParseOptions& options,
       if (close == std::string_view::npos) {
         result.errors.push_back(makeError(LrcParseErrorCode::InvalidTimestamp, path, lineNumber, cursor + 1U,
                                           "lrc timestamp is missing closing bracket", std::string{line}));
+        spdlog::debug("lrc parse: malformed line {} (missing closing bracket)", lineNumber);
         timestamps.clear();
         break;
       }
@@ -140,6 +144,7 @@ LrcParseResult parseLrcText(std::string text, const LrcParseOptions& options,
       } else if (!isMetadataTag(tag)) {
         result.errors.push_back(makeError(LrcParseErrorCode::InvalidTimestamp, path, lineNumber, cursor + 1U,
                                           "lrc timestamp is malformed", std::string{tag}));
+        spdlog::debug("lrc parse: malformed timestamp at line {}", lineNumber);
         timestamps.clear();
         break;
       }
@@ -173,14 +178,17 @@ LrcParseResult parseLrcFile(const std::filesystem::path& path, const LrcParseOpt
   std::error_code error;
   const auto size = std::filesystem::file_size(path, error);
   if (error) {
+    spdlog::warn("lrc parse: failed to stat {} ({})", path.generic_string(), error.message());
     return {.errors = {makeError(LrcParseErrorCode::IoFailure, path, 0U, 0U, "failed to stat lrc file", error.message())}};
   }
   if (size > options.maxBytes) {
+    spdlog::warn("lrc parse: file exceeds size limit ({})", path.generic_string());
     return {.errors = {makeError(LrcParseErrorCode::FileTooLarge, path, 0U, 0U, "lrc file exceeds scanner limit")}};
   }
 
   std::ifstream input(path, std::ios::binary);
   if (!input) {
+    spdlog::warn("lrc parse: failed to open {}", path.generic_string());
     return {.errors = {makeError(LrcParseErrorCode::IoFailure, path, 0U, 0U, "failed to open lrc file")}};
   }
 

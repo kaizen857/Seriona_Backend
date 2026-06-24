@@ -1,5 +1,7 @@
 #include "control_event_loop.h"
 
+#include "spdlog/spdlog.h"
+
 #include <exception>
 #include <utility>
 
@@ -24,6 +26,7 @@ void ControlEventLoop::start() {
   }
 
   started_ = true;
+  spdlog::info("control event loop started");
   if (!options_.runInlineForTests) {
     worker_ = std::thread{[this] { workerMain(); }};
   }
@@ -38,6 +41,7 @@ bool ControlEventLoop::post(std::function<void()> work) noexcept {
     {
       std::lock_guard lock{mutex_};
       if (stopping_) {
+        spdlog::warn("event loop queue rejected: loop is stopping");
         return false;
       }
 
@@ -46,6 +50,7 @@ bool ControlEventLoop::post(std::function<void()> work) noexcept {
     workAvailable_.notify_one();
     return true;
   } catch (...) {
+    spdlog::error("event loop queue push failed with exception");
     discardUnhandledException(std::current_exception());
     return false;
   }
@@ -80,6 +85,7 @@ void ControlEventLoop::stop() noexcept {
   workAvailable_.notify_all();
 
   if (!worker_.joinable()) {
+    spdlog::info("control event loop stopped (no worker)");
     return;
   }
 
@@ -88,6 +94,7 @@ void ControlEventLoop::stop() noexcept {
   }
 
   worker_.join();
+  spdlog::info("control event loop stopped");
 }
 
 void ControlEventLoop::workerMain() noexcept {

@@ -1,5 +1,7 @@
 #include "seriona/scanner/scan_scheduler.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -56,9 +58,12 @@ struct ScanScheduler::Impl {
   [[nodiscard]] bool trySubmit(std::string taskName, ScanTask task) {
     std::lock_guard lock{mutex};
     if (stopping.load() || queue.size() >= queueCapacity) {
+      spdlog::debug("scheduler trySubmit '{}' rejected (stopping={} q={}/{})", taskName, stopping.load(), queue.size(),
+                    queueCapacity);
       return false;
     }
     queue.push_back({.name = std::move(taskName), .task = std::move(task)});
+    spdlog::debug("scheduler trySubmit '{}' accepted (q={}/{})", queue.back().name, queue.size(), queueCapacity);
     queueChanged.notify_one();
     return true;
   }
@@ -67,9 +72,11 @@ struct ScanScheduler::Impl {
     std::unique_lock lock{mutex};
     capacityChanged.wait(lock, [this] { return stopping.load() || queue.size() < queueCapacity; });
     if (stopping.load()) {
+      spdlog::debug("scheduler submit '{}' rejected (stopping)", taskName);
       return false;
     }
     queue.push_back({.name = std::move(taskName), .task = std::move(task)});
+    spdlog::debug("scheduler submit '{}' accepted (q={}/{})", queue.back().name, queue.size(), queueCapacity);
     lock.unlock();
     queueChanged.notify_one();
     return true;
@@ -79,6 +86,7 @@ struct ScanScheduler::Impl {
     {
       std::lock_guard lock{mutex};
       stopping.store(true);
+      spdlog::debug("scheduler cancelling {} queued tasks", queue.size());
       while (!queue.empty()) {
         auto taskName = std::move(queue.front().name);
         queue.pop_front();
@@ -93,9 +101,11 @@ struct ScanScheduler::Impl {
   void join() {
     {
       std::unique_lock lock{mutex};
+      spdlog::debug("scheduler waiting for idle (q={} active={})", queue.size(), activeWorkers);
       idleChanged.wait(lock, [this] { return queue.empty() && activeWorkers == 0; });
       stopping.store(true);
     }
+    spdlog::debug("scheduler joining {} workers", workers.size());
     queueChanged.notify_all();
     capacityChanged.notify_all();
     for (auto& worker : workers) {

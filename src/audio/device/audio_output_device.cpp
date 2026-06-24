@@ -1,5 +1,7 @@
 #include "seriona/audio/device/audio_output_device.h"
 
+#include "spdlog/spdlog.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -134,6 +136,9 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   lastError_.reset();
   if (request.pcmQueue == nullptr || request.sampleRate == 0U || request.channelCount == 0U ||
       request.bufferFrames == 0U) {
+    spdlog::error("device init failed: invalid request (rate={} ch={} bufFrames={} queue={})",
+                  request.sampleRate, request.channelCount, request.bufferFrames,
+                  static_cast<bool>(request.pcmQueue));
     lastError_ = AudioOutputDeviceError{PlaybackErrorCode::FormatNegotiationFailed,
                                         "audio output device request is invalid",
                                         "pcm queue, sample rate, channel count, and buffer frames must be set"};
@@ -147,6 +152,7 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   auto backendRequest = request;
   backendRequest.callbackUserData = this;
   if (!backend_->initialize(backendRequest)) {
+    spdlog::error("device init failed: backend init returned false");
     lastError_ = backend_->lastError();
     return false;
   }
@@ -160,12 +166,16 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   silenceFrames_.store(0U, std::memory_order_relaxed);
   initialized_ = true;
   started_ = false;
+  spdlog::info("device initialized ({}Hz {}ch fmt={})", currentFormat_.sampleRate,
+               currentFormat_.channelCount,
+               static_cast<int>(currentFormat_.sampleFormat));
   return true;
 }
 
 bool AudioOutputDevice::start() {
   lastError_.reset();
   if (!initialized_) {
+    spdlog::error("device start failed: not initialized");
     lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
                                         "audio output device is not initialized",
                                         "start requires a successful initialize call"};
@@ -177,9 +187,10 @@ bool AudioOutputDevice::start() {
   }
 
   if (!backend_->start()) {
+    spdlog::error("device start failed: backend start returned false");
     lastError_ = backend_->lastError().value_or(AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
-                                                                       "failed to start audio output device",
-                                                                       "AudioOutputDeviceBackend::start returned false"});
+                                                                        "failed to start audio output device",
+                                                                        "AudioOutputDeviceBackend::start returned false"});
     return false;
   }
 
@@ -187,6 +198,7 @@ bool AudioOutputDevice::start() {
     publishCallbackQueue(*currentQueue_, currentFormat_);
   }
   started_ = true;
+  spdlog::info("device started");
   return true;
 }
 
@@ -197,18 +209,21 @@ bool AudioOutputDevice::stop() {
   }
 
   if (!backend_->stop()) {
+    spdlog::error("device stop failed: backend stop returned false");
     lastError_ = backend_->lastError().value_or(AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
-                                                                       "failed to stop audio output device",
-                                                                       "AudioOutputDeviceBackend::stop returned false"});
+                                                                        "failed to stop audio output device",
+                                                                        "AudioOutputDeviceBackend::stop returned false"});
     return false;
   }
 
   deactivateCallbackQueue();
   started_ = false;
+  spdlog::info("device stopped");
   return true;
 }
 
 void AudioOutputDevice::rebindQueue(PcmBufferQueue& queue) noexcept {
+  spdlog::debug("device rebind queue (generation={})", queue.generation());
   currentQueue_ = &queue;
   if (initialized_) {
     publishCallbackQueue(queue, currentFormat_);
@@ -231,6 +246,7 @@ void AudioOutputDevice::uninitialize() noexcept {
   currentQueue_ = nullptr;
   lastError_.reset();
   initialized_ = false;
+  spdlog::info("device uninitialized");
 }
 
 bool AudioOutputDevice::initialized() const noexcept { return initialized_; }
@@ -245,10 +261,15 @@ void AudioOutputDevice::setVolume(float linearGain) noexcept {
   if (std::isnan(linearGain)) {
     return;
   }
-  volume_.store(std::clamp(linearGain, 0.0F, 1.0F), std::memory_order_release);
+  const auto clamped = std::clamp(linearGain, 0.0F, 1.0F);
+  spdlog::info("device volume set to {:.2f}", clamped);
+  volume_.store(clamped, std::memory_order_release);
 }
 
-void AudioOutputDevice::setMuted(bool muted) noexcept { muted_.store(muted, std::memory_order_release); }
+void AudioOutputDevice::setMuted(bool muted) noexcept {
+  spdlog::info("device mute set to {}", muted);
+  muted_.store(muted, std::memory_order_release);
+}
 
 void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept {
   auto* device = static_cast<AudioOutputDevice*>(userData);

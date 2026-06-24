@@ -408,22 +408,26 @@ target_link_libraries(seriona_audio_fixture_tests PRIVATE
 target_link_libraries(seriona_ffmpeg_audio_source_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_ffmpeg_filter_pipeline_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_pcm_buffer_queue_tests PRIVATE
   seriona_third_party_headers
 )
 target_link_libraries(seriona_audio_output_device_tests PRIVATE
   seriona_third_party_headers
+  spdlog::spdlog
 )
 target_link_libraries(seriona_playback_clock_tests PRIVATE
   seriona_third_party_headers
 )
 target_link_libraries(seriona_playback_state_machine_tests PRIVATE
   seriona_third_party_headers
+  spdlog::spdlog
 )
 target_link_libraries(seriona_audio_event_dispatcher_tests PRIVATE
   seriona_third_party_headers
@@ -434,26 +438,32 @@ target_link_libraries(seriona_audio_event_dispatcher_shutdown_tests PRIVATE
 target_link_libraries(seriona_audio_player_single_track_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_audio_player_small_buffer_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_output_format_negotiation_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_audio_player_seamless_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_audio_error_matrix_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_audio_shutdown_lifecycle_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_test_harness_tests PRIVATE
   seriona_third_party_headers
@@ -528,12 +538,24 @@ seriona_enable_warnings(seriona_logging_tests)
 
 target_link_libraries(seriona_scanner_hash_tests PRIVATE
   PkgConfig::SERIONA_XXHASH
+  spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_cache_tests PRIVATE
   SQLite3::SQLite3
+  spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_tagreader_tests PRIVATE
   TagReaderCore
+  spdlog::spdlog
+)
+target_link_libraries(seriona_scanner_paths_tests PRIVATE
+  spdlog::spdlog
+)
+target_link_libraries(seriona_scanner_tree_tests PRIVATE
+  spdlog::spdlog
+)
+target_link_libraries(seriona_scanner_scheduler_tests PRIVATE
+  spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_service_tests PRIVATE
   seriona_scanner

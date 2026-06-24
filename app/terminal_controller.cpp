@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -206,9 +207,16 @@ int runTerminalController(const std::filesystem::path& musicPath) {
 
   TerminalState state{};
   std::mutex outputMutex;
-  auto controller = control::makeProductionMediaController(control::MediaControllerOptions{},
-                                                             runtimePaths.databasePath,
-                                                             runtimePaths.artworkDir);
+  std::unique_ptr<control::MediaController> controller;
+  try {
+    controller = control::makeProductionMediaController(control::MediaControllerOptions{},
+                                                         runtimePaths.databasePath,
+                                                         runtimePaths.artworkDir);
+  } catch (const std::exception& e) {
+    spdlog::critical("failed to create media controller: {}", e.what());
+    spdlog::shutdown();
+    return 1;
+  }
   auto playerSubscription = controller->subscribePlayerState([&](const control::PlayerStateSnapshot& snapshot) {
     updatePlayerState(state, outputMutex, snapshot);
   });
@@ -219,7 +227,13 @@ int runTerminalController(const std::filesystem::path& musicPath) {
     updateNotification(state, outputMutex, notification);
   });
 
-  controller->start();
+  try {
+    controller->start();
+  } catch (const std::exception& e) {
+    spdlog::critical("media controller failed to start: {}", e.what());
+    spdlog::shutdown();
+    return 1;
+  }
   spdlog::info("media controller started");
   printControls();
   const auto scanResult = controller->scanLibrary({scanner::ScannerRoot{.path = musicPath, .recursive = true}}, scanner::ScanMode::Full);
@@ -234,6 +248,7 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   spdlog::info("library scan accepted: {}", scanResult.message);
   renderStatus(state, outputMutex);
 
+  try {
 #if defined(__unix__) || defined(__APPLE__)
   bool running = true;
   while (running) {
@@ -246,7 +261,14 @@ int runTerminalController(const std::filesystem::path& musicPath) {
       running = false;
       continue;
     }
-    const auto result = controller->submitCommand(commandForAction(action, playerSnapshot(state)));
+    const auto command = commandForAction(action, playerSnapshot(state));
+    if (command.kind == control::MediaControlCommandKind::TogglePlayPause ||
+        command.kind == control::MediaControlCommandKind::SkipNext ||
+        command.kind == control::MediaControlCommandKind::SkipPrevious ||
+        command.kind == control::MediaControlCommandKind::Stop) {
+      spdlog::info("user command submitted: kind={}", static_cast<int>(command.kind));
+    }
+    const auto result = controller->submitCommand(command);
     if (!result.accepted && !result.message.empty()) {
       std::scoped_lock outputLock{outputMutex};
       std::cout << "\nseriona: command rejected: " << result.message << '\n';
@@ -255,6 +277,11 @@ int runTerminalController(const std::filesystem::path& musicPath) {
 #else
   std::cerr << "\nseriona: terminal keyboard control is not implemented on this platform\n";
 #endif
+  } catch (const std::exception& e) {
+    spdlog::critical("unrecoverable runtime failure: {}", e.what());
+  } catch (...) {
+    spdlog::critical("unrecoverable unknown runtime failure");
+  }
 
   control::MediaControlCommand stopCommand{};
   stopCommand.kind = control::MediaControlCommandKind::Stop;

@@ -1,5 +1,7 @@
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
 
+#include "spdlog/spdlog.h"
+
 #include <Tag.hpp>
 #include <TagReader.hpp>
 
@@ -152,6 +154,11 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
                                                   const std::filesystem::path& coverExportDir,
                                                   std::string_view contentHashSeed,
                                                   std::vector<TagReaderFailure>& failures) {
+  static bool adapterInitialized{false};
+  if (!adapterInitialized) {
+    spdlog::info("TagReader metadata adapter initialized");
+    adapterInitialized = true;
+  }
   std::vector<TagReaderSuccess> successes;
   successes.reserve(paths.size());
   for (const auto& path : paths) {
@@ -160,6 +167,7 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
       successes.push_back({.metadata = mapRawTagMetadata(raw, std::string{contentHashSeed} + ":" + path.generic_string(),
                                                          std::nullopt, false)});
     } catch (const std::exception& error) {
+      spdlog::warn("TagReader read failed for {}", path.generic_string());
       failures.push_back({.error = metadataReadError(path, error)});
     }
   }

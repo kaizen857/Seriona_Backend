@@ -1,5 +1,7 @@
 #include "metadata_synchronizer.h"
 
+#include "spdlog/spdlog.h"
+
 namespace seriona::metadata {
 
 namespace {
@@ -166,9 +168,11 @@ bool MetadataSynchronizer::shouldEmitTimelineImmediately(const control::PlayerSt
 }
 
 MetadataSyncPlan MetadataSynchronizer::synchronize(const control::PlayerStateSnapshot& snapshot) {
+  const auto startTime = std::chrono::steady_clock::now();
   MetadataSyncPlan plan{};
 
   if (!isFreshEnough(snapshot, lastFreshness_)) {
+    spdlog::debug("sync emit suppressed (stale snapshot)");
     return plan;
   }
 
@@ -193,6 +197,21 @@ MetadataSyncPlan MetadataSynchronizer::synchronize(const control::PlayerStateSna
     lastTimelineEmitAt_ = snapshot.freshness.sampledAt;
     hasTimelineEmitAt_ = true;
   }
+
+  if (!plan.emitMetadata && !plan.emitTimeline) {
+    spdlog::debug("sync emit suppressed (no changes)");
+  } else {
+    if (plan.emitMetadata) {
+      spdlog::debug("sync emit: metadata changed");
+    }
+    if (plan.emitTimeline && timelineImmediate) {
+      spdlog::debug("sync emit: timeline state transition");
+    }
+  }
+
+  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - startTime);
+  spdlog::debug("sync timing: {}us", elapsed.count());
 
   return plan;
 }

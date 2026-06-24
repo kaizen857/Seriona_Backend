@@ -7,6 +7,8 @@
 
 #include "seriona/metadata/metadata_contracts.h"
 
+#include "spdlog/spdlog.h"
+
 #include <future>
 #include <mutex>
 #include <type_traits>
@@ -52,12 +54,14 @@ public:
       stopping_ = false;
     }
 
+    spdlog::info("media controller starting");
     eventLoop_.start();
     metadataCommandSubscription_ = dependencies_.metadata->registerCommandCallback([this](const MediaControlCommand& command) {
       postMetadataCommand(command);
     });
     const auto startResult = dependencies_.metadata->start(platformStateFromSnapshot(playerStateSnapshot()));
     (void)startResult;
+    spdlog::info("media controller started");
   }
 
   void shutdown() {
@@ -69,6 +73,7 @@ public:
       started_ = false;
     }
 
+    spdlog::info("media controller shutting down");
     dependencies_.audio->setEventSink({});
     dependencies_.scanner->setEventSink({});
 
@@ -81,6 +86,7 @@ public:
       (void)stopResult;
     }
     eventLoop_.stop();
+    spdlog::info("media controller stopped");
   }
 
   MediaControllerCommandResult submitCommand(const MediaControlCommand& command) {
@@ -143,6 +149,7 @@ private:
       auto promise = std::make_shared<std::promise<Result>>();
       auto future = promise->get_future();
       if (!eventLoop_.post([promise, work = std::move(work)]() mutable { completePromise(*promise, work); })) {
+        spdlog::error("media controller dispatch failed: event loop post rejected");
         return stoppedResult();
       }
       eventLoop_.drainForTests();
@@ -152,6 +159,7 @@ private:
     auto promise = std::make_shared<std::promise<Result>>();
     auto future = promise->get_future();
     if (!eventLoop_.post([promise, work = std::move(work)]() mutable { completePromise(*promise, work); })) {
+      spdlog::error("media controller dispatch failed: event loop post rejected");
       return stoppedResult();
     }
     return future.get();
