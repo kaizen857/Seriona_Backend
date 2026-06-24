@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "active_work_id": "seriona-portable-logging-a171e6e3",
+  "active_work_id": "seriona-log-cleanup-3ed0d730",
   "works": {
     "audio-player-module-3bdc4128": {
       "work_id": "audio-player-module-3bdc4128",
@@ -1895,117 +1895,79 @@
       },
       "ended_at": "2026-06-24T11:19:27.537Z",
       "elapsed_ms": 2053211
+    },
+    "seriona-log-cleanup-302b0a86": {
+      "work_id": "seriona-log-cleanup-302b0a86",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-log-cleanup.md",
+      "plan_name": "seriona-log-cleanup",
+      "status": "active",
+      "started_at": "2026-06-24T12:15:12.702Z",
+      "updated_at": "2026-06-24T12:15:12.702Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {}
+    },
+    "seriona-log-cleanup-3ed0d730": {
+      "work_id": "seriona-log-cleanup-3ed0d730",
+      "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-log-cleanup.md",
+      "plan_name": "seriona-log-cleanup",
+      "status": "active",
+      "started_at": "2026-06-24T12:15:12.720Z",
+      "updated_at": "2026-06-24T12:17:03.648Z",
+      "session_ids": [
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
+      ],
+      "session_origins": {
+        "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Add prepareLogFile() to logging bootstrap",
+          "session_id": "opencode:ses_1067151d5ffetD00K6KUAtySHA",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-24T12:17:03.648Z",
+          "started_at": "2026-06-24T12:16:43.015Z",
+          "status": "completed",
+          "ended_at": "2026-06-24T12:17:03.648Z",
+          "elapsed_ms": 20633
+        }
+      }
     }
   },
-  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-portable-logging.md",
-  "started_at": "2026-06-24T10:45:14.326Z",
-  "status": "completed",
-  "updated_at": "2026-06-24T11:19:27.537Z",
+  "active_plan": "/home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/.omo/plans/seriona-log-cleanup.md",
+  "started_at": "2026-06-24T12:15:12.720Z",
+  "status": "active",
+  "updated_at": "2026-06-24T12:17:03.648Z",
   "session_ids": [
-    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo",
-    "opencode:ses_106b3da3fffegq63zW39j8M90p",
-    "opencode:ses_106b3b4feffeLz8c76HmnNWk2G",
-    "opencode:ses_106b38f71ffe7SESQ7P84HS3OK",
-    "opencode:ses_106b36b18ffe1lLKic2syI9iCg",
-    "opencode:ses_106b348a1ffe4Ok5xOqUbGF94d",
-    "opencode:ses_106a8d3d0ffeRINFOHuZSmKqc3",
-    "opencode:ses_106a8cd6fffeYDnN57fqCUn1b9",
-    "opencode:ses_106a8c554ffeNU6RfnZ33vEr7K",
-    "opencode:ses_106a8be92ffeJQoxyCMpPdj8kW"
+    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo"
   ],
   "session_origins": {
-    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct",
-    "opencode:ses_106b3da3fffegq63zW39j8M90p": "appended",
-    "opencode:ses_106b3b4feffeLz8c76HmnNWk2G": "appended",
-    "opencode:ses_106b38f71ffe7SESQ7P84HS3OK": "appended",
-    "opencode:ses_106b36b18ffe1lLKic2syI9iCg": "appended",
-    "opencode:ses_106b348a1ffe4Ok5xOqUbGF94d": "appended",
-    "opencode:ses_106a8d3d0ffeRINFOHuZSmKqc3": "appended",
-    "opencode:ses_106a8cd6fffeYDnN57fqCUn1b9": "appended",
-    "opencode:ses_106a8c554ffeNU6RfnZ33vEr7K": "appended",
-    "opencode:ses_106a8be92ffeJQoxyCMpPdj8kW": "appended"
+    "opencode:ses_10b603cc8ffen5tF2A35g3FUpo": "direct"
   },
-  "plan_name": "seriona-portable-logging",
+  "plan_name": "seriona-log-cleanup",
   "task_sessions": {
     "todo:1": {
       "task_key": "todo:1",
       "task_label": "1",
-      "task_title": "Add spdlog dependency and minimal logger bootstrap",
-      "session_id": "opencode:ses_106c3318bffenJzE56iK0VYuzn",
+      "task_title": "Add prepareLogFile() to logging bootstrap",
+      "session_id": "opencode:ses_1067151d5ffetD00K6KUAtySHA",
       "agent": "Sisyphus-Junior",
       "category": "deep",
-      "updated_at": "2026-06-24T10:52:12.717Z",
-      "started_at": "2026-06-24T10:50:14.119Z",
+      "updated_at": "2026-06-24T12:17:03.648Z",
+      "started_at": "2026-06-24T12:16:43.015Z",
       "status": "completed",
-      "ended_at": "2026-06-24T10:52:12.717Z",
-      "elapsed_ms": 118598
-    },
-    "todo:3": {
-      "task_key": "todo:3",
-      "task_label": "3",
-      "task_title": "Thread portable paths through production controller/scanner assembly",
-      "session_id": "opencode:ses_106bd18ccffe0DjUjxrpwQfakY",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "updated_at": "2026-06-24T10:58:02.443Z",
-      "started_at": "2026-06-24T10:56:21.887Z",
-      "status": "completed",
-      "ended_at": "2026-06-24T10:58:02.443Z",
-      "elapsed_ms": 100556
-    },
-    "todo:4": {
-      "task_key": "todo:4",
-      "task_label": "4",
-      "task_title": "Initialize logging at app startup and shut it down cleanly",
-      "session_id": "opencode:ses_106b81fbeffebeUesj3WiO2dqs",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "updated_at": "2026-06-24T11:02:25.969Z",
-      "started_at": "2026-06-24T11:01:15.199Z",
-      "status": "completed",
-      "ended_at": "2026-06-24T11:02:25.969Z",
-      "elapsed_ms": 70770
-    },
-    "todo:5": {
-      "task_key": "todo:5",
-      "task_label": "5",
-      "task_title": "Add audio logs outside realtime paths",
-      "session_id": "opencode:ses_106b348a1ffe4Ok5xOqUbGF94d",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "started_at": "2026-06-24T11:11:16.326Z",
-      "status": "completed",
-      "updated_at": "2026-06-24T11:12:35.787Z",
-      "ended_at": "2026-06-24T11:12:35.787Z",
-      "elapsed_ms": 79461
-    },
-    "todo:11": {
-      "task_key": "todo:11",
-      "task_label": "11",
-      "task_title": "Run full validation and static guardrails",
-      "session_id": "opencode:ses_106aa6525ffepsRgamKzPdd1BI",
-      "agent": "Sisyphus-Junior",
-      "category": "deep",
-      "updated_at": "2026-06-24T11:14:17.161Z",
-      "started_at": "2026-06-24T11:14:06.983Z",
-      "status": "completed",
-      "ended_at": "2026-06-24T11:14:17.161Z",
-      "elapsed_ms": 10178
-    },
-    "final-wave:f1": {
-      "task_key": "final-wave:f1",
-      "task_label": "F1",
-      "task_title": "Plan compliance audit",
-      "session_id": "opencode:ses_106a8be92ffeJQoxyCMpPdj8kW",
-      "agent": "oracle",
-      "started_at": "2026-06-24T11:18:23.306Z",
-      "status": "completed",
-      "updated_at": "2026-06-24T11:19:01.627Z",
-      "ended_at": "2026-06-24T11:19:01.627Z",
-      "elapsed_ms": 38321
+      "ended_at": "2026-06-24T12:17:03.648Z",
+      "elapsed_ms": 20633
     }
   },
-  "agent": "atlas",
-  "ended_at": "2026-06-24T11:19:27.537Z",
-  "elapsed_ms": 2053211
+  "agent": "atlas"
 }
