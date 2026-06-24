@@ -193,7 +193,7 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   runtimePaths.ensureDirectoriesExist();
 
   try {
-    seriona::logging::initialize(spdlog::level::info, runtimePaths.logFile.string());
+    seriona::logging::initialize(spdlog::level::off, runtimePaths.logFile.string());
   } catch (const std::exception& e) {
     std::cerr << "seriona: logging initialization failed: " << e.what() << '\n';
   }
