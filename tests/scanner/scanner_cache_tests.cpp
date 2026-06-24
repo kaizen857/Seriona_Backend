@@ -44,6 +44,7 @@ namespace {
   song.metadata.offset = std::chrono::milliseconds{5};
   song.metadata.duration = std::chrono::milliseconds{180000};
   song.metadata.logicalTrackId = "artist/song.flac#main";
+  song.metadata.artworkPath = "artist/covers/song.png";
   song.embeddedLyrics = {LyricLine{std::chrono::milliseconds{10}, "embedded one"},
                          LyricLine{std::chrono::milliseconds{20}, "embedded two"}};
   song.externalLyrics = {LyricLine{std::chrono::milliseconds{30}, "external one"},
@@ -79,7 +80,7 @@ TEST_CASE("sqlite scanner cache migrates schema and enables WAL pragmas") {
   test::TempScannerRoot temp{"scanner-cache-migrate"};
   auto cache = openCache(temp.dbPath());
 
-  CHECK(cache.schemaVersion() == 1);
+  CHECK(cache.schemaVersion() == 2);
   CHECK(cache.journalMode() == "wal");
 }
 
@@ -105,6 +106,7 @@ TEST_CASE("sqlite scanner cache round-trips full metadata lyrics directories and
   CHECK(song.metadata.bitDepth == 24U);
   CHECK(song.metadata.fileSizeBytes == 4096U);
   CHECK(song.metadata.contentHash == "audio-hash-1");
+  CHECK(song.metadata.artworkPath == std::filesystem::path{"artist/covers/song.png"});
   CHECK(song.metadata.effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(song.metadata.externalLyricsPath == std::filesystem::path{"artist/song.lrc"});
   CHECK(song.metadata.externalLyricsHash == "lrc-hash-1");

@@ -71,6 +71,7 @@ TEST_CASE("scanner public contracts use standard-library value types") {
   metadata.offset = std::chrono::milliseconds{30000};
   metadata.duration = std::chrono::milliseconds{180000};
   metadata.logicalTrackId = "disc.flac#track-01";
+  metadata.artworkPath = std::filesystem::path{"covers/disc.png"};
 
   CHECK(metadata.effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(metadata.effectiveLyrics.size() == 1);
@@ -81,6 +82,7 @@ TEST_CASE("scanner public contracts use standard-library value types") {
   CHECK(metadata.offset == std::chrono::milliseconds{30000});
   CHECK(metadata.duration == std::chrono::milliseconds{180000});
   CHECK(metadata.logicalTrackId == "disc.flac#track-01");
+  CHECK(metadata.artworkPath == std::filesystem::path{"covers/disc.png"});
 }
 
 TEST_CASE("scanner contract defaults are explicit and dependency-free") {
@@ -103,6 +105,7 @@ TEST_CASE("scanner contract defaults are explicit and dependency-free") {
   CHECK_FALSE(metadata.offset.has_value());
   CHECK_FALSE(metadata.duration.has_value());
   CHECK(metadata.logicalTrackId.empty());
+  CHECK_FALSE(metadata.artworkPath.has_value());
 }
 
 TEST_CASE("playlist nodes distinguish structural and track-like kinds") {

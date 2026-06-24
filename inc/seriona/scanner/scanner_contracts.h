@@ -110,6 +110,7 @@ struct SongMetadata {
   std::optional<std::chrono::milliseconds> offset;
   std::optional<std::chrono::milliseconds> duration;
   std::string logicalTrackId;
+  std::optional<std::filesystem::path> artworkPath;
 };
 
 struct PlaylistNode {

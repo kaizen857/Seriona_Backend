@@ -17,7 +17,7 @@
 namespace seriona::scanner::cache {
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 
 [[nodiscard]] sqlite3* asDb(void* db) noexcept { return static_cast<sqlite3*>(db); }
 
@@ -267,7 +267,7 @@ CREATE TABLE IF NOT EXISTS songs(
   track_number INTEGER, disc_number INTEGER, year INTEGER, sample_rate INTEGER, bit_depth INTEGER, channels INTEGER,
   file_size_bytes INTEGER, file_mtime_ns INTEGER, content_hash TEXT NOT NULL, lyrics_source TEXT NOT NULL,
   external_lrc_path TEXT, external_lrc_hash TEXT, external_lrc_mtime_ns INTEGER, source_file_path TEXT NOT NULL,
-  offset_ms INTEGER, duration_ms INTEGER, logical_track_id TEXT NOT NULL, play_count INTEGER NOT NULL DEFAULT 0,
+  offset_ms INTEGER, duration_ms INTEGER, logical_track_id TEXT NOT NULL, artwork_path TEXT, play_count INTEGER NOT NULL DEFAULT 0,
   rating INTEGER, last_played_ms INTEGER, UNIQUE(root_id, track_id),
   FOREIGN KEY(root_id) REFERENCES roots(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS lyrics(
@@ -279,14 +279,24 @@ CREATE TABLE IF NOT EXISTS errors(
 CREATE INDEX IF NOT EXISTS idx_songs_root_file ON songs(root_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_lyrics_song_kind ON lyrics(song_id, kind);
 )sql");
-  exec(db, "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '1');");
-  exec(db, "PRAGMA user_version=1;");
+  exec(db, "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '2');");
+  exec(db, "PRAGMA user_version=2;");
+}
+
+void migrateFromVersion1(sqlite3* db) {
+  exec(db, "ALTER TABLE songs ADD COLUMN artwork_path TEXT;");
+  exec(db, "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '2');");
+  exec(db, "PRAGMA user_version=2;");
 }
 
 void migrate(sqlite3* db) {
   const auto version = scalarInt(db, "PRAGMA user_version;");
   if (version == 0) {
     createSchema(db);
+    return;
+  }
+  if (version == 1) {
+    migrateFromVersion1(db);
     return;
   }
   if (version != kSchemaVersion) {
@@ -358,8 +368,8 @@ void replaceLyrics(sqlite3* db, const std::int64_t songId, const std::string_vie
   Statement upsert{db, R"sql(
 INSERT INTO songs(root_id, track_id, file_path, title, artist, album, album_artist, genre, track_number, disc_number,
 year, sample_rate, bit_depth, channels, file_size_bytes, file_mtime_ns, content_hash, lyrics_source, external_lrc_path,
-external_lrc_hash, external_lrc_mtime_ns, source_file_path, offset_ms, duration_ms, logical_track_id, play_count, rating, last_played_ms)
-VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+external_lrc_hash, external_lrc_mtime_ns, source_file_path, offset_ms, duration_ms, logical_track_id, artwork_path, play_count, rating, last_played_ms)
+VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
 ON CONFLICT(root_id, track_id) DO UPDATE SET file_path=excluded.file_path, title=excluded.title, artist=excluded.artist,
 album=excluded.album, album_artist=excluded.album_artist, genre=excluded.genre, track_number=excluded.track_number,
 disc_number=excluded.disc_number, year=excluded.year, sample_rate=excluded.sample_rate, bit_depth=excluded.bit_depth,
@@ -367,7 +377,7 @@ channels=excluded.channels, file_size_bytes=excluded.file_size_bytes, file_mtime
 content_hash=excluded.content_hash, lyrics_source=excluded.lyrics_source, external_lrc_path=excluded.external_lrc_path,
 external_lrc_hash=excluded.external_lrc_hash, external_lrc_mtime_ns=excluded.external_lrc_mtime_ns,
 source_file_path=excluded.source_file_path, offset_ms=excluded.offset_ms, duration_ms=excluded.duration_ms,
-logical_track_id=excluded.logical_track_id, play_count=songs.play_count, rating=songs.rating, last_played_ms=songs.last_played_ms;
+logical_track_id=excluded.logical_track_id, artwork_path=excluded.artwork_path, play_count=songs.play_count, rating=songs.rating, last_played_ms=songs.last_played_ms;
 )sql"};
   const auto& metadata = song.metadata;
   upsert.bind(1, rootId);
@@ -395,9 +405,10 @@ logical_track_id=excluded.logical_track_id, play_count=songs.play_count, rating=
   upsert.bindOptionalDuration(23, metadata.offset);
   upsert.bindOptionalDuration(24, metadata.duration);
   upsert.bind(25, metadata.logicalTrackId);
-  upsert.bind(26, static_cast<std::int64_t>(stats.playCount));
-  upsert.bindOptional(27, stats.rating);
-  upsert.bindOptionalSystemTime(28, stats.lastPlayed);
+  upsert.bindOptionalPath(26, metadata.artworkPath);
+  upsert.bind(27, static_cast<std::int64_t>(stats.playCount));
+  upsert.bindOptional(28, stats.rating);
+  upsert.bindOptionalSystemTime(29, stats.lastPlayed);
   upsert.stepDone();
 
   Statement select{db, "SELECT id FROM songs WHERE root_id=?1 AND track_id=?2;"};
@@ -450,7 +461,7 @@ void loadSongs(sqlite3* db, const std::int64_t rootId, CachedRoot& root) {
   Statement select{db, R"sql(
 SELECT id, track_id, file_path, title, artist, album, album_artist, genre, track_number, disc_number, year, sample_rate,
 bit_depth, channels, file_size_bytes, file_mtime_ns, content_hash, lyrics_source, external_lrc_path, external_lrc_hash,
-external_lrc_mtime_ns, source_file_path, offset_ms, duration_ms, logical_track_id, play_count, rating, last_played_ms
+external_lrc_mtime_ns, source_file_path, offset_ms, duration_ms, logical_track_id, artwork_path, play_count, rating, last_played_ms
 FROM songs WHERE root_id=?1 ORDER BY file_path;
 )sql"};
   select.bind(1, rootId);
@@ -482,9 +493,10 @@ FROM songs WHERE root_id=?1 ORDER BY file_path;
     metadata.offset = select.optionalDurationColumn(22);
     metadata.duration = select.optionalDurationColumn(23);
     metadata.logicalTrackId = select.textColumn(24);
-    song.userStats.playCount = static_cast<std::uint64_t>(select.int64Column(25));
-    song.userStats.rating = select.uint32Column(26);
-    song.userStats.lastPlayed = select.optionalSystemTimeColumn(27);
+    metadata.artworkPath = select.optionalPathColumn(25);
+    song.userStats.playCount = static_cast<std::uint64_t>(select.int64Column(26));
+    song.userStats.rating = select.uint32Column(27);
+    song.userStats.lastPlayed = select.optionalSystemTimeColumn(28);
     song.embeddedLyrics = loadLyrics(db, songId, "embedded");
     song.externalLyrics = loadLyrics(db, songId, "external");
     if (metadata.effectiveLyricsSource == LyricsSource::ExternalLrc) {
