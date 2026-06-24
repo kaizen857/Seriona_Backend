@@ -86,13 +86,13 @@ Your next move: run `$start-work .omo/plans/seriona-log-cleanup.md`, or ask for 
 
 ## Final verification wave
 > Runs in parallel after ALL todos. ALL must APPROVE.
-- [ ] F1. Plan compliance audit
+- [x] F1. Plan compliance audit
   Verify all 3 todos have evidence, matching commits, and accepted QA.
-- [ ] F2. Code quality review
+- [x] F2. Code quality review
   Read implementation for exception safety, filesystem edge cases, no spdlog dependency in cleanup, no memory leaks.
-- [ ] F3. Real manual QA
+- [x] F3. Real manual QA
   Live smoke with two app launches, verify timestamped files and old log deletion.
-- [ ] F4. Scope fidelity
+- [x] F4. Scope fidelity
   Confirm no custom spdlog sink, no RuntimePaths changes, no module changes beyond logging/app startup.
 
 ## Commit strategy
