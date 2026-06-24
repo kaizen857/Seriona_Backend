@@ -24,7 +24,7 @@ seriona::control::PlayerStateSnapshot buildSnapshot() {
   snapshot.display = seriona::control::DisplayMetadata{
       .title = "Song",
       .artist = "Artist",
-      .album = "Album",
+      .album = "R・I・O・T",
       .albumArtist = "Album Artist",
       .genre = "Genre",
   };
@@ -86,7 +86,7 @@ TEST_CASE("metadata mapper forwards supported fields and drops internal-only sna
   CHECK(dto.mpris.artwork.contentHash == std::optional<std::string>{"abc123"});
   CHECK(dto.mpris.fields.title == std::optional<std::string>{"Song"});
   CHECK(dto.mpris.fields.artist == std::optional<std::string>{"Artist"});
-  CHECK(dto.mpris.fields.album == std::optional<std::string>{"Album"});
+  CHECK(dto.mpris.fields.album == std::optional<std::string>{"R・I・O・T"});
   CHECK(dto.mpris.fields.albumArtist == std::optional<std::string>{"Album Artist"});
   CHECK(dto.mpris.fields.genre == std::optional<std::string>{"Genre"});
   CHECK(dto.mpris.playbackStatus == seriona::control::PlaybackStatus::Playing);

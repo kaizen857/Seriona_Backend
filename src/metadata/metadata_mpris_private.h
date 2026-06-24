@@ -66,7 +66,7 @@ public:
   virtual ~IMprisObject() = default;
   virtual void registerModel(const MprisObjectModel& model) = 0;
   virtual void registerCommandHandlers(const MprisCommandHandlers& handlers) = 0;
-  virtual void publish(const MprisSnapshotRecord& snapshot) = 0;
+  virtual void publish(const MprisSnapshotRecord& snapshot, bool emitPropertiesChanged) = 0;
 };
 
 class IMprisBus {

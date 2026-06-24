@@ -2,7 +2,11 @@
 
 #include <sdbus-c++/sdbus-c++.h>
 
+#include <cstdint>
+#include <map>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace seriona::metadata::detail {
 
@@ -20,15 +24,48 @@ namespace {
   return "None";
 }
 
+[[nodiscard]] control::RepeatMode repeatModeFromLoopStatus(const std::string& status) {
+  if (status == "Track") {
+    return control::RepeatMode::One;
+  }
+  if (status == "Playlist") {
+    return control::RepeatMode::All;
+  }
+  return control::RepeatMode::Off;
+}
+
+[[nodiscard]] std::string playbackStatusText(control::PlaybackStatus status) {
+  switch (status) {
+    case control::PlaybackStatus::Playing:
+      return "Playing";
+    case control::PlaybackStatus::Paused:
+      return "Paused";
+    case control::PlaybackStatus::Stopped:
+    case control::PlaybackStatus::Loading:
+    case control::PlaybackStatus::Seeking:
+    case control::PlaybackStatus::Buffering:
+    case control::PlaybackStatus::Error:
+      return "Stopped";
+  }
+  return "Stopped";
+}
+
 [[nodiscard]] std::string fileUri(const std::filesystem::path& path) {
   return std::string{"file://"} + path.generic_string();
 }
 
 [[nodiscard]] std::string artworkUrl(const std::optional<control::ArtworkRef>& artwork) {
-  if (!artwork || !artwork->localPath) {
+  if (!artwork) {
     return {};
   }
-  return fileUri(*artwork->localPath);
+  if (artwork->uri.has_value() && !artwork->uri->empty()) {
+    return *artwork->uri;
+  }
+  if (!artwork->localPath.has_value() || artwork->localPath->empty()) {
+    return {};
+  }
+  const auto path = artwork->localPath->is_absolute() ? *artwork->localPath : std::filesystem::absolute(*artwork->localPath);
+  return fileUri(path);
 }
 
 [[nodiscard]] bool capabilitiesAllowControl(const control::PlaybackCapabilities& capabilities) {
@@ -68,11 +105,62 @@ namespace {
   return false;
 }
 
+[[nodiscard]] bool sameOptionalInt64(const std::optional<std::int64_t>& left,
+                                     const std::optional<std::int64_t>& right) {
+  return left == right;
+}
+
+[[nodiscard]] bool sameCapabilities(const MetadataCapabilitySetDto& left,
+                                    const MetadataCapabilitySetDto& right) {
+  return left.canPlay == right.canPlay && left.canPause == right.canPause && left.canStop == right.canStop &&
+         left.canSeek == right.canSeek && left.canSkipNext == right.canSkipNext &&
+         left.canSkipPrevious == right.canSkipPrevious && left.canSetRepeat == right.canSetRepeat &&
+         left.canSetShuffle == right.canSetShuffle && left.canSetVolume == right.canSetVolume;
+}
+
+[[nodiscard]] bool sameTrackIdentity(const MetadataTrackIdentityDto& left,
+                                     const MetadataTrackIdentityDto& right) {
+  return left.trackId == right.trackId && left.filePath == right.filePath && left.fileUri == right.fileUri &&
+         left.sourceId == right.sourceId && left.libraryId == right.libraryId && left.trackNumber == right.trackNumber;
+}
+
+[[nodiscard]] bool sameFields(const MetadataFieldSet& left, const MetadataFieldSet& right) {
+  return left.title == right.title && left.artist == right.artist && left.album == right.album &&
+         left.albumArtist == right.albumArtist && left.genre == right.genre;
+}
+
+[[nodiscard]] bool isPlayingPositionOnlyUpdate(const MprisSnapshotRecord& previous,
+                                               const MprisSnapshotRecord& current) {
+  const auto& previousMpris = previous.snapshot.mpris;
+  const auto& currentMpris = current.snapshot.mpris;
+  return previous.trackObjectPath == current.trackObjectPath &&
+         previousMpris.playbackStatus == control::PlaybackStatus::Playing &&
+         currentMpris.playbackStatus == control::PlaybackStatus::Playing &&
+         previousMpris.positionMicros != currentMpris.positionMicros &&
+         sameTrackIdentity(previousMpris.track, currentMpris.track) && sameFields(previousMpris.fields, currentMpris.fields) &&
+         previous.artUrl == current.artUrl && previous.loopStatus == current.loopStatus && previous.canControl == current.canControl &&
+         sameOptionalInt64(previousMpris.durationMicros, currentMpris.durationMicros) &&
+         sameOptionalInt64(previousMpris.bufferedMicros, currentMpris.bufferedMicros) &&
+         sameOptionalInt64(previousMpris.seekableFromMicros, currentMpris.seekableFromMicros) &&
+         sameOptionalInt64(previousMpris.seekableToMicros, currentMpris.seekableToMicros) &&
+         previousMpris.repeatMode == currentMpris.repeatMode && previousMpris.shuffle == currentMpris.shuffle &&
+         previousMpris.muted == currentMpris.muted && previousMpris.volume == currentMpris.volume &&
+         sameCapabilities(previousMpris.capabilities, currentMpris.capabilities);
+}
+
+[[nodiscard]] bool shouldEmitPropertiesChangedSignal(const std::optional<MprisSnapshotRecord>& previous,
+                                                     const MprisSnapshotRecord& current) {
+  if (!previous) {
+    return true;
+  }
+  return !isPlayingPositionOnlyUpdate(*previous, current);
+}
+
 class NullMprisObject final : public IMprisObject {
 public:
   void registerModel(const MprisObjectModel& model) override { model_ = model; }
   void registerCommandHandlers(const MprisCommandHandlers& handlers) override { handlers_ = handlers; }
-  void publish(const MprisSnapshotRecord& snapshot) override { snapshot_ = snapshot; }
+  void publish(const MprisSnapshotRecord& snapshot, bool) override { snapshot_ = snapshot; }
 
   [[nodiscard]] const MprisCommandHandlers& handlers() const { return handlers_; }
 
@@ -82,25 +170,202 @@ private:
   MprisSnapshotRecord snapshot_{};
 };
 
+class SdbusMprisObject final : public IMprisObject {
+public:
+  SdbusMprisObject(sdbus::IConnection& connection, std::string_view objectPath)
+      : object_(sdbus::createObject(connection, sdbus::ObjectPath{std::string{objectPath}})) {}
+
+  void registerModel(const MprisObjectModel& model) override {
+    model_ = model;
+    registerRootInterface();
+    registerPlayerInterface();
+  }
+
+  void registerCommandHandlers(const MprisCommandHandlers& handlers) override { handlers_ = handlers; }
+
+  void publish(const MprisSnapshotRecord& snapshot, bool emitPropertiesChanged) override {
+    {
+      std::lock_guard lock{mutex_};
+      snapshot_ = snapshot;
+    }
+    if (emitPropertiesChanged) {
+      object_->emitPropertiesChangedSignal(kMprisPlayerInterface);
+    }
+  }
+
+private:
+  [[nodiscard]] MprisSnapshotRecord snapshot() const {
+    std::lock_guard lock{mutex_};
+    return snapshot_;
+  }
+
+  void registerRootInterface() {
+    object_->addVTable(
+               sdbus::registerMethod("Raise").implementedAs([] {}),
+               sdbus::registerMethod("Quit").implementedAs([] {}),
+               sdbus::registerProperty("CanQuit").withGetter([] { return false; }),
+               sdbus::registerProperty("CanRaise").withGetter([] { return false; }),
+               sdbus::registerProperty("HasTrackList").withGetter([] { return false; }),
+               sdbus::registerProperty("Identity").withGetter([] { return std::string{"seriona"}; }),
+               sdbus::registerProperty("DesktopEntry").withGetter([] { return std::string{"seriona"}; }),
+               sdbus::registerProperty("SupportedUriSchemes").withGetter([] { return std::vector<std::string>{"file"}; }),
+               sdbus::registerProperty("SupportedMimeTypes").withGetter([] { return std::vector<std::string>{}; }))
+        .forInterface(model_.rootInterface);
+  }
+
+  void registerPlayerInterface() {
+    object_->addVTable(
+               sdbus::registerMethod("Next").implementedAs([this] { dispatch(handlers_.next); }),
+               sdbus::registerMethod("Previous").implementedAs([this] { dispatch(handlers_.previous); }),
+               sdbus::registerMethod("Pause").implementedAs([this] { dispatch(handlers_.pause); }),
+               sdbus::registerMethod("PlayPause").implementedAs([this] { dispatch(handlers_.playPause); }),
+               sdbus::registerMethod("Stop").implementedAs([this] { dispatch(handlers_.stop); }),
+               sdbus::registerMethod("Play").implementedAs([this] { dispatch(handlers_.play); }),
+               sdbus::registerMethod("Seek").implementedAs([this](std::int64_t offset) { dispatchSeek(offset); }),
+               sdbus::registerMethod("SetPosition").implementedAs([this](sdbus::ObjectPath trackId, std::int64_t position) {
+                 dispatchSetPosition(trackId, position);
+               }),
+               sdbus::registerMethod("OpenUri").implementedAs([](const std::string&) {}),
+               sdbus::registerProperty("PlaybackStatus").withGetter([this] { return playbackStatus(); }),
+               sdbus::registerProperty("LoopStatus").withGetter([this] { return snapshot().loopStatus; }).withSetter([this](const std::string& value) {
+                 dispatchSetRepeat(value);
+               }),
+               sdbus::registerProperty("Rate").withGetter([] { return 1.0; }).withSetter([](double) {}),
+               sdbus::registerProperty("Shuffle").withGetter([this] { return snapshot().snapshot.mpris.shuffle; }).withSetter([this](bool value) {
+                 dispatchSetShuffle(value);
+               }),
+               sdbus::registerProperty("Metadata").withGetter([this] { return metadata(); }),
+               sdbus::registerProperty("Volume").withGetter([this] { return static_cast<double>(snapshot().snapshot.mpris.volume); }).withSetter([this](double value) {
+                 dispatchSetVolume(value);
+               }),
+               sdbus::registerProperty("Position").withGetter([this] { return snapshot().snapshot.mpris.positionMicros; }),
+               sdbus::registerProperty("MinimumRate").withGetter([] { return 1.0; }),
+               sdbus::registerProperty("MaximumRate").withGetter([] { return 1.0; }),
+               sdbus::registerProperty("CanGoNext").withGetter([this] { return snapshot().snapshot.mpris.capabilities.canSkipNext; }),
+               sdbus::registerProperty("CanGoPrevious").withGetter([this] { return snapshot().snapshot.mpris.capabilities.canSkipPrevious; }),
+               sdbus::registerProperty("CanPlay").withGetter([this] { return snapshot().snapshot.mpris.capabilities.canPlay; }),
+               sdbus::registerProperty("CanPause").withGetter([this] { return snapshot().snapshot.mpris.capabilities.canPause; }),
+               sdbus::registerProperty("CanSeek").withGetter([this] { return snapshot().snapshot.mpris.capabilities.canSeek; }),
+               sdbus::registerProperty("CanControl").withGetter([this] { return snapshot().canControl; }))
+        .forInterface(model_.playerInterface);
+  }
+
+  [[nodiscard]] std::string playbackStatus() const { return playbackStatusText(snapshot().snapshot.mpris.playbackStatus); }
+
+  [[nodiscard]] std::map<std::string, sdbus::Variant> metadata() const {
+    const auto current = snapshot();
+    const auto& mpris = current.snapshot.mpris;
+    auto values = std::map<std::string, sdbus::Variant>{};
+    values.emplace("mpris:trackid", sdbus::Variant{sdbus::ObjectPath{current.trackObjectPath}});
+    if (mpris.durationMicros) {
+      values.emplace("mpris:length", sdbus::Variant{*mpris.durationMicros});
+    }
+    if (!current.artUrl.empty()) {
+      values.emplace("mpris:artUrl", sdbus::Variant{current.artUrl});
+    }
+    if (!mpris.track.fileUri.empty()) {
+      values.emplace("xesam:url", sdbus::Variant{mpris.track.fileUri});
+    }
+    if (mpris.fields.title) {
+      values.emplace("xesam:title", sdbus::Variant{*mpris.fields.title});
+    }
+    if (mpris.fields.artist) {
+      values.emplace("xesam:artist", sdbus::Variant{std::vector<std::string>{*mpris.fields.artist}});
+    }
+    if (mpris.fields.album) {
+      values.emplace("xesam:album", sdbus::Variant{*mpris.fields.album});
+    }
+    if (mpris.fields.albumArtist) {
+      values.emplace("xesam:albumArtist", sdbus::Variant{std::vector<std::string>{*mpris.fields.albumArtist}});
+    }
+    if (mpris.fields.genre) {
+      values.emplace("xesam:genre", sdbus::Variant{std::vector<std::string>{*mpris.fields.genre}});
+    }
+    return values;
+  }
+
+  static void dispatch(const std::function<bool()>& handler) {
+    if (handler) {
+      static_cast<void>(handler());
+    }
+  }
+
+  void dispatchSeek(std::int64_t offset) const {
+    if (handlers_.seekBy) {
+      static_cast<void>(handlers_.seekBy(std::chrono::microseconds{offset}));
+    }
+  }
+
+  void dispatchSetPosition(const std::string& trackId, std::int64_t position) const {
+    if (handlers_.setPosition) {
+      static_cast<void>(handlers_.setPosition(trackId, std::chrono::microseconds{position}));
+    }
+  }
+
+  void dispatchSetVolume(double volume) const {
+    if (handlers_.setVolume) {
+      static_cast<void>(handlers_.setVolume(static_cast<float>(volume)));
+    }
+  }
+
+  void dispatchSetRepeat(const std::string& loopStatus) const {
+    if (handlers_.setRepeatMode) {
+      static_cast<void>(handlers_.setRepeatMode(repeatModeFromLoopStatus(loopStatus)));
+    }
+  }
+
+  void dispatchSetShuffle(bool shuffle) const {
+    if (handlers_.setShuffle) {
+      static_cast<void>(handlers_.setShuffle(shuffle));
+    }
+  }
+
+  std::unique_ptr<sdbus::IObject> object_;
+  mutable std::mutex mutex_{};
+  MprisObjectModel model_{};
+  MprisCommandHandlers handlers_{};
+  MprisSnapshotRecord snapshot_{};
+};
+
 class SdbusMprisBus final : public IMprisBus {
 public:
   SdbusMprisBus() : connection_(sdbus::createSessionBusConnection()) {}
 
-  void requestName(std::string_view name) override { connection_->requestName(sdbus::ServiceName{std::string{name}}); }
+  ~SdbusMprisBus() override {
+    if (eventLoopStarted_) {
+      try {
+        connection_->leaveEventLoop();
+      } catch (const sdbus::Error& error) {
+        (void)error;
+      }
+    }
+  }
+
+  void requestName(std::string_view name) override {
+    connection_->requestName(sdbus::ServiceName{std::string{name}});
+    if (!eventLoopStarted_) {
+      connection_->enterEventLoopAsync();
+      eventLoopStarted_ = true;
+    }
+  }
   void addObjectManager(std::string_view objectPath) override { connection_->addObjectManager(sdbus::ObjectPath{std::string{objectPath}}); }
-  [[nodiscard]] std::unique_ptr<IMprisObject> createObject(std::string_view) override { return std::make_unique<NullMprisObject>(); }
+  [[nodiscard]] std::unique_ptr<IMprisObject> createObject(std::string_view objectPath) override {
+    return std::make_unique<SdbusMprisObject>(*connection_, objectPath);
+  }
 
 private:
   std::unique_ptr<sdbus::IConnection> connection_;
+  bool eventLoopStarted_{false};
 };
 
 [[nodiscard]] MprisSnapshotRecord toSnapshotRecord(const MetadataPlatformSnapshotDto& snapshot) {
   return MprisSnapshotRecord{.snapshot = snapshot,
                              .trackObjectPath = snapshot.mpris.trackObjectPath.value,
-                             .artUrl = artworkUrl(snapshot.mpris.artwork.localPath ? std::optional<control::ArtworkRef>{control::ArtworkRef{.localPath = snapshot.mpris.artwork.localPath,
-                                                                                                                                      .uri = snapshot.mpris.artwork.uri,
-                                                                                                                                      .contentHash = snapshot.mpris.artwork.contentHash}}
-                                                                               : std::nullopt),
+                             .artUrl = artworkUrl((snapshot.mpris.artwork.localPath || snapshot.mpris.artwork.uri)
+                                                      ? std::optional<control::ArtworkRef>{control::ArtworkRef{.localPath = snapshot.mpris.artwork.localPath,
+                                                                                                                .uri = snapshot.mpris.artwork.uri,
+                                                                                                                .contentHash = snapshot.mpris.artwork.contentHash}}
+                                                      : std::nullopt),
                              .loopStatus = loopStatusText(snapshot.mpris.repeatMode),
                              .canControl = snapshot.mpris.capabilities.canPlay || snapshot.mpris.capabilities.canPause ||
                                            snapshot.mpris.capabilities.canStop || snapshot.mpris.capabilities.canSeek ||
@@ -332,7 +597,7 @@ void LinuxMprisAdapter::publishCurrentSnapshot(const PlatformMediaState& state) 
     return;
   }
   const auto record = toSnapshotRecord(mapPlayerStateSnapshot(state.controlState));
-  object_->publish(record);
+  object_->publish(record, shouldEmitPropertiesChangedSignal(lastPublishedSnapshot_, record));
   lastPublishedSnapshot_ = record;
 }
 

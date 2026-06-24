@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,10 @@
 #include "metadata_mapper.h"
 #include "metadata_mpris_private.h"
 
+#if defined(__linux__) && !defined(__APPLE__)
+#include <sdbus-c++/sdbus-c++.h>
+#endif
+
 namespace seriona::metadata {
 MetadataSyncResult metadataMprisSmokeResult();
 }
@@ -26,10 +31,16 @@ struct RecordingMprisObject final : seriona::metadata::detail::IMprisObject {
   seriona::metadata::detail::MprisObjectModel model{};
   seriona::metadata::detail::MprisCommandHandlers handlers{};
   std::vector<seriona::metadata::detail::MprisSnapshotRecord> published{};
+  int propertiesChangedSignals{0};
 
   void registerModel(const seriona::metadata::detail::MprisObjectModel& value) override { model = value; }
   void registerCommandHandlers(const seriona::metadata::detail::MprisCommandHandlers& value) override { handlers = value; }
-  void publish(const seriona::metadata::detail::MprisSnapshotRecord& snapshot) override { published.push_back(snapshot); }
+  void publish(const seriona::metadata::detail::MprisSnapshotRecord& snapshot, bool emitPropertiesChanged) override {
+    published.push_back(snapshot);
+    if (emitPropertiesChanged) {
+      ++propertiesChangedSignals;
+    }
+  }
 };
 
 struct CommandRecorder {
@@ -55,9 +66,10 @@ struct RecordingMprisBus final : seriona::metadata::detail::IMprisBus {
 };
 
 seriona::control::PlayerStateSnapshot buildSnapshot(std::string trackId,
-                                                    std::optional<std::filesystem::path> artworkPath,
-                                                    bool canControl,
-                                                    seriona::control::PlaybackStatus status = seriona::control::PlaybackStatus::Playing) {
+                                                     std::optional<std::filesystem::path> artworkPath,
+                                                     bool canControl,
+                                                     seriona::control::PlaybackStatus status = seriona::control::PlaybackStatus::Playing,
+                                                     std::chrono::milliseconds position = std::chrono::milliseconds{1234}) {
   seriona::control::PlayerStateSnapshot snapshot{};
   snapshot.freshness.version = 1U;
   snapshot.freshness.sampledAt = std::chrono::steady_clock::now();
@@ -65,7 +77,7 @@ seriona::control::PlayerStateSnapshot buildSnapshot(std::string trackId,
                                                           .filePath = std::filesystem::path{"music/track.flac"},
                                                           .sourceId = "source-a",
                                                           .libraryId = "library-a"};
-  snapshot.display = seriona::control::DisplayMetadata{.title = "Song", .artist = "Artist", .album = "Album", .albumArtist = "Album Artist", .genre = "Genre"};
+  snapshot.display = seriona::control::DisplayMetadata{.title = "Song", .artist = "Artist", .album = "R・I・O・T", .albumArtist = "Album Artist", .genre = "Genre"};
   snapshot.artwork = seriona::control::ArtworkRef{.localPath = std::move(artworkPath), .uri = std::nullopt, .contentHash = std::string{"hash-01"}};
   snapshot.playback.state = status;
   snapshot.repeatMode = seriona::control::RepeatMode::All;
@@ -79,7 +91,7 @@ seriona::control::PlayerStateSnapshot buildSnapshot(std::string trackId,
                                                                  .canSetShuffle = canControl,
                                                                  .canSetVolume = canControl,
                                                                  .canSelectTrack = canControl};
-  snapshot.timeline.position = std::chrono::milliseconds{1234};
+  snapshot.timeline.position = position;
   snapshot.timeline.duration = std::chrono::milliseconds{5678};
   snapshot.volume = 0.75F;
   return snapshot;
@@ -93,6 +105,10 @@ std::string trackObjectPath() {
       .libraryId = "library-a",
   };
   return seriona::metadata::makeMprisTrackObjectPath(track);
+}
+
+std::string fileUriForPath(const std::filesystem::path& path) {
+  return std::string{"file://"} + path.generic_string();
 }
 
 void checkCommand(const seriona::control::MediaControlCommand& command,
@@ -117,6 +133,59 @@ TEST_CASE("metadata mpris smoke path returns a stable accepted result") {
 
   CHECK(result.accepted);
   CHECK_FALSE(result.changed);
+}
+
+TEST_CASE("linux mpris art url prefers explicit uri and exports absolute local files") {
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
+  auto snapshot = buildSnapshot("track-01", std::filesystem::path{"relative/cover.jpg"}, true);
+  snapshot.artwork->uri = std::string{"file:///tmp/seriona-explicit-cover.jpg"};
+
+  CHECK(adapter.start(seriona::metadata::PlatformMediaState{.controlState = snapshot,
+                                                            .timelineUpdateInterval = std::chrono::milliseconds{1000}}).accepted);
+
+  REQUIRE(adapter.lastPublishedSnapshot().has_value());
+  CHECK(adapter.lastPublishedSnapshot()->artUrl == "file:///tmp/seriona-explicit-cover.jpg");
+  REQUIRE(busRaw->object != nullptr);
+  CHECK(busRaw->object->published.back().artUrl == "file:///tmp/seriona-explicit-cover.jpg");
+}
+
+TEST_CASE("linux mpris production object is visible on the session bus") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  if (std::getenv("DBUS_SESSION_BUS_ADDRESS") == nullptr) {
+    return;
+  }
+
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{};
+  const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
+                                                                         .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  REQUIRE(start.accepted);
+
+  try {
+    auto proxy = sdbus::createProxy(sdbus::ServiceName{seriona::metadata::detail::kMprisBusName},
+                                    sdbus::ObjectPath{seriona::metadata::detail::kMprisObjectPath},
+                                    sdbus::dont_run_event_loop_thread);
+    std::string introspectionXml;
+    proxy->callMethod("Introspect")
+        .onInterface("org.freedesktop.DBus.Introspectable")
+        .withTimeout(std::chrono::milliseconds{500})
+        .storeResultsTo(introspectionXml);
+
+    CHECK(introspectionXml.find(seriona::metadata::detail::kMprisRootInterface) != std::string::npos);
+    CHECK(introspectionXml.find(seriona::metadata::detail::kMprisPlayerInterface) != std::string::npos);
+    CHECK(introspectionXml.find("PlaybackStatus") != std::string::npos);
+    CHECK(introspectionXml.find("Metadata") != std::string::npos);
+  } catch (const sdbus::Error& error) {
+    CAPTURE(error.getName());
+    CAPTURE(error.getMessage());
+    FAIL("MPRIS object must be introspectable on the session bus");
+  }
+
+  static_cast<void>(adapter.stop());
+#endif
 }
 
 TEST_CASE("linux mpris adapter exposes the real object model through a fake bus seam") {
@@ -182,7 +251,8 @@ TEST_CASE("linux mpris adapter exposes the real object model through a fake bus 
 
   const auto& published = busRaw->object->published.back();
   CHECK(published.trackObjectPath.rfind("/org/mpris", 0) != 0);
-  CHECK(published.artUrl == "file://covers/track.jpg");
+  CHECK(published.artUrl == fileUriForPath(std::filesystem::absolute("covers/track.jpg")));
+  CHECK(published.snapshot.mpris.fields.album == std::optional<std::string>{"R・I・O・T"});
   CHECK(published.loopStatus == "Playlist");
   CHECK(published.canControl);
 
@@ -195,6 +265,34 @@ TEST_CASE("linux mpris adapter exposes the real object model through a fake bus 
   CHECK_FALSE(adapter.setPosition("/org/mpris/MediaPlayer2/TrackList/NoTrack", std::chrono::microseconds{1'000'000}));
   CHECK_FALSE(busRaw->object->handlers.seekBy(std::chrono::microseconds{-1}));
   CHECK_FALSE(busRaw->object->handlers.setPosition("/com/seriona/metadata/track/track-01", std::chrono::microseconds{-1}));
+#endif
+}
+
+TEST_CASE("linux mpris adapter updates playing position without emitting repeated properties changed signals") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
+
+  const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true, seriona::control::PlaybackStatus::Playing, std::chrono::milliseconds{26'000}),
+                                                                         .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  REQUIRE(start.accepted);
+  REQUIRE(busRaw->object != nullptr);
+  CHECK(busRaw->object->propertiesChangedSignals == 1);
+
+  const auto tick = adapter.update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true, seriona::control::PlaybackStatus::Playing, std::chrono::milliseconds{27'000}),
+                                                                          .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  REQUIRE(tick.accepted);
+  REQUIRE(busRaw->object->published.size() == 2U);
+  CHECK(busRaw->object->published.back().snapshot.mpris.positionMicros == 27'000'000);
+  CHECK(busRaw->object->propertiesChangedSignals == 1);
+
+  const auto paused = adapter.update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true, seriona::control::PlaybackStatus::Paused, std::chrono::milliseconds{27'000}),
+                                                                            .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+  REQUIRE(paused.accepted);
+  CHECK(busRaw->object->propertiesChangedSignals == 2);
 #endif
 }
 
