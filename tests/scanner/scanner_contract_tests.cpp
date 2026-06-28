@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -54,6 +55,8 @@ TEST_CASE("scanner public contracts use standard-library value types") {
   using namespace seriona::scanner;
 
   static_assert(std::is_same_v<decltype(ScannerConfig::progressInterval), std::chrono::milliseconds>);
+  static_assert(std::is_same_v<decltype(ScannerConfig::workerCount), std::size_t>);
+  static_assert(std::is_same_v<decltype(ScannerConfig::tagReaderConcurrency), std::ptrdiff_t>);
   static_assert(std::is_same_v<decltype(ScanProgress::elapsed), std::chrono::milliseconds>);
   static_assert(std::is_same_v<decltype(ScannerEvent::timestamp), std::chrono::steady_clock::time_point>);
   static_assert(std::is_same_v<decltype(SongMetadata::offset), std::optional<std::chrono::milliseconds>>);
@@ -94,6 +97,10 @@ TEST_CASE("scanner contract defaults are explicit and dependency-free") {
   CHECK_FALSE(config.followSymlinks);
   CHECK(config.readEmbeddedLyrics);
   CHECK(config.readExternalLyrics);
+  CHECK(config.workerCount == 0U);
+  CHECK(config.tagReaderConcurrency == 0);
+  CHECK(config.enableIncrementalScan);
+  CHECK_FALSE(config.forceFull);
 
   const SongMetadata metadata{};
   CHECK(metadata.effectiveLyricsSource == LyricsSource::None);

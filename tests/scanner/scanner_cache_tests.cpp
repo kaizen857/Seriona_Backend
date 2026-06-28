@@ -5,6 +5,7 @@
 #include <doctest.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <optional>

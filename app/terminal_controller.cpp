@@ -210,7 +210,7 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   try {
     seriona::logging::initialize(spdlog::level::off, timestampedLogPath.string()
 #ifdef SERIONA_RELEASE_BUILD
-                                 , spdlog::level::warn
+                                 , spdlog::level::info
 #endif
     );
   } catch (const std::exception& e) {

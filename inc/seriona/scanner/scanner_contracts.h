@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -57,10 +58,20 @@ struct ScannerRoot {
 
 struct ScannerConfig {
   std::chrono::milliseconds progressInterval{250};
+  // Empty means use the scanner's built-in supported audio extension set.
   std::vector<std::string> allowedExtensions{};
+  // Symlink traversal is opt-in to avoid scanning outside configured roots by default.
   bool followSymlinks{false};
   bool readEmbeddedLyrics{true};
   bool readExternalLyrics{true};
+  // Zero keeps the implementation's auto-sized worker count.
+  std::size_t workerCount{0};
+  // Zero keeps the implementation's auto-sized TagReader concurrency limit.
+  std::ptrdiff_t tagReaderConcurrency{0};
+  // False forces requested scans onto the Full path before cache decision logic runs.
+  bool enableIncrementalScan{true};
+  // True forces Full scans even when callers request Incremental.
+  bool forceFull{false};
 };
 
 struct ScanProgress {
@@ -100,15 +111,19 @@ struct SongMetadata {
   std::optional<std::uint16_t> channels;
   std::optional<std::uint64_t> fileSizeBytes;
   std::optional<std::filesystem::file_time_type> fileMtime;
+  // Stable content identity for deduplicating the same audio bytes across paths.
   std::string contentHash;
   LyricsSource effectiveLyricsSource{LyricsSource::None};
   std::vector<LyricLine> effectiveLyrics{};
   std::optional<std::filesystem::path> externalLyricsPath;
   std::optional<std::string> externalLyricsHash;
   std::optional<std::filesystem::file_time_type> externalLyricsMtime;
+  // Original media path used for cue-derived tracks; equals filePath for normal files.
   std::filesystem::path sourceFilePath;
+  // Cue-track timing within sourceFilePath when this metadata represents a sub-track.
   std::optional<std::chrono::milliseconds> offset;
   std::optional<std::chrono::milliseconds> duration;
+  // Stable logical identity for playlist/UI state when one source yields multiple tracks.
   std::string logicalTrackId;
   std::optional<std::filesystem::path> artworkPath;
 };

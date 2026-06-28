@@ -1,5 +1,6 @@
 #include "scanner_test_harness.h"
 
+#include "seriona/scanner/directory_tree_hash.h"
 #include "seriona/scanner/hash_utils.h"
 
 #include <doctest.h>
@@ -101,6 +102,44 @@ TEST_CASE("scanner directory merkle hash is stable and changes on child add dele
   CHECK(deleted != renamed);
 }
 
+TEST_CASE("scanner directory tree hash describes structure without reading file content") {
+  test::TempScannerRoot root("scanner-directory-tree-hash-structure");
+  writeTextFile(root.path() / "album" / "01.flac", "first audio bytes");
+  writeTextFile(root.path() / "album" / "02.flac", "second audio bytes");
+
+  const auto stable = requireHash(computeDirectoryTreeHash(root.path()));
+  writeTextFile(root.path() / "album" / "01.flac", "changed audio bytes with the same tree path");
+  const auto contentChanged = requireHash(computeDirectoryTreeHash(root.path()));
+
+  CHECK(contentChanged == stable);
+
+  writeTextFile(root.path() / "album" / "03.flac", "third audio bytes");
+  const auto added = requireHash(computeDirectoryTreeHash(root.path()));
+  CHECK(added != stable);
+
+  std::filesystem::rename(root.path() / "album" / "03.flac", root.path() / "album" / "renamed.flac");
+  const auto renamed = requireHash(computeDirectoryTreeHash(root.path()));
+  CHECK(renamed != added);
+
+  std::filesystem::remove(root.path() / "album" / "renamed.flac");
+  const auto deleted = requireHash(computeDirectoryTreeHash(root.path()));
+  CHECK(deleted != renamed);
+}
+
+TEST_CASE("scanner directory tree hash reports missing roots without partial hash") {
+  test::TempScannerRoot root("scanner-directory-tree-hash-missing");
+  const auto missing = root.path() / "missing";
+
+  const auto result = computeDirectoryTreeHash(missing);
+
+  CHECK_FALSE(result.hash.has_value());
+  REQUIRE(result.errors.size() == 1U);
+  CHECK(result.errors.front().code == HashErrorCode::IoFailure);
+  CHECK(result.errors.front().scannerError.code == ScannerErrorCode::RootUnavailable);
+  REQUIRE(result.errors.front().scannerError.path.has_value());
+  CHECK(*result.errors.front().scannerError.path == missing);
+}
+
 TEST_CASE("scanner hashing reports cancellation without a partial hash") {
   test::TempScannerRoot root("scanner-hash-cancel");
   const auto path = root.path() / "song.flac";
@@ -131,3 +170,5 @@ TEST_CASE("scanner hashing maps vanished files to recoverable scanner errors") {
 
 }
 }
+
+#include "scanner_song_identity_tests.cpp"

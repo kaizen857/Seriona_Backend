@@ -2,11 +2,15 @@
 
 #include "file_scanner_service_internal.h"
 
+#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/directory_tree_hash.h"
+
 #include <doctest.h>
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -27,6 +31,14 @@ public:
   void put(std::filesystem::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
   void fail(std::filesystem::path path, std::string message) { failures_[std::move(path)] = std::move(message); }
   void blockUntilReleased() noexcept { blockReads_ = true; }
+  void blockPathUntilReleased(std::filesystem::path path) {
+    blockPath_ = std::move(path);
+  }
+  void resetRelease() {
+    std::lock_guard lock{mutex_};
+    released_ = false;
+    blocked_ = false;
+  }
   void release() {
     {
       std::lock_guard lock{mutex_};
@@ -39,6 +51,11 @@ public:
     return changed_.wait_for(lock, timeout, [this] { return blocked_; });
   }
 
+  [[nodiscard]] bool waitForReadCount(std::size_t expectedCount, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{mutex_};
+    return changed_.wait_for(lock, timeout, [this, expectedCount] { return requestedPaths.size() >= expectedCount; });
+  }
+
   [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
                                     const std::filesystem::path& coverExportDir) override {
     {
@@ -46,7 +63,8 @@ public:
       requestedPaths.push_back(path);
       requestedCoverDirs.push_back(coverExportDir);
     }
-    if (blockReads_) {
+    changed_.notify_all();
+    if (blockReads_ || path == blockPath_) {
       std::unique_lock lock{mutex_};
       blocked_ = true;
       changed_.notify_all();
@@ -79,6 +97,7 @@ private:
   mutable std::mutex mutex_;
   std::condition_variable changed_;
   bool blockReads_{false};
+  std::filesystem::path blockPath_{};
   bool blocked_{false};
   bool released_{false};
 };
@@ -109,6 +128,30 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
                                                                .coverExportDir = temp.path() / "covers"});
 }
 
+[[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
+  return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots-v3.sqlite"};
+}
+
+[[nodiscard]] std::filesystem::path canonicalRootPath(const std::filesystem::path& path) {
+  std::error_code error;
+  auto canonical = std::filesystem::weakly_canonical(path, error);
+  if (error) {
+    canonical = path.lexically_normal();
+  }
+  return canonical;
+}
+
+void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
+  const auto rootPath = canonicalRootPath(temp.path());
+  const auto treeHash = computeDirectoryTreeHash(rootPath);
+  REQUIRE(treeHash.hash.has_value());
+  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  auto scanRoot = sidecar.loadScanRoot(rootPath);
+  REQUIRE(scanRoot.has_value());
+  scanRoot->directoryTreeHash = *treeHash.hash;
+  sidecar.updateScanRoot(*scanRoot);
+}
+
 [[nodiscard]] std::vector<SongMetadata> songsIn(const PlaylistTreeSnapshot& snapshot) {
   std::vector<SongMetadata> songs;
   for (const auto& node : snapshot.nodes) {
@@ -120,9 +163,19 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   return songs;
 }
 
+[[nodiscard]] std::vector<SongMetadata> songsInPublishedOrder(const PlaylistTreeSnapshot& snapshot) {
+  std::vector<SongMetadata> songs;
+  for (const auto& node : snapshot.nodes) {
+    if (node.song.has_value()) {
+      songs.push_back(*node.song);
+    }
+  }
+  return songs;
+}
+
 template <typename Predicate>
 [[nodiscard]] PlaylistTreeSnapshot waitForSnapshot(const FileScannerService& service, Predicate predicate) {
-  for (auto attempts = 0; attempts < 100; ++attempts) {
+  for (auto attempts = 0; attempts < 2000; ++attempts) {
     auto snapshot = service.snapshot();
     if (predicate(snapshot)) {
       return snapshot;
@@ -198,9 +251,60 @@ public:
     return false;
   }
 
+  [[nodiscard]] bool waitForEventCount(ScannerEventType type, std::size_t expectedCount, std::chrono::milliseconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      {
+        std::lock_guard lock{mutex_};
+        const auto count = static_cast<std::size_t>(std::ranges::count(events_, type, &ScannerEvent::type));
+        if (count >= expectedCount) {
+          return true;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return false;
+  }
+
+  [[nodiscard]] std::vector<SongMetadata> fileScannedSongs() const {
+    std::lock_guard lock{mutex_};
+    std::vector<SongMetadata> songs;
+    for (const auto& event : events_) {
+      if (event.type == ScannerEventType::FileScanned && std::holds_alternative<SongMetadata>(event.payload)) {
+        songs.push_back(std::get<SongMetadata>(event.payload));
+      }
+    }
+    return songs;
+  }
+
 private:
   mutable std::mutex mutex_;
   std::vector<ScannerEvent> events_;
+};
+
+class ScopedEnvVar {
+public:
+  ScopedEnvVar(std::string name, std::string value) : name_{std::move(name)} {
+    if (const auto* existing = std::getenv(name_.c_str())) {
+      previous_ = existing;
+    }
+    setenv(name_.c_str(), value.c_str(), 1);
+  }
+
+  ~ScopedEnvVar() {
+    if (previous_.has_value()) {
+      setenv(name_.c_str(), previous_->c_str(), 1);
+      return;
+    }
+    unsetenv(name_.c_str());
+  }
+
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
 };
 
 TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged rereads") {
@@ -231,6 +335,40 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   CHECK(reader->readCount() == 2U);
   CHECK(cachedSongs[1].effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(cachedSongs[1].effectiveLyrics[0].text == "external one");
+}
+
+TEST_CASE("scanner service cache lookup reuses a high-count cached root") {
+  test::TempScannerRoot temp{"scanner-service-cache-lookup"};
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  std::vector<std::filesystem::path> audioPaths;
+  constexpr auto cachedSongCount = 96U;
+  audioPaths.reserve(cachedSongCount);
+  for (auto index = 0U; index < cachedSongCount; ++index) {
+    auto filename = std::string{"track-"} + std::to_string(index) + ".flac";
+    auto audioPath = test::writeAudioFixture(temp.path(), std::move(filename));
+    reader->put(audioPath, rawMetadata("Track " + std::to_string(index)));
+    audioPaths.push_back(std::move(audioPath));
+  }
+  const auto& tailAudio = audioPaths.back();
+  writeText(tailAudio.parent_path() / "track-95.lrc", "[00:01.00]tail cached lyric\n");
+  auto service = makeService(temp, reader);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  auto songs = songsIn(waitForSongs(*service, cachedSongCount));
+
+  REQUIRE(songs.size() == cachedSongCount);
+  CHECK(reader->readCount() == cachedSongCount);
+  CHECK(songByPath(songs, tailAudio).effectiveLyricsSource == LyricsSource::ExternalLrc);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  songs = songsIn(waitForSongs(*service, cachedSongCount));
+
+  CHECK(reader->readCount() == cachedSongCount);
+  REQUIRE(songs.size() == cachedSongCount);
+  const auto& tailSong = songByPath(songs, tailAudio);
+  CHECK(tailSong.effectiveLyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(tailSong.effectiveLyrics.size() == 1U);
+  CHECK(tailSong.effectiveLyrics[0].text == "tail cached lyric");
 }
 
 TEST_CASE("scanner service rereads changed audio and reparses only changed lrc") {
@@ -400,6 +538,255 @@ TEST_CASE("scanner service records failures malformed lrc cancellation and prese
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].title == "Good");
   CHECK(std::ranges::any_of(errors, [](const ScannerError& error) { return error.code == ScannerErrorCode::Cancelled; }));
+}
+
+TEST_CASE("scanner service processes audio candidates through the worker pool") {
+  test::TempScannerRoot temp{"scanner-service-worker-pool"};
+  const auto blocked = test::writeAudioFixture(temp.path(), "blocked.flac");
+  const auto parallel = test::writeAudioFixture(temp.path(), "parallel.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(blocked, rawMetadata("Blocked"));
+  reader->put(parallel, rawMetadata("Parallel"));
+  reader->blockPathUntilReleased(blocked);
+  auto service = makeService(temp, reader);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  waitForReaderCount(*reader, 2U);
+  CHECK(reader->readCount() == 2U);
+  CHECK(service->snapshot().nodes.empty());
+
+  reader->release();
+  const auto songs = songsIn(waitForSongs(*service, 2U));
+
+  REQUIRE(songs.size() == 2U);
+  CHECK(songByPath(songs, blocked).title == "Blocked");
+  CHECK(songByPath(songs, parallel).title == "Parallel");
+}
+
+TEST_CASE("scanner service honors configured worker and tagreader concurrency") {
+  test::TempScannerRoot temp{"scanner-service-config-concurrency"};
+  const auto blocked = test::writeAudioFixture(temp.path(), "01-blocked.flac");
+  const auto parallel = test::writeAudioFixture(temp.path(), "02-parallel.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(blocked, rawMetadata("Blocked"));
+  reader->put(parallel, rawMetadata("Parallel"));
+  reader->blockUntilReleased();
+  auto service = makeService(temp, reader);
+  service->configure(ScannerConfig{.workerCount = 2U, .tagReaderConcurrency = 2});
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForReadCount(2U, std::chrono::seconds{1}));
+  CHECK(service->snapshot().nodes.empty());
+
+  reader->release();
+  const auto songs = songsIn(waitForSongs(*service, 2U));
+
+  REQUIRE(songs.size() == 2U);
+  CHECK(reader->readCount() == 2U);
+}
+
+TEST_CASE("scanner service can force serial fallback from scanner config") {
+  test::TempScannerRoot temp{"scanner-service-config-serial"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  reader->blockUntilReleased();
+  auto service = makeService(temp, reader);
+  service->configure(ScannerConfig{.workerCount = 1U, .tagReaderConcurrency = 1});
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForReadCount(1U, std::chrono::seconds{1}));
+  CHECK_FALSE(reader->waitForReadCount(2U, std::chrono::milliseconds{20}));
+
+  reader->release();
+  const auto songs = songsIn(waitForSongs(*service, 2U));
+
+  REQUIRE(songs.size() == 2U);
+  CHECK(reader->readCount() == 2U);
+}
+
+TEST_CASE("scanner service applies env worker overrides and disable concurrency wins") {
+  ScopedEnvVar workers{"SERIONA_SCANNER_WORKERS", "3"};
+  ScopedEnvVar tagReaders{"SERIONA_SCANNER_TAGREADER_CONCURRENCY", "3"};
+  ScopedEnvVar disableConcurrency{"SERIONA_SCANNER_DISABLE_CONCURRENCY", "1"};
+  test::TempScannerRoot temp{"scanner-service-env-serial"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  reader->blockUntilReleased();
+  auto service = makeService(temp, reader);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForReadCount(1U, std::chrono::seconds{1}));
+  CHECK_FALSE(reader->waitForReadCount(2U, std::chrono::milliseconds{20}));
+
+  reader->release();
+  const auto songs = songsIn(waitForSongs(*service, 2U));
+
+  REQUIRE(songs.size() == 2U);
+  CHECK(reader->readCount() == 2U);
+}
+
+TEST_CASE("scanner service ignores malformed env overrides and keeps config fallback") {
+  ScopedEnvVar workers{"SERIONA_SCANNER_WORKERS", "invalid"};
+  ScopedEnvVar tagReaders{"SERIONA_SCANNER_TAGREADER_CONCURRENCY", "0"};
+  ScopedEnvVar disableConcurrency{"SERIONA_SCANNER_DISABLE_CONCURRENCY", "maybe"};
+  test::TempScannerRoot temp{"scanner-service-env-malformed"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  reader->blockUntilReleased();
+  auto service = makeService(temp, reader);
+  service->configure(ScannerConfig{.workerCount = 2U, .tagReaderConcurrency = 2});
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForReadCount(2U, std::chrono::seconds{1}));
+
+  reader->release();
+  const auto songs = songsIn(waitForSongs(*service, 2U));
+
+  REQUIRE(songs.size() == 2U);
+  CHECK(reader->readCount() == 2U);
+}
+
+TEST_CASE("scanner config disables incremental mode and can force full scans") {
+  test::TempScannerRoot temp{"scanner-service-config-scan-mode"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  const auto databasePath = temp.path().parent_path() / (temp.path().filename().generic_string() + "-cache.sqlite");
+  const auto sidecarPath = std::filesystem::path{databasePath.generic_string() + ".scan-roots-v3.sqlite"};
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Song"));
+  auto service = makeFileScannerService(FileScannerServiceDependencies{.metadataReader = reader,
+                                                                       .watcherFactory = nullptr,
+                                                                       .databasePath = databasePath,
+                                                                       .coverExportDir = temp.path() / "covers"});
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+  const auto rootPath = canonicalRootPath(temp.path());
+
+  auto lastScanMode = [&sidecarPath, &rootPath] {
+    cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = sidecarPath}};
+    auto scanRoot = sidecar.loadScanRoot(rootPath);
+    REQUIRE(scanRoot.has_value());
+    return scanRoot->lastScanMode;
+  };
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  CHECK(lastScanMode() == ScanMode::Incremental);
+
+  service->configure(ScannerConfig{.enableIncrementalScan = false});
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 3U, std::chrono::seconds{1}));
+  CHECK(lastScanMode() == ScanMode::Full);
+
+  service->configure(ScannerConfig{.forceFull = true});
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 4U, std::chrono::seconds{1}));
+  CHECK(lastScanMode() == ScanMode::Full);
+}
+
+TEST_CASE("scanner service publishes worker results in discovered file order") {
+  test::TempScannerRoot temp{"scanner-service-event-ordering"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  reader->blockPathUntilReleased(first);
+  auto service = makeService(temp, reader);
+  std::vector<SongMetadata> publishedSongs;
+  std::mutex publishedMutex;
+  service->setEventSink([&publishedSongs, &publishedMutex](ScannerEvent event) {
+    if (event.type == ScannerEventType::FileScanned && std::holds_alternative<SongMetadata>(event.payload)) {
+      std::lock_guard lock{publishedMutex};
+      publishedSongs.push_back(std::get<SongMetadata>(event.payload));
+    }
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+
+  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  waitForReaderCount(*reader, 2U);
+  reader->release();
+  const auto snapshotSongs = songsInPublishedOrder(waitForSongs(*service, 2U));
+
+  std::vector<SongMetadata> eventSongs;
+  {
+    std::lock_guard lock{publishedMutex};
+    eventSongs = publishedSongs;
+  }
+  REQUIRE(eventSongs.size() == 2U);
+  REQUIRE(snapshotSongs.size() == 2U);
+  CHECK(eventSongs[0].filePath == first);
+  CHECK(eventSongs[1].filePath == second);
+  CHECK(snapshotSongs[0].filePath == first);
+  CHECK(snapshotSongs[1].filePath == second);
+}
+
+TEST_CASE("scanner service incremental integration reuses unchanged scans only added and changed and prunes deleted") {
+  test::TempScannerRoot temp{"scanner-service-incremental-integration"};
+  const auto unchanged = test::writeAudioFixture(temp.path(), "01-unchanged.flac");
+  const auto changed = test::writeAudioFixture(temp.path(), "02-changed.flac");
+  const auto deleted = test::writeAudioFixture(temp.path(), "03-deleted.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(unchanged, rawMetadata("Unchanged"));
+  reader->put(changed, rawMetadata("Changed Before"));
+  reader->put(deleted, rawMetadata("Deleted"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  auto songs = songsIn(waitForSongs(*service, 3U));
+
+  REQUIRE(songs.size() == 3U);
+  CHECK(reader->readCount() == 3U);
+
+  writeText(changed, "changed bytes for incremental path");
+  reader->put(changed, rawMetadata("Changed After"));
+  const auto added = test::writeAudioFixture(temp.path(), "04-added.flac");
+  reader->put(added, rawMetadata("Added"));
+  std::filesystem::remove(deleted);
+  forceNextScanIncrementalForCurrentTree(temp);
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  songs = songsIn(waitForSnapshot(*service, [&added, &changed](const PlaylistTreeSnapshot& snapshot) {
+    const auto currentSongs = songsIn(snapshot);
+    return currentSongs.size() == 3U && songByPath(currentSongs, changed).title == "Changed After" &&
+           songByPath(currentSongs, added).title == "Added";
+  }));
+
+  CHECK(reader->readCount() == 5U);
+  REQUIRE(songs.size() == 3U);
+  CHECK(songByPath(songs, unchanged).title == "Unchanged");
+  CHECK(songByPath(songs, changed).title == "Changed After");
+  CHECK(songByPath(songs, added).title == "Added");
+  CHECK(std::ranges::none_of(songs, [&deleted](const SongMetadata& song) { return song.filePath == deleted; }));
+  const auto fileScannedSongs = eventLog.fileScannedSongs();
+  REQUIRE(fileScannedSongs.size() == 6U);
+  CHECK(fileScannedSongs[3].filePath == unchanged);
+  CHECK(fileScannedSongs[4].filePath == changed);
+  CHECK(fileScannedSongs[5].filePath == added);
+  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  CHECK(locations.size() == 3U);
+  CHECK(std::ranges::none_of(locations, [&deleted](const cache::CachedLocation& location) {
+    return location.filePath == deleted;
+  }));
 }
 
 TEST_CASE("scanner service returns from scan while scanner worker performs slow metadata reads") {
