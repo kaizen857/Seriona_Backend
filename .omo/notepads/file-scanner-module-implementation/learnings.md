@@ -95,3 +95,9 @@
 - Watcher startup must create all watcher objects before launching the debounce thread; if factory construction throws, close already-created watchers and leave no joinable thread.
 - `SQLiteScannerCache::saveRoot()` is the replacement-root write boundary, so stale song pruning belongs in the same writer transaction as upsert/lyrics/error replacement.
 - Existing `.lrc` parsing already has explicit bounded defaults of 1 MiB and 10,000 lines in `LrcParseOptions`; F2 evidence records this as the task-scope policy instead of adding a second service-level knob.
+
+## 2026-06-28 task 3 xxhash CMake wiring
+
+- `seriona_scanner` needs `PkgConfig::SERIONA_XXHASH` on the public link interface because it is a static library consumed by `seriona_control` and scanner tests; keeping xxHash `PRIVATE` risks dropping the final link dependency.
+- Normal configure/build passed after refreshing the existing `build/` cache with `cmake -S . -B build -DSERIONA_BUILD_TESTS=ON` and `cmake --build build --target seriona_scanner`.
+- `SERIONA_SCANNER_SIMULATE_MISSING_XXHASH=ON` still fails early with the explicit fatal message at `CMakeLists.txt:79`, so the missing-dependency path remains clear.
