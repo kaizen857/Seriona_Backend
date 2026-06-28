@@ -23,6 +23,32 @@
 3. 外部 `.lrc` 创建或内容变化只刷新歌词解析、歌词 hash、有效歌词来源和歌曲快照，不重新调用 TagReader。
 4. 外部 `.lrc` 删除后会从缓存中的嵌入歌词回退到 `EmbeddedTag`，没有嵌入歌词时回退到 `None`。
 
+## 扫描配置与环境变量
+
+`ScannerConfig` 的并发字段都有向后兼容默认值；现有调用方可以继续使用 `ScannerConfig{}`，无需设置任何选项。
+
+| 选项 | 默认值 | 行为 |
+|------|--------|------|
+| `workerCount` | `0` | `0` 表示使用运行时检测到的 CPU 线程数；正整数会传给 scanner worker pool。|
+| `tagReaderConcurrency` | `0` | `0` 表示使用 worker 数的一半作为保守默认值；正整数限制同时进入 TagReader 的任务数，最终不会超过 worker 数。|
+| `enableIncrementalScan` | `true` | 为 `false` 时，即使调用方请求 `ScanMode::Incremental`，运行时也按 Full 扫描执行。|
+| `forceFull` | `false` | 为 `true` 时强制 Full 扫描，优先级高于传入的扫描模式。|
+
+环境变量在运行时覆盖 `ScannerConfig` 的并发字段，适合排查机器差异或强制串行回退：
+
+| 环境变量 | 合法值 | 优先级与 fallback |
+|----------|--------|-------------------|
+| `SERIONA_SCANNER_WORKERS` | 正整数 | 覆盖 `ScannerConfig::workerCount`；非法、空值或 `0` 会记录 warning 并继续使用配置/默认值。|
+| `SERIONA_SCANNER_TAGREADER_CONCURRENCY` | 正整数 | 覆盖 `ScannerConfig::tagReaderConcurrency`；非法、空值或 `0` 会记录 warning 并继续使用配置/默认值。|
+| `SERIONA_SCANNER_DISABLE_CONCURRENCY` | `0` 或 `1` | `1` 强制 `workerCount=1`、`tagReaderConcurrency=1`，优先级高于上述两个环境变量；非法值会记录 warning 并按未设置处理。|
+
+示例：
+
+```bash
+SERIONA_SCANNER_WORKERS=4 SERIONA_SCANNER_TAGREADER_CONCURRENCY=2 ./seriona /path/to/music.flac
+SERIONA_SCANNER_DISABLE_CONCURRENCY=1 ./seriona /path/to/music.flac
+```
+
 ## CUE 状态
 
 1. CUE 解析仍显式延期；当前 scanner 公共契约保留 `sourceFilePath`、`offset`、`duration`、`logicalTrackId` 等未来字段，但不会创建 CUE 分轨节点。
