@@ -1,0 +1,226 @@
+Task 21: Phase 2 ThreadSanitizer 验证和集成测试
+Date: 2026-06-28
+
+Changed files:
+- tests/scanner/scanner_phase2_tsan_stress_tests.cpp
+- tests/scanner/scanner_service_tests.cpp
+- tests/CMakeLists.txt
+- src/scanner/file_scanner_orchestrator.cpp
+- docs/optimal-scanner-architecture.md
+- .omo/notepads/scanner-refactor-implementation/learnings.md
+- .omo/notepads/scanner-refactor-implementation/issues.md
+- .omo/evidence/task-21-phase2-tsan.txt
+
+Stress / integration description:
+- Added CTest target `seriona.scanner.phase2_tsan_stress`.
+- The test creates 1000 deterministic audio fixture paths under `TempScannerRoot`.
+- Each run constructs `ScannerWorkerPool::Config{.workerCount = 4, .tagReaderSlots = 4}`.
+- It repeats the 1000-task batch 10 times, for 10000 total TagReader seam calls.
+- A condition-variable probe blocks the first four entries per batch until all four workers have entered, proving the 4-worker concurrent path without wall-clock thresholds.
+- Assertions cover result count, empty worker-pool errors, submitted/scanned stats, stable result paths, metadata paths/titles, and non-empty content hashes.
+
+Initial TSAN finding and fix:
+- First `ctest --test-dir build-tsan -R 'seriona.scanner' --output-on-failure` found `WARNING: ThreadSanitizer` in `seriona_scanner_service_tests`.
+- TSAN reported a data race in `OrchestratedFileScannerService::scanWorkerLoop()` reading `scanWorkerStopping_` while construction initialized the same object.
+- Root cause: member declaration order started `scanWorker_` before `scanWorkerStopping_` was initialized.
+- Fix: move `scanWorkerStopping_` before `scanWorker_` in `src/scanner/file_scanner_orchestrator.cpp` so the worker wait predicate reads an already-initialized flag.
+- A second TSAN run had no TSAN warnings but exposed a sanitizer-only timing false negative in `scanner service cache lookup reuses a high-count cached root`; `waitForSnapshot()` allowed only about 100ms while TSAN needed about 356ms for the 96-song first scan. The test wait budget is now about 2s, still based on observable state and not a pass/fail performance threshold.
+
+Exact TSAN configure command:
+cmake -S . -B build-tsan -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DSERIONA_BUILD_TESTS=ON
+
+Final configure output:
+-- The CXX compiler identification is GNU 16.1.1
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found PkgConfig: /usr/bin/pkg-config (found version "2.5.1")
+-- Checking for modules 'libavformat;libavcodec;libavutil;libavfilter;libswresample'
+--   Found libavformat, version 62.12.102
+--   Found libavcodec, version 62.28.102
+--   Found libavutil, version 60.26.102
+--   Found libavfilter, version 11.14.102
+--   Found libswresample, version 6.3.102
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Found SQLite3: /usr/lib/libsqlite3.so (found version "3.53.2")
+-- Checking for module 'libxxhash'
+--   Found libxxhash, version 0.8.3
+-- Checking for module 'sdbus-c++'
+--   Found sdbus-c++, version 2.3.1
+-- Checking for modules 'libavformat;libavcodec;libavutil;libswscale'
+--   Found libavformat, version 62.12.102
+--   Found libavcodec, version 62.28.102
+--   Found libavutil, version 60.26.102
+--   Found libswscale, version 9.5.102
+-- Performing Test Iconv_IS_BUILT_IN
+-- Performing Test Iconv_IS_BUILT_IN - Success
+-- Found Iconv: built in to C library
+-- Performing Test HAVE_FLAG__ffile_prefix_map__home_kaizen857_cppProject_app_and_lib__Seriona_Backend_build_tsan__deps_catch2_src__
+-- Performing Test HAVE_FLAG__ffile_prefix_map__home_kaizen857_cppProject_app_and_lib__Seriona_Backend_build_tsan__deps_catch2_src__ - Failed
+-- Configuring done (15.9s)
+-- Generating done (0.2s)
+-- Build files have been written to: /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build-tsan
+
+Exact TSAN build command:
+cmake --build build-tsan
+
+Final build output:
+[  4%] Built target seriona_audio
+[ 14%] Built target TagReaderCore
+[ 14%] Building CXX object CMakeFiles/seriona_scanner.dir/src/scanner/file_scanner_orchestrator.cpp.o
+[ 14%] Linking CXX static library libseriona_scanner.a
+[ 19%] Built target seriona_scanner
+[ 22%] Built target seriona_metadata
+[ 23%] Built target seriona_control
+[ 23%] Linking CXX executable ../seriona
+[ 25%] Built target seriona
+[ 26%] Built target seriona_tests
+[ 26%] Built target seriona_audio_contract_tests
+[ 26%] Built target seriona_audio_fixture_tests
+[ 27%] Built target seriona_ffmpeg_audio_source_tests
+[ 27%] Built target seriona_ffmpeg_filter_pipeline_tests
+[ 27%] Built target seriona_pcm_buffer_queue_tests
+[ 29%] Built target seriona_audio_output_device_tests
+[ 30%] Built target seriona_playback_clock_tests
+[ 32%] Built target seriona_playback_state_machine_tests
+[ 33%] Built target seriona_audio_event_dispatcher_tests
+[ 33%] Built target seriona_audio_event_dispatcher_shutdown_tests
+[ 38%] Built target seriona_audio_player_single_track_tests
+[ 41%] Built target seriona_audio_player_small_buffer_tests
+[ 45%] Built target seriona_output_format_negotiation_tests
+[ 50%] Built target seriona_audio_player_seamless_tests
+[ 54%] Built target seriona_audio_error_matrix_tests
+[ 58%] Built target seriona_audio_shutdown_lifecycle_tests
+[ 60%] Built target seriona_scanner_test_harness_tests
+[ 60%] Linking CXX executable seriona_scanner_contract_tests
+[ 61%] Built target seriona_scanner_contract_tests
+[ 61%] Built target seriona_metadata_contract_tests
+[ 63%] Built target seriona_metadata_mapper_tests
+[ 64%] Built target seriona_metadata_service_tests
+[ 66%] Built target seriona_metadata_service_recording_tests
+[ 66%] Built target seriona_metadata_mpris_tests
+[ 66%] Linking CXX executable seriona_control_contract_tests
+[ 67%] Built target seriona_control_contract_tests
+[ 69%] Linking CXX executable seriona_media_controller_tests
+[ 69%] Built target seriona_media_controller_tests
+[ 70%] Built target seriona_scanner_paths_tests
+[ 72%] Built target seriona_scanner_hash_tests
+[ 72%] Built target seriona_scanner_tree_tests
+[ 72%] Built target seriona_scanner_scheduler_tests
+[ 73%] Linking CXX executable seriona_scanner_thread_pool_tests
+[ 73%] Built target seriona_scanner_thread_pool_tests
+[ 73%] Linking CXX executable seriona_scanner_worker_pool_basic_tests
+[ 73%] Built target seriona_scanner_worker_pool_basic_tests
+[ 75%] Linking CXX executable seriona_scanner_worker_pool_process_tests
+[ 75%] Built target seriona_scanner_worker_pool_process_tests
+[ 75%] Linking CXX executable seriona_scanner_worker_pool_batch_tests
+[ 76%] Built target seriona_scanner_worker_pool_batch_tests
+[ 76%] Linking CXX executable seriona_scanner_worker_pool_stats_tests
+[ 76%] Built target seriona_scanner_worker_pool_stats_tests
+[ 76%] Linking CXX executable seriona_scanner_worker_pool_config_tests
+[ 76%] Built target seriona_scanner_worker_pool_config_tests
+[ 77%] Linking CXX executable seriona_scanner_phase2_tsan_stress_tests
+[ 77%] Built target seriona_scanner_phase2_tsan_stress_tests
+[ 79%] Built target seriona_scanner_cache_tests
+[ 80%] Built target seriona_scanner_cache_v3_basic_tests
+[ 83%] Built target seriona_scanner_cache_v3_content_tests
+[ 85%] Built target seriona_scanner_cache_v3_locations_tests
+[ 88%] Built target seriona_scanner_cache_v3_auxiliary_tests
+[ 89%] Built target seriona_scanner_migration_v2_to_v3_tests
+[ 92%] Built target seriona_scanner_backup_rollback_tests
+[ 95%] Built target seriona_scanner_phase1_integration_tests
+[ 95%] Built target seriona_scanner_cache_schema_v3_tests
+[ 95%] Built target seriona_scanner_tagreader_tests
+[ 95%] Linking CXX executable seriona_scanner_service_tests
+[ 97%] Built target seriona_scanner_service_tests
+[ 97%] Linking CXX executable seriona_scanner_watcher_tests
+[ 98%] Built target seriona_scanner_watcher_tests
+[ 98%] Built target seriona_runtime_paths_tests
+[100%] Built target seriona_logging_tests
+
+Exact TSAN scanner test command:
+ctest --test-dir build-tsan -R 'seriona.scanner' --output-on-failure
+
+Final scanner CTest output:
+Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build-tsan
+      Start 26: seriona.scanner_test_harness
+ 1/27 Test #26: seriona.scanner_test_harness ...................   Passed    0.03 sec
+      Start 27: seriona.scanner_contract
+ 2/27 Test #27: seriona.scanner_contract .......................   Passed    0.06 sec
+      Start 36: seriona.scanner_paths
+ 3/27 Test #36: seriona.scanner_paths ..........................   Passed    0.02 sec
+      Start 37: seriona.scanner_hash
+ 4/27 Test #37: seriona.scanner_hash ...........................   Passed    0.02 sec
+      Start 38: seriona.scanner.song_identity
+ 5/27 Test #38: seriona.scanner.song_identity ..................   Passed    0.01 sec
+      Start 39: seriona.scanner_tree
+ 6/27 Test #39: seriona.scanner_tree ...........................   Passed    0.02 sec
+      Start 40: seriona.scanner_scheduler
+ 7/27 Test #40: seriona.scanner_scheduler ......................   Passed    0.04 sec
+      Start 41: seriona.scanner.thread_pool_basic
+ 8/27 Test #41: seriona.scanner.thread_pool_basic ..............   Passed    0.06 sec
+      Start 42: seriona.scanner.worker_pool_basic
+ 9/27 Test #42: seriona.scanner.worker_pool_basic ..............   Passed    0.06 sec
+      Start 43: seriona.scanner.worker_pool_process
+10/27 Test #43: seriona.scanner.worker_pool_process ............   Passed    0.12 sec
+      Start 44: seriona.scanner.worker_pool_batch
+11/27 Test #44: seriona.scanner.worker_pool_batch ..............   Passed    0.06 sec
+      Start 45: seriona.scanner.worker_pool_stats
+12/27 Test #45: seriona.scanner.worker_pool_stats ..............   Passed    0.06 sec
+      Start 46: seriona.scanner.worker_pool_config
+13/27 Test #46: seriona.scanner.worker_pool_config .............   Passed    0.06 sec
+      Start 47: seriona.scanner.phase2_tsan_stress
+14/27 Test #47: seriona.scanner.phase2_tsan_stress .............   Passed    0.87 sec
+      Start 48: seriona.scanner_cache
+15/27 Test #48: seriona.scanner_cache ..........................   Passed    0.08 sec
+      Start 49: seriona.scanner.cache_v3_basic
+16/27 Test #49: seriona.scanner.cache_v3_basic .................   Passed    0.02 sec
+      Start 50: seriona.scanner.cache_v3_content
+17/27 Test #50: seriona.scanner.cache_v3_content ...............   Passed    0.03 sec
+      Start 51: seriona.scanner.cache_v3_locations
+18/27 Test #51: seriona.scanner.cache_v3_locations .............   Passed    0.04 sec
+      Start 52: seriona.scanner.cache_v3_auxiliary
+19/27 Test #52: seriona.scanner.cache_v3_auxiliary .............   Passed    0.03 sec
+      Start 53: seriona.scanner.migration_v2_to_v3
+20/27 Test #53: seriona.scanner.migration_v2_to_v3 .............   Passed    0.05 sec
+      Start 54: seriona.scanner.migration_phase1_integration
+21/27 Test #54: seriona.scanner.migration_phase1_integration ...   Passed    0.03 sec
+      Start 55: seriona.scanner.backup_rollback
+22/27 Test #55: seriona.scanner.backup_rollback ................   Passed    0.05 sec
+      Start 56: seriona.scanner_tagreader
+23/27 Test #56: seriona.scanner_tagreader ......................   Passed    0.05 sec
+      Start 57: seriona.scanner_service
+24/27 Test #57: seriona.scanner_service ........................   Passed    0.91 sec
+      Start 58: seriona.scanner.event_ordering
+25/27 Test #58: seriona.scanner.event_ordering .................   Passed    0.05 sec
+      Start 59: seriona.scanner.cache_lookup
+26/27 Test #59: seriona.scanner.cache_lookup ...................   Passed    0.06 sec
+      Start 60: seriona.scanner_watcher
+27/27 Test #60: seriona.scanner_watcher ........................   Passed    0.29 sec
+
+100% tests passed, 0 tests failed out of 27
+
+Total Test time (real) =   3.14 sec
+
+ThreadSanitizer warning search:
+- Command equivalent: grep `WARNING: ThreadSanitizer` over `/tmp/opencode/task21-tsan-configure.log`, `/tmp/opencode/task21-tsan-build.log`, and `/tmp/opencode/task21-tsan-ctest.log`.
+- Result: no matches found after final rerun.
+
+Diagnostics caveat:
+- Standalone `lsp_diagnostics` is unavailable in this toolset, matching inherited context. Inline diagnostics caught an initial `contentHash` type assertion error in the new stress test and it was fixed before compilation. Final confidence is compiler + TSAN + CTest + explicit warning search.
+
+Adversarial checks:
+- stale_state: after code/docs/evidence edits, the exact TSAN configure/build/scanner test sequence is rerun as the final gate.
+- dirty_worktree: final scope check verifies edits are limited to scanner tests/CMake, scanner private TSAN race fix, docs, and `.omo` evidence/notepads.
+- misleading_success_output: captured exact final configure/build/ctest output above and explicitly records no ThreadSanitizer warning matches.
+- flaky_tests: new stress test uses deterministic generated fixtures and condition-variable gating; no wall-clock threshold is used as a success criterion.
+- hung_or_long_commands: first TSAN configure attempts timed out while populating/configuring external subprojects; the final configure completed in 15.9s. First full build timed out after reaching 95%; rerun completed incrementally. Final CTest completed in 3.17s.
+- malformed_input: existing mixed success/failure scanner regressions remain in `seriona.scanner_service` and the broad scanner TSAN group passed after the lifecycle race and test wait budget were fixed.
+
+Measured performance notes:
+- `seriona.scanner.phase2_tsan_stress` under TSAN reported 0.87s CTest time for 1000 tasks * 10 repeats using fake metadata; this is a stress-test runtime, not a media parsing benchmark.
+- The scanner service 96-song first scan under TSAN logged 356ms before the wait-budget fix exposed the sanitizer overhead caveat. This number is approximate and should not be treated as a product performance target.

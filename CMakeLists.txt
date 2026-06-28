@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
+include(FetchContent)
+
 option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
 option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
@@ -24,6 +26,21 @@ pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
 )
 
 find_package(spdlog CONFIG REQUIRED)
+
+FetchContent_Declare(thread_pool
+  GIT_REPOSITORY https://github.com/bshoshany/thread-pool.git
+  GIT_TAG v4.1.0
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(thread_pool)
+
+if(NOT TARGET BS::thread_pool)
+  add_library(BS_thread_pool INTERFACE)
+  add_library(BS::thread_pool ALIAS BS_thread_pool)
+  target_include_directories(BS_thread_pool SYSTEM INTERFACE
+    $<BUILD_INTERFACE:${thread_pool_SOURCE_DIR}/include>
+  )
+endif()
 
 add_library(seriona_third_party_headers INTERFACE)
 target_include_directories(seriona_third_party_headers INTERFACE
@@ -117,13 +134,18 @@ endif()
 add_library(seriona_scanner STATIC
   src/scanner/file_scanner_service.cpp
   src/scanner/file_scanner_orchestrator.cpp
+  src/scanner/cache/sqlite_cache_v3.cpp
+  src/scanner/cache/sqlite_cache_v3_connection.cpp
+  src/scanner/cache/sqlite_cache_v3_migration.cpp
   src/scanner/cache/sqlite_scanner_cache.cpp
+  src/scanner/directory_tree_hash.cpp
   src/scanner/hash_utils.cpp
   src/scanner/lrc_parser.cpp
   src/scanner/path_utils.cpp
   src/scanner/playlist_tree_builder.cpp
   src/scanner/tag_reader_metadata_adapter.cpp
   src/scanner/scanner_module.cpp
+  src/scanner/worker_pool.cpp
 )
 
 add_library(seriona_metadata STATIC
@@ -179,10 +201,11 @@ target_include_directories(seriona_control
 )
 
 target_link_libraries(seriona_scanner
-  PRIVATE
+  PUBLIC
     SQLite3::SQLite3
     PkgConfig::SERIONA_XXHASH
     TagReaderCore
+    BS::thread_pool
     seriona_watcher_headers
     spdlog::spdlog
 )

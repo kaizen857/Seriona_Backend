@@ -1,0 +1,19 @@
+Task: 11. 使用 CMake FetchContent 集成 BS::thread_pool
+Date: 2026-06-28
+
+Changed files:
+- CMakeLists.txt
+- tests/CMakeLists.txt
+
+Implementation:
+- Added FetchContent for https://github.com/bshoshany/thread-pool.git at tag v4.1.0 with GIT_SHALLOW TRUE.
+- Created local interface target BS::thread_pool for the header-only v4.1.0 checkout.
+- Linked BS::thread_pool through seriona_scanner so scanner-scoped tests and later scanner implementation can include <BS_thread_pool.hpp> without affecting non-scanner module targets directly.
+
+Verification:
+- cmake -S . -B build -DSERIONA_BUILD_TESTS=ON: passed.
+- cmake --build build --target seriona_scanner_thread_pool_tests: passed.
+- Header presence check: build/_deps/thread_pool-src/include/BS_thread_pool.hpp exists.
+
+Notes:
+- Upstream v4.1.0 is header-only for this integration surface, so the repo defines the imported-style alias target locally after FetchContent_MakeAvailable.

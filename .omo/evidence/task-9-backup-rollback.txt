@@ -1,0 +1,40 @@
+Task: 9. 实现数据库备份和回滚机制
+Date: 2026-06-28
+
+Changed files:
+- inc/seriona/scanner/cache/sqlite_cache_v3.h
+- src/scanner/cache/sqlite_cache_v3_connection.cpp
+- src/scanner/cache/sqlite_cache_v3_migration.cpp
+- tests/scanner/scanner_backup_rollback_tests.cpp
+- tests/CMakeLists.txt
+- .omo/evidence/task-9-backup-rollback.txt
+- .omo/notepads/scanner-refactor-implementation/learnings.md
+- .omo/notepads/scanner-refactor-implementation/issues.md
+
+Behavior implemented:
+- V2->V3 migration now creates `<database>.bak` before destructive work.
+- If migration throws after backup creation, the V3 cache closes SQLite, restores the main database from `<database>.bak`, reopens/configures SQLite, then rethrows.
+- `SQLiteCacheV3::rollbackToBackup()` is available inside the V3 cache boundary and restores the main database from `<database>.bak`.
+- Successful migration intentionally retains `<database>.bak`; this preserves a manual rollback source for task-10 integration/docs.
+
+Focused coverage:
+- Backup file is created before migration and contains `PRAGMA user_version=2`.
+- Failed migration restores the main database to V2 state from backup.
+- Manual rollback restores a successfully migrated V3 database back to the backup's V2 state.
+- Backup creation failure prevents migration from starting and leaves the main DB at V2.
+
+Verification:
+- `cmake --build build --target seriona_scanner_backup_rollback_tests` passed.
+- `ctest --test-dir build -R 'seriona.scanner.backup_rollback' --output-on-failure` passed, 1/1 tests.
+- Exact combined command `cmake --build build --target seriona_scanner_backup_rollback_tests && ctest --test-dir build -R 'seriona.scanner.backup_rollback' --output-on-failure` passed.
+- Related task-8 regression check `ctest --test-dir build -R 'seriona.scanner.migration_v2_to_v3' --output-on-failure` passed.
+- Targeted `.bak` behavior verification via `build/tests/seriona_scanner_backup_rollback_tests --test-case='sqlite cache v3 creates backup before v2 migration'` passed with 18 assertions.
+- Pure LOC check: `sqlite_cache_v3.h` 90, `sqlite_cache_v3_connection.cpp` 248, `sqlite_cache_v3_migration.cpp` 154, `scanner_backup_rollback_tests.cpp` 147.
+
+LSP diagnostics:
+- The apply_patch-integrated diagnostics for the new test reported missing include path for `seriona/scanner/cache/sqlite_cache_v3.h`; CMake compile proved the include path is valid for the target.
+- The apply_patch-integrated diagnostics for V3 implementation initially lagged the updated header declarations; a subsequent codegraph read confirmed declarations were present and CMake compile passed.
+
+Residual risks:
+- Backup is retained after successful migration by design, so callers/task-10 docs should decide lifecycle cleanup policy explicitly.
+- `rollbackToBackup()` assumes a backup exists and propagates `std::filesystem`/SQLite reopen failures.

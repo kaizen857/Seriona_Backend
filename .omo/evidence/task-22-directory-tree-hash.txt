@@ -1,0 +1,54 @@
+Task 22: directory tree hash
+
+Changed files
+- Added `inc/seriona/scanner/directory_tree_hash.h`.
+- Added `src/scanner/directory_tree_hash.cpp`.
+- Updated `src/scanner/hash_utils.cpp` so `hashDirectoryMerkle()` delegates to `computeDirectoryTreeHash()`.
+- Updated `CMakeLists.txt` to compile `src/scanner/directory_tree_hash.cpp` into `seriona_scanner`.
+- Updated `tests/scanner/scanner_hash_tests.cpp` with focused directory-tree-hash coverage.
+- Updated `tests/CMakeLists.txt` to compile the new source into `seriona_scanner_hash_tests` and register exact alias `seriona.scanner.directory_tree_hash`.
+- Appended `.omo/notepads/scanner-refactor-implementation/learnings.md` and `.omo/notepads/scanner-refactor-implementation/issues.md`.
+
+Implementation notes
+- Existing `hashDirectoryMerkle()` was inspected first. Its prior private recursion mixed directory entries with file content hashes, file size, and mtime, so it was not a safe Phase 3 structure-only boundary.
+- New `computeDirectoryTreeHash(rootPath)` returns the existing `DirectoryHashResult` and `HashError` shape from `hash_utils.h`, preserving scanner-local error contracts without changing public scanner service contracts.
+- The implementation hashes only relative path names, entry kind, directory topology, and child directory sub-hashes. It does not open or read file contents and does not include file size or mtime.
+- Old `hashDirectoryMerkle()` now delegates to `computeDirectoryTreeHash()` so scanner code has one directory-tree hash behavior rather than two incompatible algorithms.
+- Missing roots return no hash plus `HashErrorCode::IoFailure` / `ScannerErrorCode::RootUnavailable`, matching existing hash error style.
+
+Focused coverage
+- `scanner directory tree hash describes structure without reading file content`: proves repeated stable 32-byte hex hash, file-content-only rewrite does not change the hash, add changes the hash, rename changes the hash, delete changes the hash.
+- `scanner directory tree hash reports missing roots without partial hash`: proves malformed missing-root input returns deterministic error and no partial hash.
+- Existing `scanner directory merkle hash is stable and changes on child add delete and rename` now characterizes the compatibility wrapper because `hashDirectoryMerkle()` delegates to the new entrypoint.
+
+Verification outputs
+- `cmake --build build --target seriona_scanner`
+  - Passed after CMake regenerated and built `src/scanner/directory_tree_hash.cpp` into `libseriona_scanner.a`.
+- `cmake --build build --target seriona_scanner_hash_tests`
+  - Passed after compiling `directory_tree_hash.cpp`, `hash_utils.cpp`, and `scanner_hash_tests.cpp` into `tests/seriona_scanner_hash_tests`.
+- `ctest --test-dir build -R 'seriona.scanner.directory_tree_hash' --output-on-failure`
+  - Passed: 1/1 test, `seriona.scanner.directory_tree_hash`, 0 failures.
+- `ctest --test-dir build -R 'seriona.scanner_hash' --output-on-failure`
+  - Passed: 1/1 test, `seriona.scanner_hash`, 0 failures.
+- `grep` exact alias check:
+  - `tests/CMakeLists.txt:832 add_test(NAME seriona.scanner.directory_tree_hash COMMAND seriona_scanner_hash_tests --test-case="scanner directory tree hash*")`.
+- Placeholder grep:
+  - No TODO/FIXME/HACK matches in `inc/seriona/scanner/directory_tree_hash.h`, `src/scanner/directory_tree_hash.cpp`, `inc/seriona/scanner/hash_utils.h`, `src/scanner/hash_utils.cpp`, `tests/scanner/scanner_hash_tests.cpp`, or `tests/CMakeLists.txt`.
+  - Full-repo grep still finds existing matches in `docs/scanner-concurrency-recommendation.md` and third-party headers only.
+
+Diagnostics caveat
+- This toolset still does not expose standalone `lsp_diagnostics`. Inline diagnostics during `apply_patch` caught the expected red phase for the missing new header/function and a header cycle; both were fixed. Final confidence comes from readback plus the focused CMake/CTest commands above.
+
+Adversarial checks
+- `stale_state`: read back `directory_tree_hash.cpp`, `directory_tree_hash.h`, `hash_utils.cpp`, `scanner_hash_tests.cpp`, and the exact CTest alias after edits; reran `cmake --build build --target seriona_scanner` and the exact focused CTest command.
+- `dirty_worktree`: `git status --short` shows many inherited unrelated modifications. Task 22 edits are limited to the listed directory-tree-hash files, hash test/CMake registration, and `.omo` artifacts.
+- `misleading_success_output`: focused alias filters `scanner directory tree hash*`, and those tests directly call `computeDirectoryTreeHash()`, not only `hashDirectoryMerkle()`.
+- `malformed_input`: missing-root behavior is covered by focused doctest with no partial hash.
+- `flaky_tests`: tests use filesystem operations and direct equality/inequality assertions only; no timing-based assertions.
+
+Pure LOC counts
+- `src/scanner/directory_tree_hash.cpp`: 158 pure LOC.
+- `src/scanner/hash_utils.cpp`: 109 pure LOC.
+- `inc/seriona/scanner/directory_tree_hash.h`: 4 pure LOC.
+- `inc/seriona/scanner/hash_utils.h`: 29 pure LOC.
+- `tests/CMakeLists.txt` is an existing monolithic registry above the 250 pure LOC ceiling; task 22 touched it only to add the new source to `seriona_scanner_hash_tests` and register the exact CTest alias.

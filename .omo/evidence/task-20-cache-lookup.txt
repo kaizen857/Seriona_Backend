@@ -1,0 +1,66 @@
+Task 20 - cache lookup O(n) to O(1)
+
+Changed files:
+- src/scanner/file_scanner_orchestrator.cpp
+- tests/scanner/scanner_service_tests.cpp
+- tests/CMakeLists.txt
+- .omo/notepads/scanner-refactor-implementation/learnings.md
+- .omo/notepads/scanner-refactor-implementation/issues.md
+- .omo/evidence/task-20-cache-lookup.txt
+
+Implementation notes:
+- Added `CachedSongPathIndex = std::unordered_map<std::string, std::reference_wrapper<const cache::CachedSong>>` in the orchestrator anonymous namespace.
+- `reconcileRoot()` now builds the path index once on the main scan thread immediately after `cache.loadRoot(rootPath)`.
+- Index keys use existing `pathKey()` normalization, matching the previous `cachedSongByPath()` comparison behavior.
+- `buildCachedSongPathIndex()` uses `try_emplace()`, so duplicate normalized paths preserve the previous `std::ranges::find_if()` first-match behavior.
+- `prepareAudioTask()` and `reconcileLyrics()` now receive the read-only index and use `cachedSongByPath(cachedSongsByPath, path)`, which performs `unordered_map::find()`.
+- Worker threads do not mutate or own the index. Workers only receive `AudioReconcileTask` values already populated on the main thread and the existing synchronized `WorkerSongStore` for full song handoff.
+- Task 19 ordering is preserved: the `std::stable_sort(workerResults.begin(), workerResults.end(), discoveryIndexForWorkerResult...)` block was left intact.
+- No Phase 3 incremental scanning behavior, public scanner API, dependencies, or worker-pool semantics were changed.
+
+Focused coverage:
+- Added doctest case `scanner service cache lookup reuses a high-count cached root` in `tests/scanner/scanner_service_tests.cpp`.
+- Added exact CTest alias `seriona.scanner.cache_lookup` in `tests/CMakeLists.txt`.
+- The test creates 96 audio fixtures, runs an initial full scan, then re-scans the high-count cached root. It asserts TagReader read count stays at 96 on the second scan and that the tail entry (`track-95.flac`) restores external lyrics from cache.
+- Baseline characterization passed before the product edit. A true red proof for O(1) complexity was not added because observing complexity directly would require invasive lookup counters or timing assertions; timing-based checks were avoided per the flaky-test requirement.
+
+Verification commands and outputs:
+1. `cmake --build build --target seriona_scanner_service_tests`
+   - Passed before and after the product edit.
+   - Final post-edit build output linked `tests/seriona_scanner_service_tests` successfully.
+
+2. `ctest --test-dir build -R 'seriona.scanner.cache_lookup' --output-on-failure`
+   - Passed after baseline test registration before product edit: 1/1 passed, 0 failed, 0.04 sec.
+   - Passed after product edit: `Test #58: seriona.scanner.cache_lookup ..... Passed`, 1/1 passed, 0 failed, 0.03 sec.
+
+3. `ctest --test-dir build -R 'seriona.scanner' --output-on-failure`
+   - Passed: 26/26 scanner tests passed, 0 failed, total real time 0.86 sec.
+
+4. `cmake --build build`
+   - Passed: linked scanner worker-pool tests, scanner watcher tests, media/control tests, and `seriona` executable.
+
+Diagnostics caveat:
+- Standalone `lsp_diagnostics` is not exposed in this OpenCode toolset. Validation used codegraph/readback, compiler output, focused CTest, broad scanner CTest, and full CMake build.
+
+Adversarial checks:
+- stale_state: reread `src/scanner/file_scanner_orchestrator.cpp` after edits. `root->songs` appears only in `buildCachedSongPathIndex()` reserve/loop. `prepareAudioTask()` and `reconcileLyrics()` both call `cachedSongByPath(cachedSongsByPath, ...)`.
+- dirty_worktree: `git status --short` shows many pre-existing unrelated dirty/untracked files. This task intentionally touched only the orchestrator, scanner service test, test CMake alias, and required `.omo` artifacts.
+- misleading_success_output: focused test uses 96 cached songs and asserts the tail cached entry restores external lyrics with no additional TagReader reads, so the alias is not a trivial tiny fixture.
+- flaky_tests: no performance timing assertions were added; the high-cache-count test is deterministic and asserts functional cache reuse.
+- malformed_input: absent cached roots still build an empty index; missing cached entries return `std::nullopt`; worker result errors still skip publication through the existing branch; the lookup map is read-only after construction.
+
+Pure LOC counts:
+- `src/scanner/file_scanner_orchestrator.cpp`: 789 pure LOC. Existing oversized file; task stayed surgical.
+- `tests/scanner/scanner_service_tests.cpp`: 458 pure LOC. Existing oversized focused service test file; new coverage added there to reuse existing scanner service fixtures and exact CTest alias.
+
+Post-write self-review:
+- Single responsibility: touched orchestrator cache lookup only; no public scanner contracts changed.
+- Boundary purity: no new untrusted input boundary introduced.
+- Variant discrimination: no new enum/tag discrimination introduced.
+- Escape hatches: no casts, unwrap-like behavior, or warning suppressions added.
+- Defensive layer: null cached root maps to an empty index, preserving previous `nullptr` behavior.
+- Helpers for one-off: the local index builder and lookup helper are both used by the orchestrator hot path; no public abstraction added.
+- Tests: focused CTest alias and broad scanner regression passed.
+- Parameter bloat: `prepareAudioTask()` already carries scan counters/context; this task replaced one parameter with the index and did not expand public APIs.
+- Redundant verification: no destructive-action re-query was added.
+- Negative naming: no new negative-form names added.

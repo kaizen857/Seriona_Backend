@@ -1,0 +1,23 @@
+Task: 14. 实现 ScannerWorkerPool::processTask() 文件处理逻辑
+
+Files changed:
+- inc/seriona/scanner/worker_pool.h
+- src/scanner/worker_pool.cpp
+- tests/scanner/scanner_worker_pool_process_tests.cpp
+- tests/CMakeLists.txt
+- .omo/notepads/scanner-refactor-implementation/learnings.md
+- .omo/notepads/scanner-refactor-implementation/issues.md
+- .omo/evidence/task-14-worker-pool-process.txt
+
+Implementation notes:
+- Added a minimal `ScannerWorkerPool::Config::tagReader` seam for focused processTask tests; production defaults to `ProductionTagMetadataReader`.
+- `processTask()` now returns cached-derived metadata from `CachedLocation` without entering the tag-reader path.
+- Cache misses acquire the tag-reader semaphore through RAII, read metadata through the seam, compute `SongMetadata::contentHash` with `computeContentId()`, and return it through the existing `WorkerResult` future path.
+- Exceptions from the tag-reading seam are intentionally not swallowed; they propagate through `future::get()` during `waitAll()`.
+
+Verification:
+- PASS: `cmake --build build --target seriona_scanner_worker_pool_process_tests`
+- PASS: `ctest --test-dir build -R 'seriona.scanner.worker_pool_process' --output-on-failure`
+
+Diagnostics:
+- Standalone `lsp_diagnostics` tool is not exposed in this session. `apply_patch` inline diagnostics initially reported stale header state for `Config::tagReader` and one real lambda return-type issue; the lambda issue was fixed, and the focused CMake build passed.

@@ -1,0 +1,24 @@
+Task: 12. 验证 BS::thread_pool 编译和基础功能
+Date: 2026-06-28
+
+Changed files:
+- tests/CMakeLists.txt
+- tests/scanner/test_thread_pool_integration.cpp
+
+Test target:
+- seriona_scanner_thread_pool_tests
+
+CTest registration:
+- seriona.scanner.thread_pool_basic
+
+Coverage:
+- Constructs BS::thread_pool with two workers.
+- Submits simple returning tasks and gathers the expected values 21, 34, and 55.
+- Verifies exception propagation through std::future::get() for a throwing task.
+
+Verification:
+- cmake -S . -B build -DSERIONA_BUILD_TESTS=ON: passed.
+- cmake --build build --target seriona_scanner_thread_pool_tests: passed.
+- ctest --test-dir build -R 'seriona.scanner.thread_pool_basic' --output-on-failure: passed, 1/1 tests, 0.03 sec.
+- lsp_diagnostics tests/scanner/test_thread_pool_integration.cpp: no diagnostics.
+- lsp_diagnostics CMakeLists.txt and tests/CMakeLists.txt: unavailable because no LSP server is configured for .txt/CMake files in this environment.
