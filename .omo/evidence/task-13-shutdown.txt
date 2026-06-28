@@ -1,7 +1,0 @@
-Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
-    Start 24: seriona.audio_shutdown_lifecycle
-1/1 Test #24: seriona.audio_shutdown_lifecycle ...   Passed    0.04 sec
-
-100% tests passed, 0 tests failed out of 1
-
-Total Test time (real) =   0.04 sec

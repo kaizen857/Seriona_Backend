@@ -1,9 +1,0 @@
-
-2026-06-17：`task-1-no-qt` 证据命令第一次把不存在的 `cmake/` 目录传给 `rg`，已修正为只检查实际存在路径。
-
-2026-06-17：T1 初版用自制 doctest/miniaudio 占位头，已替换为官方上游单头快照，避免把伪实现当作第三方依赖基线。
-
-2026-06-17：当前需要清理的仅是证据噪声；`task-1-no-qt` 之前为空或包含错误输出，必须重新生成干净的 Qt 负向检查证据。
-2026-06-18：`task-3-no-copyright-fixtures.txt` 的 `flac`/`artist` 命中来自既有 contract 测试字面量，不是已提交的音频素材；fixture 本身仍然是构建树内生成的短 WAV。
-
-2026-06-18：T4 follow-up 清理了 `playback_state_machine_tests.cpp` 中未被断言使用的 track metadata 赋值，避免 `artist` 字段名触发 no-copyright guardrail；状态机行为与断言保持不变。

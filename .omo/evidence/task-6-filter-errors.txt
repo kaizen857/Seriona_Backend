@@ -1,7 +1,0 @@
-Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
-    Start 9: seriona.ffmpeg_filter_pipeline_errors
-1/1 Test #9: seriona.ffmpeg_filter_pipeline_errors ...   Passed    0.03 sec
-
-100% tests passed, 0 tests failed out of 1
-
-Total Test time (real) =   0.03 sec

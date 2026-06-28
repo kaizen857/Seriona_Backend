@@ -1,7 +1,0 @@
-Test project /home/kaizen857/cppProject(app_and_lib)/Seriona_Backend/build
-    Start 20: seriona.audio_player_seamless_mix
-1/1 Test #20: seriona.audio_player_seamless_mix ...   Passed    0.03 sec
-
-100% tests passed, 0 tests failed out of 1
-
-Total Test time (real) =   0.03 sec

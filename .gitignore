@@ -68,3 +68,5 @@ Testing/
 .cache/
 
 tmp/
+# OpenCode working directory
+.omo/
