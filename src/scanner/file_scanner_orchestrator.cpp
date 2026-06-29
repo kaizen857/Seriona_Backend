@@ -1,4 +1,5 @@
 #include "file_scanner_service_internal.h"
+#include "scanner_internal_types.h"
 
 #include "spdlog/spdlog.h"
 
@@ -250,12 +251,6 @@ struct IncrementalScanPlan {
 struct IncrementalExecutionPlan {
   std::unordered_set<std::string> unchangedPaths;
   std::unordered_set<std::string> workerPaths;
-};
-
-struct IndexedPublishedSong {
-  std::size_t discoveryIndex{0};
-  cache::CachedSong song;
-  std::filesystem::path treeRelativePath;
 };
 
 [[nodiscard]] std::optional<std::uint64_t> fileSizeBytes(const std::filesystem::path& path) {
@@ -894,9 +889,7 @@ private:
         auto cachedSong = cachedSongByPath(cachedSongsByPath, entry.path);
         if (cachedSong.has_value()) {
           ++skipped;
-          indexedSongs.push_back({.discoveryIndex = discoveryIndex++,
-                                  .song = std::move(*cachedSong),
-                                  .treeRelativePath = relativePathFor(rootPath, entry.path)});
+          indexedSongs.push_back(IndexedPublishedSong{discoveryIndex++, std::move(*cachedSong), relativePathFor(rootPath, entry.path)});
         }
       }
       for (auto& indexedSong : indexedSongs) {
@@ -945,9 +938,7 @@ private:
         auto cachedSong = cachedSongByPath(cachedSongsByPath, entry.path);
         if (cachedSong.has_value()) {
           ++skipped;
-          indexedSongs.push_back({.discoveryIndex = currentDiscoveryIndex,
-                                  .song = std::move(*cachedSong),
-                                  .treeRelativePath = relativePathFor(rootPath, entry.path)});
+          indexedSongs.push_back(IndexedPublishedSong{currentDiscoveryIndex, std::move(*cachedSong), relativePathFor(rootPath, entry.path)});
         }
         continue;
       }
@@ -964,13 +955,14 @@ private:
       if (audioTask->cachedSong.has_value() && isAudioCacheHit(*audioTask->cachedSong, audioTask->contentHash)) {
         cachedLocation = cachedLocationFromSong(*audioTask->cachedSong, rootPath, entry.path);
       }
-      workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::move(cachedLocation)});
+      workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::move(cachedLocation), .nodeIndex = currentDiscoveryIndex});
     }
 
     auto workerSongs = std::make_shared<WorkerSongStore>();
     ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
                                                            .tagReaderSlots = config.tagReaderSlots,
-                                                           .tagReader = [this, workerSongs, &audioTasks](const WorkerTask& task) {
+                                                           .tagReader = [this, workerSongs, &audioTasks, &indexedSongs](const WorkerTask& task) {
+                                                             (void)indexedSongs;
                                                              return readWorkerSong(task, audioTasks, workerSongs);
                                                            }}};
     workerPool.submitBatch(std::move(workerTasks));
@@ -1114,9 +1106,7 @@ private:
         song = cachedSongForWorkerResult(workerResult, audioTasks);
       }
       if (song.has_value()) {
-        indexedSongs.push_back({.discoveryIndex = discoveryIndexForWorkerResult(workerResult, audioTasks),
-                                .song = std::move(*song),
-                                .treeRelativePath = relativePathFor(rootPath, workerResult.filePath)});
+        indexedSongs.push_back(IndexedPublishedSong{discoveryIndexForWorkerResult(workerResult, audioTasks), std::move(*song), relativePathFor(rootPath, workerResult.filePath)});
       }
     }
   }
