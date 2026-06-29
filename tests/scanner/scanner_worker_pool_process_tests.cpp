@@ -129,4 +129,31 @@ TEST_CASE("scanner worker pool processTask records tag reader exceptions as work
   CHECK(errors.size() == 1U);
 }
 
+TEST_CASE("scanner worker pool WorkerTask nodeIndex is accessible in callback") {
+  std::vector<std::size_t> observedIndices;
+  std::vector<std::filesystem::path> observedPaths;
+  ScannerWorkerPool pool{ScannerWorkerPool::Config{.workerCount = 2,
+                                                   .tagReaderSlots = 2,
+                                                   .tagReader = [&observedIndices, &observedPaths](const WorkerTask& task) {
+                                                     observedIndices.push_back(task.nodeIndex);
+                                                     observedPaths.push_back(task.filePath);
+                                                     return metadataFixture(task.filePath);
+                                                   }}};
+
+  pool.submitBatch({WorkerTask{.rootPath = "music", .filePath = "music/first.flac", .cachedLocation = std::nullopt, .nodeIndex = 10},
+                    WorkerTask{.rootPath = "music", .filePath = "music/second.flac", .cachedLocation = std::nullopt, .nodeIndex = 20},
+                    WorkerTask{.rootPath = "music", .filePath = "music/third.flac", .cachedLocation = std::nullopt, .nodeIndex = 30}});
+  const auto results = pool.waitAll();
+
+  REQUIRE(results.size() == 3U);
+  REQUIRE(observedIndices.size() == 3U);
+  REQUIRE(observedPaths.size() == 3U);
+  CHECK(std::find(observedIndices.begin(), observedIndices.end(), 10) != observedIndices.end());
+  CHECK(std::find(observedIndices.begin(), observedIndices.end(), 20) != observedIndices.end());
+  CHECK(std::find(observedIndices.begin(), observedIndices.end(), 30) != observedIndices.end());
+  CHECK(std::find(observedPaths.begin(), observedPaths.end(), std::filesystem::path{"music/first.flac"}) != observedPaths.end());
+  CHECK(std::find(observedPaths.begin(), observedPaths.end(), std::filesystem::path{"music/second.flac"}) != observedPaths.end());
+  CHECK(std::find(observedPaths.begin(), observedPaths.end(), std::filesystem::path{"music/third.flac"}) != observedPaths.end());
+}
+
 }

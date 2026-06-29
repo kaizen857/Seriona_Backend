@@ -18,6 +18,7 @@ struct WorkerTask {
   std::filesystem::path rootPath;
   std::filesystem::path filePath;
   std::optional<cache::CachedLocation> cachedLocation;
+  std::size_t nodeIndex{0};
 };
 
 struct WorkerResult {
