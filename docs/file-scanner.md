@@ -51,8 +51,16 @@ SERIONA_SCANNER_DISABLE_CONCURRENCY=1 ./seriona /path/to/music.flac
 
 ## CUE 状态
 
-1. CUE 解析仍显式延期；当前 scanner 公共契约保留 `sourceFilePath`、`offset`、`duration`、`logicalTrackId` 等未来字段，但不会创建 CUE 分轨节点。
-2. `.cue` 文件不会进入首版扫描入库路径，也不会改变现有 app 播放行为。
+1. 当前扫描流程已经把 `.cue` 识别为 `CueSheet`。
+2. 在两遍发现里，`.cue` 会保留为可见入口；它引用的底层音频文件会从普通音频结果中隐藏，不会被重复暴露。
+3. 损坏或格式不完整的 CUE 仍会出现在扫描结果里，并附带错误记录；扫描会继续处理同目录下的其他文件。
+4. 本文档只描述当前已经实现的发现阶段行为，不把 PlaylistTree 最终渲染、`CueTrack` 填充或其他后续工作写成既成事实。
+
+## CUE 用户体验
+
+1. 对用户来说，CUE 像一个虚拟文件夹入口：打开后看到的是这张 CUE 对应的轨道集合，而不是把底层音频文件和分轨信息混在普通文件列表里。
+2. 当同目录里同时存在 `album.cue` 和 `album.flac` 时，`album.cue` 仍会被保留，`album.flac` 会因为被引用而隐藏。
+3. 当 CUE 本身有问题时，用户仍能看到这份 CUE 的存在和对应错误，其他正常文件不会被连带影响。
 
 ## 默认验证
 
