@@ -78,39 +78,68 @@ namespace {
   return options;
 }
 
-[[nodiscard]] std::vector<std::filesystem::path> extractAudioReferencesFromCue(const std::filesystem::path& cuePath) {
+struct CueParseResult {
   std::vector<std::filesystem::path> references;
-  std::ifstream cueFile(cuePath);
-  if (!cueFile.is_open()) {
-    return references;
-  }
+  std::optional<PathClassificationError> error;
+};
 
-  std::string line;
-  const auto cueDir = cuePath.parent_path();
-  while (std::getline(cueFile, line)) {
-    const auto filePos = line.find("FILE ");
-    if (filePos == std::string::npos) {
-      continue;
+[[nodiscard]] CueParseResult extractAudioReferencesFromCue(const std::filesystem::path& cuePath) {
+  CueParseResult result;
+  
+  try {
+    std::ifstream cueFile(cuePath);
+    if (!cueFile.is_open()) {
+      result.error = makeError(ScannerErrorCode::MetadataReadFailed, cuePath, 
+                               "failed to open CUE sheet for parsing",
+                               "file could not be opened");
+      return result;
+    }
+
+    std::string line;
+    const auto cueDir = cuePath.parent_path();
+    bool foundFileLine = false;
+    
+    while (std::getline(cueFile, line)) {
+      const auto filePos = line.find("FILE ");
+      if (filePos == std::string::npos) {
+        continue;
+      }
+      
+      const auto firstQuote = line.find('"', filePos);
+      if (firstQuote == std::string::npos) {
+        continue;
+      }
+      
+      const auto secondQuote = line.find('"', firstQuote + 1);
+      if (secondQuote == std::string::npos) {
+        continue;
+      }
+      
+      const auto filename = line.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+      if (!filename.empty()) {
+        foundFileLine = true;
+        auto audioPath = cueDir / std::filesystem::path{filename};
+        result.references.push_back(std::move(audioPath));
+      }
     }
     
-    const auto firstQuote = line.find('"', filePos);
-    if (firstQuote == std::string::npos) {
-      continue;
+    if (cueFile.bad()) {
+      result.error = makeError(ScannerErrorCode::MetadataReadFailed, cuePath,
+                               "CUE sheet parsing encountered I/O error",
+                               "stream read failed");
+    } else if (!foundFileLine) {
+      result.error = makeError(ScannerErrorCode::MetadataReadFailed, cuePath,
+                               "CUE sheet contains no valid FILE lines",
+                               "malformed or empty CUE file");
     }
-    
-    const auto secondQuote = line.find('"', firstQuote + 1);
-    if (secondQuote == std::string::npos) {
-      continue;
-    }
-    
-    const auto filename = line.substr(firstQuote + 1, secondQuote - firstQuote - 1);
-    if (!filename.empty()) {
-      auto audioPath = cueDir / std::filesystem::path{filename};
-      references.push_back(std::move(audioPath));
-    }
+  } catch (const std::exception& ex) {
+    result.error = makeError(ScannerErrorCode::MetadataReadFailed, cuePath,
+                             "CUE sheet parsing failed with exception",
+                             ex.what());
+    result.references.clear();
   }
   
-  return references;
+  return result;
 }
 
 }
@@ -304,9 +333,15 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
 
   // Pass 1b: Parse CUE files and collect referenced audio files
   std::unordered_set<std::filesystem::path> referencedAudioFiles;
+  std::unordered_map<std::filesystem::path, PathClassificationError> cueParseErrors;
   for (const auto& cuePath : cueSheetPaths) {
-    const auto audioRefs = extractAudioReferencesFromCue(cuePath);
-    for (const auto& audioPath : audioRefs) {
+    const auto parseResult = extractAudioReferencesFromCue(cuePath);
+    if (parseResult.error.has_value()) {
+      const auto canonicalCuePath = weaklyCanonicalParentJoinedPath(cuePath);
+      cueParseErrors[canonicalCuePath] = *parseResult.error;
+      spdlog::warn("CUE sheet parse failed for {}: {}", cuePath.generic_string(), parseResult.error->message);
+    }
+    for (const auto& audioPath : parseResult.references) {
       const auto canonicalRefPath = weaklyCanonicalParentJoinedPath(audioPath);
       referencedAudioFiles.insert(canonicalRefPath);
     }
@@ -318,10 +353,13 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
     if (classified.kind == PathEntryKind::Directory) {
       continue;
     }
-    // Skip audio files that are referenced by any CUE sheet
+    if (classified.kind == PathEntryKind::CueSheet) {
+      if (const auto errorIt = cueParseErrors.find(classified.path); errorIt != cueParseErrors.end()) {
+        classified.errors.push_back(errorIt->second);
+      }
+    }
     if (classified.kind == PathEntryKind::AudioCandidate) {
-      const auto canonicalPath = weaklyCanonicalParentJoinedPath(path);
-      if (referencedAudioFiles.contains(canonicalPath)) {
+      if (referencedAudioFiles.contains(classified.path)) {
         continue;
       }
     }
