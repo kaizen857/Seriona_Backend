@@ -90,5 +90,7 @@ public:
                                                                  const std::filesystem::path& coverExportDir,
                                                                  std::string_view contentHashSeed,
                                                                  std::vector<TagReaderFailure>& failures);
+[[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const std::filesystem::path& cuePath,
+                                                       const std::filesystem::path& coverExportDir);
 
 }

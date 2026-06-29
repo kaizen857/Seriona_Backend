@@ -125,6 +125,17 @@ add_executable(seriona_scanner_test_harness_tests
 add_executable(seriona_scanner_contract_tests
   scanner/scanner_contract_tests.cpp
 )
+add_executable(seriona_scanner_internal_types_tests
+  scanner/scanner_internal_types_tests.cpp
+)
+add_executable(seriona_scanner_cue_adapter_tests
+  scanner/scanner_cue_adapter_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_two_pass_discovery_tests
+  scanner/scanner_two_pass_discovery_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 add_executable(seriona_metadata_contract_tests
   metadata/metadata_contract_tests.cpp
 )
@@ -347,6 +358,9 @@ target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONF
 target_compile_definitions(seriona_audio_shutdown_lifecycle_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_internal_types_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cue_adapter_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_two_pass_discovery_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -463,6 +477,19 @@ target_include_directories(seriona_scanner_test_harness_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_contract_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_internal_types_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_cue_adapter_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_two_pass_discovery_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -704,6 +731,15 @@ target_link_libraries(seriona_scanner_test_harness_tests PRIVATE
 target_link_libraries(seriona_scanner_contract_tests PRIVATE
   seriona_scanner
 )
+target_link_libraries(seriona_scanner_internal_types_tests PRIVATE
+  seriona_third_party_headers
+)
+target_link_libraries(seriona_scanner_cue_adapter_tests PRIVATE
+  seriona_scanner
+)
+target_link_libraries(seriona_scanner_two_pass_discovery_tests PRIVATE
+  seriona_scanner
+)
 target_link_libraries(seriona_metadata_contract_tests PRIVATE
   seriona_metadata
 )
@@ -753,6 +789,9 @@ seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
 seriona_enable_warnings(seriona_scanner_contract_tests)
+seriona_enable_warnings(seriona_scanner_internal_types_tests)
+seriona_enable_warnings(seriona_scanner_cue_adapter_tests)
+seriona_enable_warnings(seriona_scanner_two_pass_discovery_tests)
 seriona_enable_warnings(seriona_metadata_contract_tests)
 seriona_enable_warnings(seriona_metadata_mapper_tests)
 seriona_enable_warnings(seriona_metadata_service_tests)
@@ -932,6 +971,7 @@ add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_test
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
+add_test(NAME seriona.scanner_internal_types COMMAND seriona_scanner_internal_types_tests --test-case="scanner internal node type and cue info expose stable fields")
 add_test(NAME seriona.metadata_contract COMMAND seriona_metadata_contract_tests)
 add_test(NAME seriona.metadata_mapper COMMAND seriona_metadata_mapper_tests)
 add_test(NAME seriona.metadata_service COMMAND seriona_metadata_service_tests)
@@ -976,5 +1016,23 @@ add_test(NAME seriona.scanner.env_serial COMMAND seriona_scanner_service_tests -
 add_test(NAME seriona.scanner.env_malformed COMMAND seriona_scanner_service_tests --test-case=*malformed*env*)
 add_test(NAME seriona.scanner.config_scan_mode COMMAND seriona_scanner_service_tests --test-case=*force*full*)
 add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
+add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_tests)
+add_test(NAME seriona.scanner.two_pass_discovery COMMAND seriona_scanner_two_pass_discovery_tests)
+
+add_executable(seriona_scanner_cue_parsing_tests
+  scanner/scanner_cue_parsing_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+target_compile_definitions(seriona_scanner_cue_parsing_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_include_directories(seriona_scanner_cue_parsing_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_link_libraries(seriona_scanner_cue_parsing_tests PRIVATE
+  seriona_scanner
+)
+seriona_enable_warnings(seriona_scanner_cue_parsing_tests)
+add_test(NAME seriona.scanner.cue_parsing COMMAND seriona_scanner_cue_parsing_tests)
+
 add_test(NAME seriona.logging COMMAND seriona_logging_tests)
 add_test(NAME seriona.runtime_paths COMMAND seriona_runtime_paths_tests)

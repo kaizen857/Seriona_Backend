@@ -174,4 +174,19 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
   return successes;
 }
 
+std::vector<RawTagMetadata> readCueSheet(const std::filesystem::path& cuePath,
+                                         const std::filesystem::path& coverExportDir) {
+  std::vector<RawTagMetadata> results;
+  try {
+    const auto tags = TagReader::ReadCueSheet(cuePath, coverExportDir);
+    results.reserve(tags.size());
+    for (const auto& tag : tags) {
+      results.push_back(rawFromMusicTag(tag));
+    }
+  } catch (const std::exception& error) {
+    spdlog::warn("CUE sheet parse failed for {}: {}", cuePath.generic_string(), error.what());
+  }
+  return results;
+}
+
 }
