@@ -144,6 +144,22 @@ add_executable(seriona_scanner_two_pass_integration_tests
   scanner/scanner_two_pass_integration_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_preallocate_tests
+  scanner/scanner_preallocate_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_cue_nodes_tests
+  scanner/scanner_cue_nodes_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_playlist_cue_tests
+  scanner/scanner_playlist_cue_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_complete_e2e_tests
+  scanner/scanner_complete_e2e_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 add_executable(seriona_metadata_contract_tests
   metadata/metadata_contract_tests.cpp
 )
@@ -251,6 +267,13 @@ add_executable(seriona_scanner_incremental_e2e_tests
 )
 add_executable(seriona_scanner_perf_test
   scanner/scanner_perf_test.cpp
+  scanner/scanner_perf_logging.cpp
+  scanner/scanner_perf_report.cpp
+  scanner/scanner_perf_support.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_detailed_perf_test
+  scanner/scanner_detailed_perf_test.cpp
   scanner/scanner_perf_logging.cpp
   scanner/scanner_perf_report.cpp
   scanner/scanner_perf_support.cpp
@@ -371,6 +394,10 @@ target_compile_definitions(seriona_scanner_cue_adapter_tests PRIVATE DOCTEST_CON
 target_compile_definitions(seriona_scanner_two_pass_discovery_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cue_error_isolation_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_two_pass_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_preallocate_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cue_nodes_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_playlist_cue_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_complete_e2e_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -511,6 +538,26 @@ target_include_directories(seriona_scanner_two_pass_integration_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_preallocate_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_cue_nodes_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_playlist_cue_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_complete_e2e_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_metadata_contract_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -606,6 +653,10 @@ target_include_directories(seriona_scanner_incremental_e2e_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_perf_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+)
+target_include_directories(seriona_scanner_detailed_perf_test PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src/scanner
 )
@@ -764,6 +815,20 @@ target_link_libraries(seriona_scanner_cue_error_isolation_tests PRIVATE
 target_link_libraries(seriona_scanner_two_pass_integration_tests PRIVATE
   seriona_scanner
 )
+target_link_libraries(seriona_scanner_preallocate_tests PRIVATE
+  seriona_scanner
+)
+target_link_libraries(seriona_scanner_cue_nodes_tests PRIVATE
+  seriona_scanner
+)
+target_link_libraries(seriona_scanner_playlist_cue_tests PRIVATE
+  seriona_scanner
+)
+target_link_libraries(seriona_scanner_complete_e2e_tests PRIVATE
+  seriona_scanner
+  SQLite3::SQLite3
+  PkgConfig::SERIONA_XXHASH
+)
 target_link_libraries(seriona_metadata_contract_tests PRIVATE
   seriona_metadata
 )
@@ -818,6 +883,10 @@ seriona_enable_warnings(seriona_scanner_cue_adapter_tests)
 seriona_enable_warnings(seriona_scanner_two_pass_discovery_tests)
 seriona_enable_warnings(seriona_scanner_cue_error_isolation_tests)
 seriona_enable_warnings(seriona_scanner_two_pass_integration_tests)
+seriona_enable_warnings(seriona_scanner_preallocate_tests)
+seriona_enable_warnings(seriona_scanner_cue_nodes_tests)
+seriona_enable_warnings(seriona_scanner_playlist_cue_tests)
+seriona_enable_warnings(seriona_scanner_complete_e2e_tests)
 seriona_enable_warnings(seriona_metadata_contract_tests)
 seriona_enable_warnings(seriona_metadata_mapper_tests)
 seriona_enable_warnings(seriona_metadata_service_tests)
@@ -837,6 +906,7 @@ seriona_enable_warnings(seriona_scanner_scan_mode_decision_tests)
 seriona_enable_warnings(seriona_scanner_incremental_plan_tests)
 seriona_enable_warnings(seriona_scanner_incremental_e2e_tests)
 seriona_enable_warnings(seriona_scanner_perf_test)
+seriona_enable_warnings(seriona_scanner_detailed_perf_test)
 seriona_enable_warnings(seriona_scanner_cache_tests)
 seriona_enable_warnings(seriona_scanner_cache_v3_basic_tests)
 seriona_enable_warnings(seriona_scanner_cache_v3_content_tests)
@@ -954,6 +1024,12 @@ target_link_libraries(seriona_scanner_perf_test PRIVATE
   PkgConfig::SERIONA_XXHASH
   spdlog::spdlog
 )
+target_link_libraries(seriona_scanner_detailed_perf_test PRIVATE
+  seriona_scanner
+  SQLite3::SQLite3
+  PkgConfig::SERIONA_XXHASH
+  spdlog::spdlog
+)
 target_link_libraries(seriona_scanner_service_tests PRIVATE
   seriona_scanner
   SQLite3::SQLite3
@@ -1046,6 +1122,10 @@ add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_te
 add_test(NAME seriona.scanner.two_pass_discovery COMMAND seriona_scanner_two_pass_discovery_tests)
 add_test(NAME seriona.scanner.cue_error_isolation COMMAND seriona_scanner_cue_error_isolation_tests)
 add_test(NAME seriona.scanner.two_pass_integration COMMAND seriona_scanner_two_pass_integration_tests)
+add_test(NAME seriona.scanner.preallocate COMMAND seriona_scanner_preallocate_tests)
+add_test(NAME seriona.scanner.cue_nodes COMMAND seriona_scanner_cue_nodes_tests)
+add_test(NAME seriona.scanner.playlist_cue COMMAND seriona_scanner_playlist_cue_tests)
+add_test(NAME seriona.scanner.e2e COMMAND seriona_scanner_complete_e2e_tests)
 
 add_executable(seriona_scanner_cue_parsing_tests
   scanner/scanner_cue_parsing_tests.cpp

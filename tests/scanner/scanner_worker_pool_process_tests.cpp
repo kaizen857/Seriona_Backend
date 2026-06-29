@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -132,11 +133,15 @@ TEST_CASE("scanner worker pool processTask records tag reader exceptions as work
 TEST_CASE("scanner worker pool WorkerTask nodeIndex is accessible in callback") {
   std::vector<std::size_t> observedIndices;
   std::vector<std::filesystem::path> observedPaths;
+  std::mutex observationMutex;
   ScannerWorkerPool pool{ScannerWorkerPool::Config{.workerCount = 2,
                                                    .tagReaderSlots = 2,
-                                                   .tagReader = [&observedIndices, &observedPaths](const WorkerTask& task) {
-                                                     observedIndices.push_back(task.nodeIndex);
-                                                     observedPaths.push_back(task.filePath);
+                                                   .tagReader = [&observedIndices, &observedPaths, &observationMutex](const WorkerTask& task) {
+                                                     {
+                                                       std::lock_guard<std::mutex> lock{observationMutex};
+                                                       observedIndices.push_back(task.nodeIndex);
+                                                       observedPaths.push_back(task.filePath);
+                                                     }
                                                      return metadataFixture(task.filePath);
                                                    }}};
 

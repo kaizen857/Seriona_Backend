@@ -1,0 +1,154 @@
+========================================
+Detailed Scanner Performance Report
+========================================
+
+Library Size: 1000 songs
+----------------------------------------
+
+Scan Type: cold_full
+  Files discovered: 1000
+  Files scanned   : 1000
+  Files skipped   : 0
+  Errors          : 0
+  Snapshot songs  : 1000
+
+  Timing Breakdown:
+    Total wall time       : 318 ms
+    Phase 1 (processing)  : 305 ms (95%)
+    Phase 2 (aggregation) : 8 ms (2%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 417 ms
+
+  Per-file averages:
+    Avg hash time      : 0.00 ms/file
+    Avg TagReader time : 0.42 ms/file
+
+Scan Type: hot_full
+  Files discovered: 1000
+  Files scanned   : 0
+  Files skipped   : 1000
+  Errors          : 0
+  Snapshot songs  : 1000
+
+  Timing Breakdown:
+    Total wall time       : 234 ms
+    Phase 1 (processing)  : 223 ms (95%)
+    Phase 2 (aggregation) : 5 ms (2%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+Scan Type: incremental
+  Files discovered: 1000
+  Files scanned   : 0
+  Files skipped   : 1000
+  Errors          : 0
+  Snapshot songs  : 1000
+
+  Timing Breakdown:
+    Total wall time       : 236 ms
+    Phase 1 (processing)  : 229 ms (97%)
+    Phase 2 (aggregation) : 5 ms (2%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+
+Library Size: 5000 songs
+----------------------------------------
+
+Scan Type: cold_full
+  Files discovered: 5000
+  Files scanned   : 5000
+  Files skipped   : 0
+  Errors          : 0
+  Snapshot songs  : 5000
+
+  Timing Breakdown:
+    Total wall time       : 1874 ms
+    Phase 1 (processing)  : 1801 ms (96%)
+    Phase 2 (aggregation) : 57 ms (3%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 7888 ms
+
+  Per-file averages:
+    Avg hash time      : 0.00 ms/file
+    Avg TagReader time : 1.58 ms/file
+
+Scan Type: hot_full
+  Files discovered: 5000
+  Files scanned   : 0
+  Files skipped   : 5000
+  Errors          : 0
+  Snapshot songs  : 5000
+
+  Timing Breakdown:
+    Total wall time       : 1150 ms
+    Phase 1 (processing)  : 1092 ms (94%)
+    Phase 2 (aggregation) : 36 ms (3%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+Scan Type: incremental
+  Files discovered: 5000
+  Files scanned   : 0
+  Files skipped   : 5000
+  Errors          : 0
+  Snapshot songs  : 5000
+
+  Timing Breakdown:
+    Total wall time       : 1196 ms
+    Phase 1 (processing)  : 1153 ms (96%)
+    Phase 2 (aggregation) : 36 ms (3%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+
+Library Size: 10000 songs
+----------------------------------------
+
+Scan Type: cold_full
+  Files discovered: 10000
+  Files scanned   : 10000
+  Files skipped   : 0
+  Errors          : 0
+  Snapshot songs  : 10000
+
+  Timing Breakdown:
+    Total wall time       : 4673 ms
+    Phase 1 (processing)  : 4539 ms (97%)
+    Phase 2 (aggregation) : 101 ms (2%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 29577 ms
+
+  Per-file averages:
+    Avg hash time      : 0.00 ms/file
+    Avg TagReader time : 2.96 ms/file
+
+Scan Type: hot_full
+  Files discovered: 10000
+  Files scanned   : 0
+  Files skipped   : 10000
+  Errors          : 0
+  Snapshot songs  : 10000
+
+  Timing Breakdown:
+    Total wall time       : 2338 ms
+    Phase 1 (processing)  : 2230 ms (95%)
+    Phase 2 (aggregation) : 70 ms (2%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+Scan Type: incremental
+  Files discovered: 10000
+  Files scanned   : 0
+  Files skipped   : 10000
+  Errors          : 0
+  Snapshot songs  : 10000
+
+  Timing Breakdown:
+    Total wall time       : 2436 ms
+    Phase 1 (processing)  : 2348 ms (96%)
+    Phase 2 (aggregation) : 74 ms (3%)
+    Worker hash time      : 0 ms
+    Worker TagReader time : 0 ms
+
+

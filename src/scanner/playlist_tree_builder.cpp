@@ -42,11 +42,33 @@ namespace {
   return metadata.duration.value_or(std::chrono::milliseconds{0});
 }
 
+[[nodiscard]] bool isCueContainer(const PlaylistTreeSong& song) {
+  return song.relativePath.extension() == ".cue" && song.metadata.filePath == song.relativePath &&
+         song.metadata.sourceFilePath.empty() && !song.metadata.offset.has_value();
+}
+
+[[nodiscard]] bool isCueTrack(const PlaylistTreeSong& song) {
+  return song.relativePath.extension() == ".cue" && !song.metadata.sourceFilePath.empty() &&
+         song.metadata.offset.has_value();
+}
+
+[[nodiscard]] std::string songKeyFor(const PlaylistTreeSong& song) {
+  if (isCueTrack(song)) {
+    if (!song.metadata.logicalTrackId.empty()) {
+      return song.metadata.logicalTrackId;
+    }
+    return pathKey(song.relativePath) + "#" + pathKey(song.metadata.sourceFilePath) + "@" +
+           std::to_string(song.metadata.offset->count());
+  }
+  return pathKey(song.relativePath);
+}
+
 struct MutableNode {
   PlaylistNode node{};
   std::filesystem::path relativePath{"."};
   PlaylistTreeStats stats{};
   bool explicitDirectory{false};
+  bool virtualDirectory{false};
 };
 
 }
@@ -77,9 +99,10 @@ struct PlaylistTreeBuilder::Impl {
   }
 
   void addSongNode(PlaylistTreeSong song) {
-    const auto songKey = pathKey(song.relativePath);
+    const auto songKey = songKeyFor(song);
     songKeys.insert(songKey);
-    auto& parent = ensureDirectory(parentPathOf(song.relativePath), "Library");
+    auto& parent = isCueTrack(song) ? ensureDirectory(song.relativePath, displayNameFor(song.relativePath, songKey))
+                                    : ensureDirectory(parentPathOf(song.relativePath), "Library");
     auto& entry = nodes[songKey];
     entry.relativePath = song.relativePath.lexically_normal();
     entry.node.nodeId = nodeIdFor("track", songKey);
@@ -93,6 +116,12 @@ struct PlaylistTreeBuilder::Impl {
     if (entry.node.song->filePath.empty()) {
       entry.node.song->filePath = song.relativePath;
     }
+  }
+
+  void addVirtualDirectoryNode(PlaylistTreeSong song) {
+    auto& entry = ensureDirectory(song.relativePath, displayNameFor(song.relativePath, pathKey(song.relativePath)));
+    entry.explicitDirectory = true;
+    entry.virtualDirectory = true;
   }
 
   [[nodiscard]] PlaylistTreeStats recomputeStats(const std::string& key) {
@@ -152,7 +181,7 @@ struct PlaylistTreeBuilder::Impl {
       removed = false;
       for (auto iterator = nodes.begin(); iterator != nodes.end();) {
         const auto removable = iterator->first != "." && iterator->second.node.kind == PlaylistNodeKind::Directory &&
-                               iterator->second.node.childNodeIds.empty();
+                               iterator->second.node.childNodeIds.empty() && !iterator->second.virtualDirectory;
         if (removable) {
           iterator = nodes.erase(iterator);
           removed = true;
@@ -181,6 +210,10 @@ void PlaylistTreeBuilder::addDirectory(PlaylistTreeDirectory directory) {
 }
 
 void PlaylistTreeBuilder::addSong(PlaylistTreeSong song) {
+  if (isCueContainer(song)) {
+    impl_->addVirtualDirectoryNode(std::move(song));
+    return;
+  }
   impl_->addSongNode(std::move(song));
 }
 

@@ -1,5 +1,6 @@
 #include "file_scanner_service_internal.h"
 #include "scanner_internal_types.h"
+#include "file_scanner_orchestrator_test_access.h"
 
 #include "spdlog/spdlog.h"
 
@@ -11,6 +12,7 @@
 #include "seriona/scanner/path_utils.h"
 #include "seriona/scanner/playlist_tree_builder.h"
 #include "seriona/scanner/song_identity.h"
+#include "seriona/scanner/tag_reader_metadata_adapter.h"
 #include "seriona/scanner/worker_pool.h"
 
 #include "wtr/watcher.hpp"
@@ -43,6 +45,33 @@
 
 namespace seriona::scanner {
 namespace {
+
+static PreallocationObserver g_preallocationObserver = nullptr;
+static TestCueSheetProvider g_testCueSheetProvider = nullptr;
+
+[[nodiscard]] std::vector<RawTagMetadata> readCueSheetWithTestSeam(const std::filesystem::path& cuePath,
+                                                                   const std::filesystem::path& coverExportDir) {
+  if (g_testCueSheetProvider) {
+    const auto testTracks = g_testCueSheetProvider(cuePath);
+    if (!testTracks.empty()) {
+      std::vector<RawTagMetadata> results;
+      results.reserve(testTracks.size());
+      for (const auto& track : testTracks) {
+        RawTagMetadata raw{};
+        raw.filePath = track.audioFilePath;
+        raw.offset = std::chrono::microseconds{track.offset};
+        raw.duration = std::chrono::microseconds{track.duration};
+        raw.title = track.title;
+        raw.artist = track.artist;
+        raw.album = track.album;
+        raw.trackNumber = track.trackNumber;
+        results.push_back(raw);
+      }
+      return results;
+    }
+  }
+  return readCueSheet(cuePath, coverExportDir);
+}
 
 [[nodiscard]] std::filesystem::path defaultDatabasePath() {
   return std::filesystem::temp_directory_path() / "seriona" / "scanner-cache.sqlite";
@@ -312,7 +341,7 @@ using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_w
 [[nodiscard]] IncrementalScanPlan planIncrementalScan(const std::filesystem::path& rootPath,
                                                       const std::vector<ClassifiedPath>& fileSystemEntries,
                                                       const std::vector<cache::CachedLocation>& cachedLocations,
-                                                      bool treeHashMatches) {
+                                                      bool treeHashMatches = false) {
   const auto cachedLocationsByPath = buildCachedLocationPathIndex(rootPath, cachedLocations);
   std::unordered_set<std::string> observedFilePaths;
   observedFilePaths.reserve(fileSystemEntries.size());
@@ -668,7 +697,11 @@ public:
 
     const auto phaseAggregationStart = std::chrono::steady_clock::now();
     PlaylistTreeBuilder builder{"Library"};
+    const auto cueSourcePaths = cueReferencedAudioPaths(allSongs);
     for (const auto& publishedSong : allSongs) {
+      if (hiddenByCueSourceVisibility(publishedSong, cueSourcePaths)) {
+        continue;
+      }
       builder.addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
     }
     auto published = builder.publish();
@@ -825,6 +858,26 @@ private:
     }
   };
 
+  [[nodiscard]] std::unordered_set<std::string> cueReferencedAudioPaths(const std::vector<RootResult::PublishedSong>& songs) const {
+    std::unordered_set<std::string> referencedPaths;
+    for (const auto& publishedSong : songs) {
+      const auto& metadata = publishedSong.song.metadata;
+      if (!metadata.sourceFilePath.empty() && !metadata.filePath.empty() && pathKey(metadata.sourceFilePath) != pathKey(metadata.filePath)) {
+        referencedPaths.insert(pathKey(metadata.sourceFilePath));
+      }
+    }
+    return referencedPaths;
+  }
+
+  [[nodiscard]] bool hiddenByCueSourceVisibility(const RootResult::PublishedSong& song,
+                                                 const std::unordered_set<std::string>& cueSourcePaths) const {
+    const auto& metadata = song.song.metadata;
+    if (metadata.filePath.empty() || !cueSourcePaths.contains(pathKey(metadata.filePath))) {
+      return false;
+    }
+    return metadata.sourceFilePath.empty() || pathKey(metadata.sourceFilePath) == pathKey(metadata.filePath);
+  }
+
   void publishCancelled(const ScannerEventSink& sink, std::uint64_t scanVersion) {
     ScannerError error{};
     error.code = ScannerErrorCode::Cancelled;
@@ -890,8 +943,14 @@ private:
         if (cachedSong.has_value()) {
           ++skipped;
           indexedSongs.push_back(IndexedPublishedSong{discoveryIndex++, std::move(*cachedSong), relativePathFor(rootPath, entry.path)});
+          indexedSongs.back().filled.store(true);
         }
       }
+      
+      if (g_preallocationObserver) {
+        g_preallocationObserver(indexedSongs);
+      }
+      
       for (auto& indexedSong : indexedSongs) {
         result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
       }
@@ -916,10 +975,33 @@ private:
     const auto incrementalPlan = decision.mode == ScanMode::Incremental
                                      ? std::optional<IncrementalExecutionPlan>{incrementalExecutionPlan(rootPath, entries, databasePath_, cachedLocations, treeHashMatches)}
                                      : std::nullopt;
-    std::vector<IndexedPublishedSong> indexedSongs;
+    
+    std::size_t nodeCount = 0;
+    std::unordered_set<std::string> failedCuePaths;
+    for (const auto& entry : entries) {
+      if (entry.kind == PathEntryKind::AudioCandidate || entry.kind == PathEntryKind::SingleFileRoot) {
+        ++nodeCount;
+      } else if (entry.kind == PathEntryKind::CueSheet) {
+        try {
+          const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+          nodeCount += 1 + tracks.size();
+        } catch (const std::exception& error) {
+          result.errors.push_back(ScannerError{
+            .code = ScannerErrorCode::MetadataReadFailed,
+            .message = "Failed to read CUE sheet metadata",
+            .detail = error.what(),
+            .path = entry.path
+          });
+          spdlog::warn("CUE sheet metadata read failed for {}: {}", entry.path.generic_string(), error.what());
+          failedCuePaths.insert(pathKey(entry.path));
+          ++nodeCount;
+        }
+      }
+    }
+    
+    std::vector<IndexedPublishedSong> indexedSongs(nodeCount);
     std::vector<AudioReconcileTask> audioTasks;
     std::vector<WorkerTask> workerTasks;
-    indexedSongs.reserve(entries.size());
     audioTasks.reserve(entries.size());
     workerTasks.reserve(entries.size());
 
@@ -928,6 +1010,62 @@ private:
       for (const auto& error : entry.errors) {
         result.errors.push_back(scannerErrorFrom(error));
       }
+      
+      if (entry.kind == PathEntryKind::CueSheet) {
+        if (failedCuePaths.contains(pathKey(entry.path))) {
+          const auto cueContainerIndex = discoveryIndex++;
+          ++discovered;
+          indexedSongs[cueContainerIndex].discoveryIndex = cueContainerIndex;
+          indexedSongs[cueContainerIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
+          indexedSongs[cueContainerIndex].nodeType = NodeType::CueContainer;
+          indexedSongs[cueContainerIndex].isVirtualFolder = true;
+          continue;
+        }
+        
+        const auto cueContainerIndex = discoveryIndex++;
+        ++discovered;
+        
+        indexedSongs[cueContainerIndex].discoveryIndex = cueContainerIndex;
+        indexedSongs[cueContainerIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
+        indexedSongs[cueContainerIndex].nodeType = NodeType::CueContainer;
+        indexedSongs[cueContainerIndex].isVirtualFolder = true;
+        
+        const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+        for (std::size_t trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
+            const auto trackNodeIndex = discoveryIndex++;
+            ++discovered;
+            
+            indexedSongs[trackNodeIndex].discoveryIndex = trackNodeIndex;
+            indexedSongs[trackNodeIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
+            indexedSongs[trackNodeIndex].nodeType = NodeType::CueTrack;
+            indexedSongs[trackNodeIndex].cueInfo = CueInfo{
+              .cueFilePath = entry.path,
+              .audioFilePath = tracks[trackIdx].filePath,
+              .offset = std::chrono::microseconds(tracks[trackIdx].offset),
+              .duration = std::chrono::microseconds(tracks[trackIdx].duration),
+              .trackIndex = trackIdx
+            };
+            
+            const auto& trackRaw = tracks[trackIdx];
+            const auto contentHash = std::string{"cue:"} + entry.path.generic_string() + "#" + std::to_string(trackIdx);
+            auto mapped = mapRawTagMetadata(trackRaw, contentHash, std::nullopt, false);
+            
+            mapped.metadata.sourceFilePath = trackRaw.filePath;
+            mapped.metadata.filePath = entry.path;
+            mapped.metadata.offset = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::microseconds(trackRaw.offset));
+            mapped.metadata.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::microseconds(trackRaw.duration));
+            mapped.metadata.logicalTrackId = entry.path.generic_string() + "#track" + std::to_string(trackIdx);
+            mapped.metadata.trackId = mapped.metadata.logicalTrackId;
+            
+            auto cachedSong = cachedSongFrom(std::move(mapped));
+            indexedSongs[trackNodeIndex].song = std::move(cachedSong);
+            indexedSongs[trackNodeIndex].filled.store(true);
+          }
+        continue;
+      }
+      
       if (entry.kind != PathEntryKind::AudioCandidate && entry.kind != PathEntryKind::SingleFileRoot) {
         continue;
       }
@@ -938,9 +1076,10 @@ private:
         auto cachedSong = cachedSongByPath(cachedSongsByPath, entry.path);
         if (cachedSong.has_value()) {
           ++skipped;
-          indexedSongs.push_back(IndexedPublishedSong{currentDiscoveryIndex, std::move(*cachedSong), relativePathFor(rootPath, entry.path)});
+          indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, std::move(*cachedSong), relativePathFor(rootPath, entry.path)};
+          indexedSongs[currentDiscoveryIndex].filled.store(true);
+          continue;
         }
-        continue;
       }
       if (incrementalPlan.has_value() && !incrementalPlan->workerPaths.contains(entryKey)) {
         continue;
@@ -951,9 +1090,12 @@ private:
       }
       audioTask->discoveryIndex = currentDiscoveryIndex;
       audioTasks.push_back(*audioTask);
+      
       auto cachedLocation = std::optional<cache::CachedLocation>{};
       if (audioTask->cachedSong.has_value() && isAudioCacheHit(*audioTask->cachedSong, audioTask->contentHash)) {
         cachedLocation = cachedLocationFromSong(*audioTask->cachedSong, rootPath, entry.path);
+        indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, *audioTask->cachedSong, relativePathFor(rootPath, entry.path)};
+        indexedSongs[currentDiscoveryIndex].filled.store(true);
       }
       workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::move(cachedLocation), .nodeIndex = currentDiscoveryIndex});
     }
@@ -961,23 +1103,39 @@ private:
     auto workerSongs = std::make_shared<WorkerSongStore>();
     ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
                                                            .tagReaderSlots = config.tagReaderSlots,
-                                                           .tagReader = [this, workerSongs, &audioTasks, &indexedSongs](const WorkerTask& task) {
-                                                             (void)indexedSongs;
-                                                             return readWorkerSong(task, audioTasks, workerSongs);
+                                                           .tagReader = [this, workerSongs, &audioTasks, &indexedSongs, &rootPath](const WorkerTask& task) {
+                                                             auto metadata = readWorkerSong(task, audioTasks, workerSongs);
+                                                             if (task.nodeIndex < indexedSongs.size()) {
+                                                               auto song = workerSongs->take(task.filePath);
+                                                               if (song.has_value()) {
+                                                                 indexedSongs[task.nodeIndex].discoveryIndex = task.nodeIndex;
+                                                                 indexedSongs[task.nodeIndex].song = std::move(*song);
+                                                                 indexedSongs[task.nodeIndex].treeRelativePath = relativePathFor(rootPath, task.filePath);
+                                                                 indexedSongs[task.nodeIndex].filled.store(true);
+                                                               }
+                                                             }
+                                                             return metadata;
                                                            }}};
     workerPool.submitBatch(std::move(workerTasks));
     auto workerResults = workerPool.waitAll();
     const auto workerStats = workerPool.statsSnapshot();
     totalTagReaderTimeMs += std::chrono::duration_cast<std::chrono::milliseconds>(workerStats.tagReaderTime).count();
+    
     for (const auto& workerError : workerPool.errorsSnapshot()) {
       result.errors.push_back(scannerErrorFromWorker(workerError));
     }
-    appendWorkerSongs(rootPath, audioTasks, workerResults, *workerSongs, indexedSongs);
-    std::stable_sort(indexedSongs.begin(), indexedSongs.end(), [](const IndexedPublishedSong& lhs, const IndexedPublishedSong& rhs) {
-      return lhs.discoveryIndex < rhs.discoveryIndex;
-    });
+    
+    if (g_preallocationObserver) {
+      g_preallocationObserver(indexedSongs);
+    }
     for (auto& indexedSong : indexedSongs) {
-      result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
+      if (indexedSong.nodeType == NodeType::CueContainer) {
+        indexedSong.song.metadata.filePath = indexedSong.treeRelativePath;
+        indexedSong.song.metadata.logicalTrackId = indexedSong.treeRelativePath.generic_string();
+        result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
+      } else if (!indexedSong.song.metadata.filePath.empty()) {
+        result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
+      }
     }
 
     for (auto& publishedSong : result.songs) {
@@ -1087,37 +1245,6 @@ private:
     auto metadata = song.metadata;
     workerSongs->put(task.filePath, std::move(song));
     return metadata;
-  }
-
-  void appendWorkerSongs(const std::filesystem::path& rootPath,
-                         const std::vector<AudioReconcileTask>& audioTasks,
-                         std::vector<WorkerResult>& workerResults,
-                         WorkerSongStore& workerSongs,
-                         std::vector<IndexedPublishedSong>& indexedSongs) {
-    std::stable_sort(workerResults.begin(), workerResults.end(), [this, &audioTasks](const WorkerResult& lhs, const WorkerResult& rhs) {
-      return discoveryIndexForWorkerResult(lhs, audioTasks) < discoveryIndexForWorkerResult(rhs, audioTasks);
-    });
-    for (const auto& workerResult : workerResults) {
-      if (workerResult.error.has_value()) {
-        continue;
-      }
-      auto song = workerSongs.take(workerResult.filePath);
-      if (!song.has_value()) {
-        song = cachedSongForWorkerResult(workerResult, audioTasks);
-      }
-      if (song.has_value()) {
-        indexedSongs.push_back(IndexedPublishedSong{discoveryIndexForWorkerResult(workerResult, audioTasks), std::move(*song), relativePathFor(rootPath, workerResult.filePath)});
-      }
-    }
-  }
-
-  [[nodiscard]] std::size_t discoveryIndexForWorkerResult(const WorkerResult& workerResult,
-                                                          const std::vector<AudioReconcileTask>& audioTasks) const {
-    const auto audioTask = audioTaskByPath(audioTasks, workerResult.filePath);
-    if (audioTask == nullptr) {
-      return std::numeric_limits<std::size_t>::max();
-    }
-    return audioTask->discoveryIndex;
   }
 
   [[nodiscard]] const AudioReconcileTask* audioTaskByPath(const std::vector<AudioReconcileTask>& audioTasks,
@@ -1289,6 +1416,22 @@ private:
 
 std::shared_ptr<FileScannerService> makeFileScannerService(FileScannerServiceDependencies dependencies) {
   return std::make_shared<OrchestratedFileScannerService>(std::move(dependencies));
+}
+
+void setPreallocationObserver(PreallocationObserver observer) {
+  g_preallocationObserver = std::move(observer);
+}
+
+void clearPreallocationObserver() {
+  g_preallocationObserver = nullptr;
+}
+
+void setTestCueSheetProvider(TestCueSheetProvider provider) {
+  g_testCueSheetProvider = std::move(provider);
+}
+
+void clearTestCueSheetProvider() {
+  g_testCueSheetProvider = nullptr;
 }
 
 }
