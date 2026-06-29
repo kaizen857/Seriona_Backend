@@ -140,6 +140,10 @@ add_executable(seriona_scanner_cue_error_isolation_tests
   scanner/scanner_cue_error_isolation_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_two_pass_integration_tests
+  scanner/scanner_two_pass_integration_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 add_executable(seriona_metadata_contract_tests
   metadata/metadata_contract_tests.cpp
 )
@@ -366,6 +370,7 @@ target_compile_definitions(seriona_scanner_internal_types_tests PRIVATE DOCTEST_
 target_compile_definitions(seriona_scanner_cue_adapter_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_two_pass_discovery_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cue_error_isolation_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_two_pass_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -499,6 +504,10 @@ target_include_directories(seriona_scanner_two_pass_discovery_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_cue_error_isolation_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_two_pass_integration_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -752,6 +761,9 @@ target_link_libraries(seriona_scanner_two_pass_discovery_tests PRIVATE
 target_link_libraries(seriona_scanner_cue_error_isolation_tests PRIVATE
   seriona_scanner
 )
+target_link_libraries(seriona_scanner_two_pass_integration_tests PRIVATE
+  seriona_scanner
+)
 target_link_libraries(seriona_metadata_contract_tests PRIVATE
   seriona_metadata
 )
@@ -805,6 +817,7 @@ seriona_enable_warnings(seriona_scanner_internal_types_tests)
 seriona_enable_warnings(seriona_scanner_cue_adapter_tests)
 seriona_enable_warnings(seriona_scanner_two_pass_discovery_tests)
 seriona_enable_warnings(seriona_scanner_cue_error_isolation_tests)
+seriona_enable_warnings(seriona_scanner_two_pass_integration_tests)
 seriona_enable_warnings(seriona_metadata_contract_tests)
 seriona_enable_warnings(seriona_metadata_mapper_tests)
 seriona_enable_warnings(seriona_metadata_service_tests)
@@ -1032,6 +1045,7 @@ add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
 add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_tests)
 add_test(NAME seriona.scanner.two_pass_discovery COMMAND seriona_scanner_two_pass_discovery_tests)
 add_test(NAME seriona.scanner.cue_error_isolation COMMAND seriona_scanner_cue_error_isolation_tests)
+add_test(NAME seriona.scanner.two_pass_integration COMMAND seriona_scanner_two_pass_integration_tests)
 
 add_executable(seriona_scanner_cue_parsing_tests
   scanner/scanner_cue_parsing_tests.cpp
