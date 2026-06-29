@@ -15,7 +15,7 @@ enum class PathEntryKind {
   Directory,
   AudioCandidate,
   LyricsSidecar,
-  IgnoredCue,
+  CueSheet,
   Unsupported,
   NonRegular,
   Symlink,

@@ -35,18 +35,21 @@ TEST_CASE("scanner path classification covers roots extensions cue lrc and stabl
   writeTextFile(root.path() / "a" / "track.mp3", "audio");
   writeTextFile(root.path() / "a" / "movie.mp4", "video");
   writeTextFile(root.path() / "a" / "album.cue", "FILE track.mp3 MP3\n");
+  writeTextFile(root.path() / "a" / "sheet.CUE", "FILE track.mp3 MP3\n");
 
   const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
 
-  REQUIRE(entries.size() == 6U);
+  REQUIRE(entries.size() == 7U);
   CHECK(entries.front().kind == PathEntryKind::DirectoryRoot);
   CHECK(entries.front().relativeUtf8 == ".");
   CHECK(requireRelativePath(entries, "a/track.mp3").kind == PathEntryKind::AudioCandidate);
   CHECK(requireRelativePath(entries, "a/movie.mp4").kind == PathEntryKind::Unsupported);
   const auto& cue = requireRelativePath(entries, "a/album.cue");
-  CHECK(cue.kind == PathEntryKind::IgnoredCue);
-  REQUIRE_FALSE(cue.errors.empty());
-  CHECK(cue.errors.front().code == ScannerErrorCode::UnsupportedFile);
+  CHECK(cue.kind == PathEntryKind::CueSheet);
+  CHECK(cue.errors.empty());
+  const auto& cueUpper = requireRelativePath(entries, "a/sheet.CUE");
+  CHECK(cueUpper.kind == PathEntryKind::CueSheet);
+  CHECK(cueUpper.errors.empty());
   const auto& flac = requireRelativePath(entries, "b/song.FLAC");
   CHECK(flac.kind == PathEntryKind::AudioCandidate);
   REQUIRE(flac.sidecarLyricsPath.has_value());
@@ -155,6 +158,74 @@ TEST_CASE("lrc parser reads files without throwing through scanner callers") {
   CHECK(result.errors.empty());
   REQUIRE(result.lines.size() == 1U);
   CHECK(result.lines.front().timestamp == std::chrono::milliseconds{500});
+}
+
+TEST_CASE("cue sheet path classification recognizes lowercase and uppercase extensions") {
+  test::TempScannerRoot root("scanner-cue-extensions");
+  writeTextFile(root.path() / "album.cue", "FILE album.flac FLAC\n");
+  writeTextFile(root.path() / "soundtrack.CUE", "FILE track.ape APE\n");
+  writeTextFile(root.path() / "mixed.Cue", "FILE audio.wav WAVE\n");
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  const auto& lowercase = requireRelativePath(entries, "album.cue");
+  CHECK(lowercase.kind == PathEntryKind::CueSheet);
+  CHECK(lowercase.errors.empty());
+
+  const auto& uppercase = requireRelativePath(entries, "soundtrack.CUE");
+  CHECK(uppercase.kind == PathEntryKind::CueSheet);
+  CHECK(uppercase.errors.empty());
+
+  const auto& mixedCase = requireRelativePath(entries, "mixed.Cue");
+  CHECK(mixedCase.kind == PathEntryKind::CueSheet);
+  CHECK(mixedCase.errors.empty());
+}
+
+TEST_CASE("cue sheet classification does not depend on file content or parsing") {
+  test::TempScannerRoot root("scanner-cue-content-independent");
+  writeTextFile(root.path() / "empty.cue", "");
+  writeTextFile(root.path() / "garbage.cue", "not valid cue sheet content\n");
+  writeTextFile(root.path() / "binary.cue", "\x00\x01\x02\xFF\xFE");
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  CHECK(requireRelativePath(entries, "empty.cue").kind == PathEntryKind::CueSheet);
+  CHECK(requireRelativePath(entries, "garbage.cue").kind == PathEntryKind::CueSheet);
+  CHECK(requireRelativePath(entries, "binary.cue").kind == PathEntryKind::CueSheet);
+
+  for (const auto& entry : entries) {
+    if (entry.kind == PathEntryKind::CueSheet) {
+      CHECK(entry.errors.empty());
+    }
+  }
+}
+
+TEST_CASE("cue sheet classification works in subdirectories and with non-ascii names") {
+  test::TempScannerRoot root("scanner-cue-paths");
+  writeTextFile(root.path() / "nested" / "deep" / "album.cue", "FILE track.flac FLAC\n");
+  writeTextFile(root.path() / "古典音乐.cue", "FILE track.ape APE\n");
+  writeTextFile(root.path() / "names with spaces.CUE", "FILE audio.wav WAVE\n");
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  CHECK(requireRelativePath(entries, "nested/deep/album.cue").kind == PathEntryKind::CueSheet);
+  CHECK(requireRelativePath(entries, "古典音乐.cue").kind == PathEntryKind::CueSheet);
+  CHECK(requireRelativePath(entries, "names with spaces.CUE").kind == PathEntryKind::CueSheet);
+}
+
+TEST_CASE("cue sheet classification distinguishes from similar extensions") {
+  test::TempScannerRoot root("scanner-cue-similar");
+  writeTextFile(root.path() / "valid.cue", "FILE album.flac FLAC\n");
+  writeTextFile(root.path() / "not-cue.txt", "some text file\n");
+  writeTextFile(root.path() / "also-not.cu", "cuda file maybe\n");
+  writeTextFile(root.path() / "prefix.cue.bak", "backup of cue\n");
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  CHECK(requireRelativePath(entries, "valid.cue").kind == PathEntryKind::CueSheet);
+  CHECK(requireRelativePath(entries, "not-cue.txt").kind == PathEntryKind::Unsupported);
+  CHECK(requireRelativePath(entries, "also-not.cu").kind == PathEntryKind::Unsupported);
+  CHECK(requireRelativePath(entries, "prefix.cue.bak").kind == PathEntryKind::Unsupported);
 }
 
 }

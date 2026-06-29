@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <iterator>
 #include <string_view>
 #include <system_error>
@@ -77,12 +78,39 @@ namespace {
   return options;
 }
 
-void appendClassifiedPath(std::vector<ClassifiedPath>& entries, const std::filesystem::path& root,
-                          const std::filesystem::path& path, const PathClassificationConfig& config) {
-  auto classified = classifyScannerPath(root, path, config);
-  if (classified.kind != PathEntryKind::Directory) {
-    entries.push_back(std::move(classified));
+[[nodiscard]] std::vector<std::filesystem::path> extractAudioReferencesFromCue(const std::filesystem::path& cuePath) {
+  std::vector<std::filesystem::path> references;
+  std::ifstream cueFile(cuePath);
+  if (!cueFile.is_open()) {
+    return references;
   }
+
+  std::string line;
+  const auto cueDir = cuePath.parent_path();
+  while (std::getline(cueFile, line)) {
+    const auto filePos = line.find("FILE ");
+    if (filePos == std::string::npos) {
+      continue;
+    }
+    
+    const auto firstQuote = line.find('"', filePos);
+    if (firstQuote == std::string::npos) {
+      continue;
+    }
+    
+    const auto secondQuote = line.find('"', firstQuote + 1);
+    if (secondQuote == std::string::npos) {
+      continue;
+    }
+    
+    const auto filename = line.substr(firstQuote + 1, secondQuote - firstQuote - 1);
+    if (!filename.empty()) {
+      auto audioPath = cueDir / std::filesystem::path{filename};
+      references.push_back(std::move(audioPath));
+    }
+  }
+  
+  return references;
 }
 
 }
@@ -209,8 +237,7 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
     return result;
   }
   if (isCueSheetPath(canonicalPath)) {
-    result.kind = PathEntryKind::IgnoredCue;
-    result.errors.push_back(makeError(ScannerErrorCode::UnsupportedFile, canonicalPath, "cue sheets are ignored by scanner policy"));
+    result.kind = PathEntryKind::CueSheet;
     return result;
   }
   if (isSupportedAudioExtension(canonicalPath, config.allowedExtensions)) {
@@ -238,7 +265,13 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
   }
 
   entries.push_back(std::move(rootClassification));
+
+  // Two-pass traversal for CUE file handling:
+  // Pass 1: Collect all paths and identify CUE files
+  std::vector<std::filesystem::path> allPaths;
+  std::vector<std::filesystem::path> cueSheetPaths;
   std::error_code error;
+
   if (root.recursive) {
     for (std::filesystem::recursive_directory_iterator iterator(rootPath, directoryOptions(config), error), end;
          iterator != end; iterator.increment(error)) {
@@ -247,7 +280,11 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
         error.clear();
         continue;
       }
-      appendClassifiedPath(entries, rootPath, iterator->path(), config);
+      const auto& path = iterator->path();
+      allPaths.push_back(path);
+      if (isCueSheetPath(path)) {
+        cueSheetPaths.push_back(path);
+      }
     }
   } else {
     for (std::filesystem::directory_iterator iterator(rootPath, directoryOptions(config), error), end; iterator != end;
@@ -257,8 +294,38 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
         error.clear();
         continue;
       }
-      appendClassifiedPath(entries, rootPath, iterator->path(), config);
+      const auto& path = iterator->path();
+      allPaths.push_back(path);
+      if (isCueSheetPath(path)) {
+        cueSheetPaths.push_back(path);
+      }
     }
+  }
+
+  // Pass 1b: Parse CUE files and collect referenced audio files
+  std::unordered_set<std::filesystem::path> referencedAudioFiles;
+  for (const auto& cuePath : cueSheetPaths) {
+    const auto audioRefs = extractAudioReferencesFromCue(cuePath);
+    for (const auto& audioPath : audioRefs) {
+      const auto canonicalRefPath = weaklyCanonicalParentJoinedPath(audioPath);
+      referencedAudioFiles.insert(canonicalRefPath);
+    }
+  }
+
+  // Pass 2: Classify and add paths, skipping referenced audio files
+  for (const auto& path : allPaths) {
+    auto classified = classifyScannerPath(rootPath, path, config);
+    if (classified.kind == PathEntryKind::Directory) {
+      continue;
+    }
+    // Skip audio files that are referenced by any CUE sheet
+    if (classified.kind == PathEntryKind::AudioCandidate) {
+      const auto canonicalPath = weaklyCanonicalParentJoinedPath(path);
+      if (referencedAudioFiles.contains(canonicalPath)) {
+        continue;
+      }
+    }
+    entries.push_back(std::move(classified));
   }
 
   std::ranges::sort(entries, {}, &ClassifiedPath::relativeUtf8);
