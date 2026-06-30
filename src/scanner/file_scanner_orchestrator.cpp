@@ -3,6 +3,7 @@
 #include "file_scanner_orchestrator_test_access.h"
 
 #include "spdlog/spdlog.h"
+#include "logging/logging.h"
 
 #include "seriona/scanner/cache/sqlite_cache_v3.h"
 #include "seriona/scanner/cache/sqlite_scanner_cache.h"
@@ -598,6 +599,18 @@ public:
     }
     spdlog::info("scanner configured: database={} artwork={}", databasePath_.generic_string(),
                  coverExportDir_.generic_string());
+    
+    const auto logDir = databasePath_.parent_path() / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(logDir, ec);
+    if (!ec) {
+      const auto tagReaderLogPath = logDir / "tagreader-errors.log";
+      tagReaderErrorLogger_ = logging::createDedicatedLogger(
+          "tagreader_errors", tagReaderLogPath, spdlog::level::warn);
+      if (tagReaderErrorLogger_) {
+        spdlog::info("TagReader error logging enabled: {}", tagReaderLogPath.generic_string());
+      }
+    }
   }
 
   ~OrchestratedFileScannerService() override {
@@ -722,6 +735,65 @@ public:
     progress.errors = allErrors.size();
 
     spdlog::info("scan complete: {} discovered, {} scanned, {} skipped, {} errors", discovered, scanned, skipped, allErrors.size());
+    
+    if (!allErrors.empty()) {
+      spdlog::warn("\n========== Scan Errors ({} total) ==========", allErrors.size());
+      
+      std::unordered_map<ScannerErrorCode, std::size_t> errorCodeCounts;
+      std::size_t tagReaderErrorCount = 0;
+      
+      for (const auto& error : allErrors) {
+        ++errorCodeCounts[error.code];
+        if (error.message.find("TagReader") != std::string::npos) {
+          ++tagReaderErrorCount;
+          if (tagReaderErrorLogger_) {
+            const auto pathStr = error.path ? error.path->generic_string() : "(no path)";
+            if (error.detail.empty()) {
+              tagReaderErrorLogger_->warn("{}: {}", error.message, pathStr);
+            } else {
+              tagReaderErrorLogger_->warn("{}: {} (detail: {})", error.message, pathStr, error.detail);
+            }
+          }
+        }
+      }
+      
+      spdlog::warn("Error breakdown by type:");
+      for (const auto& [code, count] : errorCodeCounts) {
+        const char* codeName = "Unknown";
+        switch (code) {
+          case ScannerErrorCode::RootUnavailable: codeName = "RootUnavailable"; break;
+          case ScannerErrorCode::PermissionDenied: codeName = "PermissionDenied"; break;
+          case ScannerErrorCode::UnsupportedFile: codeName = "UnsupportedFile"; break;
+          case ScannerErrorCode::MetadataReadFailed: codeName = "MetadataReadFailed"; break;
+          case ScannerErrorCode::CacheUnavailable: codeName = "CacheUnavailable"; break;
+          case ScannerErrorCode::Cancelled: codeName = "Cancelled"; break;
+        }
+        spdlog::warn("  - {}: {} errors", codeName, count);
+      }
+      
+      if (tagReaderErrorCount > 0) {
+        spdlog::warn("  - TagReader errors logged to: tagreader-errors.log ({} errors)", tagReaderErrorCount);
+      }
+      
+      constexpr std::size_t kMaxDetailedErrors = 10;
+      const auto detailedErrorCount = std::min(allErrors.size(), kMaxDetailedErrors);
+      spdlog::warn("\nFirst {} error(s) with details:", detailedErrorCount);
+      for (std::size_t i = 0; i < detailedErrorCount; ++i) {
+        const auto& error = allErrors[i];
+        const auto pathStr = error.path ? error.path->generic_string() : "(no path)";
+        if (error.detail.empty()) {
+          spdlog::warn("  [{}] {}: {}", i + 1, error.message, pathStr);
+        } else {
+          spdlog::warn("  [{}] {}: {} (detail: {})", i + 1, error.message, pathStr, error.detail);
+        }
+      }
+      
+      if (allErrors.size() > kMaxDetailedErrors) {
+        spdlog::warn("  ... and {} more errors (not shown)", allErrors.size() - kMaxDetailedErrors);
+      }
+      spdlog::warn("===============================================\n");
+    }
+    
     spdlog::info("\n========== Performance Analysis Report ==========");
     spdlog::info("Total Wall Time  : {} ms", totalScanTimeMs);
     spdlog::info("Processed Files  : {}", scanned);
@@ -903,7 +975,9 @@ private:
     std::vector<cache::CachedLocation> cachedLocations;
     bool canUseFullCachePath = false;
     bool treeHashMatches = false;
-    if (decision.mode == ScanMode::Incremental || (decision.directoryTreeHash.has_value() && cachedRoot.has_value())) {
+    // Only use cache-based fast path for Incremental mode when directory tree hash matches.
+    // Full mode should always traverse the filesystem to detect file content changes.
+    if (decision.mode == ScanMode::Incremental && decision.directoryTreeHash.has_value() && cachedRoot.has_value()) {
       try {
         cache::SQLiteCacheV3 v3cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
         const auto cachedScanRoot = v3cache.loadScanRoot(rootPath);
@@ -916,7 +990,7 @@ private:
             const auto fastPathEntries = fastPathFromCache(rootPath, cachedLocations, pathConfig);
             if (fastPathEntries.has_value()) {
               entries = std::move(*fastPathEntries);
-              canUseFullCachePath = (decision.mode == ScanMode::Full);
+              canUseFullCachePath = false;  // Never skip filesystem traversal in Full mode
               spdlog::info("reconcileRoot: using cache-based fast path for {} entries (avoiding filesystem traversal)", entries.size());
             }
           }
@@ -1410,6 +1484,7 @@ private:
   bool scanWorkerStopping_{false};
   std::thread scanWorker_{[this] { scanWorkerLoop(); }};
   std::thread debounceThread_;
+  std::shared_ptr<spdlog::logger> tagReaderErrorLogger_;
 };
 
 }

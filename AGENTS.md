@@ -23,7 +23,7 @@
 - 常用分组：`-R 'seriona.audio'`、`-R 'seriona.scanner'`、`-R 'seriona.metadata'`、`-R 'seriona.control'`。
 - 测试框架是 doctest；所有测试二进制都定义 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，不需要手动写 main。
 - 可选工具默认不构建；需要 `seriona_miniaudio_platform_probe` 时重新配置 `-DSERIONA_BUILD_TOOLS=ON`。
-- 配置期需要 CMake 3.20+、C++23、`pkg-config` 可找到 FFmpeg (`libavformat`、`libavcodec`、`libavutil`、`libavfilter`、`libswresample`)、SQLite3、`libxxhash`；Linux 还需要 `sdbus-c++`。
+- 配置期需要 CMake 3.20+、C++23、`pkg-config` 可找到 FFmpeg (`libavformat`、`libavcodec`、`libavutil`、`libavfilter`、`libswresample`)、`libxxhash`；`find_package` 需要 `spdlog` 和 `SQLite3`；Linux 还需要 `sdbus-c++`。
 - CMake 从相邻目录查找 `TagReaderCore`：先试 `../TagReader`，再试 `../../cppProject(app_and_lib)/TagReader`；两者都不存在会在配置期失败。
 
 ## 硬约束

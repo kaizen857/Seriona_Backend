@@ -245,6 +245,7 @@ add_executable(seriona_scanner_scan_mode_decision_tests
   ${PROJECT_SOURCE_DIR}/src/scanner/playlist_tree_builder.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/worker_pool.cpp
+  ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
 )
 add_executable(seriona_scanner_incremental_plan_tests
   scanner/scanner_incremental_plan_tests.cpp
@@ -260,6 +261,7 @@ add_executable(seriona_scanner_incremental_plan_tests
   ${PROJECT_SOURCE_DIR}/src/scanner/playlist_tree_builder.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/worker_pool.cpp
+  ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
 )
 add_executable(seriona_scanner_incremental_e2e_tests
   scanner/scanner_incremental_e2e_tests.cpp
@@ -361,6 +363,10 @@ add_executable(seriona_scanner_watcher_tests
   scanner/scanner_watcher_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_error_logging_tests
+  scanner/scanner_error_logging_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 add_executable(seriona_runtime_paths_tests
   app/runtime_paths_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/app/runtime_paths.cpp
@@ -432,6 +438,7 @@ target_compile_definitions(seriona_scanner_tagreader_tests PRIVATE DOCTEST_CONFI
 target_compile_definitions(seriona_scanner_tagreader_concurrency_stress_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_watcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_error_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_runtime_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
@@ -714,6 +721,11 @@ target_include_directories(seriona_scanner_watcher_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src/scanner
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_error_logging_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_runtime_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -918,6 +930,7 @@ seriona_enable_warnings(seriona_scanner_phase1_integration_tests)
 seriona_enable_warnings(seriona_scanner_tagreader_tests)
 seriona_enable_warnings(seriona_scanner_service_tests)
 seriona_enable_warnings(seriona_scanner_watcher_tests)
+seriona_enable_warnings(seriona_scanner_error_logging_tests)
 seriona_enable_warnings(seriona_runtime_paths_tests)
 
 seriona_enable_warnings(seriona_logging_tests)
@@ -1038,6 +1051,9 @@ target_link_libraries(seriona_scanner_service_tests PRIVATE
 target_link_libraries(seriona_scanner_watcher_tests PRIVATE
   seriona_scanner
 )
+target_link_libraries(seriona_scanner_error_logging_tests PRIVATE
+  seriona_scanner
+)
 target_link_libraries(seriona_runtime_paths_tests PRIVATE
   seriona_third_party_headers
 )
@@ -1118,6 +1134,7 @@ add_test(NAME seriona.scanner.env_serial COMMAND seriona_scanner_service_tests -
 add_test(NAME seriona.scanner.env_malformed COMMAND seriona_scanner_service_tests --test-case=*malformed*env*)
 add_test(NAME seriona.scanner.config_scan_mode COMMAND seriona_scanner_service_tests --test-case=*force*full*)
 add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
+add_test(NAME seriona.scanner.error_logging COMMAND seriona_scanner_error_logging_tests)
 add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_tests)
 add_test(NAME seriona.scanner.two_pass_discovery COMMAND seriona_scanner_two_pass_discovery_tests)
 add_test(NAME seriona.scanner.cue_error_isolation COMMAND seriona_scanner_cue_error_isolation_tests)

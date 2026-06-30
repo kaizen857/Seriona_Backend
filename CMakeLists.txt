@@ -146,6 +146,7 @@ add_library(seriona_scanner STATIC
   src/scanner/tag_reader_metadata_adapter.cpp
   src/scanner/scanner_module.cpp
   src/scanner/worker_pool.cpp
+  src/logging/logging.cpp
 )
 
 add_library(seriona_metadata STATIC

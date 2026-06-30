@@ -153,5 +153,33 @@ std::filesystem::path prepareLogFile(
     return logDir / std::string(buf);
 }
 
+std::shared_ptr<spdlog::logger> createDedicatedLogger(
+    const std::string& logger_name,
+    const std::filesystem::path& log_file_path,
+    spdlog::level::level_enum logger_level) {
+    
+    constexpr const char* pattern =
+        "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v";
+    
+    try {
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            log_file_path.string(), 1024 * 1024 * 5, 3);
+        file_sink->set_level(spdlog::level::trace);
+        file_sink->set_pattern(pattern);
+        
+        auto logger = std::make_shared<spdlog::logger>(
+            logger_name, file_sink);
+        logger->set_level(logger_level);
+        logger->flush_on(spdlog::level::warn);
+        
+        spdlog::register_logger(logger);
+        return logger;
+    } catch (const spdlog::spdlog_ex& e) {
+        std::cerr << "Failed to create dedicated logger '" << logger_name 
+                  << "' at " << log_file_path << ": " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
 }  // namespace logging
 }  // namespace seriona

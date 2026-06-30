@@ -99,7 +99,6 @@ public:
     }
 
     dependencies_.scanner->scan(roots, mode);
-    dependencies_.scanner->startWatching(roots);
     return MediaControllerCommandResult{.accepted = true, .code = MediaControllerErrorCode::None, .message = {}};
   }
 

@@ -17,5 +17,10 @@ std::filesystem::path prepareLogFile(
     const std::filesystem::path& logDir,
     std::uintmax_t maxTotalBytes = 50ULL * 1024ULL * 1024ULL);
 
+std::shared_ptr<spdlog::logger> createDedicatedLogger(
+    const std::string& logger_name,
+    const std::filesystem::path& log_file_path,
+    spdlog::level::level_enum logger_level = spdlog::level::trace);
+
 }  // namespace logging
 }  // namespace seriona

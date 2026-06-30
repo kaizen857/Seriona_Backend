@@ -279,8 +279,6 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
   }
 
   result.kind = PathEntryKind::Unsupported;
-  result.errors.push_back(makeError(ScannerErrorCode::UnsupportedFile, canonicalPath, "unsupported scanner file extension"));
-  spdlog::debug("unsupported file skipped: {}", canonicalPath.generic_string());
   return result;
 }
 
