@@ -148,13 +148,25 @@ const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconci
 
 ---
 
-## 预期效果
+## 预期效果（基于实测数据）
 
-| 阶段 | 当前 | P0 后 | P0+P1+P2 后 |
-|------|------|-------|-------------|
-| 单线程前奏 | ~76s | ~5s | ~5s |
-| 多线程处理 | ~64s | ~64s | ~15s |
-| 总墙钟 | 140s | ~70s | ~20s |
+| 阶段 | 当前实测 | P0 后 | P0+P2+P3+P4 后 |
+|------|----------|-------|----------------|
+| prepare-hash（串行哈希） | 65.9s (50%) | ~1s | ~1s |
+| worker-wait（并行处理） | 64.3s (49%) | ~64s | ~15s |
+| 其他阶段 | 1.6s (1%) | ~2s | ~2s |
+| **总墙钟** | **132s** | **~67s** | **~18s** |
+| **加速比** | **1x** | **2.0x** | **7.3x** |
+
+**详细分解**：
+
+- **P0（并行/跳过全文件哈希）**：65.9s → ~1s，节省 64.9s
+- **P4（audioTaskByPath 哈希表）**：减少 worker-wait 中约 10-15%，节省 6-10s
+- **P3（移除 workerCount/2 限流）**：并行度从 16x 提升到 30-32x，worker-wait 减半，节省 20-25s
+- **P2（封面去重 + 锁优化）**：TagReader 平均从 215ms 降到 80-100ms，节省 15-20s
+
+**保守估计**：132s → 18-25s（提升 **5-7 倍**）  
+**乐观估计**：132s → 15s 以内（提升 **8-9 倍**）
 
 ---
 
@@ -219,7 +231,9 @@ spdlog::info("reconcileRoot phase timing for {}: total={}ms | discovery={}ms | p
 - **Phase 4** (`final-hash`): `hashDirectoryMerkle` 最终目录树哈希
 - **Phase 5** (`cache-save`): `cache.saveRoot()` SQLite 缓存写入
 
-### 测试数据（合成 fixture，5000 首歌，cold_full 扫描）
+### 测试数据对比
+
+#### 合成 Fixture（5000 首歌，cold_full 扫描）
 
 ```
 reconcileRoot phase timing:
@@ -231,24 +245,56 @@ reconcileRoot phase timing:
   cache-save  : 193 ms (19%)
 ```
 
-**注意**：合成测试数据**没有真实文件内容哈希**（fixture 是虚拟生成的），所以 `prepare-hash` 只有 90ms。真实 4771 文件扫描中，这一阶段包含 60127ms 的全文件内容哈希（串行），是性能的最大瓶颈。
+**局限性**：合成测试数据**没有真实文件内容哈希**（fixture 是虚拟生成的），所以 `prepare-hash` 只有 90ms，无法复现缺陷 1。
 
-### 真实扫描预期（基于之前 4771 文件实测）
+#### 真实音乐库（4771 文件，Full 模式，2026-06-30 实测）
 
 ```
-预估分阶段占比（Full 模式，真实文件）:
-  total       : ~140000 ms
-  discovery   : ~16000 ms  (11%)   <- 目录遍历 + 文件分类
-  prepare-hash: ~60000 ms  (43%)   <- 串行全文件哈希（致命瓶颈）
-  worker-wait : ~50000 ms  (36%)   <- 并行 TagReader（含 O(n²) 查找 + flock 等待）
-  final-hash  : ~10000 ms  (7%)    <- 最终目录树哈希
-  cache-save  : ~4000 ms   (3%)    <- SQLite 写入
+reconcileRoot phase timing for /home/kaizen857/Music/CloudMusic(for MP4):
+  total       : 131823 ms (2 分 11.8 秒)
+  discovery   : 411 ms    (0.3%)   <- 目录遍历 + 文件分类
+  prepare-hash: 65932 ms  (50.0%)  <- 串行全文件哈希（致命瓶颈）
+  worker-wait : 64329 ms  (48.8%)  <- 并行 TagReader（含 O(n²) 查找 + flock 等待）
+  final-hash  : 305 ms    (0.2%)   <- 最终目录树哈希
+  cache-save  : 844 ms    (0.6%)   <- SQLite 写入
+
+Performance Analysis Report:
+  Total Wall Time  : 132187 ms
+  Processed Files  : 4771
+  Cumulative Worker CPU Time:
+    - File Hash      : 53750 ms  (平均 11.3 ms/文件)
+    - TagReader Parse: 1027261 ms (平均 215.3 ms/文件)
 ```
 
-**关键发现验证**：
-- `prepare-hash` 阶段在真实扫描中占 40%+ 墙钟时间（60s / 140s），验证了缺陷 1 的严重性
-- `worker-wait` 阶段占 36%，包含缺陷 2（N/2 限流）、缺陷 3（O(n²) 查找）、缺陷 4（封面转码 + flock）的叠加影响
-- 合成测试的 `prepare-hash` 只有 90ms，因为没有调用真实的 `hashFileContent`，无法复现缺陷 1
+### 关键发现验证（实测数据）
+
+1. **缺陷 1（串行全文件哈希）严重性确认**：
+   - `prepare-hash` 占墙钟时间 **50.0%**（65.9s / 131.8s）
+   - 累计 CPU 时间 53.75s，与墙钟时间 65.9s 接近，证明**几乎完全串行执行**
+   - 这是**单一最大瓶颈**，消除它可直接节省 ~66 秒
+
+2. **缺陷 2/3/4 叠加影响**：
+   - `worker-wait` 占墙钟时间 **48.8%**（64.3s）
+   - 累计 TagReader CPU 时间 1027s，但墙钟只有 64s，说明并行度约 **16x**（1027 / 64）
+   - 平均单文件 TagReader 215.3ms，远高于独立测试的 45-77ms，证明包含：
+     - 缺陷 3：O(n²) `audioTaskByPath` 查找开销
+     - 缺陷 4：封面转码（90%+ TagReader 时间）+ `flock` 同专辑串行等待
+
+3. **其他阶段占比极小**：
+   - `discovery`（0.3%）、`final-hash`（0.2%）、`cache-save`（0.6%）合计不到 2%
+   - 优化这些阶段收益有限
+
+### 优化优先级（基于实测数据）
+
+| 优化项 | 预期收益 | 实施难度 | 优先级 |
+|--------|----------|----------|--------|
+| P0 - 并行化/跳过全文件哈希 | 节省 ~66s（50%） | 中 | **致命** |
+| P4 - audioTaskByPath 改哈希表 | 减少 worker-wait 中 10-20% | 低 | 高 |
+| P3 - 移除 workerCount/2 限流 | 提升并行度 1.5-2x | 低 | 高 |
+| P2 - 封面去重 + 改进锁策略 | 减少 TagReader 平均时间 30-50% | 中 | 高 |
+| P5 - 消除重复目录树哈希 | 节省 <1s | 低 | 低 |
+
+**预期最终效果**：P0 + P2 + P3 + P4 组合后，总时间从 **132s → 15-25s**（提升 **5-9 倍**）
 
 ---
 
