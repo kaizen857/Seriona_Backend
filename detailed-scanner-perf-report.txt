@@ -13,15 +13,15 @@ Scan Type: cold_full
   Snapshot songs  : 1000
 
   Timing Breakdown:
-    Total wall time       : 318 ms
-    Phase 1 (processing)  : 305 ms (95%)
-    Phase 2 (aggregation) : 8 ms (2%)
+    Total wall time       : 265 ms
+    Phase 1 (processing)  : 253 ms (95%)
+    Phase 2 (aggregation) : 7 ms (2%)
     Worker hash time      : 0 ms
-    Worker TagReader time : 417 ms
+    Worker TagReader time : 365 ms
 
   Per-file averages:
     Avg hash time      : 0.00 ms/file
-    Avg TagReader time : 0.42 ms/file
+    Avg TagReader time : 0.36 ms/file
 
 Scan Type: hot_full
   Files discovered: 1000
@@ -31,9 +31,9 @@ Scan Type: hot_full
   Snapshot songs  : 1000
 
   Timing Breakdown:
-    Total wall time       : 234 ms
-    Phase 1 (processing)  : 223 ms (95%)
-    Phase 2 (aggregation) : 5 ms (2%)
+    Total wall time       : 261 ms
+    Phase 1 (processing)  : 253 ms (96%)
+    Phase 2 (aggregation) : 6 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
 
@@ -45,8 +45,8 @@ Scan Type: incremental
   Snapshot songs  : 1000
 
   Timing Breakdown:
-    Total wall time       : 236 ms
-    Phase 1 (processing)  : 229 ms (97%)
+    Total wall time       : 204 ms
+    Phase 1 (processing)  : 197 ms (96%)
     Phase 2 (aggregation) : 5 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
@@ -63,15 +63,15 @@ Scan Type: cold_full
   Snapshot songs  : 5000
 
   Timing Breakdown:
-    Total wall time       : 1874 ms
-    Phase 1 (processing)  : 1801 ms (96%)
-    Phase 2 (aggregation) : 57 ms (3%)
+    Total wall time       : 1651 ms
+    Phase 1 (processing)  : 1591 ms (96%)
+    Phase 2 (aggregation) : 47 ms (2%)
     Worker hash time      : 0 ms
-    Worker TagReader time : 7888 ms
+    Worker TagReader time : 7378 ms
 
   Per-file averages:
     Avg hash time      : 0.00 ms/file
-    Avg TagReader time : 1.58 ms/file
+    Avg TagReader time : 1.48 ms/file
 
 Scan Type: hot_full
   Files discovered: 5000
@@ -81,9 +81,9 @@ Scan Type: hot_full
   Snapshot songs  : 5000
 
   Timing Breakdown:
-    Total wall time       : 1150 ms
-    Phase 1 (processing)  : 1092 ms (94%)
-    Phase 2 (aggregation) : 36 ms (3%)
+    Total wall time       : 1273 ms
+    Phase 1 (processing)  : 1227 ms (96%)
+    Phase 2 (aggregation) : 32 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
 
@@ -95,9 +95,9 @@ Scan Type: incremental
   Snapshot songs  : 5000
 
   Timing Breakdown:
-    Total wall time       : 1196 ms
-    Phase 1 (processing)  : 1153 ms (96%)
-    Phase 2 (aggregation) : 36 ms (3%)
+    Total wall time       : 1039 ms
+    Phase 1 (processing)  : 1004 ms (96%)
+    Phase 2 (aggregation) : 29 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
 
@@ -113,15 +113,15 @@ Scan Type: cold_full
   Snapshot songs  : 10000
 
   Timing Breakdown:
-    Total wall time       : 4673 ms
-    Phase 1 (processing)  : 4539 ms (97%)
-    Phase 2 (aggregation) : 101 ms (2%)
+    Total wall time       : 4179 ms
+    Phase 1 (processing)  : 4075 ms (97%)
+    Phase 2 (aggregation) : 76 ms (1%)
     Worker hash time      : 0 ms
-    Worker TagReader time : 29577 ms
+    Worker TagReader time : 27872 ms
 
   Per-file averages:
     Avg hash time      : 0.00 ms/file
-    Avg TagReader time : 2.96 ms/file
+    Avg TagReader time : 2.79 ms/file
 
 Scan Type: hot_full
   Files discovered: 10000
@@ -131,9 +131,9 @@ Scan Type: hot_full
   Snapshot songs  : 10000
 
   Timing Breakdown:
-    Total wall time       : 2338 ms
-    Phase 1 (processing)  : 2230 ms (95%)
-    Phase 2 (aggregation) : 70 ms (2%)
+    Total wall time       : 2624 ms
+    Phase 1 (processing)  : 2517 ms (95%)
+    Phase 2 (aggregation) : 76 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
 
@@ -145,9 +145,9 @@ Scan Type: incremental
   Snapshot songs  : 10000
 
   Timing Breakdown:
-    Total wall time       : 2436 ms
-    Phase 1 (processing)  : 2348 ms (96%)
-    Phase 2 (aggregation) : 74 ms (3%)
+    Total wall time       : 2092 ms
+    Phase 1 (processing)  : 2018 ms (96%)
+    Phase 2 (aggregation) : 62 ms (2%)
     Worker hash time      : 0 ms
     Worker TagReader time : 0 ms
 

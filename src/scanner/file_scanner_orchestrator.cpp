@@ -962,6 +962,14 @@ private:
                                          cache::SQLiteScannerCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
                                          std::uint64_t& totalHashTimeMs, std::uint64_t& totalTagReaderTimeMs) {
+    // Phase timing
+    const auto phaseStart = std::chrono::steady_clock::now();
+    auto phase1End = phaseStart;
+    auto phase2End = phaseStart;
+    auto phase3End = phaseStart;
+    auto phase4End = phaseStart;
+    auto phase5End = phaseStart;
+
     RootResult result;
     const auto rootPath = rootPathFor(root);
     const auto cachedRoot = cache.loadRoot(rootPath);
@@ -1003,6 +1011,7 @@ private:
     if (entries.empty()) {
       entries = discoverScannerPaths(ScannerRoot{.path = rootPath, .recursive = root.recursive}, pathConfig);
     }
+    phase1End = std::chrono::steady_clock::now();
 
     cache::CachedRoot updated{};
     updated.rootPath = rootPath;
@@ -1173,6 +1182,7 @@ private:
       }
       workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::move(cachedLocation), .nodeIndex = currentDiscoveryIndex});
     }
+    phase2End = std::chrono::steady_clock::now();
 
     auto workerSongs = std::make_shared<WorkerSongStore>();
     ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
@@ -1192,6 +1202,7 @@ private:
                                                            }}};
     workerPool.submitBatch(std::move(workerTasks));
     auto workerResults = workerPool.waitAll();
+    phase3End = std::chrono::steady_clock::now();
     const auto workerStats = workerPool.statsSnapshot();
     totalTagReaderTimeMs += std::chrono::duration_cast<std::chrono::milliseconds>(workerStats.tagReaderTime).count();
     
@@ -1220,6 +1231,7 @@ private:
       updated.errors.push_back(error);
     }
     const auto directoryHash = hashDirectoryMerkle(rootPath);
+    phase4End = std::chrono::steady_clock::now();
     if (directoryHash.hash.has_value()) {
       updated.directoryHash = *directoryHash.hash;
     }
@@ -1227,6 +1239,18 @@ private:
       updated.errors.push_back(scannerErrorFrom(error));
     }
     cache.saveRoot(updated);
+    phase5End = std::chrono::steady_clock::now();
+
+    const auto phase1Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase1End - phaseStart).count();
+    const auto phase2Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase2End - phase1End).count();
+    const auto phase3Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase3End - phase2End).count();
+    const auto phase4Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase4End - phase3End).count();
+    const auto phase5Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase5End - phase4End).count();
+    const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(phase5End - phaseStart).count();
+
+    spdlog::info("reconcileRoot phase timing for {}: total={}ms | discovery={}ms | prepare-hash={}ms | worker-wait={}ms | final-hash={}ms | cache-save={}ms",
+                 rootPath.generic_string(), totalMs, phase1Ms, phase2Ms, phase3Ms, phase4Ms, phase5Ms);
+
     return result;
   }
 
