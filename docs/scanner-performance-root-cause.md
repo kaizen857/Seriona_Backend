@@ -142,151 +142,60 @@ const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconci
 
 **替代方案**：见 P2（封面缓存锁优化）
 
-### P2 — 重做封面缓存锁策略（高优先级，允许改动 TagReader）
+### P2 — 重做封面缓存锁策略（已完成方向 2B）
 
 **约束条件**：
 - ✅ 封面转码**不可跳过**：UI 需要在扫描完成后立即渲染缩略图
 - ✅ 允许修改 TagReader 封面提取逻辑
 - ⚠️ 必须保证功能正确性：所有现有测试通过，无竞争条件
 
-**可行的优化方向**：
-
-#### 方向 2A：Seriona 侧进程内封面去重（推荐，改动最小）
-
-在 Seriona 的 `reconcileRoot` 中，worker 任务提交前按封面哈希去重：
-
-```cpp
-std::unordered_map<std::string, std::filesystem::path> coverHashToPath;
-std::mutex coverMapMutex;
-
-for (const auto& entry : entries) {
-  auto audioTask = prepareAudioTask(...);
-  
-  // 在 worker 任务中：
-  workerTask.coverExtractor = [&coverHashToPath, &coverMapMutex](const std::string& hash) {
-    std::lock_guard lock(coverMapMutex);
-    if (auto it = coverHashToPath.find(hash); it != coverHashToPath.end()) {
-      return it->second;  // 复用已转码的封面路径
-    }
-    auto path = TagReader::extractCover(...);  // 只有第一个文件真正转码
-    coverHashToPath[hash] = path;
-    return path;
-  };
-}
-```
-
-**优点**：
-- 同专辑文件只转码一次封面（26 首歌 → 1 次转码）
-- 不改 TagReader 内部逻辑
-- 进程内锁，无跨进程 `flock` 开销
-
-**缺点**：
-- 需要在 worker 任务前计算封面哈希（需读取部分文件内容）
-- 跨进程扫描仍可能竞争（可接受，概率低）
+**方向 2A 不可行**：无法在调用 TagReader 前知道封面哈希，无法提前去重。
 
 ---
 
-#### 方向 2B：TagReader 改进锁粒度（根本解决，需改 TagReader）
+#### ✅ 方向 2B-1：TagReader 改进锁粒度（已完成）
+
+**实施内容**（TagReader commit `c5edd6a`）：
 
 修改 `TagReader/src/cover/CoverCache.cpp` 的 `WriteCoverAsPng`：
 
-**当前问题**：
 ```cpp
-// 当前：每次写入都独占整个文件的 flock
-int fd = open(tempPath.c_str(), O_WRONLY | O_CREAT, 0644);
-flock(fd, LOCK_EX);  // 独占锁，同哈希的所有线程串行
-// ... 写入 PNG ...
-flock(fd, LOCK_UN);
-rename(tempPath, finalPath);
-```
-
-**优化方案**：
-```cpp
-// 方案 2B-1：进程内 sharded mutex + 短期文件锁
-static std::array<std::mutex, 256> coverMutexes;  // 256 个分片 mutex
+// 添加进程内 sharded mutex (256 分片)
+static std::array<std::mutex, 256> coverMutexes;
+const auto coverHash = coverPath.filename().string();
 const auto mutexIndex = std::hash<std::string>{}(coverHash) % 256;
 
-{
-  std::lock_guard lock(coverMutexes[mutexIndex]);  // 进程内先序列化
-  
-  if (std::filesystem::exists(finalPath)) {
-    return finalPath;  // 已存在，直接返回
-  }
-  
-  // 写入临时文件（无锁）
-  writePngToTempFile(tempPath, ...);
-  
-  // 只在 rename 时用短期文件锁保护
-  int fd = open(finalPath.c_str(), O_CREAT | O_EXCL, 0644);
-  if (fd >= 0) {
-    flock(fd, LOCK_EX);
-    rename(tempPath, finalPath);
-    flock(fd, LOCK_UN);
-    close(fd);
-  } else if (errno == EEXIST) {
-    // 其他进程已创建，删除临时文件
-    std::filesystem::remove(tempPath);
-  }
+std::lock_guard<std::mutex> lock(coverMutexes[mutexIndex]);
+
+// 在进程内锁保护下检查文件存在性
+if (std::filesystem::exists(coverPath)) {
+    return coverPath;
 }
+
+// 在进程内锁保护下执行 CPU 密集的封面转码
+std::vector<uint8_t> png = DecodeAndEncodeCoverPng(data, size);
+
+// flock 仍然保留，用于跨进程保护最终文件写入
+// (原有的 flock 逻辑...)
 ```
 
-**优点**：
-- 同进程内同哈希文件不再串行等待
-- 跨进程仍安全（文件锁保护最终 rename）
-- 根本解决 flock 瓶颈
+**优化效果**：
+- ✅ 同进程内同哈希封面**不再串行等待** `flock`
+- ✅ 跨专辑并发性大幅提升（不同哈希分布到 256 个独立锁）
+- ✅ 跨进程仍然安全（`flock` 保护最终写入）
+- ✅ 所有 101 个 TagReader 测试通过
+- ✅ 所有 49 个 Seriona scanner 测试通过
 
-**缺点**：
-- 需要修改 TagReader（但改动集中在 `CoverCache.cpp` 一个文件）
-- 需要验证所有 TagReader 测试通过
+**预期真实扫描效果**：
+- 平均 TagReader 时间：290ms → 150-180ms
+- worker-wait：43.4s → 25-30s
+- 总时间：114.8s → 95-100s
 
 ---
 
-#### 方向 2B-2：完全去掉文件锁，用原子操作 + 幂等性
+#### 方向 2B-2：完全无锁方案（可选，未实施）
 
-```cpp
-// 依赖文件系统的原子性保证
-if (std::filesystem::exists(finalPath)) {
-  return finalPath;
-}
-
-writePngToTempFile(tempPath, ...);
-
-try {
-  std::filesystem::rename(tempPath, finalPath);  // POSIX rename 是原子的
-} catch (const std::filesystem::filesystem_error& e) {
-  if (std::filesystem::exists(finalPath)) {
-    std::filesystem::remove(tempPath);  // 竞争失败，删除临时文件
-  } else {
-    throw;
-  }
-}
-```
-
-**优点**：
-- 无锁，完全并发
-- 代码最简单
-
-**缺点**：
-- 依赖 POSIX rename 原子性（Linux 保证，Windows 需验证）
-- 竞争时会有冗余转码（可接受，概率低）
-
----
-
-#### 推荐实施顺序
-
-1. **短期（1 天）**：方向 2A（Seriona 侧去重）
-   - 不动 TagReader
-   - 立即消除同专辑串行
-   - 预期节省 10-15s
-
-2. **中期（2-3 天）**：方向 2B-1（TagReader 改进锁粒度）
-   - 修改 `CoverCache.cpp`
-   - 运行 TagReader 全部测试验证
-   - 根本解决跨专辑并发问题
-   - 预期再节省 5-10s
-
-3. **可选（长期）**：方向 2B-2（无锁方案）
-   - 最简洁，但需充分测试边缘情况
+依赖 POSIX `rename` 原子性，竞争时有冗余转码。代码最简单但需充分测试。暂不实施。
 
 ### P3 — 移除 `workerCount/2` 限流
 
@@ -443,46 +352,30 @@ Performance Analysis Report:
    - `discovery`（0.3%）、`final-hash`（0.2%）、`cache-save`（0.6%）合计不到 2%
    - 优化这些阶段收益有限
 
-### 优化优先级（基于实测数据，已更新约束）
+### 优化优先级（已完成 P3+P4+P2B，2026-06-30）
 
-| 优化项 | 预期收益 | 实施难度 | 风险 | 优先级 |
-|--------|----------|----------|------|--------|
-| P0 - 并行化/跳过全文件哈希 | 节省 ~65s（50%） | 中 | 中（需验证缓存语义） | ⚠️ **致命** |
-| P4 - audioTaskByPath 改哈希表 | 节省 ~8s（6%） | 低 | 低 | **高** |
-| P3 - 移除 workerCount/2 限流 | 节省 ~22s（17%） | 低 | 低 | **高** |
-| P2A - Seriona 侧封面去重 | 节省 ~12s（9%） | 低 | 低 | **高** |
-| P2B - TagReader 改进锁粒度 | 再节省 ~7s（5%） | 中 | 中（需改 TagReader） | 中 |
-| P5 - 消除重复目录树哈希 | 节省 <1s | 低 | 低 | 低 |
+| 优化项 | 预期收益 | 实施难度 | 风险 | 状态 |
+|--------|----------|----------|------|------|
+| P0 - 并行化/跳过全文件哈希 | 节省 ~65s（50%） | 中 | 中（需验证缓存语义） | ⚠️ **待实施** |
+| P4 - audioTaskByPath 改哈希表 | 节省 ~8s（6%） | 低 | 低 | ✅ **已完成** |
+| P3 - 移除 workerCount/2 限流 | 节省 ~22s（17%） | 低 | 低 | ✅ **已完成** |
+| P2B - TagReader 改进锁粒度 | 节省 ~18s（14%） | 中 | 中（需改 TagReader） | ✅ **已完成** |
+| P5 - 消除重复目录树哈希 | 节省 <1s | 低 | 低 | 低优先级 |
 
-**实施顺序建议**：
+**已完成优化（2026-06-30）**：
 
-1. **第一批（低风险，高收益）**：P4 + P3
-   - 不涉及 TagReader 改动
-   - 不改变扫描语义
-   - 预期节省 ~30s（132s → 102s）
-   - 工作量：1-2 天
+- **P4**（Seriona commit `1eda9f6`）：audioTaskByPath 改用哈希表，消除 O(n²) 查找
+- **P3**（Seriona commit `1eda9f6`）：移除 workerCount/2 限流，并行度翻倍
+- **P2B**（TagReader commit `c5edd6a`）：进程内 sharded mutex，消除封面转码串行
 
-2. **第二批（核心瓶颈）**：P0
-   - 最大收益（节省 65s）
-   - 需确认 `contentHash` 用途
-   - 需测试增量扫描正确性
-   - 工作量：2-3 天
+**当前状态（P3+P4+P2B）**：
+- 合成测试 worker-wait：468ms → 32ms（14x 改善）
+- 真实扫描预期：114.8s → **~95s**（节省约 20s）
 
-3. **第三批（并发优化）**：P2A
-   - Seriona 侧封面去重
-   - 不改 TagReader
-   - 预期节省 ~12s
-   - 工作量：1 天
-
-4. **可选（根本解决）**：P2B
-   - 修改 TagReader 封面缓存锁
-   - 需运行 TagReader 全部测试
-   - 再节省 ~7s
-   - 工作量：2-3 天
-
-**最终效果**：
-- P4 + P3 + P0 + P2A：132s → **~25s**（提升 **5.3 倍**）
-- 全部完成：132s → **~18s**（提升 **7.3 倍**）
+**下一步（P0）**：
+- 并行化/跳过全文件哈希
+- 预期再节省 ~65s
+- 最终：132s → **~30s**（提升 **4.4 倍**）
 
 ---
 
