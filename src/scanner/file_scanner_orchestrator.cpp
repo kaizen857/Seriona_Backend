@@ -1184,11 +1184,17 @@ private:
     }
     phase2End = std::chrono::steady_clock::now();
 
+    std::unordered_map<std::string, std::size_t> audioTaskIndexByPath;
+    audioTaskIndexByPath.reserve(audioTasks.size());
+    for (std::size_t i = 0; i < audioTasks.size(); ++i) {
+      audioTaskIndexByPath[pathKey(audioTasks[i].path)] = i;
+    }
+
     auto workerSongs = std::make_shared<WorkerSongStore>();
     ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
                                                            .tagReaderSlots = config.tagReaderSlots,
-                                                           .tagReader = [this, workerSongs, &audioTasks, &indexedSongs, &rootPath](const WorkerTask& task) {
-                                                             auto metadata = readWorkerSong(task, audioTasks, workerSongs);
+                                                           .tagReader = [this, workerSongs, &audioTasks, &audioTaskIndexByPath, &indexedSongs, &rootPath](const WorkerTask& task) {
+                                                             auto metadata = readWorkerSong(task, audioTasks, audioTaskIndexByPath, workerSongs);
                                                              if (task.nodeIndex < indexedSongs.size()) {
                                                                auto song = workerSongs->take(task.filePath);
                                                                if (song.has_value()) {
@@ -1312,8 +1318,9 @@ private:
 
   [[nodiscard]] SongMetadata readWorkerSong(const WorkerTask& task,
                                             const std::vector<AudioReconcileTask>& audioTasks,
+                                            const std::unordered_map<std::string, std::size_t>& audioTaskIndexByPath,
                                             const std::shared_ptr<WorkerSongStore>& workerSongs) {
-    const auto audioTask = audioTaskByPath(audioTasks, task.filePath);
+    const auto audioTask = audioTaskByPath(audioTasks, audioTaskIndexByPath, task.filePath);
     if (audioTask == nullptr) {
       throw std::runtime_error{"missing scanner worker task context"};
     }
@@ -1346,20 +1353,20 @@ private:
   }
 
   [[nodiscard]] const AudioReconcileTask* audioTaskByPath(const std::vector<AudioReconcileTask>& audioTasks,
+                                                         const std::unordered_map<std::string, std::size_t>& audioTaskIndexByPath,
                                                          const std::filesystem::path& path) const {
     const auto key = pathKey(path);
-    const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconcileTask& task) {
-      return pathKey(task.path) == key;
-    });
-    if (iterator == audioTasks.end()) {
+    const auto it = audioTaskIndexByPath.find(key);
+    if (it == audioTaskIndexByPath.end()) {
       return nullptr;
     }
-    return &*iterator;
+    return &audioTasks[it->second];
   }
 
   [[nodiscard]] std::optional<cache::CachedSong> cachedSongForWorkerResult(const WorkerResult& workerResult,
-                                                                           const std::vector<AudioReconcileTask>& audioTasks) const {
-    const auto audioTask = audioTaskByPath(audioTasks, workerResult.filePath);
+                                                                           const std::vector<AudioReconcileTask>& audioTasks,
+                                                                           const std::unordered_map<std::string, std::size_t>& audioTaskIndexByPath) const {
+    const auto audioTask = audioTaskByPath(audioTasks, audioTaskIndexByPath, workerResult.filePath);
     if (audioTask == nullptr || !audioTask->cachedSong.has_value()) {
       return std::nullopt;
     }

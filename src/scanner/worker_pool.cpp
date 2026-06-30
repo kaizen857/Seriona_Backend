@@ -133,8 +133,7 @@ std::size_t getOptimalWorkerCount() noexcept {
 
 std::ptrdiff_t getOptimalTagReaderLimit(std::size_t workerCount) noexcept {
   const auto normalizedWorkerCount = normalizeWorkerCount(workerCount == 0U ? getOptimalWorkerCount() : workerCount);
-  const auto preferred = std::max<BS::concurrency_t>(1U, normalizedWorkerCount / 2U);
-  return static_cast<std::ptrdiff_t>(preferred);
+  return static_cast<std::ptrdiff_t>(normalizedWorkerCount);
 }
 
 class ScannerWorkerPool::Impl {
