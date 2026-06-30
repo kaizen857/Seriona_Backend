@@ -677,7 +677,6 @@ public:
     std::uint64_t discovered = 0;
     std::uint64_t skipped = 0;
     std::uint64_t scanned = 0;
-    std::uint64_t totalHashTimeMs = 0;
     std::uint64_t totalTagReaderTimeMs = 0;
 
     const auto phaseEnumStart = std::chrono::steady_clock::now();
@@ -692,7 +691,7 @@ public:
       spdlog::debug("scan mode decision for {}: {}", root.path.generic_string(),
                     decision.mode == ScanMode::Full ? "full" : "incremental");
       const auto rootScanStartTime = std::chrono::steady_clock::now();
-      auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, totalHashTimeMs, totalTagReaderTimeMs);
+      auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, totalTagReaderTimeMs);
       const auto rootScanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - rootScanStartTime);
       recordScanRootDecision(rootPathFor(root), decision, rootResult.songs, rootScanDuration);
       allErrors.insert(allErrors.end(), rootResult.errors.begin(), rootResult.errors.end());
@@ -802,11 +801,9 @@ public:
     spdlog::info("[Phase 2] Aggregation               : {} ms", phaseAggregationTimeMs);
     spdlog::info("-----------------------------------------------");
     spdlog::info(">> Cumulative Worker CPU Time (Sum of all threads):");
-    spdlog::info("   - File Hash      : {} ms", totalHashTimeMs);
     spdlog::info("   - TagReader Parse: {} ms", totalTagReaderTimeMs);
+    spdlog::info(">> Per-File Average:");
     if (scanned > 0) {
-      spdlog::info(">> Per-File Average:");
-      spdlog::info("   - Avg Hash       : {:.1f} ms", static_cast<double>(totalHashTimeMs) / scanned);
       spdlog::info("   - Avg TagReader  : {:.1f} ms", static_cast<double>(totalTagReaderTimeMs) / scanned);
     }
     spdlog::info("===============================================");
@@ -961,7 +958,7 @@ private:
   [[nodiscard]] RootResult reconcileRoot(const ScannerRoot& root, const ScanModeDecision& decision, const EffectiveScannerConfig& config,
                                          cache::SQLiteScannerCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
-                                         std::uint64_t& totalHashTimeMs, std::uint64_t& totalTagReaderTimeMs) {
+                                         std::uint64_t& totalTagReaderTimeMs) {
     // Phase timing
     const auto phaseStart = std::chrono::steady_clock::now();
     auto phase1End = phaseStart;
@@ -1167,20 +1164,14 @@ private:
       if (incrementalPlan.has_value() && !incrementalPlan->workerPaths.contains(entryKey)) {
         continue;
       }
-      auto audioTask = prepareAudioTask(entry.path, rootPath, cachedSongsByPath, result.errors, skipped, scanned, totalHashTimeMs);
+      auto audioTask = prepareAudioTask(entry.path, rootPath, cachedSongsByPath, result.errors, skipped, scanned);
       if (!audioTask.has_value()) {
         continue;
       }
       audioTask->discoveryIndex = currentDiscoveryIndex;
       audioTasks.push_back(*audioTask);
       
-      auto cachedLocation = std::optional<cache::CachedLocation>{};
-      if (audioTask->cachedSong.has_value() && isAudioCacheHit(*audioTask->cachedSong, audioTask->contentHash)) {
-        cachedLocation = cachedLocationFromSong(*audioTask->cachedSong, rootPath, entry.path);
-        indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, *audioTask->cachedSong, relativePathFor(rootPath, entry.path)};
-        indexedSongs[currentDiscoveryIndex].filled.store(true);
-      }
-      workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::move(cachedLocation), .nodeIndex = currentDiscoveryIndex});
+      workerTasks.push_back(WorkerTask{.rootPath = rootPath, .filePath = entry.path, .cachedLocation = std::nullopt, .nodeIndex = currentDiscoveryIndex});
     }
     phase2End = std::chrono::steady_clock::now();
 
@@ -1287,32 +1278,15 @@ private:
   [[nodiscard]] std::optional<AudioReconcileTask> prepareAudioTask(const std::filesystem::path& audioPath,
                                                                    const std::filesystem::path& rootPath,
                                                                    const CachedSongPathIndex& cachedSongsByPath,
-                                                                   std::vector<ScannerError>& errors,
-                                                                   std::uint64_t& skipped,
-                                                                   std::uint64_t& scanned,
-                                                                   std::uint64_t& totalHashTimeMs) {
-    const auto hashStartTime = std::chrono::steady_clock::now();
-    const auto hash = hashFileContent(audioPath, HashOptions{.cancellationRequested = &cancellationRequested_});
-    const auto hashEndTime = std::chrono::steady_clock::now();
-    totalHashTimeMs += std::chrono::duration_cast<std::chrono::milliseconds>(hashEndTime - hashStartTime).count();
-    
-    for (const auto& error : hash.errors) {
-      errors.push_back(scannerErrorFrom(error));
-    }
+                                                                   std::vector<ScannerError>&,
+                                                                   std::uint64_t&,
+                                                                   std::uint64_t& scanned) {
     const auto cachedSong = cachedSongByPath(cachedSongsByPath, audioPath);
-    if (cachedSong.has_value() && isAudioCacheHit(*cachedSong, hash.hash)) {
-      ++skipped;
-      return AudioReconcileTask{.path = audioPath,
-                                .treeRelativePath = relativePathFor(rootPath, audioPath),
-                                .discoveryIndex = 0,
-                                .contentHash = hash.hash,
-                                .cachedSong = cachedSong};
-    }
     ++scanned;
     return AudioReconcileTask{.path = audioPath,
                               .treeRelativePath = relativePathFor(rootPath, audioPath),
                               .discoveryIndex = 0,
-                              .contentHash = hash.hash,
+                              .contentHash = std::nullopt,
                               .cachedSong = cachedSong};
   }
 
@@ -1324,14 +1298,18 @@ private:
     if (audioTask == nullptr) {
       throw std::runtime_error{"missing scanner worker task context"};
     }
-    if (audioTask->cachedSong.has_value() && task.cachedLocation.has_value()) {
+
+    const auto hash = hashFileContent(task.filePath, HashOptions{.cancellationRequested = &cancellationRequested_});
+    const auto contentHash = hash.hash.value_or("");
+
+    if (audioTask->cachedSong.has_value() && isAudioCacheHit(*audioTask->cachedSong, hash.hash)) {
       workerSongs->put(task.filePath, *audioTask->cachedSong);
       return audioTask->cachedSong->metadata;
     }
 
     auto raw = metadataReader_->read(task.filePath, coverExportDir_);
     raw.filePath = task.filePath;
-    auto song = cachedSongFrom(mapRawTagMetadata(raw, audioTask->contentHash.value_or({}),
+    auto song = cachedSongFrom(mapRawTagMetadata(raw, contentHash,
                                                 audioTask->cachedSong.transform([](const cache::CachedSong& cachedSong) {
                                                   return tagUserStatsFrom(cachedSong.userStats);
                                                 }),
@@ -1344,8 +1322,8 @@ private:
     }
     song.metadata.trackId = task.filePath.generic_string();
     song.metadata.logicalTrackId = task.filePath.generic_string();
-    if (audioTask->contentHash.has_value()) {
-      song.metadata.contentHash = *audioTask->contentHash;
+    if (!contentHash.empty()) {
+      song.metadata.contentHash = contentHash;
     }
     auto metadata = song.metadata;
     workerSongs->put(task.filePath, std::move(song));
