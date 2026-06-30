@@ -103,10 +103,16 @@ const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconci
 
 ### 缺陷 4：封面转码 + flock 同专辑串行（高）
 
-- TagReader 的 90%+ 时间花在 `avcodec_send_frame` 的 JPEG→PNG 封面转码上。扫描阶段其实只需要元数据，但当前总是走完整 `read()` 强制转码每首歌。
-- 为修复竞争而加入 `WriteCoverAsPng` 的 `flock` 会把**同专辑同封面的文件串行化**——一个 26 首的专辑，26 个文件抢同一把锁。这个等待时间发生在 TagReader 调用内部，被计入 `Avg TagReader`。
+- TagReader 的 90%+ 时间花在 `avcodec_send_frame` 的 JPEG→PNG 封面转码上
+- 为修复竞争而加入 `WriteCoverAsPng` 的 `flock` 会把**同专辑同封面的文件串行化**——一个 26 首的专辑，26 个文件抢同一把锁。这个等待时间发生在 TagReader 调用内部，被计入 `Avg TagReader`
 
-**计时口径修正**：`Avg TagReader 222ms` **不包含** N/2 semaphore 的等待时间（计时在 `acquire()` 之后才开始），所以缺陷 2 不直接膨胀该指标，但缺陷 3、4 直接计入。
+**计时口径修正**：`Avg TagReader 215ms` **不包含** N/2 semaphore 的等待时间（计时在 `acquire()` 之后才开始），所以缺陷 2 不直接膨胀该指标，但缺陷 3、4 直接计入。
+
+**约束条件**（2026-06-30 确认）：
+
+1. **封面提取不可跳过**：UI 必须在扫描完成后立即有封面用于缩略图渲染，所以封面转码必须在扫描阶段完成，不能延迟到按需提取
+2. **TagReader 原始设计未考虑多线程**：封面提取路径（`CoverCache.cpp` / `CoverDecoder.cpp`）未针对并发优化，修改需谨慎保证功能正确性
+3. **允许 TagReader 改动**：只要保证功能不受影响，可以修改封面提取逻辑以支持并发安全
 
 ### 附带：FFmpeg 报错
 
@@ -125,14 +131,162 @@ const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconci
 
 **前置确认**：`contentHash` 是否被用作歌曲身份 / 去重 / 歌词绑定的稳定键——若是，跳过内容哈希需保证缓存语义不变。
 
-### P1 — TagReader 增加 metadata-only / 延迟封面路径
+### P1 — ~~TagReader 增加 metadata-only 模式~~（已明确不可行）
 
-扫描默认不转码封面（省掉 90% 的 FFmpeg 成本），封面在 UI 真正需要时按需提取。这是单文件 CPU 成本的最大头。
+**状态**：❌ 不可行
 
-### P2 — 重做封面缓存锁策略
+**原因**（2026-06-30 确认）：
+- UI 必须在扫描完成后立即有封面用于缩略图渲染
+- 封面转码不能延迟到按需提取阶段
+- 扫描阶段必须完成所有封面提取
 
-- 同一批扫描中相同封面只转码一次（按 hash 去重）。
-- 把跨进程 `flock` 换成进程内 sharded per-hash mutex，跨进程锁只保留在最终 rename 写入边界。消除同专辑串行。
+**替代方案**：见 P2（封面缓存锁优化）
+
+### P2 — 重做封面缓存锁策略（高优先级，允许改动 TagReader）
+
+**约束条件**：
+- ✅ 封面转码**不可跳过**：UI 需要在扫描完成后立即渲染缩略图
+- ✅ 允许修改 TagReader 封面提取逻辑
+- ⚠️ 必须保证功能正确性：所有现有测试通过，无竞争条件
+
+**可行的优化方向**：
+
+#### 方向 2A：Seriona 侧进程内封面去重（推荐，改动最小）
+
+在 Seriona 的 `reconcileRoot` 中，worker 任务提交前按封面哈希去重：
+
+```cpp
+std::unordered_map<std::string, std::filesystem::path> coverHashToPath;
+std::mutex coverMapMutex;
+
+for (const auto& entry : entries) {
+  auto audioTask = prepareAudioTask(...);
+  
+  // 在 worker 任务中：
+  workerTask.coverExtractor = [&coverHashToPath, &coverMapMutex](const std::string& hash) {
+    std::lock_guard lock(coverMapMutex);
+    if (auto it = coverHashToPath.find(hash); it != coverHashToPath.end()) {
+      return it->second;  // 复用已转码的封面路径
+    }
+    auto path = TagReader::extractCover(...);  // 只有第一个文件真正转码
+    coverHashToPath[hash] = path;
+    return path;
+  };
+}
+```
+
+**优点**：
+- 同专辑文件只转码一次封面（26 首歌 → 1 次转码）
+- 不改 TagReader 内部逻辑
+- 进程内锁，无跨进程 `flock` 开销
+
+**缺点**：
+- 需要在 worker 任务前计算封面哈希（需读取部分文件内容）
+- 跨进程扫描仍可能竞争（可接受，概率低）
+
+---
+
+#### 方向 2B：TagReader 改进锁粒度（根本解决，需改 TagReader）
+
+修改 `TagReader/src/cover/CoverCache.cpp` 的 `WriteCoverAsPng`：
+
+**当前问题**：
+```cpp
+// 当前：每次写入都独占整个文件的 flock
+int fd = open(tempPath.c_str(), O_WRONLY | O_CREAT, 0644);
+flock(fd, LOCK_EX);  // 独占锁，同哈希的所有线程串行
+// ... 写入 PNG ...
+flock(fd, LOCK_UN);
+rename(tempPath, finalPath);
+```
+
+**优化方案**：
+```cpp
+// 方案 2B-1：进程内 sharded mutex + 短期文件锁
+static std::array<std::mutex, 256> coverMutexes;  // 256 个分片 mutex
+const auto mutexIndex = std::hash<std::string>{}(coverHash) % 256;
+
+{
+  std::lock_guard lock(coverMutexes[mutexIndex]);  // 进程内先序列化
+  
+  if (std::filesystem::exists(finalPath)) {
+    return finalPath;  // 已存在，直接返回
+  }
+  
+  // 写入临时文件（无锁）
+  writePngToTempFile(tempPath, ...);
+  
+  // 只在 rename 时用短期文件锁保护
+  int fd = open(finalPath.c_str(), O_CREAT | O_EXCL, 0644);
+  if (fd >= 0) {
+    flock(fd, LOCK_EX);
+    rename(tempPath, finalPath);
+    flock(fd, LOCK_UN);
+    close(fd);
+  } else if (errno == EEXIST) {
+    // 其他进程已创建，删除临时文件
+    std::filesystem::remove(tempPath);
+  }
+}
+```
+
+**优点**：
+- 同进程内同哈希文件不再串行等待
+- 跨进程仍安全（文件锁保护最终 rename）
+- 根本解决 flock 瓶颈
+
+**缺点**：
+- 需要修改 TagReader（但改动集中在 `CoverCache.cpp` 一个文件）
+- 需要验证所有 TagReader 测试通过
+
+---
+
+#### 方向 2B-2：完全去掉文件锁，用原子操作 + 幂等性
+
+```cpp
+// 依赖文件系统的原子性保证
+if (std::filesystem::exists(finalPath)) {
+  return finalPath;
+}
+
+writePngToTempFile(tempPath, ...);
+
+try {
+  std::filesystem::rename(tempPath, finalPath);  // POSIX rename 是原子的
+} catch (const std::filesystem::filesystem_error& e) {
+  if (std::filesystem::exists(finalPath)) {
+    std::filesystem::remove(tempPath);  // 竞争失败，删除临时文件
+  } else {
+    throw;
+  }
+}
+```
+
+**优点**：
+- 无锁，完全并发
+- 代码最简单
+
+**缺点**：
+- 依赖 POSIX rename 原子性（Linux 保证，Windows 需验证）
+- 竞争时会有冗余转码（可接受，概率低）
+
+---
+
+#### 推荐实施顺序
+
+1. **短期（1 天）**：方向 2A（Seriona 侧去重）
+   - 不动 TagReader
+   - 立即消除同专辑串行
+   - 预期节省 10-15s
+
+2. **中期（2-3 天）**：方向 2B-1（TagReader 改进锁粒度）
+   - 修改 `CoverCache.cpp`
+   - 运行 TagReader 全部测试验证
+   - 根本解决跨专辑并发问题
+   - 预期再节省 5-10s
+
+3. **可选（长期）**：方向 2B-2（无锁方案）
+   - 最简洁，但需充分测试边缘情况
 
 ### P3 — 移除 `workerCount/2` 限流
 
@@ -148,25 +302,30 @@ const auto iterator = std::ranges::find_if(audioTasks, [&key](const AudioReconci
 
 ---
 
-## 预期效果（基于实测数据）
+## 预期效果（基于实测数据，已更新约束）
 
 | 阶段 | 当前实测 | P0 后 | P0+P2+P3+P4 后 |
 |------|----------|-------|----------------|
 | prepare-hash（串行哈希） | 65.9s (50%) | ~1s | ~1s |
-| worker-wait（并行处理） | 64.3s (49%) | ~64s | ~15s |
+| worker-wait（并行处理） | 64.3s (49%) | ~64s | ~20s |
 | 其他阶段 | 1.6s (1%) | ~2s | ~2s |
-| **总墙钟** | **132s** | **~67s** | **~18s** |
-| **加速比** | **1x** | **2.0x** | **7.3x** |
+| **总墙钟** | **132s** | **~67s** | **~23s** |
+| **加速比** | **1x** | **2.0x** | **5.7x** |
 
-**详细分解**：
+**详细分解**（已考虑封面不可跳过的约束）：
 
 - **P0（并行/跳过全文件哈希）**：65.9s → ~1s，节省 64.9s
 - **P4（audioTaskByPath 哈希表）**：减少 worker-wait 中约 10-15%，节省 6-10s
 - **P3（移除 workerCount/2 限流）**：并行度从 16x 提升到 30-32x，worker-wait 减半，节省 20-25s
-- **P2（封面去重 + 锁优化）**：TagReader 平均从 215ms 降到 80-100ms，节省 15-20s
+- **P2（封面去重 + 锁优化）**：
+  - 方向 2A（Seriona 侧去重）：同专辑只转码一次，节省 10-15s
+  - 方向 2B（TagReader 改进锁）：消除 flock 串行，再节省 5-10s
+  - 封面转码本身**不可避免**（UI 约束），但并发效率可提升
 
-**保守估计**：132s → 18-25s（提升 **5-7 倍**）  
-**乐观估计**：132s → 15s 以内（提升 **8-9 倍**）
+**保守估计**（P0 + P4 + P3 + P2A）：132s → 23-28s（提升 **4.7-5.7 倍**）  
+**乐观估计**（P0 + P4 + P3 + P2B）：132s → 18-23s（提升 **5.7-7.3 倍**）
+
+**注**：原预期的 P0+P1+P2 → 18s 中，P1（跳过封面转码）已确认不可行，但通过 P2 的并发优化仍可达到接近的效果。
 
 ---
 
@@ -284,17 +443,46 @@ Performance Analysis Report:
    - `discovery`（0.3%）、`final-hash`（0.2%）、`cache-save`（0.6%）合计不到 2%
    - 优化这些阶段收益有限
 
-### 优化优先级（基于实测数据）
+### 优化优先级（基于实测数据，已更新约束）
 
-| 优化项 | 预期收益 | 实施难度 | 优先级 |
-|--------|----------|----------|--------|
-| P0 - 并行化/跳过全文件哈希 | 节省 ~66s（50%） | 中 | **致命** |
-| P4 - audioTaskByPath 改哈希表 | 减少 worker-wait 中 10-20% | 低 | 高 |
-| P3 - 移除 workerCount/2 限流 | 提升并行度 1.5-2x | 低 | 高 |
-| P2 - 封面去重 + 改进锁策略 | 减少 TagReader 平均时间 30-50% | 中 | 高 |
-| P5 - 消除重复目录树哈希 | 节省 <1s | 低 | 低 |
+| 优化项 | 预期收益 | 实施难度 | 风险 | 优先级 |
+|--------|----------|----------|------|--------|
+| P0 - 并行化/跳过全文件哈希 | 节省 ~65s（50%） | 中 | 中（需验证缓存语义） | ⚠️ **致命** |
+| P4 - audioTaskByPath 改哈希表 | 节省 ~8s（6%） | 低 | 低 | **高** |
+| P3 - 移除 workerCount/2 限流 | 节省 ~22s（17%） | 低 | 低 | **高** |
+| P2A - Seriona 侧封面去重 | 节省 ~12s（9%） | 低 | 低 | **高** |
+| P2B - TagReader 改进锁粒度 | 再节省 ~7s（5%） | 中 | 中（需改 TagReader） | 中 |
+| P5 - 消除重复目录树哈希 | 节省 <1s | 低 | 低 | 低 |
 
-**预期最终效果**：P0 + P2 + P3 + P4 组合后，总时间从 **132s → 15-25s**（提升 **5-9 倍**）
+**实施顺序建议**：
+
+1. **第一批（低风险，高收益）**：P4 + P3
+   - 不涉及 TagReader 改动
+   - 不改变扫描语义
+   - 预期节省 ~30s（132s → 102s）
+   - 工作量：1-2 天
+
+2. **第二批（核心瓶颈）**：P0
+   - 最大收益（节省 65s）
+   - 需确认 `contentHash` 用途
+   - 需测试增量扫描正确性
+   - 工作量：2-3 天
+
+3. **第三批（并发优化）**：P2A
+   - Seriona 侧封面去重
+   - 不改 TagReader
+   - 预期节省 ~12s
+   - 工作量：1 天
+
+4. **可选（根本解决）**：P2B
+   - 修改 TagReader 封面缓存锁
+   - 需运行 TagReader 全部测试
+   - 再节省 ~7s
+   - 工作量：2-3 天
+
+**最终效果**：
+- P4 + P3 + P0 + P2A：132s → **~25s**（提升 **5.3 倍**）
+- 全部完成：132s → **~18s**（提升 **7.3 倍**）
 
 ---
 
