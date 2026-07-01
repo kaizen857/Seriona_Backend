@@ -396,6 +396,7 @@ TEST_CASE("scanner service rereads changed audio and reparses only changed lrc")
   CHECK(songs[0].effectiveLyrics[0].text == "external two");
 
   writeText(audio, "changed audio bytes");
+  std::this_thread::sleep_for(std::chrono::milliseconds{5}); // mtime granularity guard
   reader->put(audio, rawMetadata("After", {RawTagLyricLine{std::chrono::milliseconds{400}, "embedded after"}}));
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   songs = songsIn(waitForSnapshot(*service, [](const PlaylistTreeSnapshot& snapshot) {
@@ -758,6 +759,7 @@ TEST_CASE("scanner service incremental integration reuses unchanged scans only a
   CHECK(reader->readCount() == 3U);
 
   writeText(changed, "changed bytes for incremental path");
+  std::this_thread::sleep_for(std::chrono::milliseconds{5}); // mtime granularity guard
   reader->put(changed, rawMetadata("Changed After"));
   const auto added = test::writeAudioFixture(temp.path(), "04-added.flac");
   reader->put(added, rawMetadata("Added"));

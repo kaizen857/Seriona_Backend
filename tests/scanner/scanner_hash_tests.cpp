@@ -51,6 +51,7 @@ TEST_CASE("scanner file hash uses content not mtime") {
   std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now() - std::chrono::hours{24});
   const auto mtimeOnly = requireHash(hashFileContent(path));
   writeTextFile(path, "changed content");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   const auto changed = requireHash(hashFileContent(path));
 
   CHECK(first == mtimeOnly);
@@ -67,6 +68,7 @@ TEST_CASE("scanner sidecar lrc hash changes independently from paired audio hash
   const auto audioHash = requireHash(hashFileContent(audio));
   const auto lrcFirst = requireHash(hashLyricsSidecar(lrc));
   writeTextFile(lrc, "[00:01.00] changed\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   const auto lrcChanged = requireHash(hashLyricsSidecar(lrc));
   const auto audioAfterLrcChange = requireHash(hashFileContent(audio));
 
@@ -90,6 +92,7 @@ TEST_CASE("scanner directory merkle hash is stable and changes on child add dele
   CHECK(stableA == stableB);
 
   writeTextFile(firstRoot.path() / "c" / "three.flac", "three");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   const auto added = requireHash(hashDirectoryMerkle(firstRoot.path()));
   CHECK(added != stableA);
 
@@ -109,6 +112,7 @@ TEST_CASE("scanner directory tree hash describes structure without reading file 
 
   const auto stable = requireHash(computeDirectoryTreeHash(root.path()));
   writeTextFile(root.path() / "album" / "01.flac", "changed audio bytes with the same tree path");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   const auto contentChanged = requireHash(computeDirectoryTreeHash(root.path()));
 
   CHECK(contentChanged == stable);

@@ -117,9 +117,7 @@ std::string formatWorkerPoolStatsBreakdown(const WorkerPoolStatsSnapshot& stats)
   output << "scannedFiles=" << stats.scannedFiles << '\n';
   output << "tagReaderTimeMs=" << std::chrono::duration_cast<std::chrono::milliseconds>(stats.tagReaderTime).count()
          << '\n';
-  output << "hashTimeMs=" << std::chrono::duration_cast<std::chrono::milliseconds>(stats.hashTime).count() << '\n';
   output << "avgTagReaderMs=" << averageMilliseconds(stats.tagReaderTime, stats.scannedFiles) << '\n';
-  output << "avgHashMs=" << averageMilliseconds(stats.hashTime, stats.scannedFiles) << '\n';
   return output.str();
 }
 
@@ -159,8 +157,7 @@ public:
                                    .cacheHits = cacheHits_.load(std::memory_order_relaxed),
                                    .scannedFiles = scannedFiles_.load(std::memory_order_relaxed),
                                    .tagReaderTime = std::chrono::nanoseconds{
-                                       tagReaderTimeNs_.load(std::memory_order_relaxed)},
-                                   .hashTime = std::chrono::nanoseconds{hashTimeNs_.load(std::memory_order_relaxed)}};
+                                       tagReaderTimeNs_.load(std::memory_order_relaxed)}};
   }
 
   void submitBatch(std::vector<WorkerTask> tasks) {
@@ -252,21 +249,19 @@ private:
 
   [[nodiscard]] WorkerResult processTask(const WorkerTask& task) {
     try {
-      if (task.cachedLocation) {
-        cacheHits_.fetch_add(1, std::memory_order_relaxed);
-        return WorkerResult{.filePath = task.filePath,
-                            .metadata = metadataFromCacheLocation(*task.cachedLocation),
-                            .error = std::nullopt};
-      }
-
       TagReaderSlotGuard slot{tagReaderSlots_};
       const auto tagReaderStart = std::chrono::steady_clock::now();
       auto metadata = config_.tagReader(task);
       const auto tagReaderElapsed = std::chrono::steady_clock::now() - tagReaderStart;
       tagReaderTimeNs_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(tagReaderElapsed).count(),
                                  std::memory_order_relaxed);
-      scannedFiles_.fetch_add(1, std::memory_order_relaxed);
-      assignContentIdentity(metadata);
+      
+      if (task.cachedLocation) {
+        cacheHits_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        scannedFiles_.fetch_add(1, std::memory_order_relaxed);
+        assignContentIdentity(metadata);
+      }
       return WorkerResult{.filePath = task.filePath, .metadata = std::move(metadata), .error = std::nullopt};
     } catch (const std::exception& error) {
       return WorkerResult{.filePath = task.filePath, .metadata = std::nullopt, .error = errorFromException(task, error)};
@@ -286,7 +281,6 @@ private:
   std::atomic<std::uint64_t> cacheHits_{0};
   std::atomic<std::uint64_t> scannedFiles_{0};
   std::atomic<std::uint64_t> tagReaderTimeNs_{0};
-  std::atomic<std::uint64_t> hashTimeNs_{0};
 };
 
 ScannerWorkerPool::ScannerWorkerPool(Config config) : impl_{std::make_unique<Impl>(config)} {}

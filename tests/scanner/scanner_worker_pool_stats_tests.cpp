@@ -91,7 +91,6 @@ TEST_CASE("scanner worker pool stats accumulate tag reader time across worker ta
   CHECK(results.size() == 3U);
   CHECK(stats.scannedFiles == 3U);
   CHECK(stats.tagReaderTime > std::chrono::nanoseconds{0});
-  CHECK(stats.hashTime == std::chrono::nanoseconds{0});
   CHECK(breakdown.find("Worker Pool Phase Breakdown") != std::string::npos);
   CHECK(breakdown.find("tagReaderTimeMs=") != std::string::npos);
   CHECK(breakdown.find("avgTagReaderMs=") != std::string::npos);

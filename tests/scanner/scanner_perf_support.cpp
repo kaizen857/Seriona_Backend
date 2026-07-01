@@ -209,6 +209,7 @@ void mutateForIncremental(const std::filesystem::path& root, std::size_t baseCou
   const auto added = trackPathFor(root, baseCount);
   writeTextFile(added, "SERIONA_PERF_AUDIO\nadded=true\n");
   reader.put(added, rawMetadataFor(baseCount));
+  std::this_thread::sleep_for(std::chrono::milliseconds{5}); // mtime granularity guard for changed/added files
 }
 
 }

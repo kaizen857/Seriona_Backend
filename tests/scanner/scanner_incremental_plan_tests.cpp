@@ -75,6 +75,7 @@ TEST_CASE("incremental scan plan classifies unchanged added deleted and changed 
   std::filesystem::remove(deletedAPath);
   std::filesystem::remove(deletedBPath);
   writeText(changedPath, "changed-content");
+  std::this_thread::sleep_for(std::chrono::milliseconds{5}); // mtime granularity guard
   const auto addedPath = test::writeAudioFixture(temp.path(), "added.flac");
   const auto entries = discoverScannerPaths(ScannerRoot{.path = rootPath}, PathClassificationConfig{});
 

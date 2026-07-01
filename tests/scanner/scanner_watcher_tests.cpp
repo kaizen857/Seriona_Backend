@@ -207,6 +207,7 @@ TEST_CASE("scanner watcher debounces create modify destroy rename into hash-firs
   const auto renamed = temp.path() / "renamed.flac";
   std::filesystem::rename(first, renamed);
   reader->put(renamed, rawMetadata("Renamed"));
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   WatchEvent rename = fileEvent(renamed, WatchEffectKind::Renamed);
   rename.associated.push_back(fileEvent(first, WatchEffectKind::Renamed));
   watchers->states[0]->callback(fileEvent(created, WatchEffectKind::Created));
@@ -240,6 +241,7 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
 
   const auto lrc = temp.path() / "song.lrc";
   writeText(lrc, "[00:02.00]external\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Modified));
   waitForSnapshotSongCount(*service, 1U);
   std::this_thread::sleep_for(std::chrono::milliseconds{30});

@@ -17,6 +17,7 @@ namespace seriona::scanner {
 struct WorkerTask {
   std::filesystem::path rootPath;
   std::filesystem::path filePath;
+  std::string locationId;
   std::optional<cache::CachedLocation> cachedLocation;
   std::size_t nodeIndex{0};
 };
@@ -32,7 +33,6 @@ struct WorkerPoolStatsSnapshot {
   std::uint64_t cacheHits{0};
   std::uint64_t scannedFiles{0};
   std::chrono::nanoseconds tagReaderTime{0};
-  std::chrono::nanoseconds hashTime{0};
 };
 
 [[nodiscard]] std::string formatWorkerPoolStatsBreakdown(const WorkerPoolStatsSnapshot& stats);

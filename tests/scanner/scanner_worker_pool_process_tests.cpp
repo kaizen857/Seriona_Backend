@@ -48,14 +48,19 @@ namespace {
 
 }
 
-TEST_CASE("scanner worker pool processTask returns cached metadata without tag reader work") {
+TEST_CASE("scanner worker pool processTask invokes tagReader even with cachedLocation") {
   std::atomic<std::size_t> readCount{0};
   auto cached = cachedLocationFixture();
   ScannerWorkerPool pool{ScannerWorkerPool::Config{.workerCount = 2,
                                                    .tagReaderSlots = 1,
-                                                   .tagReader = [&readCount](const WorkerTask&) -> SongMetadata {
+                                                   .tagReader = [&readCount, &cached](const WorkerTask& task) -> SongMetadata {
                                                      ++readCount;
-                                                     throw std::runtime_error{"unexpected tag read"};
+                                                     REQUIRE(task.cachedLocation.has_value());
+                                                     CHECK(task.cachedLocation->contentId == cached.contentId);
+                                                     SongMetadata meta;
+                                                     meta.contentHash = task.cachedLocation->contentId;
+                                                     meta.filePath = task.filePath;
+                                                     return meta;
                                                    }}};
 
   pool.submitBatch({WorkerTask{.rootPath = cached.rootPath, .filePath = cached.filePath, .cachedLocation = cached}});
@@ -63,12 +68,9 @@ TEST_CASE("scanner worker pool processTask returns cached metadata without tag r
 
   REQUIRE(results.size() == 1U);
   REQUIRE(results[0].metadata.has_value());
-  CHECK(readCount.load() == 0U);
+  CHECK(readCount.load() == 1U);
   CHECK(results[0].metadata->contentHash == "cached-content-id");
   CHECK(results[0].metadata->filePath == std::filesystem::path{"music/cached.flac"});
-  CHECK(results[0].metadata->sourceFilePath == std::filesystem::path{"music/cached-source.flac"});
-  CHECK(results[0].metadata->offset == std::chrono::milliseconds{250});
-  CHECK(results[0].metadata->effectiveLyricsSource == LyricsSource::ExternalLrc);
 }
 
 TEST_CASE("scanner worker pool processTask reads metadata and computes content identity") {
