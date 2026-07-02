@@ -63,7 +63,20 @@ add_library(seriona_audio STATIC
   src/audio/ffmpeg/ffmpeg_audio_source.cpp
   src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   src/audio/playback_state_machine.cpp
+  src/audio/waveform_ffmpeg.cpp
+  src/audio/waveform_generator.cpp
+  src/audio/waveform_scalar.cpp
+  src/audio/waveform_simd.cpp
+  src/audio/waveform_simd_avx2.cpp
+  src/audio/waveform_strategy_a.cpp
+  src/audio/waveform_strategy_b.cpp
 )
+
+if(MSVC)
+  set_source_files_properties(src/audio/waveform_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/audio/waveform_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
 
 target_include_directories(seriona_audio
   PUBLIC
@@ -76,7 +89,15 @@ target_link_libraries(seriona_audio
     PkgConfig::SERIONA_FFMPEG
 )
 
-target_link_libraries(seriona_audio PRIVATE spdlog::spdlog)
+target_link_libraries(seriona_audio PRIVATE
+  BS::thread_pool
+  spdlog::spdlog
+)
+
+get_target_property(SERIONA_AUDIO_LINK_LIBRARIES seriona_audio LINK_LIBRARIES)
+if(NOT "BS::thread_pool" IN_LIST SERIONA_AUDIO_LINK_LIBRARIES)
+  message(FATAL_ERROR "seriona_audio requires BS::thread_pool for waveform generator private thread-pool headers")
+endif()
 
 function(seriona_enable_warnings target_name)
   if(MSVC)
