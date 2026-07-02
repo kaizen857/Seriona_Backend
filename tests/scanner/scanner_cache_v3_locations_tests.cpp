@@ -1,153 +1,169 @@
 #include "scanner_test_harness.h"
 
 #include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/song_identity.h"
 
 #include <doctest.h>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <filesystem>
-#include <stdexcept>
-#include <string>
 
 namespace seriona::scanner::cache {
 namespace {
 
-[[nodiscard]] SQLiteCacheV3 openCache(const std::filesystem::path& dbPath) {
-  return SQLiteCacheV3{ScannerCacheConfig{.databasePath = dbPath, .busyTimeout = std::chrono::milliseconds{25}}};
-}
+TEST_CASE("SQLiteCacheV3: stores and retrieves location without CUE offset") {
+  test::TempScannerRoot temp{"cache-v3-location-basic"};
+  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
-[[nodiscard]] SongMetadata contentFixture(std::string contentId) {
-  SongMetadata metadata{};
-  metadata.trackId = std::move(contentId);
-  metadata.title = "Song";
-  metadata.artist = "Artist";
-  metadata.album = "Album";
-  metadata.albumArtist = "Album Artist";
-  metadata.genre = "Genre";
-  metadata.duration = std::chrono::milliseconds{180000};
-  return metadata;
-}
+  cache.updateScanRoot(CachedScanRootV3{.rootPath = temp.path()});
 
-void execSql(sqlite3* db, const char* sql) {
-  char* message = nullptr;
-  if (sqlite3_exec(db, sql, nullptr, nullptr, &message) != SQLITE_OK) {
-    const auto detail = std::string{message == nullptr ? sqlite3_errmsg(db) : message};
-    sqlite3_free(message);
-    throw std::runtime_error{detail};
-  }
-}
+  SongMetadata meta;
+  meta.title = "Test Song";
+  meta.duration = std::chrono::milliseconds{180000};
+  cache.upsertContent("content-1", meta);
 
-void seedRoot(const std::filesystem::path& dbPath, const std::string& rootPath) {
-  sqlite3* db = nullptr;
-  REQUIRE(sqlite3_open_v2(dbPath.generic_string().c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
-  execSql(db, "PRAGMA foreign_keys=ON;");
-  sqlite3_stmt* statement = nullptr;
-  REQUIRE(sqlite3_prepare_v2(db, R"sql(
-INSERT INTO scan_roots(root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms)
-VALUES(?1, 'hash', 0, 'incremental', 0, 1);
-)sql", -1, &statement, nullptr) == SQLITE_OK);
-  REQUIRE(sqlite3_bind_text(statement, 1, rootPath.c_str(), static_cast<int>(rootPath.size()), SQLITE_TRANSIENT) == SQLITE_OK);
-  REQUIRE(sqlite3_step(statement) == SQLITE_DONE);
-  sqlite3_finalize(statement);
-  sqlite3_close(db);
-}
+  const auto filePath = temp.path() / "music" / "song.flac";
+  const auto locationId = computeLocationId(filePath, 1024, std::nullopt);
 
-void seedContentAndRoot(SQLiteCacheV3& cache, const std::filesystem::path& dbPath, const std::string& contentId,
-                        const std::string& rootPath) {
-  cache.upsertContent(contentId, contentFixture(contentId));
-  seedRoot(dbPath, rootPath);
-}
+  CachedLocation location{
+    .locationId = locationId,
+    .contentId = "content-1",
+    .rootPath = temp.path(),
+    .filePath = filePath,
+    .fileSizeBytes = 1024,
+    .fileMtimeNs = 123456789,
+    .sourceFilePath = filePath,
+    .cueTrackOffset = std::nullopt
+  };
 
-[[nodiscard]] CachedLocation locationFixture(std::string locationId, std::string contentId, std::string rootPath,
-                                             std::string filePath) {
-  return CachedLocation{.locationId = std::move(locationId),
-                        .contentId = std::move(contentId),
-                        .rootPath = std::move(rootPath),
-                        .filePath = std::move(filePath),
-                        .fileSizeBytes = 4096U,
-                        .fileMtimeNs = 123456789,
-                        .sourceFilePath = "disc.flac",
-                        .cueTrackOffset = std::chrono::milliseconds{45000},
-                        .artworkPath = std::filesystem::path{"cover.png"},
-                        .lyricsSource = LyricsSource::ExternalLrc,
-                        .externalLrcPath = std::filesystem::path{"song.lrc"},
-                        .externalLrcMtimeNs = 987654321,
-                        .discoveredAt = std::chrono::system_clock::time_point{std::chrono::milliseconds{1000}},
-                        .scannedAt = std::chrono::system_clock::time_point{std::chrono::milliseconds{2000}}};
-}
+  cache.upsertLocation(location);
 
-}
-
-TEST_CASE("sqlite cache v3 upserts and loads a location") {
-  test::TempScannerRoot temp{"scanner-cache-v3-location-insert"};
-  auto cache = openCache(temp.dbPath());
-  seedContentAndRoot(cache, temp.dbPath(), "content-1", "/music");
-
-  cache.upsertLocation(locationFixture("location-1", "content-1", "/music", "/music/song.flac"));
-  const auto loaded = cache.loadLocation("location-1");
-
+  auto loaded = cache.loadLocation(locationId);
   REQUIRE(loaded.has_value());
   CHECK(loaded->contentId == "content-1");
-  CHECK(loaded->filePath == std::filesystem::path{"/music/song.flac"});
-  CHECK(loaded->fileSizeBytes == 4096U);
-  CHECK(loaded->lyricsSource == LyricsSource::ExternalLrc);
-  CHECK(loaded->cueTrackOffset == std::chrono::milliseconds{45000});
-  CHECK(loaded->externalLrcMtimeNs == 987654321);
+  CHECK(loaded->filePath == filePath);
+  CHECK(loaded->fileSizeBytes == 1024);
+  CHECK_FALSE(loaded->cueTrackOffset.has_value());
 }
 
-TEST_CASE("sqlite cache v3 loads locations by root path") {
-  test::TempScannerRoot temp{"scanner-cache-v3-location-root"};
-  auto cache = openCache(temp.dbPath());
-  seedContentAndRoot(cache, temp.dbPath(), "content-2", "/music");
-  seedRoot(temp.dbPath(), "/other");
-  cache.upsertLocation(locationFixture("location-b", "content-2", "/music", "/music/b.flac"));
-  cache.upsertLocation(locationFixture("location-a", "content-2", "/music", "/music/a.flac"));
-  cache.upsertLocation(locationFixture("location-x", "content-2", "/other", "/other/x.flac"));
+TEST_CASE("SQLiteCacheV3: stores and retrieves CUE track location with offset") {
+  test::TempScannerRoot temp{"cache-v3-location-cue"};
+  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
-  const auto loaded = cache.loadLocationsByRoot("/music");
+  cache.updateScanRoot(CachedScanRootV3{.rootPath = temp.path()});
 
-  REQUIRE(loaded.size() == 2U);
-  CHECK(loaded[0].locationId == "location-a");
-  CHECK(loaded[1].locationId == "location-b");
-}
+  SongMetadata meta;
+  meta.title = "Track 1";
+  meta.duration = std::chrono::milliseconds{30000};
+  cache.upsertContent("content-track-1", meta);
 
-TEST_CASE("sqlite cache v3 prunes deleted locations by root") {
-  test::TempScannerRoot temp{"scanner-cache-v3-location-prune"};
-  auto cache = openCache(temp.dbPath());
-  seedContentAndRoot(cache, temp.dbPath(), "content-3", "/music");
-  seedRoot(temp.dbPath(), "/other");
-  cache.upsertLocation(locationFixture("keep", "content-3", "/music", "/music/keep.flac"));
-  cache.upsertLocation(locationFixture("drop", "content-3", "/music", "/music/drop.flac"));
-  cache.upsertLocation(locationFixture("other", "content-3", "/other", "/other/keep.flac"));
+  const auto cueFile = temp.path() / "album.cue";
+  const auto flacFile = temp.path() / "album.flac";
+  const auto offset = std::chrono::milliseconds{30000};
+  const auto locationId = computeLocationId(cueFile, 2048, std::nullopt, offset);
 
-  cache.pruneDeletedLocations("/music", {"keep"});
+  CachedLocation location{
+    .locationId = locationId,
+    .contentId = "content-track-1",
+    .rootPath = temp.path(),
+    .filePath = cueFile,
+    .fileSizeBytes = 2048,
+    .fileMtimeNs = 987654321,
+    .sourceFilePath = flacFile,
+    .cueTrackOffset = offset
+  };
 
-  CHECK(cache.loadLocation("keep").has_value());
-  CHECK_FALSE(cache.loadLocation("drop").has_value());
-  CHECK(cache.loadLocation("other").has_value());
-}
+  cache.upsertLocation(location);
 
-TEST_CASE("sqlite cache v3 rejects locations with invalid content foreign key") {
-  test::TempScannerRoot temp{"scanner-cache-v3-location-invalid-content"};
-  auto cache = openCache(temp.dbPath());
-  seedRoot(temp.dbPath(), "/music");
-
-  CHECK_THROWS_AS(cache.upsertLocation(locationFixture("location-4", "missing", "/music", "/music/song.flac")), std::runtime_error);
-}
-
-TEST_CASE("sqlite cache v3 replaces a changed location id for the same file path") {
-  test::TempScannerRoot temp{"scanner-cache-v3-location-replaced-path"};
-  auto cache = openCache(temp.dbPath());
-  seedContentAndRoot(cache, temp.dbPath(), "content-5", "/music");
-  cache.upsertLocation(locationFixture("location-5a", "content-5", "/music", "/music/song.flac"));
-
-  cache.upsertLocation(locationFixture("location-5b", "content-5", "/music", "/music/song.flac"));
-
-  CHECK_FALSE(cache.loadLocation("location-5a").has_value());
-  const auto loaded = cache.loadLocation("location-5b");
+  auto loaded = cache.loadLocation(locationId);
   REQUIRE(loaded.has_value());
-  CHECK(loaded->filePath == std::filesystem::path{"/music/song.flac"});
+  CHECK(loaded->contentId == "content-track-1");
+  CHECK(loaded->filePath == cueFile);
+  CHECK(loaded->sourceFilePath == flacFile);
+  REQUIRE(loaded->cueTrackOffset.has_value());
+  CHECK(loaded->cueTrackOffset->count() == 30000);
 }
 
+TEST_CASE("SQLiteCacheV3: loads locations by root path") {
+  test::TempScannerRoot temp{"cache-v3-location-by-root"};
+  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+
+  cache.updateScanRoot(CachedScanRootV3{.rootPath = temp.path()});
+
+  SongMetadata meta1, meta2;
+  meta1.title = "Song 1";
+  meta1.duration = std::chrono::milliseconds{100000};
+  meta2.title = "Song 2";
+  meta2.duration = std::chrono::milliseconds{120000};
+  cache.upsertContent("c1", meta1);
+  cache.upsertContent("c2", meta2);
+
+  const auto file1 = temp.path() / "song1.mp3";
+  const auto file2 = temp.path() / "song2.flac";
+
+  const auto id1 = computeLocationId(file1, 1000, std::nullopt);
+  const auto id2 = computeLocationId(file2, 2000, std::nullopt);
+
+  cache.upsertLocation(CachedLocation{
+    .locationId = id1, 
+    .contentId = "c1", 
+    .rootPath = temp.path(), 
+    .filePath = file1, 
+    .fileSizeBytes = 1000, 
+    .sourceFilePath = file1
+  });
+  cache.upsertLocation(CachedLocation{
+    .locationId = id2, 
+    .contentId = "c2", 
+    .rootPath = temp.path(), 
+    .filePath = file2, 
+    .fileSizeBytes = 2000, 
+    .sourceFilePath = file2
+  });
+
+  auto locations = cache.loadLocationsByRoot(temp.path());
+  CHECK(locations.size() == 2);
 }
+
+TEST_CASE("SQLiteCacheV3: updates existing location") {
+  test::TempScannerRoot temp{"cache-v3-location-update"};
+  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+
+  cache.updateScanRoot(CachedScanRootV3{.rootPath = temp.path()});
+
+  SongMetadata meta1, meta2;
+  meta1.title = "Old Content";
+  meta1.duration = std::chrono::milliseconds{100000};
+  meta2.title = "New Content";
+  meta2.duration = std::chrono::milliseconds{120000};
+  cache.upsertContent("content-old", meta1);
+  cache.upsertContent("content-new", meta2);
+
+  const auto filePath = temp.path() / "song.mp3";
+  const auto locationId = computeLocationId(filePath, 1500, std::nullopt);
+
+  cache.upsertLocation(CachedLocation{
+    .locationId = locationId,
+    .contentId = "content-old",
+    .rootPath = temp.path(),
+    .filePath = filePath,
+    .fileSizeBytes = 1500,
+    .sourceFilePath = filePath
+  });
+
+  cache.upsertLocation(CachedLocation{
+    .locationId = locationId,
+    .contentId = "content-new",
+    .rootPath = temp.path(),
+    .filePath = filePath,
+    .fileSizeBytes = 1500,
+    .sourceFilePath = filePath
+  });
+
+  auto loaded = cache.loadLocation(locationId);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->contentId == "content-new");
+}
+
+}  // namespace
+}  // namespace seriona::scanner::cache

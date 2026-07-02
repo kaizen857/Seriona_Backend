@@ -15,6 +15,7 @@ namespace seriona::scanner {
                                            std::string_view artist);
 [[nodiscard]] std::string computeLocationId(const std::filesystem::path& path,
                                             std::uint64_t fileSize,
-                                            std::optional<std::filesystem::file_time_type> mtime);
+                                            std::optional<std::filesystem::file_time_type> mtime,
+                                            std::optional<std::chrono::milliseconds> cueTrackOffset = std::nullopt);
 
 }

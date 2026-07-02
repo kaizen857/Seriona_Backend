@@ -183,12 +183,30 @@ private:
     pendingFrameWrite_.reset();
     preloadSlot_.reset();
 
+    trackEndPosition_.reset();
+    if (request.offset.has_value() && request.duration.has_value()) {
+      trackEndPosition_ = *request.offset + *request.duration;
+      spdlog::debug("track boundary: offset={}ms, duration={}ms, end={}ms",
+                    request.offset->count(),
+                    request.duration->count(),
+                    trackEndPosition_->count());
+    }
+
     stateMachine_.loadTrack(request);
 
     if (const auto error = source_->open(request.filePath)) {
       spdlog::error("track load failed (open): {} - {}", error->message, error->detail);
       fail(error->code, error->message, error->detail);
       return;
+    }
+
+    if (request.offset.has_value() && request.offset->count() > 0) {
+      if (const auto error = source_->seek(*request.offset)) {
+        spdlog::error("track load failed (initial seek to offset): {} - {}", error->message, error->detail);
+        fail(error->code, error->message, error->detail);
+        return;
+      }
+      spdlog::debug("seeked to CUE track offset: {}ms", request.offset->count());
     }
 
     const auto& streamInfo = source_->streamInfo();
@@ -628,7 +646,29 @@ private:
       return true;
     }
 
+    if (trackEndPosition_.has_value()) {
+      const auto currentPosition = clock_.snapshot().position;
+      if (currentPosition >= *trackEndPosition_) {
+        spdlog::debug("track boundary reached: current={}ms, end={}ms",
+                      currentPosition.count(),
+                      trackEndPosition_->count());
+        loadedToEnd_ = true;
+        return true;
+      }
+    }
+
     while (queue_->availableFrames() < queue_->capacityFrames()) {
+      if (trackEndPosition_.has_value()) {
+        const auto currentPosition = clock_.snapshot().position;
+        if (currentPosition >= *trackEndPosition_) {
+          spdlog::debug("track boundary reached during fill: current={}ms, end={}ms",
+                        currentPosition.count(),
+                        trackEndPosition_->count());
+          loadedToEnd_ = true;
+          return true;
+        }
+      }
+
       auto readResult = source_->readFrame();
       if (readResult.error) {
         fail(readResult.error->code, readResult.error->message, readResult.error->detail);
@@ -1027,6 +1067,7 @@ private:
   std::optional<PreloadSlot> preloadSlot_{};
   bool loadedToEnd_{false};
   bool hasCurrentTarget_{false};
+  std::optional<std::chrono::milliseconds> trackEndPosition_{};
   std::chrono::steady_clock::time_point lastProgressPublish_{};
   std::optional<std::chrono::milliseconds> lastPublishedPosition_{};
   mutable std::mutex snapshotMutex_{};

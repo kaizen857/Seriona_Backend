@@ -19,7 +19,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
 
 [[nodiscard]] cache::SQLiteCacheV3 openScanRootCache(const std::filesystem::path& databasePath) {
   return cache::SQLiteCacheV3{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath),
-                                                        .busyTimeout = std::chrono::milliseconds{25}}};
+                                                        }};
 }
 
 [[nodiscard]] std::filesystem::path externalDatabasePath(const test::TempScannerRoot& temp) {

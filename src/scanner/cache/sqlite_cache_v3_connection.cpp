@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS locations(
   location_id TEXT PRIMARY KEY,
   content_id TEXT NOT NULL,
   root_path TEXT NOT NULL,
-  file_path TEXT NOT NULL UNIQUE,
+  file_path TEXT NOT NULL,
   file_size_bytes INTEGER NOT NULL,
   file_mtime_ns INTEGER NOT NULL,
   source_file_path TEXT NOT NULL,
@@ -162,6 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_content_artist ON content(artist);
 CREATE INDEX IF NOT EXISTS idx_locations_content ON locations(content_id);
 CREATE INDEX IF NOT EXISTS idx_locations_root ON locations(root_path);
 CREATE INDEX IF NOT EXISTS idx_locations_path ON locations(file_path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_file_offset ON locations(file_path, COALESCE(cue_track_offset_ms, 0));
 CREATE INDEX IF NOT EXISTS idx_lyrics_location ON lyrics(location_id);
 CREATE INDEX IF NOT EXISTS idx_errors_root ON scan_errors(root_path);
 
@@ -179,7 +180,7 @@ void SQLiteCacheV3::configureConnection(sqlite3* db, const std::chrono::millisec
 }
 
 SQLiteCacheV3::SQLiteCacheV3(ScannerCacheConfig config)
-    : databasePath_(std::move(config.databasePath)), busyTimeout_(config.busyTimeout) {
+    : databasePath_(std::move(config.databasePath)) {
   open();
 }
 
@@ -207,9 +208,6 @@ void SQLiteCacheV3::open() {
   const auto version = readUserVersion();
   if (version == 0) {
     initializeSchemaV3();
-  } else if (version == 2) {
-    createMigrationBackup();
-    try { migrateSchemaV2ToV3(); } catch (...) { restoreMigrationBackup(); throw; }
   }
 
   if (readUserVersion() != kSchemaVersion) {

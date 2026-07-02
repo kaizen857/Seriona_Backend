@@ -1,6 +1,6 @@
 #pragma once
 
-#include "seriona/scanner/cache/sqlite_scanner_cache.h"
+#include "seriona/scanner/scanner_contracts.h"
 
 #include <chrono>
 #include <cstdint>
@@ -13,6 +13,22 @@
 struct sqlite3;
 
 namespace seriona::scanner::cache {
+
+struct CachedSong {
+  SongMetadata metadata;
+  std::vector<LyricLine> embeddedLyrics;
+  std::vector<LyricLine> externalLyrics;
+};
+
+struct CachedUserStats {
+  std::uint32_t playCount{0};
+  std::uint32_t rating{0};
+  std::optional<std::chrono::system_clock::time_point> lastPlayed;
+};
+
+struct ScannerCacheConfig {
+  std::filesystem::path databasePath;
+};
 
 struct CachedLocation {
   std::string locationId;
@@ -89,15 +105,11 @@ public:
   void saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanErrorV3>& errors);
   [[nodiscard]] std::vector<CachedScanErrorV3> loadErrors(const std::filesystem::path& rootPath) const;
   void clearErrors(const std::filesystem::path& rootPath);
-  void rollbackToBackup();
   [[nodiscard]] WriterTransaction beginWriter();
 
 private:
   void open();
   void initializeSchemaV3();
-  void migrateSchemaV2ToV3();
-  void createMigrationBackup();
-  void restoreMigrationBackup();
 
   [[nodiscard]] int readUserVersion() const;
   [[nodiscard]] std::string readJournalMode() const;

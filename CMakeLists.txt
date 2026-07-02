@@ -136,8 +136,6 @@ add_library(seriona_scanner STATIC
   src/scanner/file_scanner_orchestrator.cpp
   src/scanner/cache/sqlite_cache_v3.cpp
   src/scanner/cache/sqlite_cache_v3_connection.cpp
-  src/scanner/cache/sqlite_cache_v3_migration.cpp
-  src/scanner/cache/sqlite_scanner_cache.cpp
   src/scanner/directory_tree_hash.cpp
   src/scanner/hash_utils.cpp
   src/scanner/lrc_parser.cpp

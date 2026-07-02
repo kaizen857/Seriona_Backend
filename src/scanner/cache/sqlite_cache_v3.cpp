@@ -220,13 +220,9 @@ FROM content WHERE content_id=?1;
   if (select.columnType(12) == SQLITE_INTEGER) {
     song.metadata.channels = static_cast<std::uint16_t>(select.int64Column(12));
   }
-  song.userStats.playCount = static_cast<std::uint64_t>(select.int64Column(13));
-  if (select.columnType(14) == SQLITE_INTEGER) {
-    song.userStats.rating = static_cast<std::uint32_t>(select.int64Column(14));
-  }
-  if (select.columnType(15) == SQLITE_INTEGER) {
-    song.userStats.lastPlayed = msToSystemTime(select.int64Column(15));
-  }
+  
+  // V3: userStats removed from CachedSong, managed separately
+  
   return song;
 }
 
@@ -234,7 +230,11 @@ void SQLiteCacheV3::updateUserStats(const std::string& contentId, const CachedUs
   auto transaction = beginWriter();
   Statement update{asDb(db_), "UPDATE content SET play_count=?1, rating=?2, last_played_ms=?3 WHERE content_id=?4;"};
   update.bind(1, static_cast<std::int64_t>(userStats.playCount));
-  update.bindOptional(2, userStats.rating);
+  if (userStats.rating != 0) {
+    update.bind(2, static_cast<std::int64_t>(userStats.rating));
+  } else {
+    update.bindNull(2);
+  }
   update.bindOptionalSystemTime(3, userStats.lastPlayed);
   update.bind(4, contentId);
   update.stepDone();

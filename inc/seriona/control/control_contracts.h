@@ -167,6 +167,7 @@ struct MediaControllerCommandResult {
 struct MediaControllerOptions {
   bool runInlineForTests{false};
   std::uint64_t shuffleSeed{0};
+  std::size_t shuffleHistorySize{50};
 };
 
 struct MediaControllerDependencies {

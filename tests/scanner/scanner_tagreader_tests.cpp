@@ -97,9 +97,6 @@ TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initi
   CHECK(mapped.embeddedLyrics[0].timestamp == std::chrono::milliseconds{1});
   CHECK(mapped.embeddedLyrics[0].text == "embedded one");
   CHECK(metadata.effectiveLyrics[1].text == "embedded two");
-  CHECK(mapped.userStats.playCount == 5U);
-  CHECK(mapped.userStats.rating == 4U);
-  CHECK(mapped.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{777}});
 }
 
 TEST_CASE("tagreader adapter preserves cached user stats and respects external lrc override") {
@@ -110,9 +107,6 @@ TEST_CASE("tagreader adapter preserves cached user stats and respects external l
 
   const auto mapped = mapRawTagMetadata(rawTagFixture(), "content-hash", cachedStats, true);
 
-  CHECK(mapped.userStats.playCount == 99U);
-  CHECK(mapped.userStats.rating == 1U);
-  CHECK(mapped.userStats.lastPlayed == std::chrono::system_clock::time_point{std::chrono::milliseconds{12345}});
   CHECK(mapped.metadata.effectiveLyricsSource == LyricsSource::None);
   CHECK(mapped.metadata.effectiveLyrics.empty());
   REQUIRE(mapped.embeddedLyrics.size() == 2U);

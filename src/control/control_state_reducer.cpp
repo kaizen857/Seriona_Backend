@@ -103,7 +103,7 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 }
 
 [[nodiscard]] bool sameTrack(const TrackIdentity& lhs, const TrackIdentity& rhs) {
-  return lhs.trackId == rhs.trackId && lhs.filePath == rhs.filePath;
+  return lhs.trackId == rhs.trackId;
 }
 
 [[nodiscard]] TrackIdentity identityFromSong(const scanner::SongMetadata& song) {
@@ -111,8 +111,11 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 }
 
 [[nodiscard]] audio::TrackPlaybackRequest requestFromSong(const scanner::SongMetadata& song) {
+  // For CUE tracks, use sourceFilePath (the actual audio file) instead of filePath (the .cue file)
+  const auto& actualAudioPath = !song.sourceFilePath.empty() ? song.sourceFilePath : song.filePath;
+  
   return audio::TrackPlaybackRequest{.trackId = song.trackId,
-                                     .filePath = song.filePath,
+                                     .filePath = actualAudioPath,
                                      .title = song.title,
                                      .artist = song.artist,
                                      .offset = song.offset,
@@ -208,7 +211,46 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 
 }
 
-ControlStateReducer::ControlStateReducer(MediaControllerOptions options) : shuffleRandom_{options.shuffleSeed} {
+ShuffleHistory::ShuffleHistory(std::size_t maxSize) : maxSize_(maxSize) {}
+
+void ShuffleHistory::push(const TrackIdentity& track) {
+  history_.push_back(track);
+  if (history_.size() > maxSize_) {
+    history_.pop_front();
+  }
+}
+
+std::optional<TrackIdentity> ShuffleHistory::pop() {
+  if (history_.empty()) {
+    return std::nullopt;
+  }
+  auto track = history_.back();
+  history_.pop_back();
+  return track;
+}
+
+bool ShuffleHistory::contains(const TrackIdentity& track) const {
+  return std::find_if(history_.begin(), history_.end(), [&](const TrackIdentity& item) {
+    return sameTrack(item, track);
+  }) != history_.end();
+}
+
+void ShuffleHistory::clear() {
+  history_.clear();
+}
+
+std::size_t ShuffleHistory::size() const noexcept {
+  return history_.size();
+}
+
+bool ShuffleHistory::empty() const noexcept {
+  return history_.empty();
+}
+
+ControlStateReducer::ControlStateReducer(MediaControllerOptions options) 
+    : shuffleRandom_{options.shuffleSeed},
+      shuffleHistory_{options.shuffleHistorySize},
+      shuffleHistorySize_{options.shuffleHistorySize} {
   player_.capabilities = defaultCapabilities();
 }
 
@@ -284,8 +326,15 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       visibleStateDuringSeek_ = player_.playback.state;
       spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
     }
-    player_.timeline.position = clampPosition(*command.position);
-    reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
+    {
+      const auto trackPosition = clampPosition(*command.position);
+      auto filePosition = trackPosition;
+      if (currentTrackOffset_.has_value()) {
+        filePosition = trackPosition + *currentTrackOffset_;
+      }
+      player_.timeline.position = trackPosition;
+      reduction.intents.push_back(makeSeekIntent(filePosition));
+    }
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::SeekBy:
@@ -296,8 +345,15 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       visibleStateDuringSeek_ = player_.playback.state;
       spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
     }
-    player_.timeline.position = clampPosition(player_.timeline.position + *command.delta);
-    reduction.intents.push_back(makeSeekIntent(player_.timeline.position));
+    {
+      const auto trackPosition = clampPosition(player_.timeline.position + *command.delta);
+      auto filePosition = trackPosition;
+      if (currentTrackOffset_.has_value()) {
+        filePosition = trackPosition + *currentTrackOffset_;
+      }
+      player_.timeline.position = trackPosition;
+      reduction.intents.push_back(makeSeekIntent(filePosition));
+    }
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::SetVolume:
@@ -328,6 +384,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       return reject(MediaControllerErrorCode::InvalidCommand, "SetShuffle requires a shuffle value");
     }
     player_.shuffle = *command.shuffle;
+    shuffleHistory_.clear();
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::SkipNext:
@@ -338,13 +395,32 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
         return reduction;
       }
     }
+    if (player_.shuffle && selectedTrack_.has_value()) {
+      shuffleHistory_.push(*selectedTrack_);
+    }
     if (const auto track = nextTrack(true); track.has_value()) {
       selectTrack(reduction, *track, true);
       return reduction;
     }
     stopPlayback(reduction);
     return reduction;
-  case MediaControlCommandKind::SkipPrevious:
+  case MediaControlCommandKind::SkipPrevious: {
+    // 如果播放超过 5 秒，上一首等于 seek 到 0
+    if (player_.timeline.position > std::chrono::seconds{5}) {
+      if (isStableSeekVisibleState(player_.playback.state)) {
+        visibleStateDuringSeek_ = player_.playback.state;
+        spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
+      }
+      player_.timeline.position = std::chrono::milliseconds{0};
+      auto filePosition = std::chrono::milliseconds{0};
+      if (currentTrackOffset_.has_value()) {
+        filePosition = *currentTrackOffset_;
+      }
+      reduction.intents.push_back(makeSeekIntent(filePosition));
+      markPlayerChanged(reduction);
+      return reduction;
+    }
+    // Repeat One 模式
     if (player_.repeatMode == RepeatMode::One && selectedTrack_.has_value()) {
       const auto track = findPlayableTrack(*selectedTrack_);
       if (track.has_value()) {
@@ -352,16 +428,30 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
         return reduction;
       }
     }
+    // 尝试上一首
     if (const auto track = nextTrack(false); track.has_value()) {
       selectTrack(reduction, *track, true);
       return reduction;
     }
-    stopPlayback(reduction);
+    // 没有上一首，seek 到 0
+    if (isStableSeekVisibleState(player_.playback.state)) {
+      visibleStateDuringSeek_ = player_.playback.state;
+      spdlog::debug("seek visible state suppressed (holding {})", playbackStatusName(*visibleStateDuringSeek_));
+    }
+    player_.timeline.position = std::chrono::milliseconds{0};
+    auto filePositionFallback = std::chrono::milliseconds{0};
+    if (currentTrackOffset_.has_value()) {
+      filePositionFallback = *currentTrackOffset_;
+    }
+    reduction.intents.push_back(makeSeekIntent(filePositionFallback));
+    markPlayerChanged(reduction);
     return reduction;
+  }
   case MediaControlCommandKind::SelectTrack:
     if (!command.track.has_value()) {
       return reject(MediaControllerErrorCode::InvalidCommand, "SelectTrack requires a track identity");
     }
+    shuffleHistory_.clear();
     if (const auto track = findPlayableTrack(*command.track); track.has_value()) {
       selectTrack(reduction, *track, true);
       return reduction;
@@ -416,14 +506,40 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           player_.timeline.duration = payload.request.duration;
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackPositionUpdated>) {
-          player_.timeline.position = clampPosition(payload.clock.position);
+          auto filePosition = payload.clock.position;
+          auto trackPosition = filePosition;
+          if (currentTrackOffset_.has_value()) {
+            trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
+          }
+          if (player_.timeline.duration.has_value()) {
+            trackPosition = std::min(trackPosition, *player_.timeline.duration);
+          }
+          player_.timeline.position = trackPosition;
           markPlayerChanged(reduction, payload.clock.sampledAt);
         } else if constexpr (std::is_same_v<Payload, audio::PositionDiscontinuity>) {
-          player_.timeline.position = clampPosition(payload.after.position);
+          auto filePosition = payload.after.position;
+          auto trackPosition = filePosition;
+          if (currentTrackOffset_.has_value()) {
+            trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
+          }
+          if (player_.timeline.duration.has_value()) {
+            trackPosition = std::min(trackPosition, *player_.timeline.duration);
+          }
+          player_.timeline.position = trackPosition;
           markPlayerChanged(reduction, payload.after.sampledAt);
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
           visibleStateDuringSeek_.reset();
-          player_.timeline.position = clampPosition(payload.finalClock.position);
+          {
+            auto filePosition = payload.finalClock.position;
+            auto trackPosition = filePosition;
+            if (currentTrackOffset_.has_value()) {
+              trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
+            }
+            if (player_.timeline.duration.has_value()) {
+              trackPosition = std::min(trackPosition, *player_.timeline.duration);
+            }
+            player_.timeline.position = trackPosition;
+          }
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
           if (player_.repeatMode == RepeatMode::One) {
             if (const auto track = selectedTrack_.has_value() ? findPlayableTrack(*selectedTrack_) : std::nullopt; track.has_value()) {
@@ -447,7 +563,15 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           player_.playback.errorCode = playbackErrorCode(payload.code);
           player_.playback.errorMessage = payload.message;
           if (payload.clock.has_value()) {
-            player_.timeline.position = clampPosition(payload.clock->position);
+            auto filePosition = payload.clock->position;
+            auto trackPosition = filePosition;
+            if (currentTrackOffset_.has_value()) {
+              trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
+            }
+            if (player_.timeline.duration.has_value()) {
+              trackPosition = std::min(trackPosition, *player_.timeline.duration);
+            }
+            player_.timeline.position = trackPosition;
           }
           addNotification(reduction,
                           makeErrorNotification(ControlDomainNotificationKind::PlaybackError,
@@ -598,52 +722,132 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack
   if (tracks.empty()) {
     return std::nullopt;
   }
+  
+  // 上一曲逻辑
+  if (!forward) {
+    // 随机模式：从历史栈返回
+    if (player_.shuffle) {
+      return previousTrack();
+    }
+    // 非随机模式：返回列表中的上一个
+    if (!selectedTrack_.has_value()) {
+      return std::nullopt;
+    }
+    const auto currentIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) { 
+      return sameTrack(track.identity, *selectedTrack_); 
+    });
+    if (currentIt == tracks.end() || currentIt == tracks.begin()) {
+      if (player_.repeatMode == RepeatMode::All) {
+        return tracks.back();
+      }
+      return std::nullopt;
+    }
+    return *(currentIt - 1);
+  }
+  
+  // 随机模式 + 下一曲
   if (player_.shuffle && tracks.size() > 1U) {
     return shuffledTrack(tracks);
   }
+  
+  // 非随机模式：顺序播放
   if (!selectedTrack_.has_value()) {
     return tracks.front();
   }
-  const auto currentIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) { return sameTrack(track.identity, *selectedTrack_); });
+  const auto currentIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) { 
+    return sameTrack(track.identity, *selectedTrack_); 
+  });
   if (currentIt == tracks.end()) {
     return tracks.front();
   }
   const auto index = static_cast<std::size_t>(std::distance(tracks.begin(), currentIt));
-  if (forward) {
-    if (index + 1U < tracks.size()) {
-      return tracks[index + 1U];
-    }
-    if (player_.repeatMode == RepeatMode::All) {
-      return tracks.front();
-    }
-  } else {
-    if (index > 0U) {
-      return tracks[index - 1U];
-    }
-    if (player_.repeatMode == RepeatMode::All) {
-      return tracks.back();
-    }
+  if (index + 1U < tracks.size()) {
+    return tracks[index + 1U];
+  }
+  if (player_.repeatMode == RepeatMode::All) {
+    return tracks.front();
   }
   return std::nullopt;
 }
 
-std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(const std::vector<PlayableTrack>& tracks) {
-  if (tracks.empty()) {
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(const std::vector<PlayableTrack>&) {
+  auto candidates = getCandidatesInSameFolder();
+  if (candidates.empty()) {
     return std::nullopt;
   }
+  
   if (!selectedTrack_.has_value()) {
-    std::uniform_int_distribution<std::size_t> distribution{0U, tracks.size() - 1U};
-    return tracks[distribution(shuffleRandom_)];
+    std::uniform_int_distribution<std::size_t> distribution{0U, candidates.size() - 1U};
+    return candidates[distribution(shuffleRandom_)];
   }
-  std::vector<PlayableTrack> candidates;
-  std::copy_if(tracks.begin(), tracks.end(), std::back_inserter(candidates), [&](const PlayableTrack& track) {
-    return !sameTrack(track.identity, *selectedTrack_);
-  });
+  
+  candidates = filterOutHistory(candidates);
+  
+  std::vector<PlayableTrack> filtered;
+  std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(filtered),
+               [this](const PlayableTrack& track) {
+                 return !sameTrack(track.identity, *selectedTrack_);
+               });
+  candidates = std::move(filtered);
+  
   if (candidates.empty()) {
-    return player_.repeatMode == RepeatMode::All ? std::optional<PlayableTrack>{tracks.front()} : std::nullopt;
+    if (player_.repeatMode == RepeatMode::All) {
+      shuffleHistory_.clear();
+      candidates = getCandidatesInSameFolder();
+      candidates = filterOutHistory(candidates);
+      
+      std::vector<PlayableTrack> filtered2;
+      std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(filtered2),
+                   [this](const PlayableTrack& track) {
+                     return !sameTrack(track.identity, *selectedTrack_);
+                   });
+      candidates = std::move(filtered2);
+      
+      if (candidates.empty()) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
   }
+  
   std::uniform_int_distribution<std::size_t> distribution{0U, candidates.size() - 1U};
   return candidates[distribution(shuffleRandom_)];
+}
+
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::previousTrack() {
+  auto previousIdentity = shuffleHistory_.pop();
+  if (!previousIdentity.has_value()) {
+    return std::nullopt;
+  }
+  return findPlayableTrack(*previousIdentity);
+}
+
+std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::getCandidatesInSameFolder() const {
+  if (!selectedTrack_.has_value()) {
+    return playableTracks();
+  }
+  
+  const auto currentFolder = selectedTrack_->filePath.parent_path();
+  const auto allTracks = playableTracks();
+  std::vector<PlayableTrack> candidates;
+  
+  std::copy_if(allTracks.begin(), allTracks.end(), std::back_inserter(candidates),
+               [&](const PlayableTrack& track) {
+                 return track.identity.filePath.parent_path() == currentFolder;
+               });
+  
+  return candidates;
+}
+
+std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::filterOutHistory(
+    const std::vector<PlayableTrack>& candidates) const {
+  std::vector<PlayableTrack> filtered;
+  std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(filtered),
+               [this](const PlayableTrack& track) {
+                 return !shuffleHistory_.contains(track.identity);
+               });
+  return filtered;
 }
 
 std::chrono::milliseconds ControlStateReducer::clampPosition(std::chrono::milliseconds position) const {
@@ -690,10 +894,11 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
     return;
   }
   selectedTrack_ = track->identity;
+  currentTrackOffset_ = track->request.offset;
   player_.currentTrack = track->identity;
   player_.display = track->display;
   player_.artwork = track->artwork;
-  player_.timeline.position = track->request.offset.value_or(std::chrono::milliseconds{0});
+  player_.timeline.position = std::chrono::milliseconds{0};
   player_.timeline.duration = track->request.duration;
   player_.playback.state = PlaybackStatus::Stopped;
   player_.playback.errorCode.reset();
@@ -704,10 +909,11 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
   visibleStateDuringSeek_.reset();
   selectedTrack_ = track.identity;
+  currentTrackOffset_ = track.request.offset;
   player_.currentTrack = track.identity;
   player_.display = track.display;
   player_.artwork = track.artwork;
-  player_.timeline.position = track.request.offset.value_or(std::chrono::milliseconds{0});
+  player_.timeline.position = std::chrono::milliseconds{0};
   player_.timeline.duration = track.request.duration;
   player_.playback.state = startPlayback ? PlaybackStatus::Playing : PlaybackStatus::Stopped;
   player_.playback.errorCode.reset();
@@ -722,6 +928,7 @@ void ControlStateReducer::selectTrack(ControlReduction& reduction, const Playabl
 
 void ControlStateReducer::stopPlayback(ControlReduction& reduction) {
   visibleStateDuringSeek_.reset();
+  currentTrackOffset_.reset();
   player_.playback.state = PlaybackStatus::Stopped;
   player_.timeline.position = std::chrono::milliseconds{0};
   spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Stopped));
