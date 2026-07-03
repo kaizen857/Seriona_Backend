@@ -800,14 +800,17 @@ TEST_CASE("media controller facade shutdown unregisters callbacks and drops late
   fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
   const auto playerSnapshotBeforeShutdown = fixture.controller->playerStateSnapshot();
   const auto librarySnapshotBeforeShutdown = fixture.controller->libraryStateSnapshot();
-  const auto playerDeliveriesBeforeShutdown = playerSnapshots.count();
-  const auto libraryDeliveriesBeforeShutdown = librarySnapshots.count();
-  const auto notificationDeliveriesBeforeShutdown = notificationDeliveries;
   const auto updateCallsBeforeShutdown = fixture.fakeMetadata->updateCalls();
 
   playerSubscription.unsubscribe();
   librarySubscription.unsubscribe();
   notificationSubscription.unsubscribe();
+  // Subscription delivery callbacks are asynchronous. unsubscribe() waits for
+  // already-started pre-shutdown deliveries, so the no-late-event baseline must
+  // be captured after all subscriptions are fully removed.
+  const auto playerDeliveriesBeforeLateEvents = playerSnapshots.count();
+  const auto libraryDeliveriesBeforeLateEvents = librarySnapshots.count();
+  const auto notificationDeliveriesBeforeLateEvents = notificationDeliveries;
   fixture.controller->shutdown();
 
   CHECK(fixture.fakeAudio->setEventSinkCalls() == 2U);
@@ -823,9 +826,9 @@ TEST_CASE("media controller facade shutdown unregisters callbacks and drops late
 
   CHECK(fixture.fakeAudio->pauseCalls() == 0U);
   CHECK(fixture.fakeMetadata->updateCalls() == updateCallsBeforeShutdown);
-  CHECK(playerSnapshots.count() == playerDeliveriesBeforeShutdown);
-  CHECK(librarySnapshots.count() == libraryDeliveriesBeforeShutdown);
-  CHECK(notificationDeliveries == notificationDeliveriesBeforeShutdown);
+  CHECK(playerSnapshots.count() == playerDeliveriesBeforeLateEvents);
+  CHECK(librarySnapshots.count() == libraryDeliveriesBeforeLateEvents);
+  CHECK(notificationDeliveries == notificationDeliveriesBeforeLateEvents);
   CHECK(fixture.controller->playerStateSnapshot().freshness.version == playerSnapshotBeforeShutdown.freshness.version);
   CHECK(fixture.controller->libraryStateSnapshot().version == librarySnapshotBeforeShutdown.version);
 }
