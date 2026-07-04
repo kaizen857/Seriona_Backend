@@ -202,7 +202,7 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   std::cerr << "seriona: data root: " << runtimePaths.dataRoot.string() << '\n';
 
 #ifdef SERIONA_RELEASE_BUILD
-  av_log_set_level(AV_LOG_ERROR);
+  av_log_set_level(AV_LOG_QUIET);
 #endif
 
   const auto timestampedLogPath = seriona::logging::prepareLogFile(runtimePaths.dataRoot / "logs");
