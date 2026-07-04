@@ -126,6 +126,7 @@ private:
   std::chrono::milliseconds busyTimeout_{500};
   void* db_{nullptr};
   mutable std::mutex writerMutex_;
+  mutable std::mutex readerMutex_;
   
   void* locationStmt_{nullptr};  // sqlite3_stmt*
   void* contentStmt_{nullptr};   // sqlite3_stmt*

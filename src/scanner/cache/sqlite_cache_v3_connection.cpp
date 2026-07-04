@@ -278,6 +278,8 @@ void SQLiteCacheV3::replaceLyrics(const std::string& locationId, const std::stri
 }
 
 std::vector<LyricLine> SQLiteCacheV3::loadLyrics(const std::string& locationId, const std::string& kind) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   Statement select{asDb(db_), "SELECT timestamp_ms, text FROM lyrics WHERE location_id=?1 AND kind=?2 ORDER BY line_index;"}; select.bind(1, locationId); select.bind(2, kind); std::vector<LyricLine> lyrics;
   while (select.stepRow()) { lyrics.push_back({.timestamp = std::chrono::milliseconds{select.int64Column(0)}, .text = select.textColumn(1)}); }
   return lyrics;
@@ -289,6 +291,8 @@ void SQLiteCacheV3::updateScanRoot(const CachedScanRootV3& root) {
 }
 
 std::optional<CachedScanRootV3> SQLiteCacheV3::loadScanRoot(const std::filesystem::path& rootPath) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   Statement select{asDb(db_), "SELECT root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms FROM scan_roots WHERE root_path=?1;"}; select.bind(1, pathText(rootPath)); if (!select.stepRow()) { return std::nullopt; }
   return CachedScanRootV3{.rootPath = select.textColumn(0), .directoryTreeHash = select.textColumn(1), .totalFiles = static_cast<std::uint64_t>(select.int64Column(2)), .lastScanMode = parseScanMode(select.textColumn(3)), .lastScanDuration = std::chrono::milliseconds{select.int64Column(4)}, .lastScanAt = msToSystemTime(select.int64Column(5))};
 }
@@ -300,6 +304,8 @@ void SQLiteCacheV3::saveErrors(const std::filesystem::path& rootPath, const std:
 }
 
 std::vector<CachedScanErrorV3> SQLiteCacheV3::loadErrors(const std::filesystem::path& rootPath) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   Statement select{asDb(db_), "SELECT root_path, file_path, error_code, error_message, occurred_at_ms FROM scan_errors WHERE root_path=?1 ORDER BY id;"}; select.bind(1, pathText(rootPath)); std::vector<CachedScanErrorV3> errors;
   while (select.stepRow()) { errors.push_back({.rootPath = select.textColumn(0), .filePath = select.columnType(1) == SQLITE_TEXT ? std::optional<std::filesystem::path>{select.textColumn(1)} : std::nullopt, .errorCode = parseErrorCode(select.textColumn(2)), .errorMessage = select.textColumn(3), .occurredAt = msToSystemTime(select.int64Column(4))}); }
   return errors;

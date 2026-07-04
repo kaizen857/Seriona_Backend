@@ -184,6 +184,8 @@ created_at_ms=content.created_at_ms, updated_at_ms=excluded.updated_at_ms;
 }
 
 std::optional<CachedSong> SQLiteCacheV3::loadContent(const std::string& contentId) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   auto* stmt = static_cast<sqlite3_stmt*>(contentStmt_);
   sqlite3_reset(stmt);
   sqlite3_clear_bindings(stmt);
@@ -292,6 +294,8 @@ void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
 }
 
 std::optional<CachedLocation> SQLiteCacheV3::loadLocation(const std::string& locationId) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   auto* stmt = static_cast<sqlite3_stmt*>(locationStmt_);
   sqlite3_reset(stmt);
   sqlite3_clear_bindings(stmt);
@@ -335,6 +339,8 @@ std::optional<CachedLocation> SQLiteCacheV3::loadLocation(const std::string& loc
 }
 
 std::vector<CachedLocation> SQLiteCacheV3::loadLocationsByRoot(const std::filesystem::path& rootPath) const {
+  std::lock_guard<std::mutex> lock(readerMutex_);
+  
   Statement select{
       asDb(db_),
       "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
