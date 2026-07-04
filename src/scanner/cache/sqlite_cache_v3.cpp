@@ -184,44 +184,48 @@ created_at_ms=content.created_at_ms, updated_at_ms=excluded.updated_at_ms;
 }
 
 std::optional<CachedSong> SQLiteCacheV3::loadContent(const std::string& contentId) const {
-  Statement select{asDb(db_), R"sql(
-SELECT content_id, title, artist, album, album_artist, genre, track_number, disc_number, year, duration_ms,
-sample_rate, bit_depth, channels, play_count, rating, last_played_ms
-FROM content WHERE content_id=?1;
-)sql"};
-  select.bind(1, contentId);
-  if (!select.stepRow()) {
+  auto* stmt = static_cast<sqlite3_stmt*>(contentStmt_);
+  sqlite3_reset(stmt);
+  sqlite3_clear_bindings(stmt);
+  
+  if (sqlite3_bind_text(stmt, 1, contentId.c_str(), static_cast<int>(contentId.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
+    throw sqliteError(asDb(db_), "bind content_id");
+  }
+  
+  const auto result = sqlite3_step(stmt);
+  if (result == SQLITE_DONE) {
     return std::nullopt;
+  }
+  if (result != SQLITE_ROW) {
+    throw sqliteError(asDb(db_), "step content query");
   }
 
   CachedSong song{};
-  song.metadata.trackId = select.textColumn(0);
-  song.metadata.title = select.textColumn(1);
-  song.metadata.artist = select.textColumn(2);
-  song.metadata.album = select.textColumn(3);
-  song.metadata.albumArtist = select.textColumn(4);
-  song.metadata.genre = select.textColumn(5);
-  if (select.columnType(6) == SQLITE_INTEGER) {
-    song.metadata.trackNumber = static_cast<std::uint32_t>(select.int64Column(6));
+  song.metadata.trackId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+  song.metadata.title = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+  song.metadata.artist = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+  song.metadata.album = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+  song.metadata.albumArtist = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+  song.metadata.genre = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+  if (sqlite3_column_type(stmt, 6) == SQLITE_INTEGER) {
+    song.metadata.trackNumber = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 6));
   }
-  if (select.columnType(7) == SQLITE_INTEGER) {
-    song.metadata.discNumber = static_cast<std::uint32_t>(select.int64Column(7));
+  if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) {
+    song.metadata.discNumber = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 7));
   }
-  if (select.columnType(8) == SQLITE_INTEGER) {
-    song.metadata.year = static_cast<std::uint32_t>(select.int64Column(8));
+  if (sqlite3_column_type(stmt, 8) == SQLITE_INTEGER) {
+    song.metadata.year = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 8));
   }
-  song.metadata.duration = std::chrono::milliseconds{select.int64Column(9)};
-  if (select.columnType(10) == SQLITE_INTEGER) {
-    song.metadata.sampleRate = static_cast<std::uint32_t>(select.int64Column(10));
+  song.metadata.duration = std::chrono::milliseconds{sqlite3_column_int64(stmt, 9)};
+  if (sqlite3_column_type(stmt, 10) == SQLITE_INTEGER) {
+    song.metadata.sampleRate = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 10));
   }
-  if (select.columnType(11) == SQLITE_INTEGER) {
-    song.metadata.bitDepth = static_cast<std::uint16_t>(select.int64Column(11));
+  if (sqlite3_column_type(stmt, 11) == SQLITE_INTEGER) {
+    song.metadata.bitDepth = static_cast<std::uint16_t>(sqlite3_column_int64(stmt, 11));
   }
-  if (select.columnType(12) == SQLITE_INTEGER) {
-    song.metadata.channels = static_cast<std::uint16_t>(select.int64Column(12));
+  if (sqlite3_column_type(stmt, 12) == SQLITE_INTEGER) {
+    song.metadata.channels = static_cast<std::uint16_t>(sqlite3_column_int64(stmt, 12));
   }
-  
-  // V3: userStats removed from CachedSong, managed separately
   
   return song;
 }
@@ -288,17 +292,46 @@ void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
 }
 
 std::optional<CachedLocation> SQLiteCacheV3::loadLocation(const std::string& locationId) const {
-  Statement select{
-      asDb(db_),
-      "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
-      "source_file_path, cue_track_offset_ms, artwork_path, lyrics_source, "
-      "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms "
-      "FROM locations WHERE location_id=?1;"};
-  select.bind(1, locationId);
-  if (!select.stepRow()) {
+  auto* stmt = static_cast<sqlite3_stmt*>(locationStmt_);
+  sqlite3_reset(stmt);
+  sqlite3_clear_bindings(stmt);
+  
+  if (sqlite3_bind_text(stmt, 1, locationId.c_str(), static_cast<int>(locationId.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
+    throw sqliteError(asDb(db_), "bind location_id");
+  }
+  
+  const auto result = sqlite3_step(stmt);
+  if (result == SQLITE_DONE) {
     return std::nullopt;
   }
-  return readLocation(select);
+  if (result != SQLITE_ROW) {
+    throw sqliteError(asDb(db_), "step location query");
+  }
+  
+  CachedLocation location{};
+  location.locationId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+  location.contentId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+  location.rootPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+  location.filePath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+  location.fileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
+  location.fileMtimeNs = sqlite3_column_int64(stmt, 5);
+  location.sourceFilePath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+  if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) {
+    location.cueTrackOffset = std::chrono::milliseconds{sqlite3_column_int64(stmt, 7)};
+  }
+  if (sqlite3_column_type(stmt, 8) == SQLITE_TEXT) {
+    location.artworkPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+  }
+  location.lyricsSource = parseLyricsSource(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9)));
+  if (sqlite3_column_type(stmt, 10) == SQLITE_TEXT) {
+    location.externalLrcPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+  }
+  if (sqlite3_column_type(stmt, 11) == SQLITE_INTEGER) {
+    location.externalLrcMtimeNs = sqlite3_column_int64(stmt, 11);
+  }
+  location.discoveredAt = msToSystemTime(sqlite3_column_int64(stmt, 12));
+  location.scannedAt = msToSystemTime(sqlite3_column_int64(stmt, 13));
+  return location;
 }
 
 std::vector<CachedLocation> SQLiteCacheV3::loadLocationsByRoot(const std::filesystem::path& rootPath) const {

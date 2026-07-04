@@ -4,11 +4,13 @@ project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
 include(FetchContent)
 
+option(SERIONA_BUILD_APP "Build Seriona standalone app" ON)
 option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
 option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
 option(SERIONA_METADATA_SIMULATE_MISSING_SDBUS "Simulate missing metadata sdbus-c++ dependency" OFF)
+set(SERIONA_TAGREADER_SOURCE_DIR "" CACHE PATH "Path to the TagReader source directory")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -127,19 +129,39 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(NOT TARGET TagReaderCore)
-  set(SERIONA_TAGREADER_CANDIDATES
-    "../TagReader"
-    "../../cppProject(app_and_lib)/TagReader"
-  )
-  set(SERIONA_TAGREADER_SOURCE_DIR "")
-  foreach(SERIONA_TAGREADER_CANDIDATE IN LISTS SERIONA_TAGREADER_CANDIDATES)
-    if(EXISTS "${PROJECT_SOURCE_DIR}/${SERIONA_TAGREADER_CANDIDATE}/CMakeLists.txt")
-      set(SERIONA_TAGREADER_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE}")
-      break()
-    endif()
-  endforeach()
   if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
-    message(FATAL_ERROR "TagReaderCore is required. Place TagReader next to Seriona_Backend or provide it as the expected sibling checkout.")
+    set(SERIONA_TAGREADER_CANDIDATES
+      "../TagReader"
+      "../../cppProject(app_and_lib)/TagReader"
+    )
+    foreach(SERIONA_TAGREADER_CANDIDATE IN LISTS SERIONA_TAGREADER_CANDIDATES)
+      set(SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE}")
+      cmake_path(ABSOLUTE_PATH SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR
+        BASE_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        NORMALIZE
+      )
+      if(EXISTS "${SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR}/CMakeLists.txt")
+        set(SERIONA_TAGREADER_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR}" CACHE PATH "Path to the TagReader source directory" FORCE)
+        break()
+      endif()
+    endforeach()
+    unset(SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR)
+    unset(SERIONA_TAGREADER_CANDIDATE)
+    unset(SERIONA_TAGREADER_CANDIDATES)
+    if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
+      message(FATAL_ERROR "TagReaderCore is required. Set SERIONA_TAGREADER_SOURCE_DIR to a TagReader checkout or place TagReader next to Seriona_Backend.")
+    endif()
+  else()
+    cmake_path(ABSOLUTE_PATH SERIONA_TAGREADER_SOURCE_DIR
+      BASE_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      NORMALIZE
+      OUTPUT_VARIABLE SERIONA_TAGREADER_NORMALIZED_SOURCE_DIR
+    )
+    set(SERIONA_TAGREADER_SOURCE_DIR "${SERIONA_TAGREADER_NORMALIZED_SOURCE_DIR}" CACHE PATH "Path to the TagReader source directory" FORCE)
+    unset(SERIONA_TAGREADER_NORMALIZED_SOURCE_DIR)
+    if(NOT EXISTS "${SERIONA_TAGREADER_SOURCE_DIR}/CMakeLists.txt")
+      message(FATAL_ERROR "TagReaderCore is required. SERIONA_TAGREADER_SOURCE_DIR does not contain CMakeLists.txt: ${SERIONA_TAGREADER_SOURCE_DIR}")
+    endif()
   endif()
 
   set(SERIONA_BUILD_TESTING_BEFORE_TAGREADER ${BUILD_TESTING})
@@ -147,8 +169,6 @@ if(NOT TARGET TagReaderCore)
   add_subdirectory("${SERIONA_TAGREADER_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/tagreader" EXCLUDE_FROM_ALL)
   set(BUILD_TESTING ${SERIONA_BUILD_TESTING_BEFORE_TAGREADER} CACHE BOOL "Build tests" FORCE)
   unset(SERIONA_BUILD_TESTING_BEFORE_TAGREADER)
-  unset(SERIONA_TAGREADER_SOURCE_DIR)
-  unset(SERIONA_TAGREADER_CANDIDATES)
   set_property(DIRECTORY "${PROJECT_BINARY_DIR}/tagreader/test" PROPERTY TESTS "")
 endif()
 
@@ -249,7 +269,14 @@ if(TARGET PkgConfig::SERIONA_SDBUS_CPP)
   target_link_libraries(seriona_metadata PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
 endif()
 
-add_subdirectory(app)
+add_library(SerionaBackend::control ALIAS seriona_control)
+add_library(SerionaBackend::audio ALIAS seriona_audio)
+add_library(SerionaBackend::scanner ALIAS seriona_scanner)
+add_library(SerionaBackend::metadata ALIAS seriona_metadata)
+
+if(SERIONA_BUILD_APP)
+  add_subdirectory(app)
+endif()
 
 if(SERIONA_BUILD_TESTS)
   include(CTest)

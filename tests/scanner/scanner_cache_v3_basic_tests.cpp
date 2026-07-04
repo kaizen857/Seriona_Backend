@@ -115,5 +115,99 @@ TEST_CASE("SQLiteCacheV3: beginWriter transaction can be committed") {
   CHECK_FALSE(cache.loadContent("test").has_value());
 }
 
+TEST_CASE("SQLiteCacheV3: prepared statements reused across multiple queries") {
+  test::TempScannerRoot temp{"scanner-cache-v3-prepared-stmts"};
+  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+
+  CachedScanRootV3 root;
+  root.rootPath = temp.path();
+  root.directoryTreeHash = "test-hash";
+  root.totalFiles = 3;
+  root.lastScanMode = ScanMode::Full;
+  root.lastScanDuration = std::chrono::milliseconds{1000};
+  root.lastScanAt = std::chrono::system_clock::now();
+  cache.updateScanRoot(root);
+
+  SongMetadata meta1;
+  meta1.title = "Song 1";
+  meta1.artist = "Artist 1";
+  meta1.album = "Album 1";
+  meta1.duration = std::chrono::milliseconds{180000};
+  cache.upsertContent("content-1", meta1);
+
+  SongMetadata meta2;
+  meta2.title = "Song 2";
+  meta2.artist = "Artist 2";
+  meta2.album = "Album 2";
+  meta2.duration = std::chrono::milliseconds{200000};
+  cache.upsertContent("content-2", meta2);
+
+  SongMetadata meta3;
+  meta3.title = "Song 3";
+  meta3.artist = "Artist 3";
+  meta3.album = "Album 3";
+  meta3.duration = std::chrono::milliseconds{220000};
+  cache.upsertContent("content-3", meta3);
+
+  CachedLocation loc1;
+  loc1.locationId = "loc-1";
+  loc1.contentId = "content-1";
+  loc1.rootPath = temp.path();
+  loc1.filePath = temp.path() / "song1.flac";
+  loc1.sourceFilePath = loc1.filePath;
+  loc1.fileSizeBytes = 1000;
+  loc1.fileMtimeNs = 123456789;
+  loc1.lyricsSource = LyricsSource::None;
+  loc1.discoveredAt = std::chrono::system_clock::now();
+  loc1.scannedAt = std::chrono::system_clock::now();
+  cache.upsertLocation(loc1);
+
+  CachedLocation loc2 = loc1;
+  loc2.locationId = "loc-2";
+  loc2.contentId = "content-2";
+  loc2.filePath = temp.path() / "song2.flac";
+  loc2.sourceFilePath = loc2.filePath;
+  cache.upsertLocation(loc2);
+
+  CachedLocation loc3 = loc1;
+  loc3.locationId = "loc-3";
+  loc3.contentId = "content-3";
+  loc3.filePath = temp.path() / "song3.flac";
+  loc3.sourceFilePath = loc3.filePath;
+  cache.upsertLocation(loc3);
+
+  for (int i = 0; i < 100; ++i) {
+    auto loaded1 = cache.loadContent("content-1");
+    REQUIRE(loaded1.has_value());
+    CHECK(loaded1->metadata.title == "Song 1");
+
+    auto loaded2 = cache.loadContent("content-2");
+    REQUIRE(loaded2.has_value());
+    CHECK(loaded2->metadata.title == "Song 2");
+
+    auto loaded3 = cache.loadContent("content-3");
+    REQUIRE(loaded3.has_value());
+    CHECK(loaded3->metadata.title == "Song 3");
+
+    auto loadedLoc1 = cache.loadLocation("loc-1");
+    REQUIRE(loadedLoc1.has_value());
+    CHECK(loadedLoc1->contentId == "content-1");
+
+    auto loadedLoc2 = cache.loadLocation("loc-2");
+    REQUIRE(loadedLoc2.has_value());
+    CHECK(loadedLoc2->contentId == "content-2");
+
+    auto loadedLoc3 = cache.loadLocation("loc-3");
+    REQUIRE(loadedLoc3.has_value());
+    CHECK(loadedLoc3->contentId == "content-3");
+
+    auto nonExistent = cache.loadContent("non-existent");
+    CHECK_FALSE(nonExistent.has_value());
+
+    auto nonExistentLoc = cache.loadLocation("non-existent-loc");
+    CHECK_FALSE(nonExistentLoc.has_value());
+  }
+}
+
 }
 }

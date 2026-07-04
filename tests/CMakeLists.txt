@@ -314,6 +314,13 @@ add_executable(seriona_scanner_cache_v3_auxiliary_tests
   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 )
+add_executable(seriona_scanner_cache_v3_perf_tests
+  scanner/scanner_cache_v3_perf_tests.cpp
+  scanner/scanner_test_harness.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
+)
 # DISABLED
 # add_executable(seriona_scanner_migration_v2_to_v3_tests
 #   scanner/scanner_migration_v2_to_v3_tests.cpp
@@ -430,6 +437,7 @@ target_compile_definitions(seriona_scanner_cache_v3_basic_tests PRIVATE DOCTEST_
 # target_compile_definitions(seriona_scanner_cache_v3_content_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cache_v3_locations_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cache_v3_auxiliary_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_v3_perf_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_migration_v2_to_v3_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_backup_rollback_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_phase1_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -687,6 +695,10 @@ target_include_directories(seriona_scanner_cache_v3_auxiliary_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_cache_v3_perf_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 # target_include_directories(seriona_scanner_migration_v2_to_v3_tests PRIVATE
 #   ${PROJECT_SOURCE_DIR}/inc
 #   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -929,6 +941,7 @@ seriona_enable_warnings(seriona_scanner_cache_v3_basic_tests)
 # seriona_enable_warnings(seriona_scanner_cache_v3_content_tests)
 seriona_enable_warnings(seriona_scanner_cache_v3_locations_tests)
 seriona_enable_warnings(seriona_scanner_cache_v3_auxiliary_tests)
+seriona_enable_warnings(seriona_scanner_cache_v3_perf_tests)
 # seriona_enable_warnings(seriona_scanner_migration_v2_to_v3_tests)
 # seriona_enable_warnings(seriona_scanner_backup_rollback_tests)
 # seriona_enable_warnings(seriona_scanner_phase1_integration_tests)
@@ -961,6 +974,10 @@ target_link_libraries(seriona_scanner_cache_v3_locations_tests PRIVATE
   PkgConfig::SERIONA_XXHASH
 )
 target_link_libraries(seriona_scanner_cache_v3_auxiliary_tests PRIVATE
+  SQLite3::SQLite3
+  PkgConfig::SERIONA_XXHASH
+)
+target_link_libraries(seriona_scanner_cache_v3_perf_tests PRIVATE
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
 )
@@ -1136,6 +1153,7 @@ add_test(NAME seriona.scanner.cache_v3_basic COMMAND seriona_scanner_cache_v3_ba
 # add_test(NAME seriona.scanner.cache_v3_content COMMAND seriona_scanner_cache_v3_content_tests)
 add_test(NAME seriona.scanner.cache_v3_locations COMMAND seriona_scanner_cache_v3_locations_tests)
 add_test(NAME seriona.scanner.cache_v3_auxiliary COMMAND seriona_scanner_cache_v3_auxiliary_tests)
+add_test(NAME seriona.scanner.cache_v3_perf COMMAND seriona_scanner_cache_v3_perf_tests)
 # add_test(NAME seriona.scanner.migration_v2_to_v3 COMMAND seriona_scanner_migration_v2_to_v3_tests)
 # add_test(NAME seriona.scanner.migration_phase1_integration COMMAND seriona_scanner_phase1_integration_tests)
 # add_test(NAME seriona.scanner.backup_rollback COMMAND seriona_scanner_backup_rollback_tests)

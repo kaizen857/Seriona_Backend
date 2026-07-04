@@ -176,15 +176,20 @@ void SQLiteCacheV3::configureConnection(sqlite3* db, const std::chrono::millisec
     throw sqliteError(db, "set busy timeout");
   }
   exec(db, "PRAGMA journal_mode=WAL;");
+  exec(db, "PRAGMA synchronous=NORMAL;");  // WAL 模式下降低 fsync 频率
+  exec(db, "PRAGMA cache_size=-64000;");   // 64MB page cache
+  exec(db, "PRAGMA temp_store=MEMORY;");   // 临时表使用内存
   exec(db, "PRAGMA foreign_keys=ON;");
 }
 
 SQLiteCacheV3::SQLiteCacheV3(ScannerCacheConfig config)
     : databasePath_(std::move(config.databasePath)) {
   open();
+  prepareStatements();
 }
 
 SQLiteCacheV3::~SQLiteCacheV3() {
+  finalizeStatements();
   if (db_ != nullptr) {
     sqlite3_close(asDb(db_));
   }
@@ -302,6 +307,43 @@ std::vector<CachedScanErrorV3> SQLiteCacheV3::loadErrors(const std::filesystem::
 
 void SQLiteCacheV3::clearErrors(const std::filesystem::path& rootPath) {
   auto transaction = beginWriter(); Statement remove{asDb(db_), "DELETE FROM scan_errors WHERE root_path=?1;"}; remove.bind(1, pathText(rootPath)); remove.stepDone(); transaction.commit();
+}
+
+void SQLiteCacheV3::prepareStatements() {
+  constexpr const char* locationSql = 
+    "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
+    "source_file_path, cue_track_offset_ms, artwork_path, lyrics_source, "
+    "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms "
+    "FROM locations WHERE location_id=?1;";
+  
+  constexpr const char* contentSql = 
+    "SELECT content_id, title, artist, album, album_artist, genre, track_number, disc_number, year, duration_ms, "
+    "sample_rate, bit_depth, channels, play_count, rating, last_played_ms "
+    "FROM content WHERE content_id=?1;";
+  
+  sqlite3_stmt* locStmt = nullptr;
+  if (sqlite3_prepare_v2(asDb(db_), locationSql, -1, &locStmt, nullptr) != SQLITE_OK) {
+    throw sqliteError(asDb(db_), "prepare location statement");
+  }
+  locationStmt_ = locStmt;
+  
+  sqlite3_stmt* contStmt = nullptr;
+  if (sqlite3_prepare_v2(asDb(db_), contentSql, -1, &contStmt, nullptr) != SQLITE_OK) {
+    sqlite3_finalize(locStmt);
+    throw sqliteError(asDb(db_), "prepare content statement");
+  }
+  contentStmt_ = contStmt;
+}
+
+void SQLiteCacheV3::finalizeStatements() {
+  if (locationStmt_ != nullptr) {
+    sqlite3_finalize(static_cast<sqlite3_stmt*>(locationStmt_));
+    locationStmt_ = nullptr;
+  }
+  if (contentStmt_ != nullptr) {
+    sqlite3_finalize(static_cast<sqlite3_stmt*>(contentStmt_));
+    contentStmt_ = nullptr;
+  }
 }
 
 }

@@ -118,11 +118,17 @@ private:
   static void configureConnection(sqlite3* db, std::chrono::milliseconds busyTimeout);
   static void exec(sqlite3* db, const char* sql);
   static std::string schemaV3Sql();
+  
+  void prepareStatements();
+  void finalizeStatements();
 
   std::filesystem::path databasePath_;
   std::chrono::milliseconds busyTimeout_{500};
   void* db_{nullptr};
   mutable std::mutex writerMutex_;
+  
+  void* locationStmt_{nullptr};  // sqlite3_stmt*
+  void* contentStmt_{nullptr};   // sqlite3_stmt*
 };
 
 }
