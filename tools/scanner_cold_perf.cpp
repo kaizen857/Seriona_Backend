@@ -60,7 +60,8 @@ int main(int argc, char** argv) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " /path/to/music/library\n";
         std::cerr << "\nThis program performs a COLD scan (full rescan with no cache).\n";
-        std::cerr << "Cache and covers will be created in /tmp/scanner_perf_test/\n";
+        std::cerr << "Scanner uses default paths: /tmp/seriona/scanner-cache.sqlite\n";
+        std::cerr << "                            /tmp/seriona/scanner-covers/\n";
         return 1;
     }
 
@@ -70,25 +71,27 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 每次运行都删除旧的测试数据，确保冷扫描
-    const fs::path testBase = "/tmp/scanner_perf_test";
-    const fs::path cacheDb = testBase / "scanner_cache.sqlite";
-    const fs::path coverDir = testBase / "covers";
+    // Scanner 默认使用 /tmp/seriona/ 作为基础目录
+    // 参见 file_scanner_orchestrator.cpp: defaultDatabasePath() 和 defaultCoverExportDir()
+    const fs::path seriοnaBase = fs::temp_directory_path() / "seriona";
+    const fs::path cacheDb = seriοnaBase / "scanner-cache.sqlite";
+    const fs::path coverDir = seriοnaBase / "scanner-covers";
     
     std::cout << "===== Scanner Cold Scan Performance Test =====\n";
     std::cout << "Music root: " << musicRoot << "\n";
-    std::cout << "Cache DB: " << cacheDb << "\n";
-    std::cout << "Cover dir: " << coverDir << "\n";
+    std::cout << "Cache DB (default): " << cacheDb << "\n";
+    std::cout << "Cover dir (default): " << coverDir << "\n";
     std::cout << "\n";
 
     // 删除旧数据，确保冷扫描
-    std::cout << "Cleaning old test data...\n";
+    std::cout << "Cleaning old cache and covers for cold scan...\n";
     std::error_code ec;
-    fs::remove_all(testBase, ec);
-    fs::create_directories(testBase, ec);
-    fs::create_directories(coverDir, ec);
-
-    std::cout << "Creating scanner service...\n";
+    fs::remove_all(seriοnaBase, ec);
+    if (ec) {
+        std::cerr << "Warning: Failed to remove old data: " << ec.message() << "\n";
+    }
+    
+    std::cout << "Creating scanner service (will use default paths)...\n";
     
     // 使用公开 API 创建 scanner
     using namespace seriona::scanner;
