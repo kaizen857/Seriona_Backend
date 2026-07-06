@@ -40,6 +40,7 @@ struct CachedLocation {
   std::filesystem::path sourceFilePath;
   std::optional<std::chrono::milliseconds> cueTrackOffset;
   std::optional<std::filesystem::path> artworkPath;
+  std::optional<std::filesystem::path> thumbnailPath;
   LyricsSource lyricsSource{LyricsSource::None};
   std::optional<std::filesystem::path> externalLrcPath;
   std::optional<std::int64_t> externalLrcMtimeNs;

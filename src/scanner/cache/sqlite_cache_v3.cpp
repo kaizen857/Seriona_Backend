@@ -130,11 +130,12 @@ private:
   location.sourceFilePath = row.textColumn(6);
   if (row.columnType(7) == SQLITE_INTEGER) { location.cueTrackOffset = std::chrono::milliseconds{row.int64Column(7)}; }
   if (row.columnType(8) == SQLITE_TEXT) { location.artworkPath = row.textColumn(8); }
-  location.lyricsSource = parseLyricsSource(row.textColumn(9));
-  if (row.columnType(10) == SQLITE_TEXT) { location.externalLrcPath = row.textColumn(10); }
-  if (row.columnType(11) == SQLITE_INTEGER) { location.externalLrcMtimeNs = row.int64Column(11); }
-  location.discoveredAt = msToSystemTime(row.int64Column(12));
-  location.scannedAt = msToSystemTime(row.int64Column(13));
+  if (row.columnType(9) == SQLITE_TEXT) { location.thumbnailPath = row.textColumn(9); }
+  location.lyricsSource = parseLyricsSource(row.textColumn(10));
+  if (row.columnType(11) == SQLITE_TEXT) { location.externalLrcPath = row.textColumn(11); }
+  if (row.columnType(12) == SQLITE_INTEGER) { location.externalLrcMtimeNs = row.int64Column(12); }
+  location.discoveredAt = msToSystemTime(row.int64Column(13));
+  location.scannedAt = msToSystemTime(row.int64Column(14));
   return location;
 }
 
@@ -258,9 +259,9 @@ void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
       asDb(db_),
       "INSERT INTO locations("
       "location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
-      "source_file_path, cue_track_offset_ms, artwork_path, lyrics_source, "
+      "source_file_path, cue_track_offset_ms, artwork_path, thumbnail_path, lyrics_source, "
       "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms"
-      ") VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) "
+      ") VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) "
       "ON CONFLICT(location_id) DO UPDATE SET "
       "content_id=excluded.content_id, "
       "root_path=excluded.root_path, "
@@ -270,6 +271,7 @@ void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
       "source_file_path=excluded.source_file_path, "
       "cue_track_offset_ms=excluded.cue_track_offset_ms, "
       "artwork_path=excluded.artwork_path, "
+      "thumbnail_path=excluded.thumbnail_path, "
       "lyrics_source=excluded.lyrics_source, "
       "external_lrc_path=excluded.external_lrc_path, "
       "external_lrc_mtime_ns=excluded.external_lrc_mtime_ns, "
@@ -284,11 +286,12 @@ void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
   upsert.bind(7, pathText(location.sourceFilePath));
   upsert.bindOptionalMilliseconds(8, location.cueTrackOffset);
   upsert.bindOptionalPath(9, location.artworkPath);
-  upsert.bind(10, lyricsSourceText(location.lyricsSource));
-  upsert.bindOptionalPath(11, location.externalLrcPath);
-  upsert.bindOptionalInt64(12, location.externalLrcMtimeNs);
-  upsert.bind(13, systemTimeToMs(location.discoveredAt));
-  upsert.bind(14, systemTimeToMs(location.scannedAt));
+  upsert.bindOptionalPath(10, location.thumbnailPath);
+  upsert.bind(11, lyricsSourceText(location.lyricsSource));
+  upsert.bindOptionalPath(12, location.externalLrcPath);
+  upsert.bindOptionalInt64(13, location.externalLrcMtimeNs);
+  upsert.bind(14, systemTimeToMs(location.discoveredAt));
+  upsert.bind(15, systemTimeToMs(location.scannedAt));
   upsert.stepDone();
   transaction.commit();
 }
@@ -326,15 +329,18 @@ std::optional<CachedLocation> SQLiteCacheV3::loadLocation(const std::string& loc
   if (sqlite3_column_type(stmt, 8) == SQLITE_TEXT) {
     location.artworkPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
   }
-  location.lyricsSource = parseLyricsSource(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9)));
-  if (sqlite3_column_type(stmt, 10) == SQLITE_TEXT) {
-    location.externalLrcPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+  if (sqlite3_column_type(stmt, 9) == SQLITE_TEXT) {
+    location.thumbnailPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
   }
-  if (sqlite3_column_type(stmt, 11) == SQLITE_INTEGER) {
-    location.externalLrcMtimeNs = sqlite3_column_int64(stmt, 11);
+  location.lyricsSource = parseLyricsSource(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10)));
+  if (sqlite3_column_type(stmt, 11) == SQLITE_TEXT) {
+    location.externalLrcPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
   }
-  location.discoveredAt = msToSystemTime(sqlite3_column_int64(stmt, 12));
-  location.scannedAt = msToSystemTime(sqlite3_column_int64(stmt, 13));
+  if (sqlite3_column_type(stmt, 12) == SQLITE_INTEGER) {
+    location.externalLrcMtimeNs = sqlite3_column_int64(stmt, 12);
+  }
+  location.discoveredAt = msToSystemTime(sqlite3_column_int64(stmt, 13));
+  location.scannedAt = msToSystemTime(sqlite3_column_int64(stmt, 14));
   return location;
 }
 
@@ -344,7 +350,7 @@ std::vector<CachedLocation> SQLiteCacheV3::loadLocationsByRoot(const std::filesy
   Statement select{
       asDb(db_),
       "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
-      "source_file_path, cue_track_offset_ms, artwork_path, lyrics_source, "
+      "source_file_path, cue_track_offset_ms, artwork_path, thumbnail_path, lyrics_source, "
       "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms "
       "FROM locations WHERE root_path=?1 ORDER BY file_path;"};
   select.bind(1, pathText(rootPath));

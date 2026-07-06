@@ -18,6 +18,7 @@
 #include "wtr/watcher.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -42,6 +43,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace seriona::scanner {
 namespace {
@@ -73,12 +78,24 @@ static TestCueSheetProvider g_testCueSheetProvider = nullptr;
   return readCueSheet(cuePath, coverExportDir);
 }
 
+[[nodiscard]] std::filesystem::path resolvePortableDataRoot() {
+#ifdef __linux__
+  std::array<char, 4096> buffer{};
+  const auto len = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+  if (len > 0) {
+    buffer[static_cast<std::size_t>(len)] = '\0';
+    return std::filesystem::path{buffer.data()}.parent_path() / "SerionaData";
+  }
+#endif
+  return std::filesystem::current_path() / "SerionaData";
+}
+
 [[nodiscard]] std::filesystem::path defaultDatabasePath() {
-  return std::filesystem::temp_directory_path() / "seriona" / "scanner-cache.sqlite";
+  return resolvePortableDataRoot() / "library.sqlite";
 }
 
 [[nodiscard]] std::filesystem::path defaultCoverExportDir() {
-  return std::filesystem::temp_directory_path() / "seriona" / "scanner-covers";
+  return resolvePortableDataRoot() / "artwork";
 }
 
 [[nodiscard]] std::string pathKey(const std::filesystem::path& path) { return path.lexically_normal().generic_string(); }
@@ -370,6 +387,7 @@ using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_w
           .sourceFilePath = song.metadata.sourceFilePath.empty() ? filePath : song.metadata.sourceFilePath,
           .cueTrackOffset = song.metadata.offset,
           .artworkPath = song.metadata.artworkPath,
+          .thumbnailPath = song.metadata.thumbnailPath,
           .lyricsSource = song.metadata.effectiveLyricsSource,
           .externalLrcPath = song.metadata.externalLyricsPath,
           .externalLrcMtimeNs = fileTimeNanoseconds(song.metadata.externalLyricsMtime),
@@ -400,6 +418,29 @@ void selectEffectiveLyrics(cache::CachedSong& song) {
   }
   song.metadata.effectiveLyricsSource = LyricsSource::None;
   song.metadata.effectiveLyrics.clear();
+}
+
+void applyCachedLocation(cache::CachedSong& song,
+                         const cache::CachedLocation& location,
+                         const std::filesystem::path& filePath) {
+  song.metadata.filePath = filePath;
+  song.metadata.sourceFilePath = location.sourceFilePath.empty() ? filePath : location.sourceFilePath;
+  song.metadata.fileSizeBytes = location.fileSizeBytes;
+  song.metadata.fileMtime = std::filesystem::file_time_type{std::chrono::nanoseconds{location.fileMtimeNs}};
+  song.metadata.contentHash = location.contentId;
+  song.metadata.effectiveLyricsSource = location.lyricsSource;
+  song.metadata.offset = location.cueTrackOffset;
+  song.metadata.artworkPath = location.artworkPath;
+  song.metadata.thumbnailPath = location.thumbnailPath;
+  song.metadata.externalLyricsPath = location.externalLrcPath;
+  song.metadata.externalLyricsMtime = location.externalLrcMtimeNs.has_value()
+                                          ? std::optional<std::filesystem::file_time_type>{
+                                                std::filesystem::file_time_type{std::chrono::nanoseconds{
+                                                    *location.externalLrcMtimeNs}}}
+                                          : std::nullopt;
+  song.metadata.trackId = filePath.generic_string();
+  song.metadata.logicalTrackId = filePath.generic_string();
+  selectEffectiveLyrics(song);
 }
 
 void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint64_t version, ScannerEventPayload payload) {
@@ -1044,7 +1085,11 @@ private:
           if (cachedSong.has_value()) {
             ++skipped;
             spdlog::info("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
-            indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, *cachedSong, relativePathFor(rootPath, entry.path)};
+            auto hydratedSong = *cachedSong;
+            hydratedSong.embeddedLyrics = v3cache.loadLyrics(cachedLocation->locationId, "embedded");
+            hydratedSong.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
+            applyCachedLocation(hydratedSong, *cachedLocation, entry.path);
+            indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, std::move(hydratedSong), relativePathFor(rootPath, entry.path)};
             indexedSongs[currentDiscoveryIndex].filled.store(true);
             shouldProcessViaWorker = false;
           }
@@ -1254,32 +1299,7 @@ private:
           auto song = *cachedSong;
           song.embeddedLyrics = v3cache.loadLyrics(cachedLocation->locationId, "embedded");
           song.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
-          song.metadata.filePath = task.filePath;
-          song.metadata.sourceFilePath = cachedLocation->sourceFilePath.empty() ? task.filePath : cachedLocation->sourceFilePath;
-          song.metadata.fileSizeBytes = cachedLocation->fileSizeBytes;
-          song.metadata.fileMtime = std::filesystem::file_time_type{std::chrono::nanoseconds{cachedLocation->fileMtimeNs}};
-          song.metadata.contentHash = cachedLocation->contentId;
-          song.metadata.effectiveLyricsSource = cachedLocation->lyricsSource;
-          song.metadata.offset = cachedLocation->cueTrackOffset;
-          song.metadata.artworkPath = cachedLocation->artworkPath;
-          song.metadata.externalLyricsPath = cachedLocation->externalLrcPath;
-          song.metadata.externalLyricsMtime = cachedLocation->externalLrcMtimeNs.has_value()
-                                                  ? std::optional<std::filesystem::file_time_type>{
-                                                        std::filesystem::file_time_type{std::chrono::nanoseconds{
-                                                            *cachedLocation->externalLrcMtimeNs}}}
-                                                  : std::nullopt;
-          song.metadata.trackId = task.filePath.generic_string();
-          song.metadata.logicalTrackId = task.filePath.generic_string();
-          if (!song.externalLyrics.empty()) {
-            song.metadata.effectiveLyricsSource = LyricsSource::ExternalLrc;
-            song.metadata.effectiveLyrics = song.externalLyrics;
-          } else if (!song.embeddedLyrics.empty()) {
-            song.metadata.effectiveLyricsSource = LyricsSource::EmbeddedTag;
-            song.metadata.effectiveLyrics = song.embeddedLyrics;
-          } else {
-            song.metadata.effectiveLyricsSource = LyricsSource::None;
-            song.metadata.effectiveLyrics.clear();
-          }
+          applyCachedLocation(song, *cachedLocation, task.filePath);
           auto metadata = song.metadata;
           workerSongs->put(task.filePath, std::move(song));
           return metadata;
@@ -1301,6 +1321,10 @@ private:
     if (song.metadata.artworkPath.has_value() && !song.metadata.artworkPath->empty() &&
         song.metadata.artworkPath->is_relative()) {
       song.metadata.artworkPath = std::filesystem::absolute(*song.metadata.artworkPath);
+    }
+    if (song.metadata.thumbnailPath.has_value() && !song.metadata.thumbnailPath->empty() &&
+        song.metadata.thumbnailPath->is_relative()) {
+      song.metadata.thumbnailPath = std::filesystem::absolute(*song.metadata.thumbnailPath);
     }
     song.metadata.trackId = task.filePath.generic_string();
     song.metadata.logicalTrackId = task.filePath.generic_string();

@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS locations(
   source_file_path TEXT NOT NULL,
   cue_track_offset_ms INTEGER,
   artwork_path TEXT,
+  thumbnail_path TEXT,
   lyrics_source TEXT NOT NULL,
   external_lrc_path TEXT,
   external_lrc_mtime_ns INTEGER,
@@ -318,7 +319,7 @@ void SQLiteCacheV3::clearErrors(const std::filesystem::path& rootPath) {
 void SQLiteCacheV3::prepareStatements() {
   constexpr const char* locationSql = 
     "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
-    "source_file_path, cue_track_offset_ms, artwork_path, lyrics_source, "
+    "source_file_path, cue_track_offset_ms, artwork_path, thumbnail_path, lyrics_source, "
     "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms "
     "FROM locations WHERE location_id=?1;";
   

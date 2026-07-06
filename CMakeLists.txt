@@ -206,6 +206,10 @@ add_library(seriona_metadata STATIC
   src/metadata/metadata_mpris.cpp
 )
 
+add_library(seriona_app STATIC
+  src/app/runtime_paths.cpp
+)
+
 add_library(seriona_control STATIC
   src/control/control_event_loop.cpp
   src/control/control_state_reducer.cpp
@@ -242,6 +246,11 @@ target_include_directories(seriona_metadata
     ${PROJECT_SOURCE_DIR}/src/metadata
 )
 
+target_include_directories(seriona_app
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+)
+
 target_include_directories(seriona_control
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
@@ -270,6 +279,7 @@ target_link_libraries(seriona_control
 seriona_enable_warnings(seriona_audio)
 seriona_enable_warnings(seriona_scanner)
 seriona_enable_warnings(seriona_metadata)
+seriona_enable_warnings(seriona_app)
 seriona_enable_warnings(seriona_control)
 
 target_link_libraries(seriona_metadata PRIVATE spdlog::spdlog)
@@ -278,6 +288,7 @@ if(TARGET PkgConfig::SERIONA_SDBUS_CPP)
   target_link_libraries(seriona_metadata PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
 endif()
 
+add_library(SerionaBackend::app ALIAS seriona_app)
 add_library(SerionaBackend::control ALIAS seriona_control)
 add_library(SerionaBackend::audio ALIAS seriona_audio)
 add_library(SerionaBackend::scanner ALIAS seriona_scanner)

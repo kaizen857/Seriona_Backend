@@ -11,6 +11,10 @@ std::filesystem::path uniqueRootPath(const std::string& name) {
   return std::filesystem::temp_directory_path() / ("seriona-scanner-" + name + "-" + std::to_string(id));
 }
 
+std::filesystem::path databaseRootPath(const std::filesystem::path& rootPath) {
+  return rootPath.parent_path() / (rootPath.filename().string() + "-db");
+}
+
 void writeTextFile(const std::filesystem::path& path, const std::string& content) {
   std::filesystem::create_directories(path.parent_path());
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -39,7 +43,12 @@ FakeWatcherEvent warningEvent(FakeWatcherEvent::PathKind pathKind, std::filesyst
 }
 
 TempScannerRoot::TempScannerRoot(std::string name) : path_(uniqueRootPath(name)) {
+  const auto dbRoot = databaseRootPath(path_);
+  std::error_code error;
+  std::filesystem::remove_all(path_, error);
+  std::filesystem::remove_all(dbRoot, error);
   std::filesystem::create_directories(path_);
+  std::filesystem::create_directories(dbRoot);
 }
 
 TempScannerRoot::~TempScannerRoot() {
@@ -66,7 +75,7 @@ const std::filesystem::path& TempScannerRoot::path() const noexcept {
 }
 
 std::filesystem::path TempScannerRoot::dbPath(std::string filename) const {
-  return path_ / std::move(filename);
+  return databaseRootPath(path_) / std::move(filename);
 }
 
 bool TempScannerRoot::removed() const noexcept {
@@ -78,8 +87,10 @@ void TempScannerRoot::cleanup() noexcept {
     return;
   }
   std::error_code error;
+  const auto dbRoot = databaseRootPath(path_);
   std::filesystem::remove_all(path_, error);
-  removed_ = !std::filesystem::exists(path_);
+  std::filesystem::remove_all(dbRoot, error);
+  removed_ = !std::filesystem::exists(path_) && !std::filesystem::exists(dbRoot);
 }
 
 FakeClock::TimePoint FakeClock::now() const noexcept {

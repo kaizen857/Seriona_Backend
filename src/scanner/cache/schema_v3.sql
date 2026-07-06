@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS locations(
   source_file_path TEXT NOT NULL,
   cue_track_offset_ms INTEGER,
   artwork_path TEXT,
+  thumbnail_path TEXT,
   lyrics_source TEXT NOT NULL,
   external_lrc_path TEXT,
   external_lrc_mtime_ns INTEGER,

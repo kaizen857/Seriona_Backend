@@ -33,6 +33,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
           .sourceFilePath = filePath,
           .cueTrackOffset = std::nullopt,
           .artworkPath = std::nullopt,
+          .thumbnailPath = std::nullopt,
           .lyricsSource = LyricsSource::None,
           .externalLrcPath = std::nullopt,
           .externalLrcMtimeNs = std::nullopt,
@@ -104,6 +105,24 @@ TEST_CASE("incremental scan plan treats absent cache as all current candidates a
   CHECK(plan.changed.empty());
   CHECK(containsPath(plan.added, firstPath));
   CHECK(containsPath(plan.added, secondPath));
+}
+
+TEST_CASE("cached location from song preserves thumbnail path") {
+  test::TempScannerRoot temp{"incremental-plan-thumbnail-location"};
+  const auto filePath = test::writeAudioFixture(temp.path(), "song.flac");
+
+  cache::CachedSong song{};
+  song.metadata.contentHash = "content-id";
+  song.metadata.fileSizeBytes = fileSizeBytes(filePath);
+  song.metadata.fileMtime = fileMtime(filePath);
+  song.metadata.sourceFilePath = filePath;
+  song.metadata.artworkPath = temp.path() / "artwork" / "full.png";
+  song.metadata.thumbnailPath = temp.path() / "artwork" / "thumbnails" / "thumb.png";
+
+  const auto location = cachedLocationFromSong(song, temp.path(), filePath);
+
+  CHECK(location.artworkPath == temp.path() / "artwork" / "full.png");
+  CHECK(location.thumbnailPath == temp.path() / "artwork" / "thumbnails" / "thumb.png");
 }
 
 }

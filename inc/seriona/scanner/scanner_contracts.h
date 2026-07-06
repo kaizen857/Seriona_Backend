@@ -126,6 +126,7 @@ struct SongMetadata {
   // Stable logical identity for playlist/UI state when one source yields multiple tracks.
   std::string logicalTrackId;
   std::optional<std::filesystem::path> artworkPath;
+  std::optional<std::filesystem::path> thumbnailPath;
 };
 
 struct PlaylistNode {

@@ -665,7 +665,7 @@ TEST_CASE("scanner service ignores malformed env overrides and keeps config fall
 TEST_CASE("scanner config disables incremental mode and can force full scans") {
   test::TempScannerRoot temp{"scanner-service-config-scan-mode"};
   const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
-  const auto databasePath = temp.path().parent_path() / (temp.path().filename().generic_string() + "-cache.sqlite");
+  const auto databasePath = temp.dbPath("scanner-cache.sqlite");
   const auto sidecarPath = std::filesystem::path{databasePath.generic_string() + ".scan-roots-v3.sqlite"};
   auto reader = std::make_shared<FakeServiceMetadataReader>();
   reader->put(audio, rawMetadata("Song"));

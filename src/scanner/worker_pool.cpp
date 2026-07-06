@@ -81,6 +81,7 @@ private:
   metadata.offset = cached.cueTrackOffset;
   metadata.logicalTrackId = cached.locationId;
   metadata.artworkPath = cached.artworkPath;
+  metadata.thumbnailPath = cached.thumbnailPath;
   metadata.externalLyricsPath = cached.externalLrcPath;
   if (cached.externalLrcMtimeNs) {
     metadata.externalLyricsMtime = fileTimeFromNanoseconds(*cached.externalLrcMtimeNs);

@@ -33,7 +33,9 @@ TEST_CASE("SQLiteCacheV3: stores and retrieves location without CUE offset") {
     .fileSizeBytes = 1024,
     .fileMtimeNs = 123456789,
     .sourceFilePath = filePath,
-    .cueTrackOffset = std::nullopt
+    .cueTrackOffset = std::nullopt,
+    .artworkPath = temp.path() / "artwork" / "full.png",
+    .thumbnailPath = temp.path() / "artwork" / "thumbnails" / "thumb.png"
   };
 
   cache.upsertLocation(location);
@@ -44,6 +46,8 @@ TEST_CASE("SQLiteCacheV3: stores and retrieves location without CUE offset") {
   CHECK(loaded->filePath == filePath);
   CHECK(loaded->fileSizeBytes == 1024);
   CHECK_FALSE(loaded->cueTrackOffset.has_value());
+  CHECK(loaded->artworkPath == temp.path() / "artwork" / "full.png");
+  CHECK(loaded->thumbnailPath == temp.path() / "artwork" / "thumbnails" / "thumb.png");
 }
 
 TEST_CASE("SQLiteCacheV3: stores and retrieves CUE track location with offset") {
@@ -110,7 +114,9 @@ TEST_CASE("SQLiteCacheV3: loads locations by root path") {
     .rootPath = temp.path(), 
     .filePath = file1, 
     .fileSizeBytes = 1000, 
-    .sourceFilePath = file1
+    .sourceFilePath = file1,
+    .artworkPath = temp.path() / "artwork" / "song1.png",
+    .thumbnailPath = temp.path() / "artwork" / "thumbnails" / "song1.png"
   });
   cache.upsertLocation(CachedLocation{
     .locationId = id2, 
@@ -122,7 +128,8 @@ TEST_CASE("SQLiteCacheV3: loads locations by root path") {
   });
 
   auto locations = cache.loadLocationsByRoot(temp.path());
-  CHECK(locations.size() == 2);
+  REQUIRE(locations.size() == 2);
+  CHECK(locations[0].thumbnailPath == temp.path() / "artwork" / "thumbnails" / "song1.png");
 }
 
 TEST_CASE("SQLiteCacheV3: updates existing location") {
@@ -148,7 +155,8 @@ TEST_CASE("SQLiteCacheV3: updates existing location") {
     .rootPath = temp.path(),
     .filePath = filePath,
     .fileSizeBytes = 1500,
-    .sourceFilePath = filePath
+    .sourceFilePath = filePath,
+    .thumbnailPath = temp.path() / "old-thumb.png"
   });
 
   cache.upsertLocation(CachedLocation{
@@ -157,12 +165,14 @@ TEST_CASE("SQLiteCacheV3: updates existing location") {
     .rootPath = temp.path(),
     .filePath = filePath,
     .fileSizeBytes = 1500,
-    .sourceFilePath = filePath
+    .sourceFilePath = filePath,
+    .thumbnailPath = temp.path() / "new-thumb.png"
   });
 
   auto loaded = cache.loadLocation(locationId);
   REQUIRE(loaded.has_value());
   CHECK(loaded->contentId == "content-new");
+  CHECK(loaded->thumbnailPath == temp.path() / "new-thumb.png");
 }
 
 }  // namespace

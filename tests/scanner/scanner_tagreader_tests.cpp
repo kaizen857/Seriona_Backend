@@ -54,6 +54,7 @@ private:
                         RawTagLyricLine{std::chrono::microseconds{2500}, "embedded two"}};
   raw.filePath = "music/song.flac";
   raw.coverPath = "covers/song.png";
+  raw.thumbnailPath = "covers/thumbnails/song.png";
   raw.duration = std::chrono::microseconds{1234567};
   raw.offset = std::chrono::microseconds{9876};
   raw.lastModified = std::filesystem::file_time_type{std::chrono::nanoseconds{42}};
@@ -84,6 +85,7 @@ TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initi
   CHECK(metadata.filePath == std::filesystem::path{"music/song.flac"});
   CHECK(mapped.coverPath == std::filesystem::path{"covers/song.png"});
   CHECK(metadata.artworkPath == std::filesystem::path{"covers/song.png"});
+  CHECK(metadata.thumbnailPath == std::filesystem::path{"covers/thumbnails/song.png"});
   CHECK(metadata.duration == std::chrono::milliseconds{1234});
   CHECK(metadata.offset == std::chrono::milliseconds{9});
   CHECK(metadata.fileMtime == std::filesystem::file_time_type{std::chrono::nanoseconds{42}});

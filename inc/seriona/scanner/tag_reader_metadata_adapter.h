@@ -30,6 +30,7 @@ struct RawTagMetadata {
   std::vector<RawTagLyricLine> embeddedLyrics;
   std::filesystem::path filePath;
   std::filesystem::path coverPath;
+  std::filesystem::path thumbnailPath;
   std::chrono::microseconds duration{0};
   std::chrono::microseconds offset{0};
   std::filesystem::file_time_type lastModified{};

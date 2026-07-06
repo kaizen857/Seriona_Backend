@@ -78,6 +78,7 @@ namespace {
   raw.discNumber = tag.discNumber();
   raw.filePath = tag.filePath();
   raw.coverPath = tag.coverPath();
+  raw.thumbnailPath = tag.thumbnailPath();
   raw.duration = std::chrono::microseconds{tag.duration()};
   raw.offset = std::chrono::microseconds{tag.offset()};
   raw.lastModified = tag.lastModified();
@@ -133,6 +134,7 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
   metadata.contentHash = std::move(contentHash);
   metadata.sourceFilePath = raw.filePath;
   metadata.artworkPath = raw.coverPath.empty() ? std::optional<std::filesystem::path>{std::filesystem::path{}} : std::optional<std::filesystem::path>{raw.coverPath};
+  metadata.thumbnailPath = raw.thumbnailPath.empty() ? std::optional<std::filesystem::path>{std::filesystem::path{}} : std::optional<std::filesystem::path>{raw.thumbnailPath};
   metadata.offset = toMilliseconds(raw.offset);
   metadata.duration = toMilliseconds(raw.duration);
   metadata.logicalTrackId = raw.filePath.generic_string();

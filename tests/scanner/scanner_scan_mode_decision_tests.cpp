@@ -23,7 +23,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
 }
 
 [[nodiscard]] std::filesystem::path externalDatabasePath(const test::TempScannerRoot& temp) {
-  return temp.path().parent_path() / (temp.path().filename().generic_string() + "-scanner-cache.sqlite");
+  return temp.dbPath("scanner-cache.sqlite");
 }
 
 TEST_CASE("scan mode decision returns full for first root scan") {

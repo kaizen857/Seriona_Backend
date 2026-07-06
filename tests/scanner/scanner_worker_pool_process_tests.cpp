@@ -16,7 +16,7 @@ namespace seriona::scanner {
 namespace {
 
 [[nodiscard]] WorkerTask taskFor(std::filesystem::path path) {
-  return WorkerTask{.rootPath = "music", .filePath = std::move(path), .cachedLocation = std::nullopt};
+  return WorkerTask{.rootPath = "music", .filePath = std::move(path), .locationId = {}, .cachedLocation = std::nullopt};
 }
 
 [[nodiscard]] SongMetadata metadataFixture(const std::filesystem::path& path) {
@@ -40,6 +40,7 @@ namespace {
   cached.sourceFilePath = "music/cached-source.flac";
   cached.cueTrackOffset = std::chrono::milliseconds{250};
   cached.artworkPath = "art/cached.png";
+  cached.thumbnailPath = "art/thumbnails/cached.png";
   cached.lyricsSource = LyricsSource::ExternalLrc;
   cached.externalLrcPath = "music/cached.lrc";
   cached.externalLrcMtimeNs = 99;
@@ -63,7 +64,7 @@ TEST_CASE("scanner worker pool processTask invokes tagReader even with cachedLoc
                                                      return meta;
                                                    }}};
 
-  pool.submitBatch({WorkerTask{.rootPath = cached.rootPath, .filePath = cached.filePath, .cachedLocation = cached}});
+  pool.submitBatch({WorkerTask{.rootPath = cached.rootPath, .filePath = cached.filePath, .locationId = cached.locationId, .cachedLocation = cached}});
   const auto results = pool.waitAll();
 
   REQUIRE(results.size() == 1U);
@@ -147,9 +148,9 @@ TEST_CASE("scanner worker pool WorkerTask nodeIndex is accessible in callback") 
                                                      return metadataFixture(task.filePath);
                                                    }}};
 
-  pool.submitBatch({WorkerTask{.rootPath = "music", .filePath = "music/first.flac", .cachedLocation = std::nullopt, .nodeIndex = 10},
-                    WorkerTask{.rootPath = "music", .filePath = "music/second.flac", .cachedLocation = std::nullopt, .nodeIndex = 20},
-                    WorkerTask{.rootPath = "music", .filePath = "music/third.flac", .cachedLocation = std::nullopt, .nodeIndex = 30}});
+  pool.submitBatch({WorkerTask{.rootPath = "music", .filePath = "music/first.flac", .locationId = {}, .cachedLocation = std::nullopt, .nodeIndex = 10},
+                    WorkerTask{.rootPath = "music", .filePath = "music/second.flac", .locationId = {}, .cachedLocation = std::nullopt, .nodeIndex = 20},
+                    WorkerTask{.rootPath = "music", .filePath = "music/third.flac", .locationId = {}, .cachedLocation = std::nullopt, .nodeIndex = 30}});
   const auto results = pool.waitAll();
 
   REQUIRE(results.size() == 3U);
