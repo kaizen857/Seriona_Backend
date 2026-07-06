@@ -11,6 +11,7 @@ option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3
 option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
 option(SERIONA_METADATA_SIMULATE_MISSING_SDBUS "Simulate missing metadata sdbus-c++ dependency" OFF)
 set(SERIONA_TAGREADER_SOURCE_DIR "" CACHE PATH "Path to the TagReader source directory")
+set(SERIONA_TAGREADER_BINARY_DIR "")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -132,7 +133,6 @@ if(NOT TARGET TagReaderCore)
   if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
     set(SERIONA_TAGREADER_CANDIDATES
       "../TagReader"
-      "../../cppProject(app_and_lib)/TagReader"
     )
     foreach(SERIONA_TAGREADER_CANDIDATE IN LISTS SERIONA_TAGREADER_CANDIDATES)
       set(SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE}")
@@ -142,6 +142,7 @@ if(NOT TARGET TagReaderCore)
       )
       if(EXISTS "${SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR}/CMakeLists.txt")
         set(SERIONA_TAGREADER_SOURCE_DIR "${SERIONA_TAGREADER_CANDIDATE_SOURCE_DIR}" CACHE PATH "Path to the TagReader source directory" FORCE)
+        set(SERIONA_TAGREADER_BINARY_DIR "${PROJECT_BINARY_DIR}/tagreader")
         break()
       endif()
     endforeach()
@@ -149,7 +150,14 @@ if(NOT TARGET TagReaderCore)
     unset(SERIONA_TAGREADER_CANDIDATE)
     unset(SERIONA_TAGREADER_CANDIDATES)
     if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
-      message(FATAL_ERROR "TagReaderCore is required. Set SERIONA_TAGREADER_SOURCE_DIR to a TagReader checkout or place TagReader next to Seriona_Backend.")
+      message(STATUS "TagReader source not found next to Seriona_Backend; fetching from https://github.com/kaizen857/TagReader.git")
+      FetchContent_Populate(tagreader
+        GIT_REPOSITORY https://github.com/kaizen857/TagReader.git
+        GIT_TAG main
+        GIT_SHALLOW TRUE
+      )
+      set(SERIONA_TAGREADER_SOURCE_DIR "${tagreader_SOURCE_DIR}" CACHE PATH "Path to the TagReader source directory" FORCE)
+      set(SERIONA_TAGREADER_BINARY_DIR "${tagreader_BINARY_DIR}")
     endif()
   else()
     cmake_path(ABSOLUTE_PATH SERIONA_TAGREADER_SOURCE_DIR
@@ -162,14 +170,15 @@ if(NOT TARGET TagReaderCore)
     if(NOT EXISTS "${SERIONA_TAGREADER_SOURCE_DIR}/CMakeLists.txt")
       message(FATAL_ERROR "TagReaderCore is required. SERIONA_TAGREADER_SOURCE_DIR does not contain CMakeLists.txt: ${SERIONA_TAGREADER_SOURCE_DIR}")
     endif()
+    set(SERIONA_TAGREADER_BINARY_DIR "${PROJECT_BINARY_DIR}/tagreader")
   endif()
 
   set(SERIONA_BUILD_TESTING_BEFORE_TAGREADER ${BUILD_TESTING})
   set(BUILD_TESTING OFF CACHE BOOL "Build tests" FORCE)
-  add_subdirectory("${SERIONA_TAGREADER_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/tagreader" EXCLUDE_FROM_ALL)
+  add_subdirectory("${SERIONA_TAGREADER_SOURCE_DIR}" "${SERIONA_TAGREADER_BINARY_DIR}" EXCLUDE_FROM_ALL)
   set(BUILD_TESTING ${SERIONA_BUILD_TESTING_BEFORE_TAGREADER} CACHE BOOL "Build tests" FORCE)
   unset(SERIONA_BUILD_TESTING_BEFORE_TAGREADER)
-  set_property(DIRECTORY "${PROJECT_BINARY_DIR}/tagreader/test" PROPERTY TESTS "")
+  set_property(DIRECTORY "${SERIONA_TAGREADER_BINARY_DIR}/test" PROPERTY TESTS "")
 endif()
 
 add_library(seriona_scanner STATIC
