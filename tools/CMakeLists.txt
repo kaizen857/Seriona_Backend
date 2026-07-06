@@ -7,3 +7,14 @@ target_link_libraries(seriona_miniaudio_platform_probe PRIVATE
 )
 
 seriona_enable_warnings(seriona_miniaudio_platform_probe)
+
+add_executable(seriona_scanner_cold_perf
+  scanner_cold_perf.cpp
+)
+
+target_link_libraries(seriona_scanner_cold_perf PRIVATE
+  seriona_scanner
+  seriona_metadata
+)
+
+seriona_enable_warnings(seriona_scanner_cold_perf)
