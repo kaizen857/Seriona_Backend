@@ -12,7 +12,7 @@
 ## 入口与权威来源
 - 目标清单只看 `CMakeLists.txt`、`app/CMakeLists.txt`、`tests/CMakeLists.txt`、`tools/CMakeLists.txt`。
 - 应用目标是 `seriona`（输出到 `${PROJECT_BINARY_DIR}/seriona`），编译 `app/main.cpp`、`app/terminal_controller.cpp`、`app/terminal_io.cpp`、`src/app/runtime_paths.cpp`、`src/logging/logging.cpp`，并链接 `seriona_control`。
-- 核心静态库目标：`seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`；公开 API 在 `inc/seriona/...`，实现主要在 `src/...`。
+- 核心静态库目标：`seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`、`seriona_app`；公开 API 在 `inc/seriona/...`，实现主要在 `src/...`。
 - `app/main.cpp` 只校验一个路径参数；真实终端流程在 `app/terminal_controller.cpp`，调用 `makeProductionMediaController()` 装配 audio、scanner、metadata。
 - 音频契约在 `inc/seriona/audio/audio_contracts.h`：对外门面 `AudioPlayer`，服务接口 `AudioPlaybackService`。
 - 扫描契约在 `inc/seriona/scanner/scanner_contracts.h` 和 `inc/seriona/scanner/file_scanner_service.h`；`makeFileScannerService()` 走内部依赖装配。
@@ -34,7 +34,7 @@
 - 性能测试在 `tests/scanner/scanner_perf_test.cpp` 和 `scanner_detailed_perf_test.cpp`；这两个目标不会被 `add_test` 自动注册到 CTest，需要直接运行二进制。
 - 可选工具默认不构建；需要 `seriona_miniaudio_platform_probe` 时重新配置 `-DSERIONA_BUILD_TOOLS=ON`。
 - 配置期需要 CMake 3.20+、C++23、`pkg-config` 可找到 FFmpeg (`libavformat`、`libavcodec`、`libavutil`、`libavfilter`、`libswresample`)、`libxxhash`；`find_package` 需要 `spdlog` 和 `SQLite3`；Linux 还需要 `sdbus-c++`。
-- CMake 从相邻目录查找 `TagReaderCore`：先试 `../TagReader`，再试 `../../cppProject(app_and_lib)/TagReader`；两者都不存在会在配置期失败。也可显式传 `-DSERIONA_TAGREADER_SOURCE_DIR=<path>`。
+- CMake 从相邻目录查找 `TagReaderCore`：先试 `../TagReader`；若不存在则从 `https://github.com/kaizen857/TagReader.git` 自动拉取。也可显式传 `-DSERIONA_TAGREADER_SOURCE_DIR=<path>`。
 - FetchContent 自动拉取 `bshoshany/thread-pool` v4.1.0，别名 `BS::thread_pool`。
 - 第三方头文件在 `third_party/`：doctest、miniaudio、watcher（目录监听，来源 `third_party/watcher/include`）。
 
