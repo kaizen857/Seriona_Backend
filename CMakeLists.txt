@@ -207,7 +207,9 @@ add_library(seriona_metadata STATIC
 )
 
 add_library(seriona_app STATIC
+  src/app/application_logging.cpp
   src/app/runtime_paths.cpp
+  src/logging/logging.cpp
 )
 
 add_library(seriona_control STATIC
@@ -249,6 +251,12 @@ target_include_directories(seriona_metadata
 target_include_directories(seriona_app
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(seriona_app PRIVATE
+  spdlog::spdlog
 )
 
 target_include_directories(seriona_control

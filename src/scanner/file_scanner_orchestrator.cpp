@@ -1286,12 +1286,12 @@ private:
     }
 
     if (task.cachedLocation.has_value() && task.locationId == task.cachedLocation->locationId) {
-      spdlog::info("readWorkerSong cache-hit path: trying to load location and content for locationId={}", task.locationId);
+      spdlog::trace("readWorkerSong cache-hit path: trying to load location and content for locationId={}", task.locationId);
       const auto cachedLocation = v3cache.loadLocation(task.locationId);
       if (cachedLocation.has_value()) {
         const auto cachedSong = v3cache.loadContent(cachedLocation->contentId);
         if (cachedSong.has_value()) {
-          spdlog::info("readWorkerSong cache-hit path: successfully loaded content, will call workerSongs->put()");
+          spdlog::trace("readWorkerSong cache-hit path: successfully loaded content, will call workerSongs->put()");
         } else {
           spdlog::warn("readWorkerSong cache-hit path: loadContent returned nullopt for contentId={}", cachedLocation->contentId);
         }

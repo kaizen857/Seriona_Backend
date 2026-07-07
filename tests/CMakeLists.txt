@@ -374,6 +374,12 @@ add_executable(seriona_runtime_paths_tests
   app/runtime_paths_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/app/runtime_paths.cpp
 )
+add_executable(seriona_application_logging_tests
+  app/application_logging_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/app/application_logging.cpp
+  ${PROJECT_SOURCE_DIR}/src/app/runtime_paths.cpp
+  ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
+)
 
 add_executable(seriona_logging_tests
   logging/logging_tests.cpp
@@ -448,6 +454,7 @@ target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_
 target_compile_definitions(seriona_scanner_watcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_error_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_runtime_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_application_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -742,6 +749,11 @@ target_include_directories(seriona_runtime_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_application_logging_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_logging_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -950,6 +962,7 @@ seriona_enable_warnings(seriona_scanner_service_tests)
 seriona_enable_warnings(seriona_scanner_watcher_tests)
 seriona_enable_warnings(seriona_scanner_error_logging_tests)
 seriona_enable_warnings(seriona_runtime_paths_tests)
+seriona_enable_warnings(seriona_application_logging_tests)
 
 seriona_enable_warnings(seriona_logging_tests)
 
@@ -1079,6 +1092,10 @@ target_link_libraries(seriona_scanner_error_logging_tests PRIVATE
 target_link_libraries(seriona_runtime_paths_tests PRIVATE
   seriona_third_party_headers
 )
+target_link_libraries(seriona_application_logging_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+)
 
 target_link_libraries(seriona_logging_tests PRIVATE
   spdlog::spdlog
@@ -1196,3 +1213,4 @@ add_test(NAME seriona.scanner.cue_parsing COMMAND seriona_scanner_cue_parsing_te
 
 add_test(NAME seriona.logging COMMAND seriona_logging_tests)
 add_test(NAME seriona.runtime_paths COMMAND seriona_runtime_paths_tests)
+add_test(NAME seriona.application_logging COMMAND seriona_application_logging_tests)
