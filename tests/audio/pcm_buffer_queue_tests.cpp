@@ -3,7 +3,10 @@
 #include <doctest.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <thread>
+#include <vector>
 
 namespace seriona::audio {
 namespace {
@@ -140,6 +143,50 @@ TEST_CASE("pcm_buffer_queue read discards pcm when seek generation changes durin
     CHECK(frame == StereoFrame{0, 0, 0, 0});
   }
   CHECK(queue.counters().consumedFrames == 0U);
+}
+
+TEST_CASE("pcm_buffer_queue preserves frame order under concurrent producer consumer access") {
+  constexpr std::uint32_t totalFrames = 4096U;
+  PcmBufferQueue queue(queueConfig(64));
+  std::vector<StereoFrame> input(totalFrames);
+  std::vector<StereoFrame> output(totalFrames, StereoFrame{0, 0, 0, 0});
+  for (std::uint32_t index = 0; index < totalFrames; ++index) {
+    input[index] = StereoFrame{static_cast<std::uint8_t>(index & 0xFFU),
+                               static_cast<std::uint8_t>((index >> 8U) & 0xFFU),
+                               static_cast<std::uint8_t>((index >> 16U) & 0xFFU),
+                               static_cast<std::uint8_t>((index >> 24U) & 0xFFU)};
+  }
+
+  std::atomic<std::uint32_t> written{0};
+  std::atomic<std::uint32_t> read{0};
+  std::thread producer([&] {
+    while (written.load(std::memory_order_acquire) < totalFrames) {
+      const auto index = written.load(std::memory_order_relaxed);
+      if (queue.write(&input[index], 1U)) {
+        written.fetch_add(1U, std::memory_order_release);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+  std::thread consumer([&] {
+    while (read.load(std::memory_order_acquire) < totalFrames) {
+      StereoFrame frame{0, 0, 0, 0};
+      const auto result = queue.read(&frame, 1U);
+      const auto index = read.load(std::memory_order_relaxed);
+      if (result.copiedFrames == 1U) {
+        output[index] = frame;
+        read.fetch_add(1U, std::memory_order_release);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  producer.join();
+  consumer.join();
+
+  CHECK(output == input);
 }
 
 }

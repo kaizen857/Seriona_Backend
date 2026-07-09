@@ -5,12 +5,15 @@
 #include "media_controller_module.h"
 #include "subscription_store.h"
 
+#include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/metadata/metadata_contracts.h"
 
 #include "spdlog/spdlog.h"
 
+#include <exception>
 #include <future>
 #include <mutex>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -21,6 +24,105 @@ namespace {
   return MediaControllerCommandResult{.accepted = false,
                                       .code = MediaControllerErrorCode::ControllerStopped,
                                       .message = "Media controller is stopped"};
+}
+
+[[nodiscard]] MediaControllerCommandResult acceptedResult() {
+  return MediaControllerCommandResult{.accepted = true, .code = MediaControllerErrorCode::None, .message = {}};
+}
+
+[[nodiscard]] MediaControllerCommandResult rejectedResult(MediaControllerErrorCode code, std::string message) {
+  return MediaControllerCommandResult{.accepted = false, .code = code, .message = std::move(message)};
+}
+
+[[nodiscard]] bool isSupportedFolderSortField(FolderSortField field) noexcept {
+  switch (field) {
+  case FolderSortField::Title:
+  case FolderSortField::Artist:
+  case FolderSortField::Album:
+  case FolderSortField::Filename:
+  case FolderSortField::Year:
+  case FolderSortField::Duration:
+  case FolderSortField::CreatedDate:
+  case FolderSortField::DiscNumber:
+  case FolderSortField::TrackNumber:
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] bool isSupportedFolderSortDirection(FolderSortDirection direction) noexcept {
+  switch (direction) {
+  case FolderSortDirection::Ascending:
+  case FolderSortDirection::Descending:
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] bool isSupportedFolderSortMissingValuePolicy(FolderSortMissingValuePolicy policy) noexcept {
+  switch (policy) {
+  case FolderSortMissingValuePolicy::First:
+  case FolderSortMissingValuePolicy::Last:
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] std::optional<MediaControllerCommandResult> validateFolderSortSetting(FolderSortSetting& setting) {
+  if (setting.rootPath.empty()) {
+    return rejectedResult(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules requires a root path");
+  }
+  try {
+    setting.rootPath = std::filesystem::absolute(setting.rootPath).lexically_normal();
+  } catch (const std::filesystem::filesystem_error& error) {
+    return rejectedResult(MediaControllerErrorCode::InvalidCommand, error.what());
+  }
+  if (setting.folderNodeId.empty()) {
+    return rejectedResult(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules requires a folder node id");
+  }
+  if (setting.rules.empty()) {
+    return rejectedResult(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules requires at least one sort rule");
+  }
+  for (const auto& rule : setting.rules) {
+    if (!isSupportedFolderSortField(rule.field) || !isSupportedFolderSortDirection(rule.direction) ||
+        !isSupportedFolderSortMissingValuePolicy(rule.missingValuePolicy)) {
+      return rejectedResult(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules contains an unsupported sort rule");
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] MediaControllerErrorCode commandCodeFromStoreError(FolderSortSettingsErrorCode code) noexcept {
+  switch (code) {
+  case FolderSortSettingsErrorCode::InvalidRootPath:
+  case FolderSortSettingsErrorCode::InvalidFolderNodeId:
+  case FolderSortSettingsErrorCode::InvalidRulesJson:
+    return MediaControllerErrorCode::InvalidCommand;
+  case FolderSortSettingsErrorCode::StorageError:
+    return MediaControllerErrorCode::BackendRejected;
+  }
+  return MediaControllerErrorCode::BackendRejected;
+}
+
+[[nodiscard]] ControlDomainNotification makeCommandRejectedNotification(MediaControllerErrorCode code, std::string message) {
+  return ControlDomainNotification{.kind = ControlDomainNotificationKind::CommandRejected,
+                                   .errorCode = code,
+                                   .message = std::move(message),
+                                   .scanStatus = std::nullopt,
+                                   .folderSortSetting = std::nullopt};
+}
+
+[[nodiscard]] ControlDomainNotification makeFolderSortAppliedNotification(FolderSortSetting setting) {
+  return ControlDomainNotification{.kind = ControlDomainNotificationKind::FolderSortRulesApplied,
+                                   .errorCode = MediaControllerErrorCode::None,
+                                   .message = "Folder sort rules applied",
+                                   .scanStatus = std::nullopt,
+                                   .folderSortSetting = std::move(setting)};
+}
+
+[[nodiscard]] bool canLoadSavedFolderRules(const PlaybackContextDescriptor& descriptor) {
+  return descriptor.scope == PlaybackContextScope::Folder && descriptor.sortRules.empty() && !descriptor.rootPath.empty() &&
+         !descriptor.folderNodeId.empty();
 }
 
 [[nodiscard]] metadata::PlatformMediaState platformStateFromSnapshot(const PlayerStateSnapshot& snapshot) {
@@ -76,6 +178,9 @@ public:
     spdlog::info("media controller shutting down");
     dependencies_.audio->setEventSink({});
     dependencies_.scanner->setEventSink({});
+    if (shouldStopMetadata) {
+      stopScannerWatching("shutdown");
+    }
 
     if (metadataCommandSubscription_.unsubscribe) {
       metadataCommandSubscription_.unsubscribe();
@@ -99,7 +204,20 @@ public:
     }
 
     dependencies_.scanner->scan(roots, mode);
-    return MediaControllerCommandResult{.accepted = true, .code = MediaControllerErrorCode::None, .message = {}};
+    if (mode == scanner::ScanMode::Full) {
+      try {
+        dependencies_.scanner->startWatching(roots);
+      } catch (const std::exception& error) {
+        stopScannerWatching("watcher start failure");
+        return rejectCommand(MediaControllerErrorCode::BackendRejected,
+                             std::string{"Failed to start scanner watcher: "} + error.what());
+      } catch (...) {
+        stopScannerWatching("watcher start failure");
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, "Failed to start scanner watcher");
+      }
+    }
+    publishSavedFolderSortRulesForRoots(roots);
+    return acceptedResult();
   }
 
   SubscriptionHandle subscribePlayerState(PlayerStateSnapshotCallback callback) {
@@ -228,10 +346,102 @@ private:
   }
 
   MediaControllerCommandResult reduceCommand(const MediaControlCommand& command) {
+    if (command.kind == MediaControlCommandKind::ApplyFolderSortRules) {
+      return applyFolderSortRules(command);
+    }
+    if (command.kind == MediaControlCommandKind::StartPlaybackFromContext) {
+      return startPlaybackFromContext(command);
+    }
+
     auto reduction = reducer_.reduceCommand(command);
     commitReduction(reduction);
     executeIntents(reduction.intents);
     return reduction.result;
+  }
+
+  MediaControllerCommandResult startPlaybackFromContext(const MediaControlCommand& command) {
+    auto commandWithSavedRules = command;
+    if (commandWithSavedRules.playbackContext.has_value()) {
+      applySavedFolderSortRulesIfNeeded(*commandWithSavedRules.playbackContext);
+    }
+
+    auto reduction = reducer_.reduceCommand(commandWithSavedRules);
+    commitReduction(reduction);
+    executeIntents(reduction.intents);
+    return reduction.result;
+  }
+
+  void applySavedFolderSortRulesIfNeeded(PlaybackContextDescriptor& descriptor) const {
+    if (!canLoadSavedFolderRules(descriptor)) {
+      return;
+    }
+    try {
+      const auto saved = dependencies_.folderSortSettingsStore->load(descriptor.rootPath, descriptor.folderNodeId);
+      if (saved.has_value()) {
+        descriptor.sortRules = saved->rules;
+      }
+    } catch (const FolderSortSettingsError& error) {
+      spdlog::warn("failed to load saved folder sort rules for root '{}' folder '{}': {}",
+                   descriptor.rootPath.generic_string(),
+                   descriptor.folderNodeId,
+                   error.what());
+    } catch (const std::exception& error) {
+      spdlog::warn("failed to load saved folder sort rules for root '{}' folder '{}': {}",
+                   descriptor.rootPath.generic_string(),
+                   descriptor.folderNodeId,
+                   error.what());
+    }
+  }
+
+  MediaControllerCommandResult applyFolderSortRules(const MediaControlCommand& command) {
+    if (!command.folderSortSetting.has_value()) {
+      return rejectCommand(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules requires folder sort settings");
+    }
+
+    auto setting = *command.folderSortSetting;
+    if (auto validationError = validateFolderSortSetting(setting); validationError.has_value()) {
+      return rejectCommand(validationError->code, validationError->message);
+    }
+
+    try {
+      dependencies_.folderSortSettingsStore->upsert(setting);
+    } catch (const FolderSortSettingsError& error) {
+      return rejectCommand(commandCodeFromStoreError(error.code()), error.what());
+    } catch (const std::exception& error) {
+      return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
+    }
+
+    notificationSubscriptions_.publish(makeFolderSortAppliedNotification(setting));
+    return acceptedResult();
+  }
+
+  MediaControllerCommandResult rejectCommand(MediaControllerErrorCode code, std::string message) {
+    notificationSubscriptions_.publish(makeCommandRejectedNotification(code, message));
+    return rejectedResult(code, std::move(message));
+  }
+
+  void publishSavedFolderSortRulesForRoots(const std::vector<scanner::ScannerRoot>& roots) {
+    for (const auto& root : roots) {
+      try {
+        for (auto setting : dependencies_.folderSortSettingsStore->list(root.path)) {
+          notificationSubscriptions_.publish(makeFolderSortAppliedNotification(std::move(setting)));
+        }
+      } catch (const FolderSortSettingsError& error) {
+        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", root.path.generic_string(), error.what());
+      } catch (const std::exception& error) {
+        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", root.path.generic_string(), error.what());
+      }
+    }
+  }
+
+  void stopScannerWatching(std::string_view reason) noexcept {
+    try {
+      dependencies_.scanner->stopWatching();
+    } catch (const std::exception& error) {
+      spdlog::warn("failed to stop scanner watcher during {}: {}", reason, error.what());
+    } catch (...) {
+      spdlog::warn("failed to stop scanner watcher during {}", reason);
+    }
   }
 
   void handleAudioEvent(const audio::BackendEvent& event) {

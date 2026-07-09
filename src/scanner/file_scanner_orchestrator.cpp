@@ -501,6 +501,44 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
          message.contains("warning") || message.contains("error");
 }
 
+[[nodiscard]] bool pathChangeRequestsScan(const WatchEvent& event) {
+  switch (event.pathKind) {
+  case WatchPathKind::File:
+  case WatchPathKind::Directory:
+    break;
+  case WatchPathKind::Watcher:
+  case WatchPathKind::Other:
+    return false;
+  }
+
+  switch (event.effectKind) {
+  case WatchEffectKind::Created:
+  case WatchEffectKind::Modified:
+  case WatchEffectKind::Destroyed:
+  case WatchEffectKind::Renamed:
+  case WatchEffectKind::OwnerChanged:
+    return true;
+  case WatchEffectKind::Other:
+    return false;
+  }
+  return false;
+}
+
+void collectActionableWatcherEvent(const WatchEvent& event, std::vector<std::string>& messages, bool& actionable) {
+  if (event.pathKind == WatchPathKind::Watcher) {
+    if (watcherMessageRequestsRootReconciliation(event.path)) {
+      messages.push_back(event.path.generic_string());
+      actionable = true;
+    }
+  } else if (pathChangeRequestsScan(event)) {
+    actionable = true;
+  }
+
+  for (const auto& associated : event.associated) {
+    collectActionableWatcherEvent(associated, messages, actionable);
+  }
+}
+
 class WtrFolderWatcher final : public FolderWatcher {
 public:
   WtrFolderWatcher(const std::filesystem::path& root, WatchEventCallback callback)
@@ -543,13 +581,10 @@ void enqueueWatcherEvent(const std::shared_ptr<WatchRuntimeState>& state, const 
   if (state->stopping) {
     return;
   }
-  if (event.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(event.path)) {
-    state->pendingWatcherMessages.push_back(event.path.generic_string());
-  }
-  for (const auto& associated : event.associated) {
-    if (associated.pathKind == WatchPathKind::Watcher && watcherMessageRequestsRootReconciliation(associated.path)) {
-      state->pendingWatcherMessages.push_back(associated.path.generic_string());
-    }
+  bool actionable = false;
+  collectActionableWatcherEvent(event, state->pendingWatcherMessages, actionable);
+  if (!actionable) {
+    return;
   }
   ++state->dirtyGeneration;
   state->changed.notify_one();

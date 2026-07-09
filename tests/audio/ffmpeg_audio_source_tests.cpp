@@ -7,10 +7,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
+
+extern "C" {
+#include <libavformat/avformat.h>
+}
 
 using namespace std::chrono_literals;
 
@@ -92,6 +98,117 @@ std::filesystem::path sineFixture(std::string name, std::uint32_t frames) {
   const auto path = fixtureDir() / std::move(name);
   writeWav(path, makeSine(frames, 440.0, 0.5));
   return path;
+}
+
+std::string shellQuote(const std::filesystem::path& path) {
+  const auto text = path.string();
+  REQUIRE(text.find('\'') == std::string::npos);
+  return "'" + text + "'";
+}
+
+void requireFfmpegCommand(const std::string& command) {
+  REQUIRE(std::filesystem::exists("/usr/bin/ffmpeg"));
+  const int exitCode = std::system(command.c_str());
+  REQUIRE_MESSAGE(exitCode == 0, "ffmpeg command failed with exit=" << exitCode << ": " << command);
+}
+
+void transcodeMp3(const std::filesystem::path& sourceWav,
+                  const std::filesystem::path& outputMp3,
+                  const char* bitrate = "128k") {
+  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+                       " -map_metadata -1 -id3v2_version 0 -write_id3v1 0 -codec:a libmp3lame -b:a " + bitrate + " " +
+                       shellQuote(outputMp3);
+
+  requireFfmpegCommand(command);
+  REQUIRE(std::filesystem::exists(outputMp3));
+}
+
+void copyWithId3v1Tag(const std::filesystem::path& sourceMp3,
+                     const std::filesystem::path& taggedMp3) {
+  std::filesystem::copy_file(sourceMp3, taggedMp3, std::filesystem::copy_options::overwrite_existing);
+
+  auto tag = std::array<unsigned char, 128>{};
+  tag[0] = 'T';
+  tag[1] = 'A';
+  tag[2] = 'G';
+
+  std::ofstream output(taggedMp3, std::ios::binary | std::ios::app);
+  REQUIRE(output.good());
+  output.write(reinterpret_cast<const char*>(tag.data()), static_cast<std::streamsize>(tag.size()));
+  REQUIRE(output.good());
+}
+
+struct AudioPacketRange {
+  std::int64_t position{0};
+  int size{0};
+};
+
+std::vector<AudioPacketRange> audioPacketRanges(const std::filesystem::path& sourceMp3,
+                                                int minimumSize = 0) {
+  AVFormatContext* rawFormat = nullptr;
+  REQUIRE(avformat_open_input(&rawFormat, sourceMp3.string().c_str(), nullptr, nullptr) >= 0);
+  REQUIRE(avformat_find_stream_info(rawFormat, nullptr) >= 0);
+
+  const int audioStreamIndex = av_find_best_stream(rawFormat, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+  REQUIRE(audioStreamIndex >= 0);
+
+  std::vector<AudioPacketRange> packets;
+  auto packet = std::unique_ptr<AVPacket, void (*)(AVPacket*)>(av_packet_alloc(), [](AVPacket* value) {
+    av_packet_free(&value);
+  });
+  REQUIRE(packet != nullptr);
+  while (av_read_frame(rawFormat, packet.get()) >= 0) {
+    if (packet->stream_index == audioStreamIndex && packet->pos >= 0 && packet->size >= minimumSize) {
+      packets.push_back(AudioPacketRange{packet->pos, packet->size});
+    }
+    av_packet_unref(packet.get());
+  }
+
+  avformat_close_input(&rawFormat);
+
+  return packets;
+}
+
+AudioPacketRange middleAudioPacketRange(const std::filesystem::path& sourceMp3,
+                                        int minimumSize = 0) {
+  auto packets = audioPacketRanges(sourceMp3, minimumSize);
+  REQUIRE(packets.size() >= 3U);
+  return packets[packets.size() / 2U];
+}
+
+void copyWithEmbeddedId3v1BlockAt(const std::filesystem::path& sourceMp3,
+                                  const std::filesystem::path& taggedMp3,
+                                  std::int64_t insertionOffset) {
+  REQUIRE(insertionOffset > 0);
+
+  std::ifstream input(sourceMp3, std::ios::binary);
+  REQUIRE(input.good());
+  std::vector<std::uint8_t> bytes(std::istreambuf_iterator<char>(input), {});
+  REQUIRE(static_cast<std::uint64_t>(insertionOffset) < bytes.size());
+
+  auto tag = std::array<std::uint8_t, 128>{};
+  tag[0] = 'T';
+  tag[1] = 'A';
+  tag[2] = 'G';
+
+  bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(insertionOffset), tag.begin(), tag.end());
+
+  std::ofstream output(taggedMp3, std::ios::binary | std::ios::trunc);
+  REQUIRE(output.good());
+  output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  REQUIRE(output.good());
+}
+
+void copyWithEmbeddedId3v1BlockAtPacketBoundary(const std::filesystem::path& sourceMp3,
+                                                const std::filesystem::path& taggedMp3) {
+  const auto packet = middleAudioPacketRange(sourceMp3);
+  copyWithEmbeddedId3v1BlockAt(sourceMp3, taggedMp3, packet.position);
+}
+
+void copyWithEmbeddedId3v1BlockInsidePacket(const std::filesystem::path& sourceMp3,
+                                            const std::filesystem::path& taggedMp3) {
+  const auto packet = middleAudioPacketRange(sourceMp3, 512);
+  copyWithEmbeddedId3v1BlockAt(sourceMp3, taggedMp3, packet.position + 80);
 }
 
 std::uint64_t readAllFrames(FfmpegAudioSource& source) {
@@ -190,6 +307,107 @@ TEST_CASE("ffmpeg_audio_source seek flushes stale decoder state") {
   CHECK(beforeSeek.position < 100ms);
   CHECK(afterSeek.position >= 900ms);
   CHECK(afterSeek.position > beforeSeek.position);
+}
+
+TEST_CASE("ffmpeg_audio_source ignores terminal mp3 id3v1 tag bytes") {
+  if (!std::filesystem::exists("/usr/bin/ffmpeg")) {
+    INFO("/usr/bin/ffmpeg not available; skipping mp3 tail corruption regression test");
+    return;
+  }
+
+  const auto sourceWav = sineFixture("ffmpeg_source_id3v1_source.wav", kSampleRate * 2U);
+  const auto untaggedMp3 = fixtureDir() / "ffmpeg_source_id3v1_untagged.mp3";
+  const auto taggedMp3 = fixtureDir() / "ffmpeg_source_id3v1_tagged.mp3";
+  transcodeMp3(sourceWav, untaggedMp3);
+  copyWithId3v1Tag(untaggedMp3, taggedMp3);
+
+  FfmpegAudioSource source;
+  REQUIRE_FALSE(source.open(taggedMp3).has_value());
+
+  CHECK(readAllFrames(source) > 0U);
+}
+
+TEST_CASE("ffmpeg_audio_source trims embedded mp3 id3v1 packet prefixes without losing decode progress") {
+  if (!std::filesystem::exists("/usr/bin/ffmpeg")) {
+    INFO("/usr/bin/ffmpeg not available; skipping embedded mp3 ID3v1 regression test");
+    return;
+  }
+
+  const auto sourceWav = sineFixture("ffmpeg_source_embedded_id3v1_source.wav", kSampleRate * 4U);
+  const auto cleanMp3 = fixtureDir() / "ffmpeg_source_embedded_id3v1_clean.mp3";
+  const auto taggedMp3 = fixtureDir() / "ffmpeg_source_embedded_id3v1_tagged.mp3";
+  transcodeMp3(sourceWav, cleanMp3, "320k");
+  copyWithEmbeddedId3v1BlockAtPacketBoundary(cleanMp3, taggedMp3);
+
+  FfmpegAudioSource cleanSource;
+  REQUIRE_FALSE(cleanSource.open(cleanMp3).has_value());
+  const auto cleanFrames = readAllFrames(cleanSource);
+
+  FfmpegAudioSource taggedSource;
+  REQUIRE_FALSE(taggedSource.open(taggedMp3).has_value());
+  const auto taggedFrames = readAllFrames(taggedSource);
+
+  CHECK(taggedFrames == cleanFrames);
+}
+
+TEST_CASE("ffmpeg_audio_source removes embedded mp3 id3v1 blocks inside packets without catastrophic decode loss") {
+  if (!std::filesystem::exists("/usr/bin/ffmpeg")) {
+    INFO("/usr/bin/ffmpeg not available; skipping embedded in-packet mp3 ID3v1 regression test");
+    return;
+  }
+
+  const auto sourceWav = sineFixture("ffmpeg_source_embedded_midpacket_id3v1_source.wav", kSampleRate * 4U);
+  const auto cleanMp3 = fixtureDir() / "ffmpeg_source_embedded_midpacket_id3v1_clean.mp3";
+  const auto taggedMp3 = fixtureDir() / "ffmpeg_source_embedded_midpacket_id3v1_tagged.mp3";
+  transcodeMp3(sourceWav, cleanMp3, "320k");
+  copyWithEmbeddedId3v1BlockInsidePacket(cleanMp3, taggedMp3);
+
+  FfmpegAudioSource cleanSource;
+  REQUIRE_FALSE(cleanSource.open(cleanMp3).has_value());
+  const auto cleanFrames = readAllFrames(cleanSource);
+
+  FfmpegAudioSource taggedSource;
+  REQUIRE_FALSE(taggedSource.open(taggedMp3).has_value());
+  const auto taggedFrames = readAllFrames(taggedSource);
+
+  CHECK(taggedFrames <= cleanFrames);
+  CHECK(taggedFrames >= cleanFrames - 1152U);
+}
+
+TEST_CASE("ffmpeg_audio_source tail guard keeps legitimate final mp3 frame") {
+  const auto info = FfmpegAudioStreamInfo{44'100U, 2U, AudioSampleFormat::Float32, std::chrono::microseconds{320'626'667}};
+  const auto finalFrame = FfmpegAudioFrame{44'100U,
+                                           2U,
+                                           AudioSampleFormat::Float32,
+                                           0,
+                                           std::chrono::microseconds{320'626'939},
+                                           1'093U,
+                                           {}};
+
+  CHECK_FALSE(seriona::audio::detail::shouldTerminateCorruptedMp3Tail(info, finalFrame, false));
+  CHECK_FALSE(seriona::audio::detail::shouldTerminateCorruptedMp3Tail(info, finalFrame, true));
+}
+
+TEST_CASE("ffmpeg_audio_source tail guard truncates post-invalid mp3 tail drift and signature jumps") {
+  const auto info = FfmpegAudioStreamInfo{44'100U, 2U, AudioSampleFormat::Float32, std::chrono::microseconds{320'626'667}};
+  const auto lateFrameSameSignature = FfmpegAudioFrame{44'100U,
+                                                       2U,
+                                                       AudioSampleFormat::Float32,
+                                                       0,
+                                                       std::chrono::microseconds{320'679'184},
+                                                       1'152U,
+                                                       {}};
+  const auto lateFrameDifferentSignature = FfmpegAudioFrame{12'000U,
+                                                            2U,
+                                                            AudioSampleFormat::Float32,
+                                                            0,
+                                                            std::chrono::microseconds{320'705'306},
+                                                            1'152U,
+                                                            {}};
+
+  CHECK(seriona::audio::detail::shouldTerminateCorruptedMp3Tail(info, lateFrameSameSignature, true));
+  CHECK(seriona::audio::detail::shouldTerminateCorruptedMp3Tail(info, lateFrameDifferentSignature, true));
+  CHECK_FALSE(seriona::audio::detail::shouldTerminateCorruptedMp3Tail(info, lateFrameDifferentSignature, false));
 }
 
 }

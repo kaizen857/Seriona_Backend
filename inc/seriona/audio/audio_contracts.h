@@ -72,6 +72,7 @@ struct TrackPlaybackRequest {
   std::optional<std::uint16_t> bitDepth;
   std::optional<std::uint16_t> channels;
   std::optional<std::string> format;
+  bool boundedSegment{false};
 };
 
 struct AudioOutputConfig {

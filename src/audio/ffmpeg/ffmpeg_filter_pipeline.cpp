@@ -215,7 +215,7 @@ public:
     const auto input = signatureOf(frame);
     if (!graph_ || !(input == input_)) {
       if (graph_ && !sinkDrained_) {
-        return makeError(PlaybackErrorCode::FormatNegotiationFailed, "input format changed while filtered frames are pending", "drain or reset before changing input format");
+        spdlog::warn("filter pipeline resetting pending graph for decoded input format change");
       }
       if (const auto error = buildGraph(input)) {
         return error;

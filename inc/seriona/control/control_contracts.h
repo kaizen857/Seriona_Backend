@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "../audio/audio_contracts.h"
 #include "../scanner/scanner_contracts.h"
@@ -16,6 +17,8 @@ class MetadataSharingService;
 }
 
 namespace seriona::control {
+
+class FolderSortSettingsStore;
 
 enum class PlaybackStatus {
   Stopped,
@@ -129,6 +132,53 @@ struct LibraryStateSnapshot {
   std::optional<scanner::ScannerError> lastError;
 };
 
+enum class FolderSortField {
+  Title,
+  Artist,
+  Album,
+  Filename,
+  Year,
+  Duration,
+  CreatedDate,
+  DiscNumber,
+  TrackNumber,
+};
+
+enum class FolderSortDirection {
+  Ascending,
+  Descending,
+};
+
+enum class FolderSortMissingValuePolicy {
+  First,
+  Last,
+};
+
+struct FolderSortRule {
+  FolderSortField field{FolderSortField::Title};
+  FolderSortDirection direction{FolderSortDirection::Ascending};
+  FolderSortMissingValuePolicy missingValuePolicy{FolderSortMissingValuePolicy::Last};
+};
+
+struct FolderSortSetting {
+  std::filesystem::path rootPath;
+  std::string folderNodeId;
+  std::vector<FolderSortRule> rules;
+};
+
+enum class PlaybackContextScope {
+  Root,
+  Folder,
+};
+
+struct PlaybackContextDescriptor {
+  PlaybackContextScope scope{PlaybackContextScope::Root};
+  std::filesystem::path rootPath;
+  std::string folderNodeId;
+  std::optional<TrackIdentity> anchorTrack;
+  std::vector<FolderSortRule> sortRules;
+};
+
 enum class ControlDomainNotificationKind {
   LibrarySnapshotUpdated,
   LibraryScanStarted,
@@ -140,6 +190,7 @@ enum class ControlDomainNotificationKind {
   PlaybackError,
   OutputModeFallback,
   CommandRejected,
+  FolderSortRulesApplied,
 };
 
 enum class MediaControllerErrorCode {
@@ -156,6 +207,7 @@ struct ControlDomainNotification {
   MediaControllerErrorCode errorCode{MediaControllerErrorCode::None};
   std::string message;
   std::optional<LibraryScanStatus> scanStatus;
+  std::optional<FolderSortSetting> folderSortSetting;
 };
 
 struct MediaControllerCommandResult {
@@ -174,6 +226,7 @@ struct MediaControllerDependencies {
   std::shared_ptr<audio::AudioPlaybackService> audio;
   std::shared_ptr<scanner::FileScannerService> scanner;
   std::unique_ptr<::seriona::metadata::MetadataSharingService> metadata;
+  std::shared_ptr<FolderSortSettingsStore> folderSortSettingsStore;
 };
 
 enum class MediaControlCommandKind {
@@ -190,6 +243,8 @@ enum class MediaControlCommandKind {
   SkipNext,
   SkipPrevious,
   SelectTrack,
+  StartPlaybackFromContext,
+  ApplyFolderSortRules,
 };
 
 struct MediaControlCommand {
@@ -201,6 +256,8 @@ struct MediaControlCommand {
   std::optional<RepeatMode> repeatMode;
   std::optional<bool> shuffle;
   std::optional<TrackIdentity> track;
+  std::optional<PlaybackContextDescriptor> playbackContext;
+  std::optional<FolderSortSetting> folderSortSetting;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;

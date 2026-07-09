@@ -1,10 +1,13 @@
 #pragma once
 
+#include "playback_context_builder.h"
+
 #include "seriona/audio/audio_contracts.h"
 #include "seriona/control/control_contracts.h"
 #include "seriona/scanner/scanner_contracts.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -76,13 +79,24 @@ private:
     std::optional<ArtworkRef> artwork{};
   };
 
+  struct PlaybackContextState {
+    PlaybackContextDescriptor descriptor{};
+    std::vector<PlayableTrack> order{};
+    std::size_t index{0};
+  };
+
   [[nodiscard]] std::vector<PlayableTrack> playableTracks() const;
   [[nodiscard]] std::optional<PlayableTrack> firstPlayableTrack() const;
   [[nodiscard]] std::optional<PlayableTrack> findPlayableTrack(const TrackIdentity& identity) const;
+  [[nodiscard]] std::optional<PlaybackContextDescriptor> defaultContextDescriptorForTrack(const TrackIdentity& identity) const;
+  [[nodiscard]] std::optional<PlaybackContextState> buildPlaybackContextState(PlaybackContextDescriptor descriptor,
+                                                                              PlaybackContextBuildStatus* status = nullptr) const;
+  [[nodiscard]] std::optional<std::size_t> selectedContextIndex() const;
+  [[nodiscard]] std::optional<PlayableTrack> selectedPlaybackContextTrack();
+  [[nodiscard]] bool activateTrackWithDefaultContext(ControlReduction& reduction, const TrackIdentity& identity, bool startPlayback);
   [[nodiscard]] std::optional<PlayableTrack> nextTrack(bool forward);
   [[nodiscard]] std::optional<PlayableTrack> shuffledTrack(const std::vector<PlayableTrack>& tracks);
   [[nodiscard]] std::optional<PlayableTrack> previousTrack();
-  [[nodiscard]] std::vector<PlayableTrack> getCandidatesInSameFolder() const;
   [[nodiscard]] std::vector<PlayableTrack> filterOutHistory(const std::vector<PlayableTrack>& candidates) const;
   [[nodiscard]] std::chrono::milliseconds clampPosition(std::chrono::milliseconds position) const;
 
@@ -90,6 +104,7 @@ private:
   ControlReduction reject(MediaControllerErrorCode code, std::string message);
   void markPlayerChanged(ControlReduction& reduction, std::chrono::steady_clock::time_point sampledAt = {});
   void addNotification(ControlReduction& reduction, ControlDomainNotification notification);
+  void reconcilePlaybackContextAfterSnapshot(ControlReduction& reduction);
   void selectFirstTrackWhenIdle(ControlReduction& reduction);
   void selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback);
   void stopPlayback(ControlReduction& reduction);
@@ -97,6 +112,7 @@ private:
   PlayerStateSnapshot player_{};
   LibraryStateSnapshot library_{};
   std::optional<TrackIdentity> selectedTrack_{};
+  std::optional<PlaybackContextState> playbackContext_{};
   std::optional<PlaybackStatus> visibleStateDuringSeek_{};
   std::optional<std::chrono::milliseconds> currentTrackOffset_{};
   std::uint64_t lastAudioPlayerVersion_{0};

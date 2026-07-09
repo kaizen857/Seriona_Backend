@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,8 @@ namespace scanner = seriona::scanner;
 using namespace std::chrono_literals;
 
 constexpr auto kIdleRefreshInterval = 100ms;
+
+using TerminalActionReader = std::function<TerminalAction(std::chrono::milliseconds)>;
 
 struct TerminalState {
   control::PlayerStateSnapshot player{};
@@ -85,7 +88,7 @@ std::string currentTrackLabel(const control::PlayerStateSnapshot& player) {
   return "no track";
 }
 
-void renderStatus(TerminalState& state, std::mutex& outputMutex) {
+void renderStatus(TerminalState& state, std::mutex& outputMutex, std::ostream& output) {
   control::PlayerStateSnapshot player;
   control::LibraryStateSnapshot library;
   std::optional<control::ControlDomainNotification> notification;
@@ -97,13 +100,13 @@ void renderStatus(TerminalState& state, std::mutex& outputMutex) {
   }
 
   std::scoped_lock outputLock{outputMutex};
-  std::cout << "\r\033[K[" << playbackStatusName(player.playback.state) << "] " << currentTrackLabel(player) << " | "
-            << player.timeline.position.count() << " ms | volume " << static_cast<int>(player.volume * 100.0F) << "%"
-            << (player.muted ? " muted" : "") << " | scan " << scanStatusName(library.scanStatus);
+  output << "\r\033[K[" << playbackStatusName(player.playback.state) << "] " << currentTrackLabel(player) << " | "
+         << player.timeline.position.count() << " ms | volume " << static_cast<int>(player.volume * 100.0F) << "%"
+         << (player.muted ? " muted" : "") << " | scan " << scanStatusName(library.scanStatus);
   if (notification.has_value() && !notification->message.empty()) {
-    std::cout << " | " << notification->message;
+    output << " | " << notification->message;
   }
-  std::cout << std::flush;
+  output << std::flush;
 }
 
 control::MediaControlCommand commandForAction(TerminalAction action, const control::PlayerStateSnapshot& player) {
@@ -147,35 +150,47 @@ control::PlayerStateSnapshot playerSnapshot(TerminalState& state) {
   return state.player;
 }
 
-void printControls() {
-  std::cout << "Controls: space/p play-pause, n/right next, b/left previous, s stop, +/- volume, m mute, q quit\n";
+void printControls(std::ostream& output) {
+  output << "Controls: space/p play-pause, n/right next, b/left previous, s stop, +/- volume, m mute, q quit\n";
 }
 
-void updatePlayerState(TerminalState& state, std::mutex& outputMutex, const control::PlayerStateSnapshot& snapshot) {
+void updatePlayerState(TerminalState& state,
+                       std::mutex& outputMutex,
+                       std::ostream& output,
+                       const control::PlayerStateSnapshot& snapshot) {
   {
     std::scoped_lock lock{state.mutex};
     state.player = snapshot;
   }
-  renderStatus(state, outputMutex);
+  renderStatus(state, outputMutex, output);
 }
 
-void updateLibraryState(TerminalState& state, std::mutex& outputMutex, const control::LibraryStateSnapshot& snapshot) {
+void updateLibraryState(TerminalState& state,
+                        std::mutex& outputMutex,
+                        std::ostream& output,
+                        const control::LibraryStateSnapshot& snapshot) {
   {
     std::scoped_lock lock{state.mutex};
     state.library = snapshot;
   }
-  renderStatus(state, outputMutex);
+  renderStatus(state, outputMutex, output);
 }
 
-void updateNotification(TerminalState& state, std::mutex& outputMutex, const control::ControlDomainNotification& notification) {
+void updateNotification(TerminalState& state,
+                        std::mutex& outputMutex,
+                        std::ostream& output,
+                        const control::ControlDomainNotification& notification) {
   {
     std::scoped_lock lock{state.mutex};
     state.notification = notification;
   }
-  renderStatus(state, outputMutex);
+  renderStatus(state, outputMutex, output);
 }
 
-void refreshPlayerState(TerminalState& state, std::mutex& outputMutex, const control::MediaController& controller) {
+void refreshPlayerState(TerminalState& state,
+                        std::mutex& outputMutex,
+                        std::ostream& output,
+                        const control::MediaController& controller) {
   const auto snapshot = controller.playerStateSnapshot();
   {
     std::scoped_lock lock{state.mutex};
@@ -184,11 +199,114 @@ void refreshPlayerState(TerminalState& state, std::mutex& outputMutex, const con
     }
     state.player = snapshot;
   }
-  renderStatus(state, outputMutex);
+  renderStatus(state, outputMutex, output);
+}
+
+int runTerminalControllerSession(const std::filesystem::path& musicPath,
+                                 control::MediaController& controller,
+                                 const TerminalActionReader& readAction,
+                                 std::ostream& output,
+                                 std::ostream& error,
+                                 bool keyboardControlAvailable) {
+  TerminalState state{};
+  std::mutex outputMutex;
+  auto playerSubscription = controller.subscribePlayerState([&](const control::PlayerStateSnapshot& snapshot) {
+    updatePlayerState(state, outputMutex, output, snapshot);
+  });
+  auto librarySubscription = controller.subscribeLibraryState([&](const control::LibraryStateSnapshot& snapshot) {
+    updateLibraryState(state, outputMutex, output, snapshot);
+  });
+  auto notificationSubscription = controller.subscribeDomainNotifications([&](const control::ControlDomainNotification& notification) {
+    updateNotification(state, outputMutex, output, notification);
+  });
+
+  auto unsubscribeAll = [&] {
+    playerSubscription.unsubscribe();
+    librarySubscription.unsubscribe();
+    notificationSubscription.unsubscribe();
+  };
+
+  try {
+    controller.start();
+  } catch (const std::exception& e) {
+    spdlog::critical("media controller failed to start: {}", e.what());
+    unsubscribeAll();
+    return 1;
+  }
+  spdlog::info("media controller started");
+  printControls(output);
+  const auto scanResult = controller.scanLibrary({scanner::ScannerRoot{.path = musicPath, .recursive = true}}, scanner::ScanMode::Full);
+  if (!scanResult.accepted) {
+    spdlog::warn("library scan rejected: {}", scanResult.message);
+    error << "\nseriona: failed to scan library: " << scanResult.message << '\n';
+    spdlog::info("seriona shutting down");
+    controller.shutdown();
+    unsubscribeAll();
+    return 1;
+  }
+  spdlog::info("library scan accepted: {}", scanResult.message);
+  renderStatus(state, outputMutex, output);
+
+  try {
+    if (keyboardControlAvailable) {
+      bool running = true;
+      while (running) {
+        const auto action = readAction(kIdleRefreshInterval);
+        if (action == TerminalAction::None) {
+          refreshPlayerState(state, outputMutex, output, controller);
+          continue;
+        }
+        if (action == TerminalAction::Quit) {
+          running = false;
+          continue;
+        }
+        const auto command = commandForAction(action, playerSnapshot(state));
+        if (command.kind == control::MediaControlCommandKind::TogglePlayPause ||
+            command.kind == control::MediaControlCommandKind::SkipNext ||
+            command.kind == control::MediaControlCommandKind::SkipPrevious ||
+            command.kind == control::MediaControlCommandKind::Stop) {
+          spdlog::info("user command submitted: kind={}", static_cast<int>(command.kind));
+        }
+        const auto result = controller.submitCommand(command);
+        if (!result.accepted && !result.message.empty()) {
+          std::scoped_lock outputLock{outputMutex};
+          output << "\nseriona: command rejected: " << result.message << '\n';
+        }
+      }
+    } else {
+      error << "\nseriona: terminal keyboard control is not implemented on this platform\n";
+    }
+  } catch (const std::exception& e) {
+    spdlog::critical("unrecoverable runtime failure: {}", e.what());
+  } catch (...) {
+    spdlog::critical("unrecoverable unknown runtime failure");
+  }
+
+  control::MediaControlCommand stopCommand{};
+  stopCommand.kind = control::MediaControlCommandKind::Stop;
+  static_cast<void>(controller.submitCommand(stopCommand));
+  controller.shutdown();
+  spdlog::info("seriona shutting down");
+  unsubscribeAll();
+  output << "\nseriona: stopped\n";
+  return 0;
 }
 
 }
 
+#ifdef SERIONA_TERMINAL_CONTROLLER_TESTING
+namespace testing {
+
+int runTerminalControllerForTest(const std::filesystem::path& musicPath,
+                                 control::MediaController& controller,
+                                 const TerminalActionReader& readAction,
+                                 std::ostream& output,
+                                 std::ostream& error) {
+  return runTerminalControllerSession(musicPath, controller, readAction, output, error, true);
+}
+
+}
+#else
 int runTerminalController(const std::filesystem::path& musicPath) {
   TerminalMode terminalMode;
   if (!terminalMode.enabled()) {
@@ -224,8 +342,6 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   spdlog::info("  artwork dir:     {}", runtimePaths.artworkDir.string());
   spdlog::info("  music scan root: {}", musicPath.string());
 
-  TerminalState state{};
-  std::mutex outputMutex;
   std::unique_ptr<control::MediaController> controller;
   try {
     controller = control::makeProductionMediaController(control::MediaControllerOptions{},
@@ -236,86 +352,22 @@ int runTerminalController(const std::filesystem::path& musicPath) {
     spdlog::shutdown();
     return 1;
   }
-  auto playerSubscription = controller->subscribePlayerState([&](const control::PlayerStateSnapshot& snapshot) {
-    updatePlayerState(state, outputMutex, snapshot);
-  });
-  auto librarySubscription = controller->subscribeLibraryState([&](const control::LibraryStateSnapshot& snapshot) {
-    updateLibraryState(state, outputMutex, snapshot);
-  });
-  auto notificationSubscription = controller->subscribeDomainNotifications([&](const control::ControlDomainNotification& notification) {
-    updateNotification(state, outputMutex, notification);
-  });
-
-  try {
-    controller->start();
-  } catch (const std::exception& e) {
-    spdlog::critical("media controller failed to start: {}", e.what());
-    spdlog::shutdown();
-    return 1;
-  }
-  spdlog::info("media controller started");
-  printControls();
-  const auto scanResult = controller->scanLibrary({scanner::ScannerRoot{.path = musicPath, .recursive = true}}, scanner::ScanMode::Full);
-  if (!scanResult.accepted) {
-    spdlog::warn("library scan rejected: {}", scanResult.message);
-    std::cerr << "\nseriona: failed to scan library: " << scanResult.message << '\n';
-    spdlog::info("seriona shutting down");
-    spdlog::shutdown();
-    controller->shutdown();
-    return 1;
-  }
-  spdlog::info("library scan accepted: {}", scanResult.message);
-  renderStatus(state, outputMutex);
-
-  try {
 #if defined(__unix__) || defined(__APPLE__)
-  bool running = true;
-  while (running) {
-    const auto action = readTerminalAction(kIdleRefreshInterval);
-    if (action == TerminalAction::None) {
-      refreshPlayerState(state, outputMutex, *controller);
-      continue;
-    }
-    if (action == TerminalAction::Quit) {
-      running = false;
-      continue;
-    }
-    const auto command = commandForAction(action, playerSnapshot(state));
-    if (command.kind == control::MediaControlCommandKind::TogglePlayPause ||
-        command.kind == control::MediaControlCommandKind::SkipNext ||
-        command.kind == control::MediaControlCommandKind::SkipPrevious ||
-        command.kind == control::MediaControlCommandKind::Stop) {
-      spdlog::info("user command submitted: kind={}", static_cast<int>(command.kind));
-    }
-    const auto result = controller->submitCommand(command);
-    if (!result.accepted && !result.message.empty()) {
-      std::scoped_lock outputLock{outputMutex};
-      std::cout << "\nseriona: command rejected: " << result.message << '\n';
-    }
-  }
+  constexpr bool keyboardControlAvailable = true;
 #else
-  std::cerr << "\nseriona: terminal keyboard control is not implemented on this platform\n";
+  constexpr bool keyboardControlAvailable = false;
 #endif
-  } catch (const std::exception& e) {
-    spdlog::critical("unrecoverable runtime failure: {}", e.what());
-  } catch (...) {
-    spdlog::critical("unrecoverable unknown runtime failure");
-  }
-
-  control::MediaControlCommand stopCommand{};
-  stopCommand.kind = control::MediaControlCommandKind::Stop;
-  static_cast<void>(controller->submitCommand(stopCommand));
-  {
-    controller->shutdown();
-    spdlog::info("seriona shutting down");
-    controller.reset();
-  }
+  const auto exitCode = runTerminalControllerSession(
+      musicPath,
+      *controller,
+      [](std::chrono::milliseconds timeout) { return readTerminalAction(timeout); },
+      std::cout,
+      std::cerr,
+      keyboardControlAvailable);
+  controller.reset();
   spdlog::shutdown();
-  playerSubscription.unsubscribe();
-  librarySubscription.unsubscribe();
-  notificationSubscription.unsubscribe();
-  std::cout << "\nseriona: stopped\n";
-  return 0;
+  return exitCode;
 }
+#endif
 
 }

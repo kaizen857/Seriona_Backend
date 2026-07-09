@@ -101,6 +101,17 @@ TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initi
   CHECK(metadata.effectiveLyrics[1].text == "embedded two");
 }
 
+TEST_CASE("tagreader adapter preserves zero offset for plain files") {
+  auto raw = rawTagFixture();
+  raw.offset = std::chrono::microseconds{0};
+
+  const auto mapped = mapRawTagMetadata(raw, "content-hash", std::nullopt, false);
+
+  REQUIRE(mapped.metadata.offset.has_value());
+  CHECK(*mapped.metadata.offset == std::chrono::milliseconds{0});
+  CHECK(mapped.metadata.duration == std::chrono::milliseconds{1234});
+}
+
 TEST_CASE("tagreader adapter preserves cached user stats and respects external lrc override") {
   TagUserStats cachedStats{};
   cachedStats.playCount = 99;

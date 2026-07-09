@@ -192,6 +192,21 @@ add_executable(seriona_media_controller_tests
   control/media_controller_tests.cpp
   control/control_test_harness.cpp
 )
+add_executable(seriona_control_folder_sort_settings_store_tests
+  control/folder_sort_settings_store_tests.cpp
+)
+add_executable(seriona_control_persistence_guardrail_tests
+  control/persistence_guardrail_tests.cpp
+  control/control_test_harness.cpp
+)
+add_executable(seriona_control_playback_context_builder_tests
+  control/playback_context_builder_tests.cpp
+)
+add_executable(seriona_terminal_controller_tests
+  app/terminal_controller_tests.cpp
+  control/control_test_harness.cpp
+  ${PROJECT_SOURCE_DIR}/app/terminal_controller.cpp
+)
 add_executable(seriona_scanner_paths_tests
   scanner/scanner_paths_tests.cpp
   scanner/scanner_test_harness.cpp
@@ -424,6 +439,12 @@ target_compile_definitions(seriona_metadata_service_recording_tests PRIVATE DOCT
 target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_control_folder_sort_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_control_persistence_guardrail_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_terminal_controller_tests PRIVATE
+  DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+  SERIONA_TERMINAL_CONTROLLER_TESTING
+)
 target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -456,6 +477,7 @@ target_compile_definitions(seriona_scanner_error_logging_tests PRIVATE DOCTEST_C
 target_compile_definitions(seriona_runtime_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_application_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_control_playback_context_builder_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -613,6 +635,19 @@ target_include_directories(seriona_media_controller_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_control_folder_sort_settings_store_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_control_persistence_guardrail_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_control_playback_context_builder_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_scanner_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -758,6 +793,12 @@ target_include_directories(seriona_logging_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_terminal_controller_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/app
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_link_libraries(seriona_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -892,6 +933,27 @@ target_link_libraries(seriona_media_controller_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_control_folder_sort_settings_store_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  seriona_scanner
+  SQLite3::SQLite3
+)
+target_link_libraries(seriona_control_persistence_guardrail_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  seriona_scanner
+  SQLite3::SQLite3
+)
+target_link_libraries(seriona_control_playback_context_builder_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
+target_link_libraries(seriona_terminal_controller_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  spdlog::spdlog
+)
 
 if(UNIX AND NOT APPLE)
   target_link_libraries(seriona_metadata_mpris_tests PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
@@ -917,6 +979,10 @@ seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_media_controller_tests)
+seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
+seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
+seriona_enable_warnings(seriona_control_playback_context_builder_tests)
+seriona_enable_warnings(seriona_terminal_controller_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
 seriona_enable_warnings(seriona_scanner_contract_tests)
 seriona_enable_warnings(seriona_scanner_internal_types_tests)
@@ -1119,6 +1185,7 @@ set_tests_properties(seriona.audio.waveform.perf PROPERTIES TIMEOUT 240)
 add_test(NAME seriona.ffmpeg_audio_source COMMAND seriona_ffmpeg_audio_source_tests --test-case=*decodes*)
 add_test(NAME seriona.ffmpeg_audio_source_errors COMMAND seriona_ffmpeg_audio_source_tests --test-case=*maps*)
 add_test(NAME seriona.ffmpeg_audio_source_seek COMMAND seriona_ffmpeg_audio_source_tests --test-case=*seek*)
+add_test(NAME seriona.ffmpeg_audio_source_id3v1_tail COMMAND seriona_ffmpeg_audio_source_tests --test-case=*id3v1*)
 add_test(NAME seriona.ffmpeg_filter_pipeline COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*converts*)
 add_test(NAME seriona.ffmpeg_filter_pipeline_drain COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*drains*)
 add_test(NAME seriona.ffmpeg_filter_pipeline_errors COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*invalid*)
@@ -1134,7 +1201,9 @@ add_test(NAME seriona.audio_player_small_buffer COMMAND seriona_audio_player_sma
 add_test(NAME seriona.output_format_negotiation COMMAND seriona_output_format_negotiation_tests --test-case=*covers*)
 add_test(NAME seriona.output_format_negotiation_failure COMMAND seriona_output_format_negotiation_tests --test-case=*failure*)
 add_test(NAME seriona.audio_player_seamless_mix COMMAND seriona_audio_player_seamless_tests --test-case=*seamless_mix*)
+add_test(NAME seriona.audio_player_redundant_play COMMAND seriona_audio_player_seamless_tests --test-case=*redundant_play*)
 add_test(NAME seriona.audio_player_direct_preload COMMAND seriona_audio_player_seamless_tests --test-case=*direct_preload*)
+add_test(NAME seriona.audio_player_reload_param_change COMMAND seriona_audio_player_seamless_tests --test-case=*different_stream_parameters*)
 add_test(NAME seriona.audio_player_preload_failure COMMAND seriona_audio_player_seamless_tests --test-case=*preload_failure*)
 add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_tests)
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
@@ -1149,6 +1218,10 @@ add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
 add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
 add_test(NAME seriona.control_contract COMMAND seriona_control_contract_tests)
 add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
+add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control_folder_sort_settings_store_tests)
+add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)
+add_test(NAME seriona.control_playback_context_builder COMMAND seriona_control_playback_context_builder_tests)
+add_test(NAME seriona.terminal_controller COMMAND seriona_terminal_controller_tests)
 add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
 add_test(NAME seriona.scanner.directory_tree_hash COMMAND seriona_scanner_hash_tests --test-case="scanner directory tree hash*")

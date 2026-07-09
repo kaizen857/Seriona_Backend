@@ -277,6 +277,82 @@ TEST_CASE("audio_player_small_buffer drains pending tail before playback ended")
   }));
 }
 
+TEST_CASE("audio_player_small_buffer treats final partial callback as natural end rather than underrun") {
+  const auto path = writeSineFixture("audio_player_small_buffer_tail_partial.wav", 1001U);
+  auto backend = std::make_unique<SmallBufferBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  std::vector<BackendEvent> events;
+  player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
+
+  AudioOutputConfig config{};
+  config.targetSampleRate = kSampleRate;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 1;
+  config.bufferDuration = 1ms;
+  player.configureOutput(config);
+
+  player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
+  player.play();
+  static_cast<void>(player.queryPlaybackClock());
+
+  for (int index = 0; index < 400 && std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+         return event.type == BackendEventType::PlaybackEnded;
+       });
+       ++index) {
+    fake->consume(16U);
+    static_cast<void>(player.queryPlaybackClock());
+  }
+
+  CHECK(std::any_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackEnded;
+  }));
+  CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackError &&
+           std::get<PlaybackError>(event.payload).code == PlaybackErrorCode::BufferUnderrun;
+  }));
+}
+
+TEST_CASE("audio_player_small_buffer suppresses tail underrun after seek near end") {
+  const auto path = writeSineFixture("audio_player_small_buffer_seek_tail_partial.wav", 6001U);
+  auto backend = std::make_unique<SmallBufferBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  std::vector<BackendEvent> events;
+  player.setEventSink([&events](BackendEvent event) { events.push_back(std::move(event)); });
+
+  AudioOutputConfig config{};
+  config.targetSampleRate = kSampleRate;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 1;
+  config.bufferDuration = 1ms;
+  player.configureOutput(config);
+
+  player.loadTrack(requestFor(path));
+  static_cast<void>(player.queryPlaybackClock());
+  player.play();
+  static_cast<void>(player.queryPlaybackClock());
+  player.seek(104ms);
+  static_cast<void>(player.queryPlaybackClock());
+
+  for (int index = 0; index < 400 && std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+         return event.type == BackendEventType::PlaybackEnded;
+       });
+       ++index) {
+    fake->consume(16U);
+    static_cast<void>(player.queryPlaybackClock());
+  }
+
+  CHECK(std::any_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackEnded;
+  }));
+  CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackError &&
+           std::get<PlaybackError>(event.payload).code == PlaybackErrorCode::BufferUnderrun;
+  }));
+}
+
 TEST_CASE("audio_player_resume_from_stopped_does_not_start_device") {
   const auto path = writeSineFixture("audio_player_resume_from_stopped.wav", kSampleRate);
   auto backend = std::make_unique<SmallBufferBackend>();

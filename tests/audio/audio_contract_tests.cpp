@@ -55,6 +55,7 @@ TEST_CASE("backend event preserves payload and version semantics") {
       .bitDepth = 24,
       .channels = 2,
       .format = std::string{"wav"},
+      .boundedSegment = true,
   };
 
   const auto clock = makeClock("track-1", 17, std::chrono::milliseconds{1250});

@@ -1,5 +1,8 @@
 #include "control_test_harness.h"
 
+#include "../../src/control/media_controller_module.h"
+
+#include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/control/media_controller.h"
 
 #include <doctest.h>
@@ -11,8 +14,10 @@
 #include <mutex>
 #include <optional>
 #include <future>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -49,7 +54,8 @@ scanner::SongMetadata song(std::string id, std::string path, std::chrono::millis
                                .offset = std::nullopt,
                                .duration = duration,
                                .logicalTrackId = {},
-                               .artworkPath = std::nullopt};
+                               .artworkPath = std::nullopt,
+                               .thumbnailPath = std::nullopt};
 }
 
 scanner::SongMetadata songWithArtwork(std::string id, std::string path, std::filesystem::path artworkPath) {
@@ -75,6 +81,14 @@ scanner::SongMetadata songWithDisplayMetadata(std::string id,
   return metadata;
 }
 
+scanner::SongMetadata songWithTrackNumber(std::string id,
+                                          std::string path,
+                                          std::uint32_t trackNumber) {
+  auto metadata = song(std::move(id), std::move(path));
+  metadata.trackNumber = trackNumber;
+  return metadata;
+}
+
 scanner::PlaylistNode rootNode(std::vector<std::string> children) {
   return scanner::PlaylistNode{.nodeId = "root",
                                .parentNodeId = std::nullopt,
@@ -87,6 +101,27 @@ scanner::PlaylistNode rootNode(std::vector<std::string> children) {
 scanner::PlaylistNode trackNode(std::string nodeId, scanner::SongMetadata metadata) {
   return scanner::PlaylistNode{.nodeId = std::move(nodeId),
                                .parentNodeId = std::string{"root"},
+                               .kind = scanner::PlaylistNodeKind::Track,
+                               .displayName = metadata.trackId,
+                               .song = std::move(metadata),
+                               .childNodeIds = {}};
+}
+
+scanner::PlaylistNode directoryNode(std::string nodeId,
+                                    std::string parentNodeId,
+                                    std::string displayName,
+                                    std::vector<std::string> children) {
+  return scanner::PlaylistNode{.nodeId = std::move(nodeId),
+                               .parentNodeId = std::move(parentNodeId),
+                               .kind = scanner::PlaylistNodeKind::Directory,
+                               .displayName = std::move(displayName),
+                               .song = std::nullopt,
+                               .childNodeIds = std::move(children)};
+}
+
+scanner::PlaylistNode trackNodeInParent(std::string nodeId, std::string parentNodeId, scanner::SongMetadata metadata) {
+  return scanner::PlaylistNode{.nodeId = std::move(nodeId),
+                               .parentNodeId = std::move(parentNodeId),
                                .kind = scanner::PlaylistNodeKind::Track,
                                .displayName = metadata.trackId,
                                .song = std::move(metadata),
@@ -106,6 +141,55 @@ scanner::PlaylistTreeSnapshot libraryTree(std::vector<scanner::SongMetadata> son
   for (std::size_t index = 0; index < songs.size(); ++index) {
     snapshot.nodes.push_back(trackNode(children[index], std::move(songs[index])));
   }
+  return snapshot;
+}
+
+scanner::PlaylistTreeSnapshot contextLibraryTree(std::uint64_t version = 50) {
+  scanner::PlaylistTreeSnapshot snapshot{};
+  snapshot.version = version;
+  snapshot.rootNodeId = "root";
+  snapshot.nodes = {rootNode({"dir:a", "dir:b", "dir:empty"}),
+                    directoryNode("dir:a", "root", "Folder A", {"track:a-01", "track:a-02", "track:a-03"}),
+                    directoryNode("dir:b", "root", "Folder B", {"track:b-01", "track:b-02"}),
+                    directoryNode("dir:empty", "root", "Empty", {}),
+                    trackNodeInParent("track:a-01", "dir:a", song("a-01", "music/folder-a/01.flac")),
+                    trackNodeInParent("track:a-02", "dir:a", song("a-02", "music/folder-a/02.flac")),
+                    trackNodeInParent("track:a-03", "dir:a", song("a-03", "music/folder-a/03.flac")),
+                    trackNodeInParent("track:b-01", "dir:b", song("b-01", "music/folder-b/01.flac")),
+                    trackNodeInParent("track:b-02", "dir:b", song("b-02", "music/folder-b/02.flac"))};
+  return snapshot;
+}
+
+scanner::PlaylistTreeSnapshot contextLibraryTreeWithFolderA(std::vector<scanner::SongMetadata> folderASongs,
+                                                            std::uint64_t version,
+                                                            bool includeFolderA = true) {
+  scanner::PlaylistTreeSnapshot snapshot{};
+  snapshot.version = version;
+  snapshot.rootNodeId = "root";
+
+  std::vector<std::string> rootChildren;
+  if (includeFolderA) {
+    rootChildren.push_back("dir:a");
+  }
+  rootChildren.push_back("dir:b");
+  snapshot.nodes.push_back(rootNode(std::move(rootChildren)));
+
+  if (includeFolderA) {
+    std::vector<std::string> folderAChildren;
+    folderAChildren.reserve(folderASongs.size());
+    for (const auto& metadata : folderASongs) {
+      folderAChildren.push_back("track:" + metadata.trackId);
+    }
+    snapshot.nodes.push_back(directoryNode("dir:a", "root", "Folder A", std::move(folderAChildren)));
+    for (auto& metadata : folderASongs) {
+      const auto nodeId = "track:" + metadata.trackId;
+      snapshot.nodes.push_back(trackNodeInParent(nodeId, "dir:a", std::move(metadata)));
+    }
+  }
+
+  snapshot.nodes.push_back(directoryNode("dir:b", "root", "Folder B", {"track:b-01", "track:b-02"}));
+  snapshot.nodes.push_back(trackNodeInParent("track:b-01", "dir:b", song("b-01", "music/folder-b/01.flac")));
+  snapshot.nodes.push_back(trackNodeInParent("track:b-02", "dir:b", song("b-02", "music/folder-b/02.flac")));
   return snapshot;
 }
 
@@ -201,8 +285,134 @@ MediaControlCommand command(MediaControlCommandKind kind) {
   return value;
 }
 
+class FakeFolderSortSettingsStore final : public FolderSortSettingsStore {
+public:
+  void upsert(FolderSortSetting setting) override {
+    ++upsertAttempts_;
+    throwIfConfigured();
+    ++upsertCalls_;
+    settings_.push_back(std::move(setting));
+  }
+
+  [[nodiscard]] std::optional<FolderSortSetting> load(const std::filesystem::path& rootPath,
+                                                      const std::string& folderNodeId) const override {
+    throwIfConfigured();
+    ++loadCalls_;
+    throwIfLoadConfigured();
+    for (const auto& setting : settings_) {
+      if (setting.rootPath == rootPath && setting.folderNodeId == folderNodeId) {
+        return setting;
+      }
+    }
+    return std::nullopt;
+  }
+
+  void remove(const std::filesystem::path& rootPath, const std::string& folderNodeId) override {
+    throwIfConfigured();
+    ++removeCalls_;
+    std::erase_if(settings_, [&](const FolderSortSetting& setting) {
+      return setting.rootPath == rootPath && setting.folderNodeId == folderNodeId;
+    });
+  }
+
+  [[nodiscard]] std::vector<FolderSortSetting> list(const std::filesystem::path& rootPath) const override {
+    throwIfConfigured();
+    ++listCalls_;
+    std::vector<FolderSortSetting> matches;
+    for (const auto& setting : settings_) {
+      if (setting.rootPath == rootPath) {
+        matches.push_back(setting);
+      }
+    }
+    return matches;
+  }
+
+  void throwOnAccess(bool value = true) noexcept { throwOnAccess_ = value; }
+  void throwOnLoad(FolderSortSettingsErrorCode code, std::string message) {
+    loadFailureCode_ = code;
+    loadFailureMessage_ = std::move(message);
+  }
+  void seed(FolderSortSetting setting) { settings_.push_back(std::move(setting)); }
+
+  [[nodiscard]] std::size_t upsertAttempts() const noexcept { return upsertAttempts_; }
+  [[nodiscard]] std::size_t upsertCalls() const noexcept { return upsertCalls_; }
+  [[nodiscard]] std::size_t loadCalls() const noexcept { return loadCalls_; }
+  [[nodiscard]] std::size_t listCalls() const noexcept { return listCalls_; }
+  [[nodiscard]] std::optional<FolderSortSetting> lastUpsert() const {
+    if (settings_.empty()) {
+      return std::nullopt;
+    }
+    return settings_.back();
+  }
+  [[nodiscard]] std::size_t totalCalls() const noexcept { return upsertCalls_ + loadCalls_ + removeCalls_ + listCalls_; }
+
+private:
+  void throwIfConfigured() const {
+    if (throwOnAccess_) {
+      throw FolderSortSettingsError{FolderSortSettingsErrorCode::StorageError, "fake folder sort store failure"};
+    }
+  }
+
+  void throwIfLoadConfigured() const {
+    if (loadFailureCode_.has_value()) {
+      throw FolderSortSettingsError{*loadFailureCode_, loadFailureMessage_};
+    }
+  }
+
+  std::vector<FolderSortSetting> settings_{};
+  mutable std::size_t upsertAttempts_{0};
+  mutable std::size_t upsertCalls_{0};
+  mutable std::size_t loadCalls_{0};
+  mutable std::size_t removeCalls_{0};
+  mutable std::size_t listCalls_{0};
+  bool throwOnAccess_{false};
+  std::optional<FolderSortSettingsErrorCode> loadFailureCode_{};
+  std::string loadFailureMessage_{};
+};
+
 TrackIdentity track(std::string id, std::string path) {
   return TrackIdentity{.trackId = std::move(id), .filePath = std::filesystem::path{std::move(path)}, .sourceId = {}, .libraryId = {}};
+}
+
+PlaybackContextDescriptor folderContextForRoot(std::filesystem::path rootPath, std::string folderNodeId, TrackIdentity anchor) {
+  return PlaybackContextDescriptor{.scope = PlaybackContextScope::Folder,
+                                   .rootPath = std::move(rootPath),
+                                   .folderNodeId = std::move(folderNodeId),
+                                   .anchorTrack = std::move(anchor),
+                                   .sortRules = {}};
+}
+
+PlaybackContextDescriptor folderContext(std::string folderNodeId, TrackIdentity anchor) {
+  return folderContextForRoot("/library", std::move(folderNodeId), std::move(anchor));
+}
+
+std::vector<FolderSortRule> trackNumberDescendingRules() {
+  return {FolderSortRule{.field = FolderSortField::TrackNumber,
+                         .direction = FolderSortDirection::Descending,
+                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}};
+}
+
+FolderSortSetting savedTrackNumberDescendingSetting(std::filesystem::path rootPath, std::string folderNodeId = "dir:a") {
+  return FolderSortSetting{.rootPath = std::move(rootPath),
+                           .folderNodeId = std::move(folderNodeId),
+                           .rules = trackNumberDescendingRules()};
+}
+
+MediaControlCommand startPlaybackFromContext(PlaybackContextDescriptor descriptor) {
+  auto value = command(MediaControlCommandKind::StartPlaybackFromContext);
+  value.playbackContext = std::move(descriptor);
+  return value;
+}
+
+MediaControlCommand applyFolderSortRules(FolderSortSetting setting) {
+  auto value = command(MediaControlCommandKind::ApplyFolderSortRules);
+  value.folderSortSetting = std::move(setting);
+  return value;
+}
+
+std::filesystem::path uniqueMediaControllerDatabasePath() {
+  const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  return std::filesystem::temp_directory_path() / ("seriona-media-controller-sort-store-" + suffix + ".sqlite");
 }
 
 template <typename Predicate>
@@ -225,9 +435,17 @@ bool hasNotification(const std::vector<ControlDomainNotification>& notifications
   });
 }
 
+bool hasNotificationKind(const std::vector<ControlDomainNotification>& notifications,
+                         ControlDomainNotificationKind kind) {
+  return std::ranges::any_of(notifications, [kind](const ControlDomainNotification& notification) {
+    return notification.kind == kind;
+  });
+}
+
 struct ControllerFixture {
   std::shared_ptr<control_test::FakeAudioPlaybackService> fakeAudio{std::make_shared<control_test::FakeAudioPlaybackService>()};
   std::shared_ptr<control_test::FakeFileScannerService> fakeScanner{std::make_shared<control_test::FakeFileScannerService>()};
+  std::shared_ptr<FakeFolderSortSettingsStore> fakeFolderSortSettingsStore{std::make_shared<FakeFolderSortSettingsStore>()};
   control_test::FakeMetadataSharingService* fakeMetadata{nullptr};
   std::unique_ptr<MediaController> controller{};
 
@@ -236,7 +454,8 @@ struct ControllerFixture {
     fakeMetadata = metadataService.get();
     controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
                                                                  .scanner = fakeScanner,
-                                                                 .metadata = std::move(metadataService)},
+                                                                 .metadata = std::move(metadataService),
+                                                                 .folderSortSettingsStore = fakeFolderSortSettingsStore},
                                      MediaControllerOptions{.runInlineForTests = true});
   }
 
@@ -245,7 +464,8 @@ struct ControllerFixture {
     fakeMetadata = metadataService.get();
     controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
                                                                  .scanner = fakeScanner,
-                                                                 .metadata = std::move(metadataService)},
+                                                                 .metadata = std::move(metadataService),
+                                                                 .folderSortSettingsStore = fakeFolderSortSettingsStore},
                                      options);
   }
 };
@@ -256,6 +476,302 @@ void installLibrary(ControllerFixture& fixture, std::uint64_t treeVersion = 20, 
   fixture.controller->drainForTests();
 }
 
+}
+
+TEST_CASE("media controller dependencies default a missing folder sort settings store during construction") {
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+
+  {
+    auto controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                      .scanner = fakeScanner,
+                                                                      .metadata = std::move(metadataService),
+                                                                      .folderSortSettingsStore = {}},
+                                         MediaControllerOptions{.runInlineForTests = true});
+    CHECK(fakeAudio->setEventSinkCalls() == 1U);
+    CHECK(fakeScanner->setEventSinkCalls() == 1U);
+  }
+
+  CHECK(fakeAudio->setEventSinkCalls() == 2U);
+  CHECK(fakeScanner->setEventSinkCalls() == 2U);
+}
+
+TEST_CASE("media controller dependencies carry an explicit fake folder sort settings store") {
+  ControllerFixture fixture{};
+
+  fixture.controller->start();
+  installLibrary(fixture);
+  const auto playResult = fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  CHECK(playResult.accepted);
+  CHECK(fixture.fakeFolderSortSettingsStore->totalCalls() == 0U);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
+}
+
+TEST_CASE("media controller preserves zero-offset normal tracks without marking them as bounded segments") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  auto plainSong = song("mp3-track", "music/song.mp3", std::chrono::milliseconds{293760});
+  plainSong.sourceFilePath = plainSong.filePath;
+  plainSong.offset = std::chrono::milliseconds{0};
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({std::move(plainSong)}, 20), 1));
+  fixture.controller->drainForTests();
+
+  const auto playResult = fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  CHECK(playResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack()->offset.has_value());
+  CHECK(*fixture.fakeAudio->lastLoadedTrack()->offset == std::chrono::milliseconds{0});
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->duration == std::chrono::milliseconds{293760});
+  CHECK_FALSE(fixture.fakeAudio->lastLoadedTrack()->boundedSegment);
+}
+
+TEST_CASE("media controller keeps state stable when an injected fake folder sort store would fail") {
+  ControllerFixture fixture{};
+  fixture.fakeFolderSortSettingsStore->throwOnAccess();
+  fixture.controller->start();
+  installLibrary(fixture);
+  const auto before = fixture.controller->playerStateSnapshot();
+
+  auto invalidSeek = command(MediaControlCommandKind::SeekTo);
+  const auto result = fixture.controller->submitCommand(invalidSeek);
+
+  CHECK_FALSE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.fakeFolderSortSettingsStore->totalCalls() == 0U);
+  const auto after = fixture.controller->playerStateSnapshot();
+  CHECK(after.playback.state == before.playback.state);
+  REQUIRE(before.currentTrack.has_value());
+  REQUIRE(after.currentTrack.has_value());
+  CHECK(after.currentTrack->trackId == before.currentTrack->trackId);
+}
+
+TEST_CASE("media controller applies folder sort rules through the injected store and publishes a state signal") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  const auto result = fixture.controller->submitCommand(applyFolderSortRules(FolderSortSetting{
+      .rootPath = "/library/../library",
+      .folderNodeId = "dir:a",
+      .rules = {FolderSortRule{.field = FolderSortField::Artist,
+                               .direction = FolderSortDirection::Descending,
+                               .missingValuePolicy = FolderSortMissingValuePolicy::First}}}));
+
+  REQUIRE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::None);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertAttempts() == 1U);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertCalls() == 1U);
+  REQUIRE(fixture.fakeFolderSortSettingsStore->lastUpsert().has_value());
+  const auto stored = *fixture.fakeFolderSortSettingsStore->lastUpsert();
+  CHECK(stored.rootPath == std::filesystem::path{"/library"});
+  CHECK(stored.folderNodeId == "dir:a");
+  REQUIRE(stored.rules.size() == 1U);
+  CHECK(stored.rules.front().field == FolderSortField::Artist);
+  CHECK(stored.rules.front().direction == FolderSortDirection::Descending);
+  CHECK(stored.rules.front().missingValuePolicy == FolderSortMissingValuePolicy::First);
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotificationKind(notifications, ControlDomainNotificationKind::FolderSortRulesApplied);
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    const auto applied = std::ranges::find_if(notifications, [](const ControlDomainNotification& notification) {
+      return notification.kind == ControlDomainNotificationKind::FolderSortRulesApplied;
+    });
+    REQUIRE(applied != notifications.end());
+    CHECK(applied->errorCode == MediaControllerErrorCode::None);
+    REQUIRE(applied->folderSortSetting.has_value());
+    CHECK(applied->folderSortSetting->rootPath == std::filesystem::path{"/library"});
+    CHECK(applied->folderSortSetting->folderNodeId == "dir:a");
+    REQUIRE(applied->folderSortSetting->rules.size() == 1U);
+    CHECK(applied->folderSortSetting->rules.front().field == FolderSortField::Artist);
+    CHECK_FALSE(hasNotification(notifications, ControlDomainNotificationKind::CommandRejected, MediaControllerErrorCode::InvalidCommand));
+  }
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller scanLibrary replays saved folder sort rules for scanned roots") {
+  ControllerFixture fixture{};
+  fixture.fakeFolderSortSettingsStore->seed(savedTrackNumberDescendingSetting("/library"));
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  scanner::ScannerRoot root{};
+  root.path = "/library";
+  root.recursive = true;
+  const auto result = fixture.controller->scanLibrary({root}, scanner::ScanMode::Full);
+
+  REQUIRE(result.accepted);
+  CHECK(fixture.fakeFolderSortSettingsStore->listCalls() == 1U);
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotificationKind(notifications, ControlDomainNotificationKind::FolderSortRulesApplied);
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    const auto applied = std::ranges::find_if(notifications, [](const ControlDomainNotification& notification) {
+      return notification.kind == ControlDomainNotificationKind::FolderSortRulesApplied;
+    });
+    REQUIRE(applied != notifications.end());
+    REQUIRE(applied->folderSortSetting.has_value());
+    CHECK(applied->folderSortSetting->rootPath == std::filesystem::path{"/library"});
+    CHECK(applied->folderSortSetting->folderNodeId == "dir:a");
+    REQUIRE(applied->folderSortSetting->rules.size() == 1U);
+    CHECK(applied->folderSortSetting->rules.front().field == FolderSortField::TrackNumber);
+    CHECK(applied->folderSortSetting->rules.front().direction == FolderSortDirection::Descending);
+  }
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller rejects malformed folder sort commands before store upsert") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  auto setting = FolderSortSetting{.rootPath = "/library",
+                                   .folderNodeId = "dir:a",
+                                   .rules = {FolderSortRule{.field = FolderSortField::Title,
+                                                            .direction = FolderSortDirection::Ascending,
+                                                            .missingValuePolicy = FolderSortMissingValuePolicy::Last}}};
+
+  SUBCASE("missing root path") {
+    setting.rootPath.clear();
+  }
+  SUBCASE("empty folder node id") {
+    setting.folderNodeId.clear();
+  }
+  SUBCASE("empty rules") {
+    setting.rules.clear();
+  }
+  SUBCASE("unsupported rule enum") {
+    setting.rules.front().field = static_cast<FolderSortField>(999);
+  }
+
+  const auto before = fixture.controller->playerStateSnapshot();
+  const auto result = fixture.controller->submitCommand(applyFolderSortRules(std::move(setting)));
+
+  CHECK_FALSE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertAttempts() == 0U);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertCalls() == 0U);
+  CHECK_FALSE(fixture.fakeFolderSortSettingsStore->lastUpsert().has_value());
+  const auto after = fixture.controller->playerStateSnapshot();
+  CHECK(after.playback.state == before.playback.state);
+  CHECK(after.currentTrack.has_value() == before.currentTrack.has_value());
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotification(notifications, ControlDomainNotificationKind::CommandRejected, MediaControllerErrorCode::InvalidCommand);
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK_FALSE(hasNotificationKind(notifications, ControlDomainNotificationKind::FolderSortRulesApplied));
+  }
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller reports folder sort store failures without changing playback context") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 64));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  const auto before = fixture.controller->playerStateSnapshot();
+  const auto loadCallsBeforeFailure = fixture.fakeAudio->loadTrackCalls();
+  const auto playCallsBeforeFailure = fixture.fakeAudio->playCalls();
+  const auto stopCallsBeforeFailure = fixture.fakeAudio->stopCalls();
+  fixture.fakeFolderSortSettingsStore->throwOnAccess();
+
+  const auto result = fixture.controller->submitCommand(applyFolderSortRules(FolderSortSetting{
+      .rootPath = "/library",
+      .folderNodeId = "dir:a",
+      .rules = {FolderSortRule{.field = FolderSortField::TrackNumber,
+                               .direction = FolderSortDirection::Ascending,
+                               .missingValuePolicy = FolderSortMissingValuePolicy::Last}}}));
+
+  CHECK_FALSE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::BackendRejected);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertAttempts() == 1U);
+  CHECK(fixture.fakeFolderSortSettingsStore->upsertCalls() == 0U);
+  CHECK_FALSE(fixture.fakeFolderSortSettingsStore->lastUpsert().has_value());
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeFailure);
+  CHECK(fixture.fakeAudio->playCalls() == playCallsBeforeFailure);
+  CHECK(fixture.fakeAudio->stopCalls() == stopCallsBeforeFailure);
+  const auto after = fixture.controller->playerStateSnapshot();
+  CHECK(after.playback.state == before.playback.state);
+  REQUIRE(before.currentTrack.has_value());
+  REQUIRE(after.currentTrack.has_value());
+  CHECK(after.currentTrack->trackId == before.currentTrack->trackId);
+  CHECK(after.currentTrack->filePath == before.currentTrack->filePath);
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotification(notifications, ControlDomainNotificationKind::CommandRejected, MediaControllerErrorCode::BackendRejected);
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK_FALSE(hasNotificationKind(notifications, ControlDomainNotificationKind::FolderSortRulesApplied));
+  }
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("production media controller dependencies own a sqlite folder sort settings store using database path") {
+  const auto databasePath = uniqueMediaControllerDatabasePath();
+  std::error_code cleanupError{};
+  std::filesystem::remove(databasePath, cleanupError);
+
+  auto dependencies = makeProductionMediaControllerDependencies(databasePath, std::filesystem::temp_directory_path());
+
+  REQUIRE(dependencies.folderSortSettingsStore != nullptr);
+  CHECK(std::filesystem::exists(databasePath));
+  dependencies.folderSortSettingsStore->upsert(FolderSortSetting{.rootPath = "/music/root",
+                                                                 .folderNodeId = "folder-a",
+                                                                 .rules = {FolderSortRule{.field = FolderSortField::Album,
+                                                                                          .direction = FolderSortDirection::Descending,
+                                                                                          .missingValuePolicy = FolderSortMissingValuePolicy::First}}});
+
+  auto reopenedStore = makeSQLiteFolderSortSettingsStore(FolderSortSettingsStoreConfig{.databasePath = databasePath});
+  const auto loaded = reopenedStore->load("/music/root", "folder-a");
+
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->rules.size() == 1U);
+  CHECK(loaded->rules.front().field == FolderSortField::Album);
+  CHECK(loaded->rules.front().direction == FolderSortDirection::Descending);
+  CHECK(loaded->rules.front().missingValuePolicy == FolderSortMissingValuePolicy::First);
+  reopenedStore.reset();
+  dependencies.folderSortSettingsStore.reset();
+  std::filesystem::remove(databasePath, cleanupError);
 }
 
 TEST_CASE("media controller facade drives fake audio load before play for play and select") {
@@ -441,6 +957,558 @@ TEST_CASE("media controller facade applies skip repeat and playback-ended polici
   notificationSubscription.unsubscribe();
 }
 
+TEST_CASE("media controller SelectTrack fallback still loads the requested track from a folder tree") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 50));
+  fixture.controller->drainForTests();
+
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track("a-02", "music/folder-a/02.flac");
+  const auto selectResult = fixture.controller->submitCommand(select);
+
+  CHECK(selectResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+  const auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Playing);
+}
+
+TEST_CASE("media controller keeps idle and SelectTrack default fallback compatibility explicit") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 56));
+  fixture.controller->drainForTests();
+
+  auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-01");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+
+  REQUIRE(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-01");
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track("b-01", "music/folder-b/01.flac");
+  REQUIRE(fixture.controller->submitCommand(select).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "b-01");
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "b-02");
+}
+
+TEST_CASE("media controller folder playback context keeps next and previous inside the transient order") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 51));
+  fixture.controller->drainForTests();
+
+  const auto startResult = fixture.controller->submitCommand(
+      startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))));
+  CHECK(startResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  const auto previousResult = fixture.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious));
+  CHECK(previousResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-01");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+
+  const auto loadCallsBeforeEnd = fixture.fakeAudio->loadTrackCalls();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeEnd);
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller StartPlaybackFromContext owns sorted next and previous navigation") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               91),
+                                                91));
+  fixture.controller->drainForTests();
+  auto descriptor = folderContext("dir:a", track("a-02", "music/folder-a/02.flac"));
+  descriptor.sortRules = trackNumberDescendingRules();
+
+  const auto startResult = fixture.controller->submitCommand(startPlaybackFromContext(std::move(descriptor)));
+  CHECK(startResult.accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-01");
+}
+
+TEST_CASE("media controller SelectTrack default context fallback does not skip into sibling folders") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 52));
+  fixture.controller->drainForTests();
+
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track("a-02", "music/folder-a/02.flac");
+  REQUIRE(fixture.controller->submitCommand(select).accepted);
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+
+  const auto loadCallsBeforeEnd = fixture.fakeAudio->loadTrackCalls();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeEnd);
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller repeat-one skip does not re-enter full-tree lookup after active context drift") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 57));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  auto repeatOne = command(MediaControlCommandKind::SetRepeatMode);
+  repeatOne.repeatMode = RepeatMode::One;
+  REQUIRE(fixture.controller->submitCommand(repeatOne).accepted);
+  const auto loadCallsBeforeDrift = fixture.fakeAudio->loadTrackCalls();
+
+  fixture.fakeAudio->emit(audioTrackChangedEvent("b-01", "music/folder-b/01.flac", 91));
+  fixture.controller->drainForTests();
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeDrift);
+  const auto loadCallsBeforeSkip = fixture.fakeAudio->loadTrackCalls();
+
+  const auto skipResult = fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+
+  CHECK(skipResult.accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSkip);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller shuffle candidates are limited to the current playback context order") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 53));
+  fixture.controller->drainForTests();
+
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  auto enableShuffle = command(MediaControlCommandKind::SetShuffle);
+  enableShuffle.shuffle = true;
+  REQUIRE(fixture.controller->submitCommand(enableShuffle).accepted);
+
+  std::set<std::string> playedTrackIds{"a-01"};
+  for (int index = 0; index < 2; ++index) {
+    CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+    REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+    const auto& trackId = fixture.fakeAudio->lastLoadedTrack()->trackId;
+    CHECK(trackId != "b-01");
+    CHECK(trackId != "b-02");
+    playedTrackIds.insert(trackId);
+  }
+
+  CHECK(playedTrackIds == std::set<std::string>{"a-01", "a-02", "a-03"});
+  const auto loadCallsBeforeExhaustedShuffle = fixture.fakeAudio->loadTrackCalls();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeExhaustedShuffle);
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller playback-ended advances only within the current playback context") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 54));
+  fixture.controller->drainForTests();
+
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-02", "music/folder-a/02.flac", 80));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+
+  const auto loadCallsBeforeEnd = fixture.fakeAudio->loadTrackCalls();
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-03", "music/folder-a/03.flac", 81));
+  fixture.controller->drainForTests();
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeEnd);
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller ignores playback-ended events for a stale previous track") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({song("a-01", "music/folder-a/01.flac"),
+                                                                                song("a-02", "music/folder-a/02.flac"),
+                                                                                song("a-03", "music/folder-a/03.flac"),
+                                                                                song("a-04", "music/folder-a/04.flac")},
+                                                                               95),
+                                                95));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-02", "music/folder-a/02.flac", 120));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  const auto loadCallsAfterValidEnd = fixture.fakeAudio->loadTrackCalls();
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-02", "music/folder-a/02.flac", 121));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsAfterValidEnd);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  const auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-03");
+  CHECK(player.playback.state == PlaybackStatus::Playing);
+}
+
+TEST_CASE("media controller StartPlaybackFromContext baseline uses tree order unless explicit command rules are supplied") {
+  ControllerFixture withoutRules{};
+  withoutRules.controller->start();
+  withoutRules.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                     songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                     songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                                    86),
+                                                     86));
+  withoutRules.controller->drainForTests();
+
+  REQUIRE(withoutRules.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  CHECK(withoutRules.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(withoutRules.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(withoutRules.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  ControllerFixture withExplicitRules{};
+  withExplicitRules.controller->start();
+  withExplicitRules.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                          songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                          songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                                         87),
+                                                          87));
+  withExplicitRules.controller->drainForTests();
+  auto explicitContext = folderContext("dir:a", track("a-01", "music/folder-a/01.flac"));
+  explicitContext.sortRules = trackNumberDescendingRules();
+
+  REQUIRE(withExplicitRules.controller->submitCommand(startPlaybackFromContext(std::move(explicitContext))).accepted);
+  CHECK(withExplicitRules.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  REQUIRE(withExplicitRules.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(withExplicitRules.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+  CHECK(withExplicitRules.fakeFolderSortSettingsStore->loadCalls() == 0U);
+}
+
+TEST_CASE("media controller loads saved folder rules for matching root and folder when context omits rules") {
+  ControllerFixture fixture{};
+  fixture.fakeFolderSortSettingsStore->seed(savedTrackNumberDescendingSetting("/library"));
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               88),
+                                                88));
+  fixture.controller->drainForTests();
+
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+
+  CHECK(fixture.fakeFolderSortSettingsStore->loadCalls() == 1U);
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+}
+
+TEST_CASE("media controller saved folder rules are keyed by root path and folder node id") {
+  ControllerFixture fixture{};
+  fixture.fakeFolderSortSettingsStore->seed(savedTrackNumberDescendingSetting("/other-library"));
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               89),
+                                                89));
+  fixture.controller->drainForTests();
+
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContextForRoot("/library", "dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+
+  CHECK(fixture.fakeFolderSortSettingsStore->loadCalls() == 1U);
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  ControllerFixture matchingRoot{};
+  matchingRoot.fakeFolderSortSettingsStore->seed(savedTrackNumberDescendingSetting("/other-library"));
+  matchingRoot.controller->start();
+  matchingRoot.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                     songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                     songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                                    90),
+                                                     90));
+  matchingRoot.controller->drainForTests();
+
+  REQUIRE(matchingRoot.controller->submitCommand(
+              startPlaybackFromContext(folderContextForRoot("/other-library", "dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  CHECK(matchingRoot.fakeFolderSortSettingsStore->loadCalls() == 1U);
+  CHECK(matchingRoot.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  REQUIRE(matchingRoot.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(matchingRoot.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+}
+
+TEST_CASE("media controller snapshot reconcile reuses saved rules loaded into the active context") {
+  ControllerFixture fixture{};
+  fixture.fakeFolderSortSettingsStore->seed(savedTrackNumberDescendingSetting("/library"));
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               91),
+                                                91));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  const auto loadCallsAfterStart = fixture.fakeFolderSortSettingsStore->loadCalls();
+  const auto loadCallsBeforeSnapshot = fixture.fakeAudio->loadTrackCalls();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3),
+                                                                                songWithTrackNumber("a-04", "music/folder-a/04.flac", 4)},
+                                                                               92),
+                                                92));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  CHECK(fixture.fakeFolderSortSettingsStore->loadCalls() == loadCallsAfterStart);
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+}
+
+TEST_CASE("media controller falls back to tree order when saved folder rules are missing or corrupt") {
+  ControllerFixture missing{};
+  missing.controller->start();
+  missing.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               93),
+                                                93));
+  missing.controller->drainForTests();
+
+  REQUIRE(missing.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  CHECK(missing.fakeFolderSortSettingsStore->loadCalls() == 1U);
+  CHECK(missing.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(missing.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(missing.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+
+  ControllerFixture corrupt{};
+  corrupt.fakeFolderSortSettingsStore->throwOnLoad(FolderSortSettingsErrorCode::InvalidRulesJson,
+                                                   "corrupt saved folder sort rules");
+  corrupt.controller->start();
+  corrupt.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({songWithTrackNumber("a-01", "music/folder-a/01.flac", 1),
+                                                                                songWithTrackNumber("a-02", "music/folder-a/02.flac", 2),
+                                                                                songWithTrackNumber("a-03", "music/folder-a/03.flac", 3)},
+                                                                               94),
+                                                94));
+  corrupt.controller->drainForTests();
+
+  REQUIRE(corrupt.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+  CHECK(corrupt.fakeFolderSortSettingsStore->loadCalls() == 1U);
+  CHECK(corrupt.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(corrupt.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(corrupt.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+}
+
+TEST_CASE("media controller snapshot reconcile keeps current track and rebuilds its context index") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 56));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  const auto loadCallsBeforeSnapshot = fixture.fakeAudio->loadTrackCalls();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({song("a-02", "music/folder-a/02.flac"),
+                                                                                song("a-03", "music/folder-a/03.flac")},
+                                                                               57),
+                                                57));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Playing);
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipPrevious)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+}
+
+TEST_CASE("media controller snapshot reconcile advances to successor when current context anchor is removed") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 58));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  const auto loadCallsBeforeSnapshot = fixture.fakeAudio->loadTrackCalls();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({song("a-01", "music/folder-a/01.flac"),
+                                                                                song("a-03", "music/folder-a/03.flac")},
+                                                                               59),
+                                                59));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot + 1U);
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  const auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-03");
+  CHECK(player.playback.state == PlaybackStatus::Playing);
+}
+
+TEST_CASE("media controller snapshot reconcile stops and clears context when folder becomes empty") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 60));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  const auto loadCallsBeforeSnapshot = fixture.fakeAudio->loadTrackCalls();
+  const auto stopCallsBeforeSnapshot = fixture.fakeAudio->stopCalls();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({}, 61), 61));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  CHECK(fixture.fakeAudio->stopCalls() == stopCallsBeforeSnapshot + 1U);
+  auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller snapshot reconcile stops and clears context when folder node is missing") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 62));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-02", "music/folder-a/02.flac"))))
+              .accepted);
+  const auto loadCallsBeforeSnapshot = fixture.fakeAudio->loadTrackCalls();
+  const auto stopCallsBeforeSnapshot = fixture.fakeAudio->stopCalls();
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithFolderA({}, 63, false), 63));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  CHECK(fixture.fakeAudio->stopCalls() == stopCallsBeforeSnapshot + 1U);
+  auto player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeSnapshot);
+  player = fixture.controller->playerStateSnapshot();
+  REQUIRE(player.currentTrack.has_value());
+  CHECK(player.currentTrack->trackId == "a-02");
+  CHECK(player.playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller handles missing or invalid playback context order without rebuilding the full tree") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 55));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "a-01");
+
+  const auto skipResult = fixture.controller->submitCommand(command(MediaControlCommandKind::SkipNext));
+  CHECK(skipResult.accepted);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "a-01");
+
+  auto invalidDescriptor = folderContext("dir:a", track("a-01", "music/folder-a/01.flac"));
+  invalidDescriptor.rootPath.clear();
+  const auto invalidResult = fixture.controller->submitCommand(startPlaybackFromContext(std::move(invalidDescriptor)));
+  CHECK_FALSE(invalidResult.accepted);
+  CHECK(invalidResult.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+
+  const auto deletedAnchorResult = fixture.controller->submitCommand(
+      startPlaybackFromContext(folderContext("dir:a", track("deleted", "music/folder-a/deleted.flac"))));
+  CHECK_FALSE(deletedAnchorResult.accepted);
+  CHECK(deletedAnchorResult.code == MediaControllerErrorCode::TrackNotInLibrary);
+  CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
+}
+
 TEST_CASE("media controller propagates scanner artwork to player snapshot metadata") {
   ControllerFixture fixture{};
   fixture.controller->start();
@@ -572,7 +1640,7 @@ TEST_CASE("media controller facade shuffle produces deterministic selected track
   CHECK(first.fakeAudio->lastLoadedTrack()->trackId == second.fakeAudio->lastLoadedTrack()->trackId);
 }
 
-TEST_CASE("media controller facade scans library and publishes committed library snapshots") {
+TEST_CASE("media controller facade scans library, starts watching, and publishes committed library snapshots") {
   ControllerFixture fixture{};
   std::mutex librarySnapshotMutex{};
   std::vector<LibraryStateSnapshot> librarySnapshots{};
@@ -591,6 +1659,11 @@ TEST_CASE("media controller facade scans library and publishes committed library
   CHECK(fixture.fakeScanner->lastScannedRoots()->front().path == std::filesystem::path{"music"});
   REQUIRE(fixture.fakeScanner->lastScanMode().has_value());
   CHECK(*fixture.fakeScanner->lastScanMode() == scanner::ScanMode::Full);
+  CHECK(fixture.fakeScanner->startWatchingCalls() == 1U);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots()->size() == 1U);
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->front().path == std::filesystem::path{"music"});
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->front().recursive);
 
   fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("a", "music/a.flac")}, 33), 2));
   fixture.controller->drainForTests();
@@ -606,6 +1679,93 @@ TEST_CASE("media controller facade scans library and publishes committed library
     CHECK(librarySnapshots.back().libraryTree->version == 33U);
   }
   librarySubscription.unsubscribe();
+}
+
+TEST_CASE("media controller repeated full scans restart watching through the scanner facade") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  const std::vector<scanner::ScannerRoot> initialRoots{{.path = std::filesystem::path{"music-a"}, .recursive = true}};
+  const auto firstScan = fixture.controller->scanLibrary(initialRoots, scanner::ScanMode::Full);
+
+  REQUIRE(firstScan.accepted);
+  CHECK(fixture.fakeScanner->scanCalls() == 1U);
+  CHECK(fixture.fakeScanner->startWatchingCalls() == 1U);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->front().path == std::filesystem::path{"music-a"});
+
+  const std::vector<scanner::ScannerRoot> replacementRoots{{.path = std::filesystem::path{"music-b"}, .recursive = false},
+                                                           {.path = std::filesystem::path{"music-c"}, .recursive = true}};
+  const auto secondScan = fixture.controller->scanLibrary(replacementRoots, scanner::ScanMode::Full);
+
+  REQUIRE(secondScan.accepted);
+  CHECK(fixture.fakeScanner->scanCalls() == 2U);
+  CHECK(fixture.fakeScanner->startWatchingCalls() == 2U);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots()->size() == 2U);
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->at(0).path == std::filesystem::path{"music-b"});
+  CHECK_FALSE(fixture.fakeScanner->lastWatchingRoots()->at(0).recursive);
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->at(1).path == std::filesystem::path{"music-c"});
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->at(1).recursive);
+}
+
+TEST_CASE("media controller shutdown stops scanner watching") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  const std::vector<scanner::ScannerRoot> roots{{.path = std::filesystem::path{"music"}, .recursive = true}};
+  REQUIRE(fixture.controller->scanLibrary(roots, scanner::ScanMode::Full).accepted);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+
+  fixture.controller->shutdown();
+
+  CHECK(fixture.fakeScanner->stopWatchingCalls() == 1U);
+  CHECK_FALSE(fixture.fakeScanner->lastWatchingRoots().has_value());
+}
+
+TEST_CASE("media controller reports watcher start failure without stale watched roots or playback mutation") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("a", "music-a/a.flac")}, 70), 70));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+  const auto before = fixture.controller->playerStateSnapshot();
+  const auto loadCallsBeforeFailure = fixture.fakeAudio->loadTrackCalls();
+  const auto playCallsBeforeFailure = fixture.fakeAudio->playCalls();
+  const auto stopCallsBeforeFailure = fixture.fakeAudio->stopCalls();
+
+  const std::vector<scanner::ScannerRoot> initialRoots{{.path = std::filesystem::path{"music-a"}, .recursive = true}};
+  REQUIRE(fixture.controller->scanLibrary(initialRoots, scanner::ScanMode::Full).accepted);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  fixture.fakeScanner->startWatchingThrows(std::runtime_error{"fake watcher start failed"});
+
+  const std::vector<scanner::ScannerRoot> replacementRoots{{.path = std::filesystem::path{"music-b"}, .recursive = true}};
+  const auto result = fixture.controller->scanLibrary(replacementRoots, scanner::ScanMode::Full);
+
+  CHECK_FALSE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::BackendRejected);
+  CHECK(result.message.find("start scanner watcher") != std::string::npos);
+  CHECK(fixture.fakeScanner->scanCalls() == 2U);
+  CHECK(fixture.fakeScanner->startWatchingCalls() == 2U);
+  CHECK_FALSE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeFailure);
+  CHECK(fixture.fakeAudio->playCalls() == playCallsBeforeFailure);
+  CHECK(fixture.fakeAudio->stopCalls() == stopCallsBeforeFailure);
+  const auto after = fixture.controller->playerStateSnapshot();
+  CHECK(after.playback.state == before.playback.state);
+  REQUIRE(before.currentTrack.has_value());
+  REQUIRE(after.currentTrack.has_value());
+  CHECK(after.currentTrack->trackId == before.currentTrack->trackId);
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotification(notifications, ControlDomainNotificationKind::CommandRejected, MediaControllerErrorCode::BackendRejected);
+  }));
+  notificationSubscription.unsubscribe();
 }
 
 TEST_CASE("media controller facade does not run scanner work on the control executor") {
@@ -840,7 +2000,8 @@ TEST_CASE("media controller facade clears constructor-installed sinks when destr
   {
     auto controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
                                                                       .scanner = fakeScanner,
-                                                                      .metadata = std::move(metadataService)},
+                                                                      .metadata = std::move(metadataService),
+                                                                      .folderSortSettingsStore = {}},
                                          MediaControllerOptions{.runInlineForTests = true});
     CHECK(fakeAudio->setEventSinkCalls() == 1U);
     CHECK(fakeScanner->setEventSinkCalls() == 1U);

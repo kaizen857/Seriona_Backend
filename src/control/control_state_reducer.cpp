@@ -110,6 +110,10 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   return TrackIdentity{.trackId = song.trackId, .filePath = song.filePath, .sourceId = {}, .libraryId = {}};
 }
 
+[[nodiscard]] bool isCueDerivedTrack(const scanner::SongMetadata& song) {
+  return !song.sourceFilePath.empty() && song.sourceFilePath != song.filePath && song.offset.has_value();
+}
+
 [[nodiscard]] audio::TrackPlaybackRequest requestFromSong(const scanner::SongMetadata& song) {
   // For CUE tracks, use sourceFilePath (the actual audio file) instead of filePath (the .cue file)
   const auto& actualAudioPath = !song.sourceFilePath.empty() ? song.sourceFilePath : song.filePath;
@@ -123,7 +127,8 @@ constexpr std::size_t kRecentNotificationLimit = 32;
                                      .sampleRate = song.sampleRate,
                                      .bitDepth = song.bitDepth,
                                      .channels = song.channels,
-                                     .format = {}};
+                                     .format = {},
+                                     .boundedSegment = isCueDerivedTrack(song)};
 }
 
 [[nodiscard]] DisplayMetadata displayFromSong(const scanner::SongMetadata& song) {
@@ -152,6 +157,34 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 [[nodiscard]] bool isTrackNode(const scanner::PlaylistNode& node) noexcept {
   return node.kind == scanner::PlaylistNodeKind::Track && node.song.has_value() && !node.song->trackId.empty() &&
          !node.song->filePath.empty();
+}
+
+[[nodiscard]] bool isContextContainerNode(const scanner::PlaylistNode& node) noexcept {
+  return node.kind == scanner::PlaylistNodeKind::Root || node.kind == scanner::PlaylistNodeKind::Directory ||
+         node.kind == scanner::PlaylistNodeKind::Album || node.kind == scanner::PlaylistNodeKind::Disc;
+}
+
+[[nodiscard]] std::filesystem::path defaultPlaybackRootPath(const scanner::SongMetadata& song) {
+  const auto root = song.filePath.root_path();
+  if (!root.empty()) {
+    return root;
+  }
+  return std::filesystem::path{"."};
+}
+
+[[nodiscard]] MediaControllerErrorCode contextBuildErrorCode(PlaybackContextBuildStatus status) noexcept {
+  switch (status) {
+  case PlaybackContextBuildStatus::Ready:
+    return MediaControllerErrorCode::None;
+  case PlaybackContextBuildStatus::InvalidDescriptor:
+    return MediaControllerErrorCode::InvalidCommand;
+  case PlaybackContextBuildStatus::AnchorNotFound:
+    return MediaControllerErrorCode::TrackNotInLibrary;
+  case PlaybackContextBuildStatus::ContextNotFound:
+  case PlaybackContextBuildStatus::EmptyContext:
+    return MediaControllerErrorCode::NoPlayableTrack;
+  }
+  return MediaControllerErrorCode::InvalidCommand;
 }
 
 [[nodiscard]] ControlIntent makeIntent(ControlIntentKind kind) {
@@ -273,8 +306,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   case MediaControlCommandKind::Play:
     if (selectedTrack_.has_value()) {
       if (player_.playback.state == PlaybackStatus::Stopped) {
-        if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
-          selectTrack(reduction, *track, true);
+        if (activateTrackWithDefaultContext(reduction, *selectedTrack_, true)) {
           spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
           return reduction;
         }
@@ -286,7 +318,9 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       return reduction;
     }
     if (const auto track = firstPlayableTrack(); track.has_value()) {
-      selectTrack(reduction, *track, true);
+      if (!activateTrackWithDefaultContext(reduction, track->identity, true)) {
+        selectTrack(reduction, *track, true);
+      }
       spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
       return reduction;
     }
@@ -305,8 +339,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     return reduction;
   case MediaControlCommandKind::TogglePlayPause:
     if (player_.playback.state == PlaybackStatus::Stopped && selectedTrack_.has_value()) {
-      if (const auto track = findPlayableTrack(*selectedTrack_); track.has_value()) {
-        selectTrack(reduction, *track, true);
+      if (activateTrackWithDefaultContext(reduction, *selectedTrack_, true)) {
         spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Playing));
         return reduction;
       }
@@ -389,7 +422,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     return reduction;
   case MediaControlCommandKind::SkipNext:
     if (player_.repeatMode == RepeatMode::One && selectedTrack_.has_value()) {
-      const auto track = findPlayableTrack(*selectedTrack_);
+      const auto track = this->selectedPlaybackContextTrack();
       if (track.has_value()) {
         selectTrack(reduction, *track, true);
         return reduction;
@@ -422,7 +455,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     }
     // Repeat One 模式
     if (player_.repeatMode == RepeatMode::One && selectedTrack_.has_value()) {
-      const auto track = findPlayableTrack(*selectedTrack_);
+      const auto track = this->selectedPlaybackContextTrack();
       if (track.has_value()) {
         selectTrack(reduction, *track, true);
         return reduction;
@@ -452,11 +485,27 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       return reject(MediaControllerErrorCode::InvalidCommand, "SelectTrack requires a track identity");
     }
     shuffleHistory_.clear();
-    if (const auto track = findPlayableTrack(*command.track); track.has_value()) {
-      selectTrack(reduction, *track, true);
+    if (activateTrackWithDefaultContext(reduction, *command.track, true)) {
       return reduction;
     }
     return reject(MediaControllerErrorCode::TrackNotInLibrary, "Selected track is not present in the current library");
+  case MediaControlCommandKind::StartPlaybackFromContext: {
+    if (!command.playbackContext.has_value()) {
+      return reject(MediaControllerErrorCode::InvalidCommand, "StartPlaybackFromContext requires a playback context");
+    }
+    PlaybackContextBuildStatus status{PlaybackContextBuildStatus::InvalidDescriptor};
+    auto context = buildPlaybackContextState(*command.playbackContext, &status);
+    if (!context.has_value()) {
+      const auto code = contextBuildErrorCode(status);
+      return reject(code, "Playback context could not produce a playable order");
+    }
+    shuffleHistory_.clear();
+    playbackContext_ = std::move(*context);
+    selectTrack(reduction, playbackContext_->order[playbackContext_->index], true);
+    return reduction;
+  }
+  case MediaControlCommandKind::ApplyFolderSortRules:
+    return reject(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules must be handled by MediaController");
   }
 
   return reject(MediaControllerErrorCode::InvalidCommand, "Unsupported media control command");
@@ -527,9 +576,13 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           }
           player_.timeline.position = trackPosition;
           markPlayerChanged(reduction, payload.after.sampledAt);
-        } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
-          visibleStateDuringSeek_.reset();
-          {
+	        } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
+	          if (selectedTrack_.has_value() && !sameTrack(identityFromRequest(payload.request), *selectedTrack_)) {
+	            spdlog::debug("ignoring stale playback-ended event for track '{}'", payload.request.trackId);
+	            return;
+	          }
+	          visibleStateDuringSeek_.reset();
+	          {
             auto filePosition = payload.finalClock.position;
             auto trackPosition = filePosition;
             if (currentTrackOffset_.has_value()) {
@@ -542,8 +595,10 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           }
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
           if (player_.repeatMode == RepeatMode::One) {
-            if (const auto track = selectedTrack_.has_value() ? findPlayableTrack(*selectedTrack_) : std::nullopt; track.has_value()) {
+            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
               selectTrack(reduction, *track, true);
+            } else {
+              stopPlayback(reduction);
             }
           } else if (const auto track = nextTrack(true); track.has_value()) {
             selectTrack(reduction, *track, true);
@@ -615,7 +670,11 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
     if (const auto* snapshot = std::get_if<scanner::PlaylistTreeSnapshot>(&event.payload)) {
       library_.libraryTree = *snapshot;
       library_.version = snapshot->version;
-      selectFirstTrackWhenIdle(reduction);
+      if (playbackContext_.has_value()) {
+        reconcilePlaybackContextAfterSnapshot(reduction);
+      } else {
+        selectFirstTrackWhenIdle(reduction);
+      }
     }
     addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibrarySnapshotUpdated,
                                                     "Library snapshot updated",
@@ -717,11 +776,120 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::findPlaya
   return *trackIt;
 }
 
-std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack(bool forward) {
-  const auto tracks = playableTracks();
-  if (tracks.empty()) {
+std::optional<PlaybackContextDescriptor> ControlStateReducer::defaultContextDescriptorForTrack(const TrackIdentity& identity) const {
+  if (identity.trackId.empty() || !library_.libraryTree.has_value()) {
     return std::nullopt;
   }
+
+  const auto& tree = *library_.libraryTree;
+  const auto trackIt = std::find_if(tree.nodes.begin(), tree.nodes.end(), [&](const scanner::PlaylistNode& node) {
+    return isTrackNode(node) && node.song->trackId == identity.trackId &&
+           (identity.filePath.empty() || node.song->filePath == identity.filePath);
+  });
+  if (trackIt == tree.nodes.end()) {
+    return std::nullopt;
+  }
+
+  PlaybackContextDescriptor descriptor{};
+  descriptor.scope = PlaybackContextScope::Root;
+  descriptor.rootPath = defaultPlaybackRootPath(*trackIt->song);
+  descriptor.anchorTrack = identityFromSong(*trackIt->song);
+
+  if (trackIt->parentNodeId.has_value()) {
+    const auto parentIt = std::find_if(tree.nodes.begin(), tree.nodes.end(), [&](const scanner::PlaylistNode& node) {
+      return node.nodeId == *trackIt->parentNodeId;
+    });
+    const auto parentIsRoot = tree.rootNodeId.has_value() && parentIt != tree.nodes.end() && parentIt->nodeId == *tree.rootNodeId;
+    if (parentIt != tree.nodes.end() && !parentIsRoot && isContextContainerNode(*parentIt)) {
+      descriptor.scope = PlaybackContextScope::Folder;
+      descriptor.folderNodeId = parentIt->nodeId;
+    }
+  }
+
+  return descriptor;
+}
+
+std::optional<ControlStateReducer::PlaybackContextState> ControlStateReducer::buildPlaybackContextState(
+    PlaybackContextDescriptor descriptor,
+    PlaybackContextBuildStatus* status) const {
+  if (!library_.libraryTree.has_value()) {
+    if (status != nullptr) {
+      *status = PlaybackContextBuildStatus::ContextNotFound;
+    }
+    return std::nullopt;
+  }
+
+  auto result = buildPlaybackContextOrder(*library_.libraryTree, std::move(descriptor));
+  if (status != nullptr) {
+    *status = result.status;
+  }
+  if (result.status != PlaybackContextBuildStatus::Ready || !result.anchorIndex.has_value()) {
+    return std::nullopt;
+  }
+
+  PlaybackContextState state{};
+  state.descriptor = std::move(result.context);
+  state.index = *result.anchorIndex;
+  state.order.reserve(result.order.size());
+  for (const auto& item : result.order) {
+    state.order.push_back(PlayableTrack{.identity = item.identity,
+                                        .request = requestFromSong(item.metadata),
+                                        .display = displayFromSong(item.metadata),
+                                        .artwork = artworkFromSong(item.metadata)});
+  }
+  return state;
+}
+
+std::optional<std::size_t> ControlStateReducer::selectedContextIndex() const {
+  if (!playbackContext_.has_value() || !selectedTrack_.has_value()) {
+    return std::nullopt;
+  }
+  const auto iterator = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
+    return sameTrack(track.identity, *selectedTrack_);
+  });
+  if (iterator == playbackContext_->order.end()) {
+    return std::nullopt;
+  }
+  return static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), iterator));
+}
+
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::selectedPlaybackContextTrack() {
+  const auto currentIndex = selectedContextIndex();
+  if (!currentIndex.has_value()) {
+    return std::nullopt;
+  }
+  playbackContext_->index = *currentIndex;
+  return playbackContext_->order[*currentIndex];
+}
+
+bool ControlStateReducer::activateTrackWithDefaultContext(ControlReduction& reduction,
+                                                          const TrackIdentity& identity,
+                                                          bool startPlayback) {
+  const auto descriptor = defaultContextDescriptorForTrack(identity);
+  if (!descriptor.has_value()) {
+    return false;
+  }
+  auto context = buildPlaybackContextState(*descriptor);
+  if (!context.has_value()) {
+    return false;
+  }
+  playbackContext_ = std::move(*context);
+  selectTrack(reduction, playbackContext_->order[playbackContext_->index], startPlayback);
+  return true;
+}
+
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack(bool forward) {
+  if (!playbackContext_.has_value() || playbackContext_->order.empty()) {
+    return std::nullopt;
+  }
+  const auto currentIndex = selectedContextIndex();
+  if (selectedTrack_.has_value() && !currentIndex.has_value()) {
+    return std::nullopt;
+  }
+  if (currentIndex.has_value()) {
+    playbackContext_->index = *currentIndex;
+  }
+  const auto& tracks = playbackContext_->order;
   
   // 上一曲逻辑
   if (!forward) {
@@ -733,16 +901,15 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack
     if (!selectedTrack_.has_value()) {
       return std::nullopt;
     }
-    const auto currentIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) { 
-      return sameTrack(track.identity, *selectedTrack_); 
-    });
-    if (currentIt == tracks.end() || currentIt == tracks.begin()) {
+    if (playbackContext_->index == 0U) {
       if (player_.repeatMode == RepeatMode::All) {
+        playbackContext_->index = tracks.size() - 1U;
         return tracks.back();
       }
       return std::nullopt;
     }
-    return *(currentIt - 1);
+    --playbackContext_->index;
+    return tracks[playbackContext_->index];
   }
   
   // 随机模式 + 下一曲
@@ -752,26 +919,22 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack
   
   // 非随机模式：顺序播放
   if (!selectedTrack_.has_value()) {
+    playbackContext_->index = 0U;
     return tracks.front();
   }
-  const auto currentIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) { 
-    return sameTrack(track.identity, *selectedTrack_); 
-  });
-  if (currentIt == tracks.end()) {
-    return tracks.front();
-  }
-  const auto index = static_cast<std::size_t>(std::distance(tracks.begin(), currentIt));
-  if (index + 1U < tracks.size()) {
-    return tracks[index + 1U];
+  if (playbackContext_->index + 1U < tracks.size()) {
+    ++playbackContext_->index;
+    return tracks[playbackContext_->index];
   }
   if (player_.repeatMode == RepeatMode::All) {
+    playbackContext_->index = 0U;
     return tracks.front();
   }
   return std::nullopt;
 }
 
-std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(const std::vector<PlayableTrack>&) {
-  auto candidates = getCandidatesInSameFolder();
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(const std::vector<PlayableTrack>& tracks) {
+  auto candidates = tracks;
   if (candidates.empty()) {
     return std::nullopt;
   }
@@ -793,7 +956,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
   if (candidates.empty()) {
     if (player_.repeatMode == RepeatMode::All) {
       shuffleHistory_.clear();
-      candidates = getCandidatesInSameFolder();
+      candidates = tracks;
       candidates = filterOutHistory(candidates);
       
       std::vector<PlayableTrack> filtered2;
@@ -812,32 +975,32 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
   }
   
   std::uniform_int_distribution<std::size_t> distribution{0U, candidates.size() - 1U};
-  return candidates[distribution(shuffleRandom_)];
+  auto selected = candidates[distribution(shuffleRandom_)];
+  if (playbackContext_.has_value()) {
+    const auto selectedIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
+      return sameTrack(track.identity, selected.identity);
+    });
+    if (selectedIt != playbackContext_->order.end()) {
+      playbackContext_->index = static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), selectedIt));
+    }
+  }
+  return selected;
 }
 
 std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::previousTrack() {
-  auto previousIdentity = shuffleHistory_.pop();
-  if (!previousIdentity.has_value()) {
+  if (!playbackContext_.has_value()) {
     return std::nullopt;
   }
-  return findPlayableTrack(*previousIdentity);
-}
-
-std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::getCandidatesInSameFolder() const {
-  if (!selectedTrack_.has_value()) {
-    return playableTracks();
+  while (auto previousIdentity = shuffleHistory_.pop()) {
+    const auto previousIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
+      return sameTrack(track.identity, *previousIdentity);
+    });
+    if (previousIt != playbackContext_->order.end()) {
+      playbackContext_->index = static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), previousIt));
+      return *previousIt;
+    }
   }
-  
-  const auto currentFolder = selectedTrack_->filePath.parent_path();
-  const auto allTracks = playableTracks();
-  std::vector<PlayableTrack> candidates;
-  
-  std::copy_if(allTracks.begin(), allTracks.end(), std::back_inserter(candidates),
-               [&](const PlayableTrack& track) {
-                 return track.identity.filePath.parent_path() == currentFolder;
-               });
-  
-  return candidates;
+  return std::nullopt;
 }
 
 std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::filterOutHistory(
@@ -883,6 +1046,82 @@ void ControlStateReducer::addNotification(ControlReduction& reduction, ControlDo
     recentNotifications_.erase(recentNotifications_.begin());
   }
   reduction.notifications.push_back(std::move(notification));
+}
+
+void ControlStateReducer::reconcilePlaybackContextAfterSnapshot(ControlReduction& reduction) {
+  if (!playbackContext_.has_value()) {
+    selectFirstTrackWhenIdle(reduction);
+    return;
+  }
+
+  const auto previousDescriptor = playbackContext_->descriptor;
+  const auto previousIndex = selectedContextIndex().value_or(playbackContext_->index);
+  const auto previousTrack = selectedTrack_;
+  const auto previousPlaybackState = player_.playback.state;
+
+  if (!library_.libraryTree.has_value()) {
+    playbackContext_.reset();
+    shuffleHistory_.clear();
+    if (previousPlaybackState != PlaybackStatus::Stopped) {
+      reduction.intents.push_back(makeIntent(ControlIntentKind::Stop));
+    }
+    stopPlayback(reduction);
+    return;
+  }
+
+  auto result = buildPlaybackContextOrder(*library_.libraryTree, previousDescriptor);
+  if (result.status == PlaybackContextBuildStatus::InvalidDescriptor ||
+      result.status == PlaybackContextBuildStatus::ContextNotFound ||
+      result.status == PlaybackContextBuildStatus::EmptyContext || result.order.empty()) {
+    playbackContext_.reset();
+    shuffleHistory_.clear();
+    if (previousPlaybackState != PlaybackStatus::Stopped) {
+      reduction.intents.push_back(makeIntent(ControlIntentKind::Stop));
+    }
+    stopPlayback(reduction);
+    return;
+  }
+
+  PlaybackContextState rebuilt{};
+  rebuilt.descriptor = std::move(result.context);
+  rebuilt.order.reserve(result.order.size());
+  for (const auto& item : result.order) {
+    rebuilt.order.push_back(PlayableTrack{.identity = item.identity,
+                                          .request = requestFromSong(item.metadata),
+                                          .display = displayFromSong(item.metadata),
+                                          .artwork = artworkFromSong(item.metadata)});
+  }
+
+  std::optional<std::size_t> currentIndex{};
+  if (previousTrack.has_value()) {
+    const auto currentIt = std::find_if(rebuilt.order.begin(), rebuilt.order.end(), [&](const PlayableTrack& track) {
+      return sameTrack(track.identity, *previousTrack);
+    });
+    if (currentIt != rebuilt.order.end()) {
+      currentIndex = static_cast<std::size_t>(std::distance(rebuilt.order.begin(), currentIt));
+    }
+  }
+
+  const auto reconciledIndex = currentIndex.value_or(std::min(previousIndex, rebuilt.order.size() - 1U));
+  rebuilt.index = reconciledIndex;
+  rebuilt.descriptor.anchorTrack = rebuilt.order[rebuilt.index].identity;
+  const auto currentTrackStillPresent = currentIndex.has_value();
+  playbackContext_ = std::move(rebuilt);
+  shuffleHistory_.clear();
+
+  if (currentTrackStillPresent) {
+    return;
+  }
+
+  const auto shouldContinuePlayback = previousPlaybackState == PlaybackStatus::Playing ||
+                                      previousPlaybackState == PlaybackStatus::Loading ||
+                                      previousPlaybackState == PlaybackStatus::Buffering ||
+                                      previousPlaybackState == PlaybackStatus::Seeking;
+  selectTrack(reduction, playbackContext_->order[playbackContext_->index], shouldContinuePlayback);
+  if (previousPlaybackState == PlaybackStatus::Paused) {
+    player_.playback.state = PlaybackStatus::Paused;
+    markPlayerChanged(reduction);
+  }
 }
 
 void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) {

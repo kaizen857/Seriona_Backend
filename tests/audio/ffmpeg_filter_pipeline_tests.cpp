@@ -284,6 +284,17 @@ std::vector<std::int16_t> readInt16Samples(const FfmpegAudioFrame& frame) {
   return samples;
 }
 
+FfmpegAudioFrame decodedFrame(std::uint32_t sampleRate, std::uint16_t channels, AudioSampleFormat format, std::uint32_t frames) {
+  const auto sampleBytes = bytesPerSample(format);
+  FfmpegAudioFrame frame{};
+  frame.sampleRate = sampleRate;
+  frame.channelCount = channels;
+  frame.sampleFormat = format;
+  frame.frameCount = frames;
+  frame.sampleBytes.assign(static_cast<std::size_t>(frames) * channels * sampleBytes, 0U);
+  return frame;
+}
+
 }
 
 TEST_CASE("ffmpeg_filter_pipeline converts generated wav to target pcm") {
@@ -315,6 +326,31 @@ TEST_CASE("ffmpeg_filter_pipeline drains EOF without losing filtered frames") {
 
   REQUIRE_FALSE(output.empty());
   CHECK(countFrames(output) == sourceFrameCount);
+}
+
+TEST_CASE("ffmpeg_filter_pipeline drains or resets pending graph when decoded input format changes") {
+  FfmpegFilterPipeline pipeline;
+  const auto target = FfmpegFilterTargetFormat{44'100, AudioSampleFormat::Float32, 2};
+  REQUIRE_FALSE(pipeline.configure(target).has_value());
+  REQUIRE_FALSE(pipeline.pushFrame(decodedFrame(44'100, 2, AudioSampleFormat::Float32, 512U)).has_value());
+
+  const auto changedInput = decodedFrame(44'100, 2, AudioSampleFormat::Int16, 512U);
+  const auto error = pipeline.pushFrame(changedInput);
+
+  CHECK_FALSE(error.has_value());
+  bool producedFrame = false;
+  for (int guard = 0; guard < 16; ++guard) {
+    auto result = pipeline.readFrame();
+    REQUIRE_FALSE(result.error.has_value());
+    if (result.frame.has_value()) {
+      producedFrame = true;
+      CHECK(result.frame->sampleRate == target.sampleRate);
+      CHECK(result.frame->channelCount == target.channelCount);
+      CHECK(result.frame->sampleFormat == target.sampleFormat);
+      break;
+    }
+  }
+  CHECK(producedFrame);
 }
 
 TEST_CASE("ffmpeg_filter_pipeline receives interleaved bytes from stereo planar source") {

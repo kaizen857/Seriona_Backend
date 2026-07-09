@@ -152,6 +152,8 @@ public:
 
   void emit(scanner::ScannerEvent event);
   void setSnapshot(scanner::PlaylistTreeSnapshot snapshot);
+  void startWatchingThrows(std::exception_ptr exception) noexcept;
+  void startWatchingThrows(std::runtime_error exception);
   void blockScansUntilReleased() noexcept;
   void releaseBlockedScans();
   [[nodiscard]] bool waitForBlockedScan(std::chrono::milliseconds timeout);
@@ -174,6 +176,7 @@ private:
   std::optional<std::vector<scanner::ScannerRoot>> lastScannedRoots_{};
   std::optional<scanner::ScanMode> lastScanMode_{};
   std::optional<std::vector<scanner::ScannerRoot>> lastWatchingRoots_{};
+  std::exception_ptr startWatchingException_{};
   bool blockScans_{false};
   bool scanBlocked_{false};
   bool releaseScans_{false};

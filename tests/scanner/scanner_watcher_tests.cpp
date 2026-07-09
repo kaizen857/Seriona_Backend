@@ -176,6 +176,12 @@ void waitForSnapshotSongCount(const FileScannerService& service, std::size_t exp
   FAIL("timed out waiting for watcher reconciliation snapshot");
 }
 
+[[nodiscard]] std::size_t scanStartedCount(const std::vector<ScannerEvent>& events) {
+  return static_cast<std::size_t>(std::ranges::count_if(events, [](const ScannerEvent& event) {
+    return event.type == ScannerEventType::ScanStarted;
+  }));
+}
+
 [[nodiscard]] WatchEvent fileEvent(std::filesystem::path path, WatchEffectKind effect) {
   return WatchEvent{.path = std::move(path), .pathKind = WatchPathKind::File, .effectKind = effect, .associated = {}};
 }
@@ -296,6 +302,43 @@ TEST_CASE("scanner watcher warning error and overflow messages force root reconc
       }
       return std::get<ScannerError>(event.payload).message == "watcher requested root reconciliation";
     }));
+  }
+}
+
+TEST_CASE("scanner watcher lifecycle messages do not trigger incremental scans") {
+  test::TempScannerRoot temp{"scanner-watcher-lifecycle"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  watchers->states[0]->callback(watcherMessage("s/self/live@" + temp.path().generic_string()));
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
+
+  const auto second = test::writeAudioFixture(temp.path(), "second.flac");
+  reader->put(second, rawMetadata("Second"));
+  watchers->states[0]->callback(fileEvent(second, WatchEffectKind::Created));
+
+  waitForReadCount(*reader, 2U);
+  waitForSnapshotSongCount(*service, 2U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 2U);
   }
 }
 

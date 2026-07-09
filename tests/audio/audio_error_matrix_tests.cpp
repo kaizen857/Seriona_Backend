@@ -386,7 +386,7 @@ TEST_CASE("audio_error_matrix maps decode, underrun, and seek failures") {
   checkUsefulError(seekError, PlaybackErrorCode::SeekFailed);
   CHECK(seekError.detail.find("missing playback pipeline") != std::string::npos);
 
-  const auto underrunPath = sineFixture("audio_error_matrix_underrun.wav", 480U);
+  const auto underrunPath = sineFixture("audio_error_matrix_underrun.wav", kSampleRate);
   auto backend = std::make_unique<ErrorMatrixAudioOutputDeviceBackend>();
   auto* fake = backend.get();
   AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
@@ -397,7 +397,7 @@ TEST_CASE("audio_error_matrix maps decode, underrun, and seek failures") {
   static_cast<void>(player.queryPlaybackClock());
   player.play();
   static_cast<void>(player.queryPlaybackClock());
-  fake->consumeFrames(960U);
+  fake->consumeFrames(1920U);
   const auto clock = player.queryPlaybackClock();
 
   CHECK(clock.trackId == "underrun");

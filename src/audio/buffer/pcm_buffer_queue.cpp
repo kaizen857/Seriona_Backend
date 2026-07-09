@@ -16,15 +16,19 @@ bool PcmBufferQueue::write(const void* source, std::uint32_t frameCount) noexcep
     return true;
   }
 
-  if (source == nullptr || bytesPerFrame_ == 0U || byteCount > capacityBytes() - usedBytes()) {
+  const auto readCursorBytes = readCursorBytes_.load(std::memory_order_acquire);
+  const auto writeCursorBytes = writeCursorBytes_.load(std::memory_order_relaxed);
+  const auto usedBytes = static_cast<std::size_t>(writeCursorBytes - readCursorBytes);
+  if (source == nullptr || bytesPerFrame_ == 0U || byteCount > capacityBytes() - usedBytes) {
     overflowCount_.fetch_add(1U, std::memory_order_relaxed);
     droppedFrames_.fetch_add(frameCount, std::memory_order_relaxed);
     droppedBytes_.fetch_add(byteCount, std::memory_order_relaxed);
     return false;
   }
 
-  copyIntoRing(static_cast<const std::uint8_t*>(source), byteCount);
-  usedBytes_.fetch_add(byteCount, std::memory_order_release);
+  copyIntoRing(static_cast<const std::uint8_t*>(source), byteCount,
+               static_cast<std::size_t>(writeCursorBytes % capacityBytes()));
+  writeCursorBytes_.store(writeCursorBytes + byteCount, std::memory_order_release);
   submittedFrames_.fetch_add(frameCount, std::memory_order_relaxed);
   return true;
 }
@@ -45,10 +49,10 @@ PcmBufferReadResult PcmBufferQueue::read(void* destination, std::uint32_t frameC
     return result;
   }
 
+  const auto readCursorBytes = readCursorBytes_.load(std::memory_order_relaxed);
   const auto availableBytes = usedBytes();
   const auto copiedBytes = std::min(requestedBytes, availableBytes);
-  usedBytes_.fetch_sub(copiedBytes, std::memory_order_release);
-  return readReserved(destination, frameCount, requestedBytes, copiedBytes);
+  return readReserved(destination, frameCount, requestedBytes, copiedBytes, readCursorBytes);
 }
 
 PcmBufferReadResult PcmBufferQueue::readIfGeneration(void* destination,
@@ -77,21 +81,9 @@ PcmBufferReadResult PcmBufferQueue::readIfGeneration(void* destination,
     return result;
   }
 
-  auto availableBytes = usedBytes_.load(std::memory_order_acquire);
-  std::size_t copiedBytes = 0;
-  do {
-    if (generation != this->generation()) {
-      std::memset(destination, 0, requestedBytes);
-      underrunCount_.fetch_add(1U, std::memory_order_relaxed);
-      silenceFrames_.fetch_add(frameCount, std::memory_order_relaxed);
-      result.silenceFrames = frameCount;
-      return result;
-    }
-    copiedBytes = std::min(requestedBytes, availableBytes);
-  } while (!usedBytes_.compare_exchange_weak(availableBytes,
-                                            availableBytes - copiedBytes,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_acquire));
+  const auto readCursorBytes = readCursorBytes_.load(std::memory_order_relaxed);
+  const auto availableBytes = usedBytes();
+  const auto copiedBytes = std::min(requestedBytes, availableBytes);
 
   if (generation != this->generation()) {
     std::memset(destination, 0, requestedBytes);
@@ -101,19 +93,29 @@ PcmBufferReadResult PcmBufferQueue::readIfGeneration(void* destination,
     return result;
   }
 
-  return readReserved(destination, frameCount, requestedBytes, copiedBytes);
+  return readReserved(destination, frameCount, requestedBytes, copiedBytes, readCursorBytes);
 }
 
 PcmBufferReadResult PcmBufferQueue::readReserved(void* destination,
                                                  std::uint32_t frameCount,
                                                  std::size_t requestedBytes,
-                                                 std::size_t copiedBytes) noexcept {
+                                                 std::size_t copiedBytes,
+                                                 std::uint64_t readCursorBytes) noexcept {
   PcmBufferReadResult result{};
   result.requestedFrames = frameCount;
   auto* output = static_cast<std::uint8_t*>(destination);
 
   if (copiedBytes > 0U) {
-    copyOutOfRing(output, copiedBytes);
+    copyOutOfRing(output, copiedBytes,
+                  static_cast<std::size_t>(readCursorBytes % capacityBytes()));
+    const auto advancedReadCursor = readCursorBytes + copiedBytes;
+    auto expectedReadCursor = readCursorBytes;
+    if (!readCursorBytes_.compare_exchange_strong(expectedReadCursor,
+                                                  advancedReadCursor,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed)) {
+      copiedBytes = 0U;
+    }
   }
 
   const auto silenceBytes = requestedBytes - copiedBytes;
@@ -131,9 +133,9 @@ PcmBufferReadResult PcmBufferQueue::readReserved(void* destination,
 
 void PcmBufferQueue::clearForSeek() noexcept {
   generation_.fetch_add(1U, std::memory_order_acq_rel);
-  const auto clearedBytes = usedBytes_.exchange(0U, std::memory_order_acq_rel);
-  readOffset_.store(0U, std::memory_order_release);
-  writeOffset_.store(0U, std::memory_order_release);
+  const auto writeCursorBytes = writeCursorBytes_.load(std::memory_order_acquire);
+  const auto previousReadCursor = readCursorBytes_.exchange(writeCursorBytes, std::memory_order_acq_rel);
+  const auto clearedBytes = static_cast<std::size_t>(writeCursorBytes - previousReadCursor);
   clearCount_.fetch_add(1U, std::memory_order_relaxed);
   if (bytesPerFrame_ > 0U) {
     clearedFrames_.fetch_add(clearedBytes / bytesPerFrame_, std::memory_order_relaxed);
@@ -181,31 +183,33 @@ PcmBufferQueueCounters PcmBufferQueue::counters() const noexcept {
 }
 
 std::size_t PcmBufferQueue::usedBytes() const noexcept {
-  return usedBytes_.load(std::memory_order_acquire);
+  const auto readCursorBytes = readCursorBytes_.load(std::memory_order_acquire);
+  const auto writeCursorBytes = writeCursorBytes_.load(std::memory_order_acquire);
+  return static_cast<std::size_t>(writeCursorBytes - readCursorBytes);
 }
 
 std::size_t PcmBufferQueue::capacityBytes() const noexcept { return buffer_.size(); }
 
-void PcmBufferQueue::copyIntoRing(const std::uint8_t* source, std::size_t byteCount) noexcept {
+void PcmBufferQueue::copyIntoRing(const std::uint8_t* source,
+                                  std::size_t byteCount,
+                                  std::size_t ringOffset) noexcept {
   const auto capacity = capacityBytes();
-  auto offset = writeOffset_.load(std::memory_order_relaxed);
-  const auto firstCopy = std::min(byteCount, capacity - offset);
-  std::memcpy(buffer_.data() + offset, source, firstCopy);
+  const auto firstCopy = std::min(byteCount, capacity - ringOffset);
+  std::memcpy(buffer_.data() + ringOffset, source, firstCopy);
   if (firstCopy < byteCount) {
     std::memcpy(buffer_.data(), source + firstCopy, byteCount - firstCopy);
   }
-  writeOffset_.store((offset + byteCount) % capacity, std::memory_order_release);
 }
 
-void PcmBufferQueue::copyOutOfRing(std::uint8_t* destination, std::size_t byteCount) noexcept {
+void PcmBufferQueue::copyOutOfRing(std::uint8_t* destination,
+                                   std::size_t byteCount,
+                                   std::size_t ringOffset) noexcept {
   const auto capacity = capacityBytes();
-  auto offset = readOffset_.load(std::memory_order_relaxed);
-  const auto firstCopy = std::min(byteCount, capacity - offset);
-  std::memcpy(destination, buffer_.data() + offset, firstCopy);
+  const auto firstCopy = std::min(byteCount, capacity - ringOffset);
+  std::memcpy(destination, buffer_.data() + ringOffset, firstCopy);
   if (firstCopy < byteCount) {
     std::memcpy(destination + firstCopy, buffer_.data(), byteCount - firstCopy);
   }
-  readOffset_.store((offset + byteCount) % capacity, std::memory_order_release);
 }
 
 }

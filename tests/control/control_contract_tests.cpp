@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 using namespace seriona::control;
 namespace audio = seriona::audio;
@@ -43,6 +44,18 @@ std::string readTextFile(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
+bool playbackContextIsValid(const PlaybackContextDescriptor& descriptor) {
+  if (descriptor.rootPath.empty() || !descriptor.anchorTrack.has_value()) {
+    return false;
+  }
+
+  if (descriptor.scope == PlaybackContextScope::Folder) {
+    return !descriptor.folderNodeId.empty();
+  }
+
+  return descriptor.scope == PlaybackContextScope::Root;
+}
+
 }
 
 TEST_CASE("control public contracts remain value types") {
@@ -66,6 +79,128 @@ TEST_CASE("snapshot subscription callbacks take owned values") {
   CHECK(std::is_same_v<PlayerStateSnapshotCallback, std::function<void(PlayerStateSnapshot)>>);
   CHECK(std::is_same_v<LibraryStateSnapshotCallback, std::function<void(LibraryStateSnapshot)>>);
   CHECK(std::is_same_v<ControlDomainNotificationCallback, std::function<void(ControlDomainNotification)>>);
+}
+
+TEST_CASE("select track command remains the compatibility default context fallback") {
+  MediaControlCommand command{};
+  command.kind = MediaControlCommandKind::SelectTrack;
+  command.track = TrackIdentity{.trackId = "track-compat",
+                                .filePath = std::filesystem::path{"music/track-compat.flac"},
+                                .sourceId = "scanner",
+                                .libraryId = "library"};
+
+  CHECK(MediaControlCommand{}.kind == MediaControlCommandKind::Play);
+  CHECK(command.kind == MediaControlCommandKind::SelectTrack);
+  CHECK(static_cast<int>(MediaControlCommandKind::SelectTrack) > static_cast<int>(MediaControlCommandKind::SkipPrevious));
+  REQUIRE(command.track.has_value());
+  CHECK(command.track->trackId == "track-compat");
+  CHECK(command.position == std::nullopt);
+  CHECK(command.delta == std::nullopt);
+  CHECK(command.repeatMode == std::nullopt);
+}
+
+TEST_CASE("folder sort public contract covers supported fields directions and missing values") {
+  expectValueSemantics<FolderSortRule>();
+  expectValueSemantics<FolderSortSetting>();
+
+  const FolderSortRule defaultRule{};
+  CHECK(defaultRule.field == FolderSortField::Title);
+  CHECK(defaultRule.direction == FolderSortDirection::Ascending);
+  CHECK(defaultRule.missingValuePolicy == FolderSortMissingValuePolicy::Last);
+
+  const std::array<FolderSortField, 9> supportedFields{FolderSortField::Title,
+                                                       FolderSortField::Artist,
+                                                       FolderSortField::Album,
+                                                       FolderSortField::Filename,
+                                                       FolderSortField::Year,
+                                                       FolderSortField::Duration,
+                                                       FolderSortField::CreatedDate,
+                                                       FolderSortField::DiscNumber,
+                                                       FolderSortField::TrackNumber};
+  CHECK(supportedFields.front() == FolderSortField::Title);
+  CHECK(supportedFields.back() == FolderSortField::TrackNumber);
+
+  const FolderSortRule descendingFilename{.field = FolderSortField::Filename,
+                                          .direction = FolderSortDirection::Descending,
+                                          .missingValuePolicy = FolderSortMissingValuePolicy::First};
+  CHECK(descendingFilename.field == FolderSortField::Filename);
+  CHECK(descendingFilename.direction == FolderSortDirection::Descending);
+  CHECK(descendingFilename.missingValuePolicy == FolderSortMissingValuePolicy::First);
+
+  FolderSortSetting setting{};
+  CHECK(setting.rootPath.empty());
+  CHECK(setting.folderNodeId.empty());
+  CHECK(setting.rules.empty());
+  setting.rootPath = std::filesystem::path{"/music"};
+  setting.folderNodeId = "folder-node";
+  setting.rules.push_back(descendingFilename);
+  REQUIRE(setting.rules.size() == 1U);
+  CHECK(setting.rules.front().field == FolderSortField::Filename);
+}
+
+TEST_CASE("playback context descriptor is invalid until scoped root and anchor are provided") {
+  expectValueSemantics<PlaybackContextDescriptor>();
+
+  PlaybackContextDescriptor descriptor{};
+  CHECK(descriptor.scope == PlaybackContextScope::Root);
+  CHECK(descriptor.rootPath.empty());
+  CHECK(descriptor.folderNodeId.empty());
+  CHECK(descriptor.sortRules.empty());
+  CHECK_FALSE(descriptor.anchorTrack.has_value());
+  CHECK_FALSE(playbackContextIsValid(descriptor));
+
+  descriptor.rootPath = std::filesystem::path{"/music"};
+  CHECK_FALSE(playbackContextIsValid(descriptor));
+
+  descriptor.anchorTrack = TrackIdentity{.trackId = "track-01",
+                                         .filePath = std::filesystem::path{"/music/album/track-01.flac"},
+                                         .sourceId = "scanner",
+                                         .libraryId = "library"};
+  CHECK(playbackContextIsValid(descriptor));
+
+  descriptor.scope = PlaybackContextScope::Folder;
+  CHECK_FALSE(playbackContextIsValid(descriptor));
+  descriptor.folderNodeId = "folder-node";
+  descriptor.sortRules.push_back(FolderSortRule{.field = FolderSortField::TrackNumber,
+                                                .direction = FolderSortDirection::Ascending,
+                                                .missingValuePolicy = FolderSortMissingValuePolicy::Last});
+  CHECK(playbackContextIsValid(descriptor));
+  REQUIRE(descriptor.sortRules.size() == 1U);
+  CHECK(descriptor.sortRules.front().field == FolderSortField::TrackNumber);
+}
+
+TEST_CASE("media control commands expose context playback and folder sort application") {
+  PlaybackContextDescriptor context{};
+  context.rootPath = std::filesystem::path{"/music"};
+  context.anchorTrack = TrackIdentity{.trackId = "track-01",
+                                      .filePath = std::filesystem::path{"/music/track-01.flac"},
+                                      .sourceId = "scanner",
+                                      .libraryId = "library"};
+
+  MediaControlCommand startCommand{};
+  startCommand.kind = MediaControlCommandKind::StartPlaybackFromContext;
+  startCommand.playbackContext = context;
+  CHECK(static_cast<int>(MediaControlCommandKind::StartPlaybackFromContext) >
+        static_cast<int>(MediaControlCommandKind::SelectTrack));
+  CHECK(startCommand.kind == MediaControlCommandKind::StartPlaybackFromContext);
+  REQUIRE(startCommand.playbackContext.has_value());
+  CHECK(startCommand.playbackContext->anchorTrack->trackId == "track-01");
+
+  FolderSortSetting setting{};
+  setting.rootPath = std::filesystem::path{"/music"};
+  setting.folderNodeId = "folder-node";
+  setting.rules.push_back(FolderSortRule{.field = FolderSortField::Album,
+                                         .direction = FolderSortDirection::Descending,
+                                         .missingValuePolicy = FolderSortMissingValuePolicy::Last});
+
+  MediaControlCommand applySortCommand{};
+  applySortCommand.kind = MediaControlCommandKind::ApplyFolderSortRules;
+  applySortCommand.folderSortSetting = setting;
+  CHECK(static_cast<int>(MediaControlCommandKind::ApplyFolderSortRules) >
+        static_cast<int>(MediaControlCommandKind::StartPlaybackFromContext));
+  CHECK(applySortCommand.kind == MediaControlCommandKind::ApplyFolderSortRules);
+  REQUIRE(applySortCommand.folderSortSetting.has_value());
+  CHECK(applySortCommand.folderSortSetting->rules.front().field == FolderSortField::Album);
 }
 
 TEST_CASE("control test harness records fake playback scanner and metadata activity") {

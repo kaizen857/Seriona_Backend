@@ -93,6 +93,55 @@ bool sameTarget(const FfmpegFilterTargetFormat& left, const FfmpegFilterTargetFo
          left.channelCount == right.channelCount;
 }
 
+std::optional<std::chrono::milliseconds> endPositionFor(const TrackPlaybackRequest& request) {
+  if (!request.boundedSegment || !request.offset.has_value() || !request.duration.has_value()) {
+    return std::nullopt;
+  }
+
+  return *request.offset + *request.duration;
+}
+
+struct BoundaryTrimResult {
+  std::optional<FfmpegAudioFrame> frame;
+  bool reachedBoundary{false};
+};
+
+BoundaryTrimResult trimFrameToBoundary(FfmpegAudioFrame frame,
+                                       std::optional<std::chrono::milliseconds> endPosition) {
+  if (!endPosition.has_value() || frame.sampleRate == 0U || frame.frameCount == 0U) {
+    return BoundaryTrimResult{std::move(frame), false};
+  }
+
+  const auto frameStart = std::chrono::duration_cast<std::chrono::microseconds>(frame.position);
+  const auto boundary = std::chrono::duration_cast<std::chrono::microseconds>(*endPosition);
+  if (frameStart >= boundary) {
+    return BoundaryTrimResult{std::nullopt, true};
+  }
+
+  const auto bytesPerFrame = static_cast<std::size_t>(frame.channelCount) * bytesPerSample(frame.sampleFormat);
+  if (bytesPerFrame == 0U || frame.sampleBytes.size() != static_cast<std::size_t>(frame.frameCount) * bytesPerFrame) {
+    return BoundaryTrimResult{std::move(frame), false};
+  }
+
+  const auto frameDurationUs = (static_cast<std::uint64_t>(frame.frameCount) * 1'000'000ULL) / frame.sampleRate;
+  const auto frameEnd = frameStart + std::chrono::microseconds{static_cast<std::chrono::microseconds::rep>(frameDurationUs)};
+  if (frameEnd <= boundary) {
+    return BoundaryTrimResult{std::move(frame), false};
+  }
+
+  const auto availableUs = std::max<std::chrono::microseconds::rep>(0, (boundary - frameStart).count());
+  const auto allowedFrames = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      frame.frameCount,
+      (static_cast<std::uint64_t>(availableUs) * frame.sampleRate) / 1'000'000ULL));
+  if (allowedFrames == 0U) {
+    return BoundaryTrimResult{std::nullopt, true};
+  }
+
+  frame.frameCount = allowedFrames;
+  frame.sampleBytes.resize(static_cast<std::size_t>(allowedFrames) * bytesPerFrame);
+  return BoundaryTrimResult{std::move(frame), true};
+}
+
 AudioOutputConfig explicitConfig(AudioOutputConfig config, AudioOutputMode mode, const FfmpegFilterTargetFormat& target) {
   config.outputMode = mode;
   config.targetSampleRate = target.sampleRate;
@@ -183,12 +232,11 @@ private:
     pendingFrameWrite_.reset();
     preloadSlot_.reset();
 
-    trackEndPosition_.reset();
-    if (request.offset.has_value() && request.duration.has_value()) {
-      trackEndPosition_ = *request.offset + *request.duration;
+    trackEndPosition_ = endPositionFor(request);
+    if (trackEndPosition_.has_value()) {
       spdlog::debug("track boundary: offset={}ms, duration={}ms, end={}ms",
-                    request.offset->count(),
-                    request.duration->count(),
+                    request.offset.value_or(std::chrono::milliseconds{0}).count(),
+                    request.duration.value_or(std::chrono::milliseconds{0}).count(),
                     trackEndPosition_->count());
     }
 
@@ -273,10 +321,17 @@ private:
     slot.request = request;
     slot.source = std::make_unique<FfmpegAudioSource>();
     slot.pipeline = std::make_unique<FfmpegFilterPipeline>();
+    slot.endPosition = endPositionFor(request);
 
     if (const auto error = slot.source->open(request.filePath)) {
       emitPreloadError(error->code, error->message, error->detail);
       return;
+    }
+    if (request.offset.has_value() && request.offset->count() > 0) {
+      if (const auto error = slot.source->seek(*request.offset)) {
+        emitPreloadError(error->code, error->message, error->detail);
+        return;
+      }
     }
 
     slot.target = hasCurrentTarget_ ? currentTarget_ : requestedTarget(slot.source->streamInfo());
@@ -311,6 +366,12 @@ private:
     if (!queue_ || !source_ || !pipeline_) {
       spdlog::error("play failed: no loaded track");
       fail(PlaybackErrorCode::OpenFailed, "play requires a loaded track", "missing playback pipeline");
+      return;
+    }
+
+    const auto state = stateMachine_.state();
+    if (state != PlaybackState::Ready && state != PlaybackState::Paused && state != PlaybackState::Stopped) {
+      stateMachine_.play();
       return;
     }
 
@@ -394,63 +455,36 @@ private:
     const bool shouldResume = stateMachine_.state() == PlaybackState::Playing;
     const auto seekGeneration = stateMachine_.beginSeek(position);
 
-    auto nextSource = std::make_unique<FfmpegAudioSource>();
-    if (const auto error = nextSource->open(currentRequest_.filePath)) {
-      spdlog::error("seek failed (open): {} - {}", error->message, error->detail);
-      stateMachine_.cancelSeek(error->code, error->message, error->detail);
-      publishPosition();
-      return;
-    }
-    if (const auto error = nextSource->seek(position)) {
+    stopDevice();
+    if (const auto error = source_->seek(position)) {
       spdlog::error("seek failed (ffmpeg seek): {} - {}", error->message, error->detail);
+      if (shouldResume) {
+        clock_.resume();
+        if (device_.start()) {
+          startProgressWorker();
+        } else {
+          clock_.pause();
+          failWithDeviceError("failed to restart audio output device after seek failure",
+                              "AudioOutputDeviceBackend::start returned false");
+          return;
+        }
+      }
       stateMachine_.cancelSeek(error->code, error->message, error->detail);
       publishPosition();
       return;
     }
 
-    auto nextPipeline = std::make_unique<FfmpegFilterPipeline>();
-    if (const auto error = nextPipeline->configure(currentTarget_)) {
-      spdlog::error("seek failed (pipeline): {} - {}", error->message, error->detail);
-      stateMachine_.cancelSeek(error->code, error->message, error->detail);
-      publishPosition();
-      return;
-    }
-
-    const auto sampleBytes = bytesPerSample(currentTarget_.sampleFormat);
-    auto nextQueue = std::make_unique<PcmBufferQueue>(
-        PcmBufferQueueConfig{bufferFrameCount(currentTarget_.sampleRate, config_.bufferDuration),
-                             currentTarget_.channelCount * sampleBytes});
-
-    auto previousSource = std::move(source_);
-    auto previousPipeline = std::move(pipeline_);
-    auto previousQueue = std::move(queue_);
-    auto previousPendingFrameWrite = std::move(pendingFrameWrite_);
-    const bool previousLoadedToEnd = loadedToEnd_;
-    source_ = std::move(nextSource);
-    pipeline_ = std::move(nextPipeline);
-    queue_ = std::move(nextQueue);
+    pipeline_->reset();
+    queue_->clearForSeek();
     pendingFrameWrite_.reset();
     observedQueueCounters_ = queue_->counters();
     loadedToEnd_ = false;
 
     if (!fillQueue()) {
       spdlog::error("seek failed (fillQueue)");
-      source_ = std::move(previousSource);
-      pipeline_ = std::move(previousPipeline);
-      queue_ = std::move(previousQueue);
-      pendingFrameWrite_ = std::move(previousPendingFrameWrite);
-      loadedToEnd_ = previousLoadedToEnd;
-      observedQueueCounters_ = queue_ ? queue_->counters() : PcmBufferQueueCounters{};
-      stateMachine_.cancelSeek(PlaybackErrorCode::SeekFailed, "seek failed", "failed to fill PCM queue after seek");
-      publishPosition();
+      fail(PlaybackErrorCode::SeekFailed, "seek failed", "failed to fill PCM queue after seek");
       return;
     }
-
-    stopDevice();
-    device_.rebindQueue(*queue_);
-    previousQueue.reset();
-    previousPipeline.reset();
-    previousSource.reset();
 
     observedQueueCounters_ = queue_->counters();
     clock_.seek(position);
@@ -478,6 +512,7 @@ private:
   struct PreloadSlot {
     TrackPlaybackRequest request{};
     FfmpegFilterTargetFormat target{};
+    std::optional<std::chrono::milliseconds> endPosition{};
     std::optional<PendingFrameWrite> pendingFrameWrite{};
     std::unique_ptr<FfmpegAudioSource> source{};
     std::unique_ptr<FfmpegFilterPipeline> pipeline{};
@@ -498,6 +533,11 @@ private:
     FfmpegFilterTargetFormat target{};
     AudioDeviceFormat deviceFormat{};
     std::string fallbackReason{};
+  };
+
+  struct QueueUnderrunDelta {
+    std::uint64_t silenceFrames{0};
+    std::uint64_t underrunCount{0};
   };
 
   using AudioCommand = std::function<void()>;
@@ -695,6 +735,9 @@ private:
       if (!drainPipeline(false)) {
         return false;
       }
+      if (loadedToEnd_) {
+        return true;
+      }
     }
 
     return true;
@@ -735,6 +778,9 @@ private:
       }
       if (!drainPreloadPipeline(slot, false)) {
         return false;
+      }
+      if (slot.loadedToEnd) {
+        return true;
       }
     }
 
@@ -788,13 +834,23 @@ private:
   }
 
   bool writeFrame(const FfmpegAudioFrame& frame) {
-    const auto bytesPerFrame = static_cast<std::size_t>(frame.channelCount) * bytesPerSample(frame.sampleFormat);
-    if (bytesPerFrame == 0U || frame.sampleBytes.size() != static_cast<std::size_t>(frame.frameCount) * bytesPerFrame) {
+    const auto trimmed = trimFrameToBoundary(frame, trackEndPosition_);
+    if (trimmed.reachedBoundary) {
+      loadedToEnd_ = true;
+    }
+    if (!trimmed.frame.has_value()) {
+      pendingFrameWrite_.reset();
+      return true;
+    }
+
+    const auto& boundedFrame = *trimmed.frame;
+    const auto bytesPerFrame = static_cast<std::size_t>(boundedFrame.channelCount) * bytesPerSample(boundedFrame.sampleFormat);
+    if (bytesPerFrame == 0U || boundedFrame.sampleBytes.size() != static_cast<std::size_t>(boundedFrame.frameCount) * bytesPerFrame) {
       fail(PlaybackErrorCode::DecodeFailed, "filtered frame has invalid PCM payload", "sampleBytes size does not match frame shape");
       return false;
     }
 
-    pendingFrameWrite_ = PendingFrameWrite{frame, 0U};
+    pendingFrameWrite_ = PendingFrameWrite{*trimmed.frame, 0U};
     return writePendingFrame();
   }
 
@@ -825,13 +881,23 @@ private:
   }
 
   bool writePreloadFrame(PreloadSlot& slot, const FfmpegAudioFrame& frame) {
-    const auto bytesPerFrame = static_cast<std::size_t>(frame.channelCount) * bytesPerSample(frame.sampleFormat);
-    if (bytesPerFrame == 0U || frame.sampleBytes.size() != static_cast<std::size_t>(frame.frameCount) * bytesPerFrame) {
+    const auto trimmed = trimFrameToBoundary(frame, slot.endPosition);
+    if (trimmed.reachedBoundary) {
+      slot.loadedToEnd = true;
+    }
+    if (!trimmed.frame.has_value()) {
+      slot.pendingFrameWrite.reset();
+      return true;
+    }
+
+    const auto& boundedFrame = *trimmed.frame;
+    const auto bytesPerFrame = static_cast<std::size_t>(boundedFrame.channelCount) * bytesPerSample(boundedFrame.sampleFormat);
+    if (bytesPerFrame == 0U || boundedFrame.sampleBytes.size() != static_cast<std::size_t>(boundedFrame.frameCount) * bytesPerFrame) {
       emitPreloadError(PlaybackErrorCode::DecodeFailed, "preloaded frame has invalid PCM payload", "sampleBytes size does not match frame shape");
       return false;
     }
 
-    slot.pendingFrameWrite = PendingFrameWrite{frame, 0U};
+    slot.pendingFrameWrite = PendingFrameWrite{*trimmed.frame, 0U};
     return writePendingPreloadFrame(slot);
   }
 
@@ -861,18 +927,22 @@ private:
   }
 
   void servicePlaybackProgress() {
-    updateClockFromQueue();
+    const auto deferredUnderrun = updateClockFromQueue(UnderrunReporting::Suppress);
     if (stateMachine_.state() == PlaybackState::Playing && !loadedToEnd_) {
-      static_cast<void>(fillQueue());
-      updateClockFromQueue();
+      const bool filled = fillQueue();
+      if (filled && deferredUnderrun.silenceFrames > 0U && !loadedToEnd_) {
+        emitBufferUnderrun(deferredUnderrun.silenceFrames, deferredUnderrun.underrunCount);
+      }
+      updateClockFromQueue(UnderrunReporting::Report);
     }
     if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && pendingFrameWrite_) {
       static_cast<void>(writePendingFrame());
-      updateClockFromQueue();
+      updateClockFromQueue(UnderrunReporting::Report);
     }
 
     if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && !pendingFrameWrite_ && queue_ &&
         queue_->availableFrames() == 0U) {
+      updateClockFromQueue(UnderrunReporting::Suppress);
       if (handoffToPreparedNext()) {
         return;
       }
@@ -906,15 +976,13 @@ private:
       return false;
     }
 
-    const auto endedClock = clock_.snapshot();
-    dispatcher_.dispatch(BackendEventType::PlaybackEnded, PlaybackEnded{currentRequest_, endedClock});
-
     auto slot = std::move(*preloadSlot_);
     preloadSlot_.reset();
     source_ = std::move(slot.source);
     pipeline_ = std::move(slot.pipeline);
     currentRequest_ = slot.request;
     currentTarget_ = slot.target;
+    trackEndPosition_ = slot.endPosition;
     pendingFrameWrite_ = std::move(slot.pendingFrameWrite);
     hasCurrentTarget_ = true;
     loadedToEnd_ = false;
@@ -957,7 +1025,7 @@ private:
   }
 
   void publishPosition() {
-    updateClockFromQueue();
+    updateClockFromQueue(UnderrunReporting::Report);
     dispatchPosition(clock_.snapshot());
   }
 
@@ -986,9 +1054,12 @@ private:
     dispatcher_.dispatch(BackendEventType::PlaybackPositionUpdated, PlaybackPositionUpdated{snapshot});
   }
 
-  void updateClockFromQueue() {
+  enum class UnderrunReporting { Report, Suppress };
+
+  QueueUnderrunDelta updateClockFromQueue(UnderrunReporting underrunReporting = UnderrunReporting::Report) {
+    QueueUnderrunDelta underrun{};
     if (!queue_) {
-      return;
+      return underrun;
     }
 
     const auto counters = queue_->counters();
@@ -996,11 +1067,15 @@ private:
       clock_.consumeFrames(counters.consumedFrames - observedQueueCounters_.consumedFrames);
     }
     if (counters.silenceFrames > observedQueueCounters_.silenceFrames) {
-      const auto silenceDelta = counters.silenceFrames - observedQueueCounters_.silenceFrames;
-      clock_.reportUnderrun(silenceDelta);
-      emitBufferUnderrun(silenceDelta, counters.underrunCount - observedQueueCounters_.underrunCount);
+      underrun.silenceFrames = counters.silenceFrames - observedQueueCounters_.silenceFrames;
+      underrun.underrunCount = counters.underrunCount - observedQueueCounters_.underrunCount;
+      clock_.reportUnderrun(underrun.silenceFrames);
+      if (underrunReporting == UnderrunReporting::Report) {
+        emitBufferUnderrun(underrun.silenceFrames, underrun.underrunCount);
+      }
     }
     observedQueueCounters_ = counters;
+    return underrun;
   }
 
   void stopDevice() {

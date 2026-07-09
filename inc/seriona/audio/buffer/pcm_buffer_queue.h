@@ -61,16 +61,20 @@ private:
   [[nodiscard]] PcmBufferReadResult readReserved(void* destination,
                                                  std::uint32_t frameCount,
                                                  std::size_t requestedBytes,
-                                                 std::size_t copiedBytes) noexcept;
-  void copyIntoRing(const std::uint8_t* source, std::size_t byteCount) noexcept;
-  void copyOutOfRing(std::uint8_t* destination, std::size_t byteCount) noexcept;
+                                                 std::size_t copiedBytes,
+                                                 std::uint64_t readCursorBytes) noexcept;
+  void copyIntoRing(const std::uint8_t* source,
+                    std::size_t byteCount,
+                    std::size_t ringOffset) noexcept;
+  void copyOutOfRing(std::uint8_t* destination,
+                     std::size_t byteCount,
+                     std::size_t ringOffset) noexcept;
 
   std::vector<std::uint8_t> buffer_;
   std::uint32_t capacityFrames_{0};
   std::uint32_t bytesPerFrame_{0};
-  std::atomic<std::size_t> readOffset_{0};
-  std::atomic<std::size_t> writeOffset_{0};
-  std::atomic<std::size_t> usedBytes_{0};
+  std::atomic<std::uint64_t> readCursorBytes_{0};
+  std::atomic<std::uint64_t> writeCursorBytes_{0};
   std::atomic<std::uint64_t> submittedFrames_{0};
   std::atomic<std::uint64_t> consumedFrames_{0};
   std::atomic<std::uint64_t> overflowCount_{0};

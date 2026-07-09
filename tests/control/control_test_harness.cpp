@@ -224,11 +224,16 @@ void FakeFileScannerService::scan(const std::vector<scanner::ScannerRoot>& roots
 
 void FakeFileScannerService::startWatching(const std::vector<scanner::ScannerRoot>& roots) {
   ++startWatchingCalls_;
+  if (startWatchingException_) {
+    lastWatchingRoots_.reset();
+    std::rethrow_exception(startWatchingException_);
+  }
   lastWatchingRoots_ = roots;
 }
 
 void FakeFileScannerService::stopWatching() {
   ++stopWatchingCalls_;
+  lastWatchingRoots_.reset();
 }
 
 void FakeFileScannerService::stop() {
@@ -292,6 +297,14 @@ void FakeFileScannerService::emit(scanner::ScannerEvent event) {
 
 void FakeFileScannerService::setSnapshot(scanner::PlaylistTreeSnapshot snapshot) {
   snapshot_ = std::move(snapshot);
+}
+
+void FakeFileScannerService::startWatchingThrows(std::exception_ptr exception) noexcept {
+  startWatchingException_ = std::move(exception);
+}
+
+void FakeFileScannerService::startWatchingThrows(std::runtime_error exception) {
+  startWatchingException_ = std::make_exception_ptr(std::move(exception));
 }
 
 void FakeFileScannerService::blockScansUntilReleased() noexcept {

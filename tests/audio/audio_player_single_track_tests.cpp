@@ -416,4 +416,149 @@ TEST_CASE("audio_player_public_commands_enqueue_without_waiting_for_device_start
   player.setEventSink(BackendEventSink{});
 }
 
+TEST_CASE("audio_player_single_track seek reuses the open source after the file is removed") {
+  const auto path = sineFixture("audio_player_seek_reuses_open_source.wav", kSampleRate * 2U);
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  EventLog eventLog;
+  player.setEventSink(eventLog.sink());
+
+  AudioOutputConfig config{};
+  config.preferredDeviceId = "fake-device";
+  config.targetSampleRate = 48000;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 2;
+  config.bufferDuration = 150ms;
+  player.configureOutput(config);
+
+  const TrackPlaybackRequest request{.trackId = "seek-open-source",
+                                     .filePath = path,
+                                     .title = "Generated Fixture",
+                                     .artist = {},
+                                     .offset = std::nullopt,
+                                     .duration = std::nullopt,
+                                     .sampleRate = std::nullopt,
+                                     .bitDepth = std::nullopt,
+                                     .channels = std::nullopt,
+                                     .format = std::nullopt};
+
+  player.loadTrack(request);
+  waitForState(eventLog, PlaybackState::Ready);
+  REQUIRE(std::filesystem::remove(path));
+
+  player.seek(700ms);
+
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  auto afterSeek = player.queryPlaybackClock();
+  while (afterSeek.position < 700ms && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+    afterSeek = player.queryPlaybackClock();
+  }
+
+  const auto events = eventLog.snapshot();
+  CHECK(afterSeek.trackId == "seek-open-source");
+  CHECK(afterSeek.position >= 700ms);
+  CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackError &&
+           std::get<PlaybackError>(event.payload).code == PlaybackErrorCode::SeekFailed;
+  }));
+
+  player.setEventSink(BackendEventSink{});
+}
+
+TEST_CASE("audio_player_single_track ignores duration metadata as a hard stop when offset is absent") {
+  const auto path = sineFixture("audio_player_duration_without_offset.wav", kSampleRate * 2U);
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  EventLog eventLog;
+  player.setEventSink(eventLog.sink());
+
+  AudioOutputConfig config{};
+  config.preferredDeviceId = "fake-device";
+  config.targetSampleRate = 48000;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 2;
+  config.bufferDuration = 150ms;
+  player.configureOutput(config);
+
+  const TrackPlaybackRequest request{.trackId = "duration-without-offset",
+                                     .filePath = path,
+                                     .title = "Generated Fixture",
+                                     .artist = {},
+                                     .offset = std::nullopt,
+                                     .duration = 100ms,
+                                     .sampleRate = std::nullopt,
+                                     .bitDepth = std::nullopt,
+                                     .channels = std::nullopt,
+                                     .format = std::nullopt};
+
+  player.loadTrack(request);
+  waitForState(eventLog, PlaybackState::Ready);
+  player.play();
+  waitForState(eventLog, PlaybackState::Playing);
+
+  for (int index = 0; index < 6; ++index) {
+    fake->consumeFrames(2400U);
+    static_cast<void>(player.queryPlaybackClock());
+  }
+
+  const auto clock = player.queryPlaybackClock();
+  const auto events = eventLog.snapshot();
+  CHECK(clock.position >= 250ms);
+  CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackEnded;
+  }));
+
+  player.setEventSink(BackendEventSink{});
+}
+
+TEST_CASE("audio_player_single_track honors bounded segment duration when the segment starts at offset zero") {
+  const auto path = sineFixture("audio_player_bounded_segment_offset_zero.wav", kSampleRate * 2U);
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  EventLog eventLog;
+  player.setEventSink(eventLog.sink());
+
+  AudioOutputConfig config{};
+  config.preferredDeviceId = "fake-device";
+  config.targetSampleRate = 48000;
+  config.targetSampleFormat = AudioSampleFormat::Float32;
+  config.targetChannelCount = 2;
+  config.bufferDuration = 150ms;
+  player.configureOutput(config);
+
+  const TrackPlaybackRequest request{.trackId = "bounded-segment-offset-zero",
+                                     .filePath = path,
+                                     .title = "Generated Fixture",
+                                     .artist = {},
+                                     .offset = 0ms,
+                                     .duration = 100ms,
+                                     .sampleRate = std::nullopt,
+                                     .bitDepth = std::nullopt,
+                                     .channels = std::nullopt,
+                                     .format = std::nullopt,
+                                     .boundedSegment = true};
+
+  player.loadTrack(request);
+  waitForState(eventLog, PlaybackState::Ready);
+  player.play();
+  waitForState(eventLog, PlaybackState::Playing);
+
+  for (int index = 0; index < 6; ++index) {
+    fake->consumeFrames(2400U);
+    static_cast<void>(player.queryPlaybackClock());
+  }
+
+  const auto clock = player.queryPlaybackClock();
+  const auto events = eventLog.snapshot();
+  CHECK(clock.position <= 150ms);
+  CHECK(std::any_of(events.begin(), events.end(), [](const BackendEvent& event) {
+    return event.type == BackendEventType::PlaybackEnded;
+  }));
+
+  player.setEventSink(BackendEventSink{});
+}
+
 }

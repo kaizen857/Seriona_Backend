@@ -1,6 +1,7 @@
 #include "media_controller_module.h"
 
 #include "seriona/audio/audio_playback_service.h"
+#include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/control/media_controller.h"
 #include "seriona/metadata/metadata_contracts.h"
 #include "scanner/file_scanner_service_internal.h"
@@ -37,8 +38,28 @@ private:
   audio::PlaybackClockSnapshot clock_{};
 };
 
+class NoopFolderSortSettingsStore final : public FolderSortSettingsStore {
+public:
+  void upsert(FolderSortSetting) override {}
+  [[nodiscard]] std::optional<FolderSortSetting> load(const std::filesystem::path&, const std::string&) const override { return std::nullopt; }
+  void remove(const std::filesystem::path&, const std::string&) override {}
+  [[nodiscard]] std::vector<FolderSortSetting> list(const std::filesystem::path&) const override { return {}; }
+};
+
 [[nodiscard]] std::shared_ptr<audio::AudioPlaybackService> makeNoopAudioPlaybackService() {
   return std::make_shared<NoopAudioPlaybackService>();
+}
+
+[[nodiscard]] std::shared_ptr<FolderSortSettingsStore> makeNoopFolderSortSettingsStore() {
+  return std::make_shared<NoopFolderSortSettingsStore>();
+}
+
+[[nodiscard]] std::shared_ptr<FolderSortSettingsStore> makeFolderSortSettingsStore(std::filesystem::path databasePath) {
+  if (databasePath.empty()) {
+    return makeNoopFolderSortSettingsStore();
+  }
+  return std::shared_ptr<FolderSortSettingsStore>{makeSQLiteFolderSortSettingsStore(
+      FolderSortSettingsStoreConfig{.databasePath = std::move(databasePath)})};
 }
 
 [[nodiscard]] const char* backendKindText(metadata::MetadataBackendKind kind) {
@@ -70,6 +91,7 @@ MediaControllerDependencies makeDefaultMediaControllerDependencies() {
   dependencies.audio = makeNoopAudioPlaybackService();
   dependencies.scanner = scanner::makeFileScannerService();
   dependencies.metadata = metadata::makeMetadataSharingService(metadata::MetadataSharingOptions{});
+  dependencies.folderSortSettingsStore = makeNoopFolderSortSettingsStore();
   return dependencies;
 }
 
@@ -80,10 +102,12 @@ MediaControllerDependencies makeProductionMediaControllerDependencies(
   MediaControllerDependencies dependencies{};
   dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend());
   scanner::FileScannerServiceDependencies scannerDeps{};
+  auto sortSettingsDatabasePath = databasePath;
   scannerDeps.databasePath = std::move(databasePath);
   scannerDeps.coverExportDir = std::move(coverExportDir);
   dependencies.scanner = scanner::makeFileScannerService(std::move(scannerDeps));
   dependencies.metadata = metadata::makeMetadataSharingService(makeProductionMetadataOptions());
+  dependencies.folderSortSettingsStore = makeFolderSortSettingsStore(std::move(sortSettingsDatabasePath));
   return dependencies;
 }
 
@@ -109,6 +133,9 @@ void normalizeMediaControllerDependencies(MediaControllerDependencies& dependenc
   if (!dependencies.metadata) {
     dependencies.metadata = metadata::makeMetadataSharingService(metadata::MetadataSharingOptions{});
     spdlog::info("selected noop metadata backend (missing dependency)");
+  }
+  if (!dependencies.folderSortSettingsStore) {
+    dependencies.folderSortSettingsStore = makeNoopFolderSortSettingsStore();
   }
 }
 
