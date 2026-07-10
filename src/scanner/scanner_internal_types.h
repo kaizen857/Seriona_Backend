@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <optional>
+#include <string>
 
 namespace seriona::scanner {
 
@@ -14,6 +15,17 @@ enum class NodeType {
   Song,
   CueContainer,
   CueTrack,
+};
+
+enum class ScanItemOrigin {
+  CacheHit,
+  CueTrackCacheHit,
+  RescannedChanged,
+  ScannedNew,
+  ScannedFull,
+  CueTrackRescannedChanged,
+  CueTrackScannedNew,
+  VirtualContainer,
 };
 
 struct CueInfo {
@@ -30,6 +42,8 @@ struct IndexedPublishedSong {
   std::filesystem::path treeRelativePath;
   NodeType nodeType{NodeType::Song};
   std::optional<CueInfo> cueInfo;
+  ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+  std::optional<std::string> locationId;
   std::atomic<bool> filled{false};
   std::atomic<bool> needsScan{true};
   bool isVirtualFolder{false};
@@ -45,6 +59,8 @@ struct IndexedPublishedSong {
         treeRelativePath(std::move(other.treeRelativePath)),
         nodeType(other.nodeType),
         cueInfo(std::move(other.cueInfo)),
+        origin(other.origin),
+        locationId(std::move(other.locationId)),
         filled(other.filled.load()),
         needsScan(other.needsScan.load()),
         isVirtualFolder(other.isVirtualFolder) {}
@@ -56,6 +72,8 @@ struct IndexedPublishedSong {
       treeRelativePath = std::move(other.treeRelativePath);
       nodeType = other.nodeType;
       cueInfo = std::move(other.cueInfo);
+      origin = other.origin;
+      locationId = std::move(other.locationId);
       filled.store(other.filled.load());
       needsScan.store(other.needsScan.load());
       isVirtualFolder = other.isVirtualFolder;

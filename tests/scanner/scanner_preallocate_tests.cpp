@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -75,6 +76,18 @@ struct ScanEvents {
       return scanCompletedCount > initialCount;
     });
   }
+
+  [[nodiscard]] std::size_t completedCount() {
+    std::lock_guard lock{mutex};
+    return scanCompletedCount;
+  }
+
+  [[nodiscard]] bool waitForScanCompletionAfter(std::size_t initialCount, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{mutex};
+    return cv.wait_for(lock, timeout, [this, initialCount] {
+      return scanCompletedCount > initialCount;
+    });
+  }
 };
 
 [[nodiscard]] RawTagMetadata makeMetadata(std::string title) {
@@ -95,11 +108,14 @@ TEST_CASE("IndexedPublishedSong: preallocated array supports CueContainer nodes"
   
   nodes[0].discoveryIndex = 0;
   nodes[0].nodeType = NodeType::CueContainer;
+  nodes[0].origin = ScanItemOrigin::VirtualContainer;
   nodes[0].isVirtualFolder = true;
   nodes[0].treeRelativePath = "album.cue";
   
   nodes[1].discoveryIndex = 1;
   nodes[1].nodeType = NodeType::CueTrack;
+  nodes[1].origin = ScanItemOrigin::CueTrackCacheHit;
+  nodes[1].locationId = "cue-track-cache-location";
   nodes[1].cueInfo = CueInfo{
     .cueFilePath = "album.cue",
     .audioFilePath = "album.flac",
@@ -119,12 +135,106 @@ TEST_CASE("IndexedPublishedSong: preallocated array supports CueContainer nodes"
   };
   
   CHECK(nodes[0].nodeType == NodeType::CueContainer);
+  CHECK(nodes[0].origin == ScanItemOrigin::VirtualContainer);
   CHECK(nodes[0].isVirtualFolder == true);
   CHECK(nodes[1].nodeType == NodeType::CueTrack);
+  CHECK(nodes[1].origin == ScanItemOrigin::CueTrackCacheHit);
+  REQUIRE(nodes[1].locationId.has_value());
+  CHECK(*nodes[1].locationId == "cue-track-cache-location");
   CHECK(nodes[1].cueInfo.has_value());
   CHECK(nodes[1].cueInfo->trackIndex == 0);
   CHECK(nodes[2].nodeType == NodeType::CueTrack);
   CHECK(nodes[2].cueInfo->trackIndex == 1);
+}
+
+TEST_CASE("reconcileRoot: worker-filled song keeps default origin and computed location id") {
+  test::TempScannerRoot temp{"scanner-preallocate-worker-origin"};
+
+  const auto audioFile = temp.path() / "worker-origin.flac";
+  std::ofstream{audioFile} << "worker origin audio";
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(audioFile, makeMetadata("Worker Origin"));
+
+  std::vector<ScanItemOrigin> observedOrigins;
+  std::vector<std::optional<std::string>> observedLocationIds;
+  setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
+    for (const auto& node : nodes) {
+      if (node.nodeType == NodeType::Song) {
+        observedOrigins.push_back(node.origin);
+        observedLocationIds.push_back(node.locationId);
+      }
+    }
+  });
+
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+    .metadataReader = reader,
+    .databasePath = temp.dbPath(),
+    .coverExportDir = temp.path() / "covers"
+  });
+
+  ScanEvents events;
+  service->setEventSink([&events](ScannerEvent event) {
+    events.onEvent(event);
+  });
+
+  const auto beforeScan = events.completedCount();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+  clearPreallocationObserver();
+
+  REQUIRE(observedOrigins.size() == 1);
+  CHECK(observedOrigins[0] == ScanItemOrigin::ScannedFull);
+  REQUIRE(observedLocationIds.size() == 1);
+  REQUIRE(observedLocationIds[0].has_value());
+  CHECK_FALSE(observedLocationIds[0]->empty());
+}
+
+TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location id") {
+  test::TempScannerRoot temp{"scanner-preallocate-cache-hit-origin"};
+
+  const auto audioFile = temp.path() / "cached-origin.flac";
+  std::ofstream{audioFile} << "cached origin audio";
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(audioFile, makeMetadata("Cached Origin"));
+
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+    .metadataReader = reader,
+    .databasePath = temp.dbPath(),
+    .coverExportDir = temp.path() / "covers"
+  });
+
+  ScanEvents events;
+  service->setEventSink([&events](ScannerEvent event) {
+    events.onEvent(event);
+  });
+
+  auto beforeScan = events.completedCount();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+
+  std::vector<ScanItemOrigin> observedOrigins;
+  std::vector<std::optional<std::string>> observedLocationIds;
+  setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
+    for (const auto& node : nodes) {
+      if (node.nodeType == NodeType::Song) {
+        observedOrigins.push_back(node.origin);
+        observedLocationIds.push_back(node.locationId);
+      }
+    }
+  });
+
+  beforeScan = events.completedCount();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+  clearPreallocationObserver();
+
+  REQUIRE(observedOrigins.size() == 1);
+  CHECK(observedOrigins[0] == ScanItemOrigin::CacheHit);
+  REQUIRE(observedLocationIds.size() == 1);
+  REQUIRE(observedLocationIds[0].has_value());
+  CHECK_FALSE(observedLocationIds[0]->empty());
 }
 
 TEST_CASE("IndexedPublishedSong: CueContainer with 0 tracks creates single node") {

@@ -906,6 +906,8 @@ private:
     struct PublishedSong {
       cache::CachedSong song;
       std::filesystem::path treeRelativePath;
+      ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+      std::optional<std::string> locationId;
     };
 
     std::vector<PublishedSong> songs;
@@ -920,16 +922,22 @@ private:
     std::optional<cache::CachedSong> cachedSong;
   };
 
+  struct WorkerSongPublication {
+    cache::CachedSong song;
+    ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+    std::optional<std::string> locationId;
+  };
+
   struct WorkerSongStore {
     std::mutex mutex;
-    std::map<std::string, cache::CachedSong> songsByPath;
+    std::map<std::string, WorkerSongPublication> songsByPath;
 
-    void put(const std::filesystem::path& path, cache::CachedSong song) {
+    void put(const std::filesystem::path& path, WorkerSongPublication song) {
       std::scoped_lock lock{mutex};
       songsByPath[pathKey(path)] = std::move(song);
     }
 
-    [[nodiscard]] std::optional<cache::CachedSong> take(const std::filesystem::path& path) {
+    [[nodiscard]] std::optional<WorkerSongPublication> take(const std::filesystem::path& path) {
       std::scoped_lock lock{mutex};
       const auto iterator = songsByPath.find(pathKey(path));
       if (iterator == songsByPath.end()) {
@@ -1057,6 +1065,7 @@ private:
           indexedSongs[cueContainerIndex].discoveryIndex = cueContainerIndex;
           indexedSongs[cueContainerIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
           indexedSongs[cueContainerIndex].nodeType = NodeType::CueContainer;
+          indexedSongs[cueContainerIndex].origin = ScanItemOrigin::VirtualContainer;
           indexedSongs[cueContainerIndex].isVirtualFolder = true;
           continue;
         }
@@ -1067,6 +1076,7 @@ private:
         indexedSongs[cueContainerIndex].discoveryIndex = cueContainerIndex;
         indexedSongs[cueContainerIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
         indexedSongs[cueContainerIndex].nodeType = NodeType::CueContainer;
+        indexedSongs[cueContainerIndex].origin = ScanItemOrigin::VirtualContainer;
         indexedSongs[cueContainerIndex].isVirtualFolder = true;
         
         const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
@@ -1128,6 +1138,8 @@ private:
             hydratedSong.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
             applyCachedLocation(hydratedSong, *cachedLocation, entry.path);
             indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, std::move(hydratedSong), relativePathFor(rootPath, entry.path)};
+            indexedSongs[currentDiscoveryIndex].origin = ScanItemOrigin::CacheHit;
+            indexedSongs[currentDiscoveryIndex].locationId = cachedLocation->locationId;
             indexedSongs[currentDiscoveryIndex].filled.store(true);
             shouldProcessViaWorker = false;
           }
@@ -1179,13 +1191,15 @@ private:
                                                                auto song = workerSongs->take(task.filePath);
                                                                if (song.has_value()) {
                                                                  indexedSongs[task.nodeIndex].discoveryIndex = task.nodeIndex;
-                                                                 indexedSongs[task.nodeIndex].song = std::move(*song);
+                                                                 indexedSongs[task.nodeIndex].song = std::move(song->song);
+                                                                 indexedSongs[task.nodeIndex].origin = song->origin;
+                                                                 indexedSongs[task.nodeIndex].locationId = std::move(song->locationId);
                                                                  indexedSongs[task.nodeIndex].treeRelativePath = relativePathFor(rootPath, task.filePath);
                                                                  indexedSongs[task.nodeIndex].filled.store(true);
-                                                                } else {
-                                                                  spdlog::debug("Worker callback: take() returned nullopt for task.filePath={}, nodeIndex={}", 
+                                                               } else {
+                                                                 spdlog::debug("Worker callback: take() returned nullopt for task.filePath={}, nodeIndex={}",
                                                                                task.filePath.generic_string(), task.nodeIndex);
-                                                                }
+                                                               }
                                                              } else {
                                                                spdlog::error("Worker callback: task.nodeIndex={} >= indexedSongs.size()={}", 
                                                                             task.nodeIndex, indexedSongs.size());
@@ -1204,7 +1218,9 @@ private:
       if (!workResult.error && workResult.metadata.has_value() && nodeIdx < indexedSongs.size()) {
         auto song = workerSongs->take(workResult.filePath);
         if (song.has_value()) {
-          indexedSongs[nodeIdx].song = std::move(*song);
+          indexedSongs[nodeIdx].song = std::move(song->song);
+          indexedSongs[nodeIdx].origin = song->origin;
+          indexedSongs[nodeIdx].locationId = std::move(song->locationId);
           indexedSongs[nodeIdx].treeRelativePath = relativePathFor(rootPath, workResult.filePath);
           indexedSongs[nodeIdx].filled.store(true);
         } else {
@@ -1227,10 +1243,16 @@ private:
       if (indexedSong.nodeType == NodeType::CueContainer) {
         indexedSong.song.metadata.filePath = indexedSong.treeRelativePath;
         indexedSong.song.metadata.logicalTrackId = indexedSong.treeRelativePath.generic_string();
-        result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
+        result.songs.push_back({.song = std::move(indexedSong.song),
+                                .treeRelativePath = std::move(indexedSong.treeRelativePath),
+                                .origin = indexedSong.origin,
+                                .locationId = std::move(indexedSong.locationId)});
         ++filledCount;
       } else if (indexedSong.filled.load()) {
-        result.songs.push_back({.song = std::move(indexedSong.song), .treeRelativePath = std::move(indexedSong.treeRelativePath)});
+        result.songs.push_back({.song = std::move(indexedSong.song),
+                                .treeRelativePath = std::move(indexedSong.treeRelativePath),
+                                .origin = indexedSong.origin,
+                                .locationId = std::move(indexedSong.locationId)});
         ++filledCount;
       } else {
         ++unfilledCount;
@@ -1249,7 +1271,6 @@ private:
       reconcileLyrics(publishedSong.song, config.scanner, result.errors, skipped);
     }
     
-    const auto directoryHash = hashDirectoryMerkle(rootPath);
     phase4End = std::chrono::steady_clock::now();
     
     // V3 Cache: No need for saveRoot, data is already saved via upsertContent/upsertLocation
@@ -1262,7 +1283,7 @@ private:
     const auto phase5Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase5End - phase4End).count();
     const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(phase5End - phaseStart).count();
 
-    spdlog::info("reconcileRoot phase timing for {}: total={}ms | discovery={}ms | task-prep={}ms | worker-wait={}ms | final-hash={}ms | cache-save={}ms",
+    spdlog::info("reconcileRoot phase timing for {}: total={}ms | discovery={}ms | task-prep={}ms | worker-wait={}ms | finalize={}ms | cache-save={}ms",
                  rootPath.generic_string(), totalMs, phase1Ms, phase2Ms, phase3Ms, phase4Ms, phase5Ms);
 
     return result;
@@ -1342,7 +1363,10 @@ private:
           song.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
           applyCachedLocation(song, *cachedLocation, task.filePath);
           auto metadata = song.metadata;
-          workerSongs->put(task.filePath, std::move(song));
+          workerSongs->put(task.filePath,
+                           WorkerSongPublication{.song = std::move(song),
+                                                 .origin = ScanItemOrigin::CacheHit,
+                                                 .locationId = cachedLocation->locationId});
           return metadata;
         }
       }
@@ -1370,7 +1394,11 @@ private:
     song.metadata.trackId = task.filePath.generic_string();
     song.metadata.logicalTrackId = task.filePath.generic_string();
     auto metadata = song.metadata;
-    workerSongs->put(task.filePath, std::move(song));
+    workerSongs->put(task.filePath,
+                     WorkerSongPublication{.song = std::move(song),
+                                           .origin = ScanItemOrigin::ScannedFull,
+                                           .locationId = task.locationId.empty() ? std::optional<std::string>{}
+                                                                              : std::optional<std::string>{task.locationId}});
     return metadata;
   }
 

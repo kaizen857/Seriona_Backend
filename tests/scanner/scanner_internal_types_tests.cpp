@@ -33,6 +33,17 @@ TEST_CASE("scanner internal node type and cue info expose stable fields") {
   CHECK(cueInfo.trackIndex == 2U);
 }
 
+TEST_CASE("scanner internal scan item origin exposes stable variants") {
+  CHECK(ScanItemOrigin::CacheHit == ScanItemOrigin::CacheHit);
+  CHECK(ScanItemOrigin::CueTrackCacheHit == ScanItemOrigin::CueTrackCacheHit);
+  CHECK(ScanItemOrigin::RescannedChanged == ScanItemOrigin::RescannedChanged);
+  CHECK(ScanItemOrigin::ScannedNew == ScanItemOrigin::ScannedNew);
+  CHECK(ScanItemOrigin::ScannedFull == ScanItemOrigin::ScannedFull);
+  CHECK(ScanItemOrigin::CueTrackRescannedChanged == ScanItemOrigin::CueTrackRescannedChanged);
+  CHECK(ScanItemOrigin::CueTrackScannedNew == ScanItemOrigin::CueTrackScannedNew);
+  CHECK(ScanItemOrigin::VirtualContainer == ScanItemOrigin::VirtualContainer);
+}
+
 TEST_CASE("NodeType distinguishes Song, CueContainer, and CueTrack") {
   const auto song = NodeType::Song;
   const auto cueContainer = NodeType::CueContainer;
@@ -66,6 +77,8 @@ TEST_CASE("IndexedPublishedSong default initialization sets Song nodeType") {
 
   CHECK(indexed.nodeType == NodeType::Song);
   CHECK_FALSE(indexed.cueInfo.has_value());
+  CHECK(indexed.origin == ScanItemOrigin::ScannedFull);
+  CHECK_FALSE(indexed.locationId.has_value());
   CHECK_FALSE(indexed.filled.load());
   CHECK(indexed.needsScan.load());
   CHECK_FALSE(indexed.isVirtualFolder);
@@ -109,6 +122,8 @@ TEST_CASE("IndexedPublishedSong atomic needsScan flag defaults to true") {
 TEST_CASE("IndexedPublishedSong move constructor transfers atomic state") {
   IndexedPublishedSong source{};
   source.nodeType = NodeType::CueContainer;
+  source.origin = ScanItemOrigin::VirtualContainer;
+  source.locationId = "virtual-container-location";
   source.filled.store(true);
   source.needsScan.store(false);
   source.isVirtualFolder = true;
@@ -116,6 +131,9 @@ TEST_CASE("IndexedPublishedSong move constructor transfers atomic state") {
   IndexedPublishedSong moved{std::move(source)};
 
   CHECK(moved.nodeType == NodeType::CueContainer);
+  CHECK(moved.origin == ScanItemOrigin::VirtualContainer);
+  REQUIRE(moved.locationId.has_value());
+  CHECK(*moved.locationId == "virtual-container-location");
   CHECK(moved.filled.load());
   CHECK_FALSE(moved.needsScan.load());
   CHECK(moved.isVirtualFolder);
@@ -124,6 +142,8 @@ TEST_CASE("IndexedPublishedSong move constructor transfers atomic state") {
 TEST_CASE("IndexedPublishedSong move assignment transfers atomic state") {
   IndexedPublishedSong source{};
   source.nodeType = NodeType::Directory;
+  source.origin = ScanItemOrigin::CacheHit;
+  source.locationId = "cached-location-id";
   source.filled.store(true);
   source.needsScan.store(false);
   source.isVirtualFolder = true;
@@ -132,6 +152,9 @@ TEST_CASE("IndexedPublishedSong move assignment transfers atomic state") {
   target = std::move(source);
 
   CHECK(target.nodeType == NodeType::Directory);
+  CHECK(target.origin == ScanItemOrigin::CacheHit);
+  REQUIRE(target.locationId.has_value());
+  CHECK(*target.locationId == "cached-location-id");
   CHECK(target.filled.load());
   CHECK_FALSE(target.needsScan.load());
   CHECK(target.isVirtualFolder);
@@ -320,6 +343,8 @@ TEST_CASE("IndexedPublishedSong move constructor with default-initialized source
   IndexedPublishedSong moved{std::move(source)};
 
   CHECK(moved.nodeType == NodeType::Song);
+  CHECK(moved.origin == ScanItemOrigin::ScannedFull);
+  CHECK_FALSE(moved.locationId.has_value());
   CHECK_FALSE(moved.filled.load());
   CHECK(moved.needsScan.load());
   CHECK_FALSE(moved.isVirtualFolder);

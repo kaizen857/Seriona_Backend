@@ -62,8 +62,8 @@ TEST_CASE("scan mode decision returns full when directory tree hash changes") {
   const auto firstDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
   REQUIRE(firstDecision.directoryTreeHash.has_value());
   auto cache = openScanRootCache(databasePath);
-  cache.updateScanRoot(scanRootRecord(rootPathFor(ScannerRoot{.path = temp.path()}), firstDecision, 1U,
-                                      std::chrono::milliseconds{5}));
+  const auto rootPath = rootPathFor(ScannerRoot{.path = temp.path()});
+  cache.updateScanRoot(scanRootRecord(rootPath, firstDecision, 1U, std::chrono::milliseconds{5}));
 
   const auto newAudioPath = test::writeAudioFixture(temp.path(), "new-song.flac");
   const auto changedDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
@@ -73,6 +73,15 @@ TEST_CASE("scan mode decision returns full when directory tree hash changes") {
   CHECK(changedDecision.mode == ScanMode::Full);
   REQUIRE(changedDecision.directoryTreeHash.has_value());
   CHECK(*changedDecision.directoryTreeHash != *firstDecision.directoryTreeHash);
+  const auto staleScanRoot = cache.loadScanRoot(rootPath);
+  REQUIRE(staleScanRoot.has_value());
+  CHECK(staleScanRoot->directoryTreeHash == *firstDecision.directoryTreeHash);
+
+  cache.updateScanRoot(scanRootRecord(rootPath, changedDecision, 2U, std::chrono::milliseconds{7}));
+  const auto refreshedDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
+
+  CHECK(refreshedDecision.mode == ScanMode::Incremental);
+  CHECK(refreshedDecision.directoryTreeHash == changedDecision.directoryTreeHash);
 }
 
 TEST_CASE("scan mode decision preserves explicit full request") {

@@ -81,6 +81,17 @@ public:
     return songs;
   }
 
+  [[nodiscard]] std::vector<ScanProgress> progressEvents() const {
+    std::lock_guard lock{mutex_};
+    std::vector<ScanProgress> progresses;
+    for (const auto& event : events_) {
+      if (event.type == ScannerEventType::ProgressUpdated && std::holds_alternative<ScanProgress>(event.payload)) {
+        progresses.push_back(std::get<ScanProgress>(event.payload));
+      }
+    }
+    return progresses;
+  }
+
 private:
   mutable std::mutex mutex_;
   std::vector<ScannerEvent> events_;
@@ -271,6 +282,82 @@ TEST_CASE("scanner incremental e2e covers full unchanged changed added and delet
             << "final_playlist_songs=" << songs.size() << '\n';
 }
 
+TEST_CASE("scanner incremental e2e characterizes cache-hit FileScanned events") {
+  test::TempScannerRoot temp{"scanner-incremental-cache-hit-events"};
+  const auto audio = test::writeAudioFixture(temp.path(), "stable.flac");
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(audio, rawMetadata("Stable"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 1U;
+  });
+  auto songs = songsIn(full.snapshot);
+
+  REQUIRE(songs.size() == 1U);
+  CHECK(reader->readCount() == 1U);
+
+  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                          [](const PlaylistTreeSnapshot& snapshot) {
+                                            return songsIn(snapshot).size() == 1U;
+                                          });
+  songs = songsIn(incremental.snapshot);
+
+  REQUIRE(songs.size() == 1U);
+  CHECK(reader->readCount() == 1U);
+  const auto fileScannedSongs = eventLog.fileScannedSongs();
+  REQUIRE(fileScannedSongs.size() == 2U);
+  CHECK(fileScannedSongs[0].filePath == audio);
+  CHECK(fileScannedSongs[1].filePath == audio);
+}
+
+TEST_CASE("scanner incremental e2e relies on scan-root directory tree hash before cache hit") {
+  test::TempScannerRoot temp{"scanner-incremental-scan-root-hash"};
+  const auto audio = test::writeAudioFixture(temp.path(), "stable.flac");
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(audio, rawMetadata("Stable Before Stale Hash"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 1U;
+  });
+  auto songs = songsIn(full.snapshot);
+
+  REQUIRE(songs.size() == 1U);
+  CHECK(songByPath(songs, audio).title == "Stable Before Stale Hash");
+  CHECK(reader->readCount() == 1U);
+
+  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto rootPath = canonicalRootPath(temp.path());
+  auto scanRoot = sidecar.loadScanRoot(rootPath);
+  REQUIRE(scanRoot.has_value());
+  CHECK_FALSE(scanRoot->directoryTreeHash.empty());
+  scanRoot->directoryTreeHash = "stale-directory-tree-hash";
+  sidecar.updateScanRoot(*scanRoot);
+
+  reader->put(audio, rawMetadata("Stable After Stale Hash"));
+  const auto fallbackFull = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                           [](const PlaylistTreeSnapshot& snapshot) {
+                                             return songsIn(snapshot).size() == 1U;
+                                           });
+  songs = songsIn(fallbackFull.snapshot);
+
+  REQUIRE(songs.size() == 1U);
+  const auto progressEvents = eventLog.progressEvents();
+  REQUIRE(progressEvents.size() >= 2U);
+  CHECK(progressEvents.back().filesScanned == 1U);
+  CHECK(progressEvents.back().filesSkipped == 0U);
+  const auto currentTreeHash = computeDirectoryTreeHash(rootPath);
+  REQUIRE(currentTreeHash.hash.has_value());
+  const auto refreshedScanRoot = sidecar.loadScanRoot(rootPath);
+  REQUIRE(refreshedScanRoot.has_value());
+  CHECK(refreshedScanRoot->directoryTreeHash == *currentTreeHash.hash);
+}
+
 TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nodes") {
   test::TempScannerRoot temp{"scanner-incremental-cue-cache"};
   const auto cueFile = temp.path() / "album.cue";
@@ -314,6 +401,24 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
   REQUIRE(songs.size() == 3U);
   CHECK(std::ranges::count(songs, cueFile, &SongMetadata::filePath) == 2U);
   CHECK(songByPath(songs, standalone).title == "Bonus Track");
+  std::vector<SongMetadata> cueTracks;
+  for (const auto& song : songs) {
+    if (song.filePath == cueFile) {
+      cueTracks.push_back(song);
+    }
+  }
+  std::ranges::sort(cueTracks, {}, &SongMetadata::offset);
+  REQUIRE(cueTracks.size() == 2U);
+  CHECK(cueTracks[0].sourceFilePath == referencedAudio);
+  CHECK(cueTracks[0].logicalTrackId == cueFile.generic_string() + "#track0");
+  CHECK(cueTracks[0].trackId == cueTracks[0].logicalTrackId);
+  CHECK(cueTracks[0].offset == std::chrono::milliseconds{0});
+  CHECK(cueTracks[0].duration == std::chrono::milliseconds{180000});
+  CHECK(cueTracks[1].sourceFilePath == referencedAudio);
+  CHECK(cueTracks[1].logicalTrackId == cueFile.generic_string() + "#track1");
+  CHECK(cueTracks[1].trackId == cueTracks[1].logicalTrackId);
+  CHECK(cueTracks[1].offset == std::chrono::milliseconds{180000});
+  CHECK(cueTracks[1].duration == std::chrono::milliseconds{200000});
 
   cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());

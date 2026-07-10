@@ -6,6 +6,7 @@
 #include "seriona/scanner/directory_tree_hash.h"
 
 #include <doctest.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <chrono>
@@ -128,8 +129,12 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
                                                                .coverExportDir = temp.path() / "covers"});
 }
 
+[[nodiscard]] std::filesystem::path scannerSidecarPath(const std::filesystem::path& databasePath) {
+  return std::filesystem::path{databasePath.generic_string() + ".scan-roots-v3.sqlite"};
+}
+
 [[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
-  return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots-v3.sqlite"};
+  return scannerSidecarPath(temp.dbPath());
 }
 
 [[nodiscard]] std::filesystem::path canonicalRootPath(const std::filesystem::path& path) {
@@ -282,6 +287,67 @@ private:
   std::vector<ScannerEvent> events_;
 };
 
+class SqliteReadHandle final {
+public:
+  explicit SqliteReadHandle(const std::filesystem::path& databasePath) {
+    const auto path = databasePath.generic_string();
+    REQUIRE(sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK);
+  }
+
+  ~SqliteReadHandle() {
+    if (db_ != nullptr) {
+      static_cast<void>(sqlite3_close(db_));
+    }
+  }
+
+  SqliteReadHandle(const SqliteReadHandle&) = delete;
+  SqliteReadHandle& operator=(const SqliteReadHandle&) = delete;
+
+  [[nodiscard]] sqlite3* get() const noexcept { return db_; }
+
+private:
+  sqlite3* db_{};
+};
+
+[[nodiscard]] std::vector<std::string> sqliteTableNames(sqlite3* db) {
+  sqlite3_stmt* statement = nullptr;
+  REQUIRE(sqlite3_prepare_v2(db,
+                             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;",
+                             -1,
+                             &statement,
+                             nullptr) == SQLITE_OK);
+  std::vector<std::string> names;
+  while (sqlite3_step(statement) == SQLITE_ROW) {
+    const auto* name = sqlite3_column_text(statement, 0);
+    names.emplace_back(reinterpret_cast<const char*>(name));
+  }
+  REQUIRE(sqlite3_finalize(statement) == SQLITE_OK);
+  return names;
+}
+
+[[nodiscard]] int sqliteUserVersion(sqlite3* db) {
+  sqlite3_stmt* statement = nullptr;
+  REQUIRE(sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &statement, nullptr) == SQLITE_OK);
+  REQUIRE(sqlite3_step(statement) == SQLITE_ROW);
+  const auto version = sqlite3_column_int(statement, 0);
+  REQUIRE(sqlite3_finalize(statement) == SQLITE_OK);
+  return version;
+}
+
+[[nodiscard]] int tableRowCount(sqlite3* db, const std::string& tableName) {
+  sqlite3_stmt* statement = nullptr;
+  const std::string sql = "SELECT COUNT(*) FROM " + tableName + ";";
+  REQUIRE(sqlite3_prepare_v2(db, sql.c_str(), -1, &statement, nullptr) == SQLITE_OK);
+  REQUIRE(sqlite3_step(statement) == SQLITE_ROW);
+  const auto count = sqlite3_column_int(statement, 0);
+  REQUIRE(sqlite3_finalize(statement) == SQLITE_OK);
+  return count;
+}
+
+[[nodiscard]] std::vector<std::string> scannerSchemaTables() {
+  return {"content", "locations", "lyrics", "scan_errors", "scan_roots"};
+}
+
 class ScopedEnvVar {
 public:
   ScopedEnvVar(std::string name, std::string value) : name_{std::move(name)} {
@@ -335,6 +401,80 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   CHECK(reader->readCount() == 2U);
   CHECK(cachedSongs[1].effectiveLyricsSource == LyricsSource::ExternalLrc);
   CHECK(cachedSongs[1].effectiveLyrics[0].text == "external one");
+}
+
+TEST_CASE("scanner service runScan characterizes main database scanner schema side effect") {
+  test::TempScannerRoot temp{"scanner-service-main-db-schema"};
+  const auto databasePath = temp.dbPath("scanner-main.sqlite");
+  const auto sidecarPath = scannerSidecarPath(databasePath);
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Song"));
+  auto service = makeFileScannerService(FileScannerServiceDependencies{.metadataReader = reader,
+                                                                       .watcherFactory = nullptr,
+                                                                       .databasePath = databasePath,
+                                                                       .coverExportDir = temp.path() / "covers"});
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  CHECK_FALSE(std::filesystem::exists(databasePath));
+  CHECK_FALSE(std::filesystem::exists(sidecarPath));
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(reader->readCount() == 1U);
+  REQUIRE(std::filesystem::exists(databasePath));
+  REQUIRE(std::filesystem::exists(sidecarPath));
+
+  SqliteReadHandle mainDatabase{databasePath};
+  CHECK(sqliteUserVersion(mainDatabase.get()) == 3);
+  CHECK(sqliteTableNames(mainDatabase.get()) == scannerSchemaTables());
+  CHECK(tableRowCount(mainDatabase.get(), "locations") == 0);
+
+  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = sidecarPath}};
+  const auto rootPath = canonicalRootPath(temp.path());
+  CHECK(sidecar.loadScanRoot(rootPath).has_value());
+  CHECK(sidecar.loadLocationsByRoot(rootPath).size() == 1U);
+}
+
+TEST_CASE("scanner service clears stale external lrc after a cached song sees malformed sidecar") {
+  test::TempScannerRoot temp{"scanner-service-stale-lrc-cleanup"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  writeText(temp.path() / "song.lrc", "[00:01.00]external valid\n");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Song", {RawTagLyricLine{std::chrono::milliseconds{300}, "embedded fallback"}}));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "external valid");
+  CHECK(reader->readCount() == 1U);
+
+  writeText(temp.path() / "song.lrc", "[00:99.00]malformed stale external\n");
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  songs = songsIn(service->snapshot());
+
+  CHECK(reader->readCount() == 1U);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "embedded fallback");
+  CHECK(std::ranges::none_of(songs[0].effectiveLyrics, [](const LyricLine& line) {
+    return line.text == "external valid" || line.text == "malformed stale external";
+  }));
+  CHECK(std::ranges::any_of(eventLog.errors(), [](const ScannerError& error) {
+    return error.message == "failed to parse external lyrics";
+  }));
 }
 
 TEST_CASE("scanner service cache lookup reuses a high-count cached root") {

@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -140,16 +141,22 @@ TEST_CASE("CUE nodes: multi-track CUE creates container + tracks with complete s
   std::size_t observedContainerCount = 0;
   std::size_t observedTrackCount = 0;
   std::vector<NodeType> nodeSequence;
+  std::vector<ScanItemOrigin> originSequence;
+  std::vector<std::optional<std::string>> locationIdSequence;
   std::vector<cache::CachedSong> trackSongs;
   std::vector<CueInfo> trackCueInfos;
   
   setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
     for (const auto& node : nodes) {
       nodeSequence.push_back(node.nodeType);
+      originSequence.push_back(node.origin);
+      locationIdSequence.push_back(node.locationId);
       
       if (node.nodeType == NodeType::CueContainer) {
         ++observedContainerCount;
         CHECK(node.isVirtualFolder == true);
+        CHECK(node.origin == ScanItemOrigin::VirtualContainer);
+        CHECK_FALSE(node.locationId.has_value());
       } else if (node.nodeType == NodeType::CueTrack) {
         ++observedTrackCount;
         REQUIRE(node.cueInfo.has_value());
@@ -184,6 +191,13 @@ TEST_CASE("CUE nodes: multi-track CUE creates container + tracks with complete s
   CHECK(nodeSequence[1] == NodeType::CueTrack);
   CHECK(nodeSequence[2] == NodeType::CueTrack);
   CHECK(nodeSequence[3] == NodeType::CueTrack);
+  REQUIRE(originSequence.size() == 4);
+  CHECK(originSequence[0] == ScanItemOrigin::VirtualContainer);
+  CHECK(originSequence[1] == ScanItemOrigin::ScannedFull);
+  CHECK(originSequence[2] == ScanItemOrigin::ScannedFull);
+  CHECK(originSequence[3] == ScanItemOrigin::ScannedFull);
+  REQUIRE(locationIdSequence.size() == 4);
+  CHECK_FALSE(locationIdSequence[0].has_value());
   
   // Verify CueInfo population
   REQUIRE(trackCueInfos.size() == 3);

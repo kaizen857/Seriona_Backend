@@ -1209,7 +1209,7 @@ add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_test
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
-add_test(NAME seriona.scanner_internal_types COMMAND seriona_scanner_internal_types_tests --test-case="scanner internal node type and cue info expose stable fields")
+add_test(NAME seriona.scanner.internal_types COMMAND seriona_scanner_internal_types_tests)
 add_test(NAME seriona.metadata_contract COMMAND seriona_metadata_contract_tests)
 add_test(NAME seriona.metadata_mapper COMMAND seriona_metadata_mapper_tests)
 add_test(NAME seriona.metadata_service COMMAND seriona_metadata_service_tests)
