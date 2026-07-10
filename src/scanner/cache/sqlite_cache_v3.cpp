@@ -250,10 +250,18 @@ void SQLiteCacheV3::updateUserStats(const std::string& contentId, const CachedUs
 
 void SQLiteCacheV3::upsertLocation(const CachedLocation& location) {
   auto transaction = beginWriter();
-  Statement removeReplacedPath{asDb(db_), "DELETE FROM locations WHERE file_path=?1 AND location_id<>?2;"};
-  removeReplacedPath.bind(1, pathText(location.filePath));
-  removeReplacedPath.bind(2, location.locationId);
-  removeReplacedPath.stepDone();
+  if (location.cueTrackOffset.has_value()) {
+    Statement removeReplacedPath{asDb(db_), "DELETE FROM locations WHERE file_path=?1 AND cue_track_offset_ms=?2 AND location_id<>?3;"};
+    removeReplacedPath.bind(1, pathText(location.filePath));
+    removeReplacedPath.bind(2, location.cueTrackOffset->count());
+    removeReplacedPath.bind(3, location.locationId);
+    removeReplacedPath.stepDone();
+  } else {
+    Statement removeReplacedPath{asDb(db_), "DELETE FROM locations WHERE file_path=?1 AND cue_track_offset_ms IS NULL AND location_id<>?2;"};
+    removeReplacedPath.bind(1, pathText(location.filePath));
+    removeReplacedPath.bind(2, location.locationId);
+    removeReplacedPath.stepDone();
+  }
 
   Statement upsert{
       asDb(db_),
@@ -368,7 +376,7 @@ void SQLiteCacheV3::pruneDeletedLocations(const std::filesystem::path& rootPath,
   Statement clear{asDb(db_), "DELETE FROM retained_locations;"};
   clear.stepDone();
   for (const auto& locationId : retainedLocationIds) {
-    Statement insert{asDb(db_), "INSERT INTO retained_locations(location_id) VALUES(?1);"};
+    Statement insert{asDb(db_), "INSERT OR IGNORE INTO retained_locations(location_id) VALUES(?1);"};
     insert.bind(1, locationId);
     insert.stepDone();
   }

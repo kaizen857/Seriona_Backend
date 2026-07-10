@@ -1709,6 +1709,23 @@ TEST_CASE("media controller repeated full scans restart watching through the sca
   CHECK(fixture.fakeScanner->lastWatchingRoots()->at(1).recursive);
 }
 
+TEST_CASE("media controller incremental scans also start watching through the scanner facade") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  const std::vector<scanner::ScannerRoot> roots{{.path = std::filesystem::path{"music"}, .recursive = true}};
+  const auto result = fixture.controller->scanLibrary(roots, scanner::ScanMode::Incremental);
+
+  REQUIRE(result.accepted);
+  CHECK(fixture.fakeScanner->scanCalls() == 1U);
+  REQUIRE(fixture.fakeScanner->lastScanMode().has_value());
+  CHECK(*fixture.fakeScanner->lastScanMode() == scanner::ScanMode::Incremental);
+  CHECK(fixture.fakeScanner->startWatchingCalls() == 1U);
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots().has_value());
+  REQUIRE(fixture.fakeScanner->lastWatchingRoots()->size() == 1U);
+  CHECK(fixture.fakeScanner->lastWatchingRoots()->front().path == std::filesystem::path{"music"});
+}
+
 TEST_CASE("media controller shutdown stops scanner watching") {
   ControllerFixture fixture{};
   fixture.controller->start();

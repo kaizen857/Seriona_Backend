@@ -378,7 +378,10 @@ using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_w
   const auto stableMtime = filesystemMtime.has_value() ? filesystemMtime : song.metadata.fileMtime;
   const auto mtime = fileTimeNanoseconds(stableMtime).value_or(0);
   const auto fileSize = song.metadata.fileSizeBytes.value_or(0);
-  return {.locationId = computeLocationId(filePath, fileSize, stableMtime),
+  const auto cueTrackOffset = !song.metadata.sourceFilePath.empty() && pathKey(song.metadata.sourceFilePath) != pathKey(filePath)
+                              ? song.metadata.offset
+                              : std::optional<std::chrono::milliseconds>{};
+  return {.locationId = computeLocationId(filePath, fileSize, stableMtime, cueTrackOffset),
           .contentId = song.metadata.contentHash,
           .rootPath = rootPath,
           .filePath = filePath,
@@ -1119,7 +1122,7 @@ private:
           const auto cachedSong = v3cache.loadContent(cachedLocation->contentId);
           if (cachedSong.has_value()) {
             ++skipped;
-            spdlog::info("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+            spdlog::debug("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
             auto hydratedSong = *cachedSong;
             hydratedSong.embeddedLyrics = v3cache.loadLyrics(cachedLocation->locationId, "embedded");
             hydratedSong.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
@@ -1278,6 +1281,9 @@ private:
       std::vector<std::string> retainedLocationIds;
       retainedLocationIds.reserve(songs.size());
       for (const auto& publishedSong : songs) {
+        if (!publishedSong.song.metadata.duration.has_value() || publishedSong.song.metadata.contentHash.empty()) {
+          continue;
+        }
         cache.upsertContent(publishedSong.song.metadata.contentHash, publishedSong.song.metadata);
         const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath);
         retainedLocationIds.push_back(location.locationId);

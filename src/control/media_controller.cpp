@@ -204,17 +204,15 @@ public:
     }
 
     dependencies_.scanner->scan(roots, mode);
-    if (mode == scanner::ScanMode::Full) {
-      try {
-        dependencies_.scanner->startWatching(roots);
-      } catch (const std::exception& error) {
-        stopScannerWatching("watcher start failure");
-        return rejectCommand(MediaControllerErrorCode::BackendRejected,
-                             std::string{"Failed to start scanner watcher: "} + error.what());
-      } catch (...) {
-        stopScannerWatching("watcher start failure");
-        return rejectCommand(MediaControllerErrorCode::BackendRejected, "Failed to start scanner watcher");
-      }
+    try {
+      dependencies_.scanner->startWatching(roots);
+    } catch (const std::exception& error) {
+      stopScannerWatching("watcher start failure");
+      return rejectCommand(MediaControllerErrorCode::BackendRejected,
+                           std::string{"Failed to start scanner watcher: "} + error.what());
+    } catch (...) {
+      stopScannerWatching("watcher start failure");
+      return rejectCommand(MediaControllerErrorCode::BackendRejected, "Failed to start scanner watcher");
     }
     publishSavedFolderSortRulesForRoots(roots);
     return acceptedResult();
