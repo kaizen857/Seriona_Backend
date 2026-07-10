@@ -57,6 +57,58 @@ FILE "album.flac" WAVE
   CHECK(referencedAudioCount == 0); // album.flac should be hidden
 }
 
+TEST_CASE("Two-pass integration: TagReader-compatible FILE command forms hide referenced audio") {
+  TempScannerRoot temp{"two_pass_integration_file_forms"};
+
+  std::ofstream(temp.path() / "lower.cue") << R"(file "lower.flac" WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+)";
+  std::ofstream(temp.path() / "mixed.cue") << R"(  FiLe "mixed.flac" FLAC
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+)";
+  std::ofstream(temp.path() / "unquoted.cue") << R"(FILE unquoted.flac WAVE
+  TRACK 01 AUDIO
+    INDEX 01 00:00:00
+)";
+  std::ofstream(temp.path() / "lower.flac");
+  std::ofstream(temp.path() / "mixed.flac");
+  std::ofstream(temp.path() / "unquoted.flac");
+  std::ofstream(temp.path() / "standalone.mp3");
+
+  const auto paths = discoverScannerPaths({temp.path(), false});
+
+  std::size_t cueCount = 0;
+  bool hasLowerAudio = false;
+  bool hasMixedAudio = false;
+  bool hasUnquotedAudio = false;
+  bool hasStandaloneAudio = false;
+
+  for (const auto& entry : paths) {
+    if (entry.kind == PathEntryKind::CueSheet) {
+      ++cueCount;
+    } else if (entry.kind == PathEntryKind::AudioCandidate) {
+      const auto filename = entry.path.filename();
+      if (filename == "lower.flac") {
+        hasLowerAudio = true;
+      } else if (filename == "mixed.flac") {
+        hasMixedAudio = true;
+      } else if (filename == "unquoted.flac") {
+        hasUnquotedAudio = true;
+      } else if (filename == "standalone.mp3") {
+        hasStandaloneAudio = true;
+      }
+    }
+  }
+
+  CHECK(cueCount == 3);
+  CHECK_FALSE(hasLowerAudio);
+  CHECK_FALSE(hasMixedAudio);
+  CHECK_FALSE(hasUnquotedAudio);
+  CHECK(hasStandaloneAudio);
+}
+
 TEST_CASE("Two-pass integration: nested directories with recursive discovery") {
   TempScannerRoot temp{"two_pass_integration_nested"};
   

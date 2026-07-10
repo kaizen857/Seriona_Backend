@@ -43,6 +43,69 @@ namespace {
   return {.code = code, .path = std::move(path), .message = std::move(message), .detail = std::move(detail)};
 }
 
+[[nodiscard]] std::string_view trimLeft(std::string_view text) {
+  std::size_t index = 0;
+  while (index < text.size() && std::isspace(static_cast<unsigned char>(text[index])) != 0) {
+    ++index;
+  }
+  return text.substr(index);
+}
+
+[[nodiscard]] bool equalsIgnoreAsciiCase(std::string_view lhs, std::string_view rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < lhs.size(); ++index) {
+    const auto left = static_cast<unsigned char>(lhs[index]);
+    const auto right = static_cast<unsigned char>(rhs[index]);
+    if (std::tolower(left) != std::tolower(right)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct ParsedCueToken {
+  std::string_view value;
+  std::string_view tail;
+};
+
+[[nodiscard]] std::optional<ParsedCueToken> parseCueToken(std::string_view text, bool allowQuoted) {
+  text = trimLeft(text);
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  if (allowQuoted && text.front() == '"') {
+    const auto closingQuote = text.find('"', 1);
+    if (closingQuote == std::string_view::npos) {
+      return std::nullopt;
+    }
+    return ParsedCueToken{.value = text.substr(1, closingQuote - 1), .tail = text.substr(closingQuote + 1)};
+  }
+
+  std::size_t end = 0;
+  while (end < text.size() && std::isspace(static_cast<unsigned char>(text[end])) == 0) {
+    ++end;
+  }
+  return ParsedCueToken{.value = text.substr(0, end), .tail = text.substr(end)};
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> cueFileReferenceFromLine(std::string_view line) {
+  const auto command = parseCueToken(line, false);
+  if (!command.has_value() || !equalsIgnoreAsciiCase(command->value, "FILE")) {
+    return std::nullopt;
+  }
+
+  const auto filename = parseCueToken(command->tail, true);
+  if (!filename.has_value() || filename->value.empty()) {
+    return std::nullopt;
+  }
+  if (!parseCueToken(filename->tail, false).has_value()) {
+    return std::nullopt;
+  }
+  return std::filesystem::path{std::string{filename->value}};
+}
+
 [[nodiscard]] std::filesystem::path weaklyCanonicalParentJoinedPath(const std::filesystem::path& path) {
   std::error_code error;
   const auto parent = std::filesystem::weakly_canonical(path.parent_path(), error);
@@ -95,33 +158,19 @@ struct CueParseResult {
       return result;
     }
 
-    std::string line;
-    const auto cueDir = cuePath.parent_path();
-    bool foundFileLine = false;
-    
-    while (std::getline(cueFile, line)) {
-      const auto filePos = line.find("FILE ");
-      if (filePos == std::string::npos) {
-        continue;
-      }
-      
-      const auto firstQuote = line.find('"', filePos);
-      if (firstQuote == std::string::npos) {
-        continue;
-      }
-      
-      const auto secondQuote = line.find('"', firstQuote + 1);
-      if (secondQuote == std::string::npos) {
-        continue;
-      }
-      
-      const auto filename = line.substr(firstQuote + 1, secondQuote - firstQuote - 1);
-      if (!filename.empty()) {
-        foundFileLine = true;
-        auto audioPath = cueDir / std::filesystem::path{filename};
-        result.references.push_back(std::move(audioPath));
-      }
-    }
+	    std::string line;
+	    const auto cueDir = cuePath.parent_path();
+	    bool foundFileLine = false;
+	    
+	    while (std::getline(cueFile, line)) {
+	      auto filename = cueFileReferenceFromLine(line);
+	      if (!filename.has_value()) {
+	        continue;
+	      }
+	      foundFileLine = true;
+	      auto audioPath = cueDir / *filename;
+	      result.references.push_back(std::move(audioPath));
+	    }
     
     if (cueFile.bad()) {
       result.error = makeError(ScannerErrorCode::MetadataReadFailed, cuePath,

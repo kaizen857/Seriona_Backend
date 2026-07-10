@@ -1,10 +1,13 @@
 #pragma once
 
 #include "scanner_internal_types.h"
+#include "seriona/scanner/hash_utils.h"
 
-#include <functional>
-#include <vector>
 #include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace seriona::scanner {
 
@@ -25,6 +28,30 @@ using PreallocationObserver = std::function<void(const std::vector<IndexedPublis
 
 void setPreallocationObserver(PreallocationObserver observer);
 void clearPreallocationObserver();
+
+struct WorkerTaskSnapshot {
+  std::filesystem::path filePath;
+  ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+  bool hasCachedLocation{false};
+  std::size_t nodeIndex{0};
+};
+
+using WorkerTaskObserver = std::function<void(const std::vector<WorkerTaskSnapshot>&)>;
+
+void setWorkerTaskObserver(WorkerTaskObserver observer);
+void clearWorkerTaskObserver();
+
+struct PublishedSongSnapshot {
+  std::filesystem::path filePath;
+  std::filesystem::path treeRelativePath;
+  ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+  std::optional<std::string> locationId;
+};
+
+using PublishedSongObserver = std::function<void(const std::vector<PublishedSongSnapshot>&)>;
+
+void setPublishedSongObserver(PublishedSongObserver observer);
+void clearPublishedSongObserver();
 
 // Test-only CUE sheet provider: allows tests to inject controlled track data
 // without requiring parseable audio files.
@@ -49,5 +76,26 @@ using TestCueSheetProvider = std::function<std::vector<TestCueTrackData>(const s
 
 void setTestCueSheetProvider(TestCueSheetProvider provider);
 void clearTestCueSheetProvider();
+
+using LrcParseObserver = std::function<void(const std::filesystem::path& path)>;
+
+void setLrcParseObserver(LrcParseObserver observer);
+void clearLrcParseObserver();
+
+using TestLyricsSidecarHashProvider = std::function<FileHashResult(const std::filesystem::path& path,
+                                                                   const HashOptions& options)>;
+
+void setTestLyricsSidecarHashProvider(TestLyricsSidecarHashProvider provider);
+void clearTestLyricsSidecarHashProvider();
+
+struct IncrementalPlanSnapshot {
+  std::vector<std::string> retainedLocationIds;
+  std::vector<cache::LyricsCacheUpdate> lyricsOnlyUpdates;
+};
+
+using IncrementalPlanObserver = std::function<void(const IncrementalPlanSnapshot& snapshot)>;
+
+void setIncrementalPlanObserver(IncrementalPlanObserver observer);
+void clearIncrementalPlanObserver();
 
 } // namespace seriona::scanner

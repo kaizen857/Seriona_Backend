@@ -5,7 +5,7 @@
 #include "spdlog/spdlog.h"
 #include "logging/logging.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
 #include "seriona/scanner/hash_utils.h"
 #include "seriona/scanner/lrc_parser.h"
@@ -53,6 +53,11 @@ namespace {
 
 static PreallocationObserver g_preallocationObserver = nullptr;
 static TestCueSheetProvider g_testCueSheetProvider = nullptr;
+static LrcParseObserver g_lrcParseObserver = nullptr;
+static TestLyricsSidecarHashProvider g_testLyricsSidecarHashProvider = nullptr;
+static IncrementalPlanObserver g_incrementalPlanObserver = nullptr;
+static WorkerTaskObserver g_workerTaskObserver = nullptr;
+static PublishedSongObserver g_publishedSongObserver = nullptr;
 
 [[nodiscard]] std::vector<RawTagMetadata> readCueSheetWithTestSeam(const std::filesystem::path& cuePath,
                                                                    const std::filesystem::path& coverExportDir) {
@@ -76,6 +81,21 @@ static TestCueSheetProvider g_testCueSheetProvider = nullptr;
     }
   }
   return readCueSheet(cuePath, coverExportDir);
+}
+
+[[nodiscard]] FileHashResult hashLyricsSidecarWithTestSeam(const std::filesystem::path& path,
+                                                           const HashOptions& options) {
+  if (g_testLyricsSidecarHashProvider) {
+    return g_testLyricsSidecarHashProvider(path, options);
+  }
+  return hashLyricsSidecar(path, options);
+}
+
+[[nodiscard]] LrcParseResult parseLrcFileWithTestSeam(const std::filesystem::path& path) {
+  if (g_lrcParseObserver) {
+    g_lrcParseObserver(path);
+  }
+  return parseLrcFile(path);
 }
 
 [[nodiscard]] std::filesystem::path resolvePortableDataRoot() {
@@ -118,6 +138,13 @@ struct EffectiveScannerConfig {
   ScannerConfig scanner;
   std::size_t workerCount{1};
   std::ptrdiff_t tagReaderSlots{1};
+};
+
+enum class ExternalLyricsCacheAction {
+  None,
+  UpdateExternal,
+  RemoveExternal,
+  Cancelled,
 };
 
 [[nodiscard]] std::optional<std::size_t> parsePositiveSizeEnv(std::string_view name) {
@@ -170,13 +197,13 @@ struct EffectiveScannerConfig {
 }
 
 [[nodiscard]] std::filesystem::path scanRootDatabasePath(const std::filesystem::path& databasePath) {
-  return std::filesystem::path{databasePath.generic_string() + ".scan-roots-v3.sqlite"};
+  return std::filesystem::path{databasePath.generic_string() + ".scan-roots.sqlite"};
 }
 
-[[nodiscard]] cache::CachedScanRootV3 scanRootRecord(const std::filesystem::path& rootPath,
-                                                     const ScanModeDecision& decision,
-                                                     const std::uint64_t totalFiles,
-                                                     const std::chrono::milliseconds scanDuration) {
+[[nodiscard]] cache::CachedScanRoot scanRootRecord(const std::filesystem::path& rootPath,
+                                                   const ScanModeDecision& decision,
+                                                   const std::uint64_t totalFiles,
+                                                   const std::chrono::milliseconds scanDuration) {
   return {.rootPath = rootPath,
           .directoryTreeHash = decision.directoryTreeHash.value_or({}),
           .totalFiles = totalFiles,
@@ -194,7 +221,7 @@ struct EffectiveScannerConfig {
     return {.mode = ScanMode::Full, .directoryTreeHash = directoryTreeHash.hash};
   }
   try {
-    const cache::SQLiteCacheV3 cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath)}};
+    const cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath)}};
     const auto cachedRoot = cache.loadScanRoot(rootPath);
     if (cachedRoot.has_value() && cachedRoot->directoryTreeHash == *directoryTreeHash.hash) {
       return {.mode = ScanMode::Incremental, .directoryTreeHash = directoryTreeHash.hash};
@@ -256,12 +283,48 @@ struct IncrementalScanPlan {
   std::vector<ClassifiedPath> unchanged;
   std::vector<ClassifiedPath> added;
   std::vector<ClassifiedPath> changed;
+  std::vector<ClassifiedPath> cueUnchanged;
+  std::vector<ClassifiedPath> cueAdded;
+  std::vector<ClassifiedPath> cueChanged;
 };
 
 struct IncrementalExecutionPlan {
   std::unordered_set<std::string> unchangedPaths;
   std::unordered_set<std::string> workerPaths;
+  std::unordered_map<std::string, ScanItemOrigin> workerOriginsByPath;
+  std::unordered_map<std::string, ScanItemOrigin> cueReaderOriginsByPath;
+  std::vector<std::string> retainedLocationIds;
+  std::unordered_map<std::string, std::vector<cache::CachedLocation>> cueLocationsByCuePath;
+  std::unordered_map<std::string, std::vector<std::string>> cueRetainedLocationIdsByCuePath;
+  std::vector<cache::LyricsCacheUpdate> lyricsOnlyUpdates;
 };
+
+struct CachedCueTrack {
+  cache::CachedLocation location;
+  cache::CachedSong song;
+  std::uint32_t trackIndex{0};
+};
+
+using CachedCueTracksByPath = std::unordered_map<std::string, std::vector<CachedCueTrack>>;
+
+[[nodiscard]] IncrementalPlanSnapshot incrementalPlanSnapshotFrom(const IncrementalExecutionPlan& plan) {
+  return {.retainedLocationIds = plan.retainedLocationIds, .lyricsOnlyUpdates = plan.lyricsOnlyUpdates};
+}
+
+[[nodiscard]] ScanItemOrigin workerOriginForPath(const std::unordered_map<std::string, ScanItemOrigin>& originsByPath,
+                                                const std::filesystem::path& path) {
+  const auto origin = originsByPath.find(pathKey(path));
+  return origin == originsByPath.end() ? ScanItemOrigin::ScannedFull : origin->second;
+}
+
+[[nodiscard]] ScanItemOrigin cueReaderOriginForPath(const std::optional<IncrementalExecutionPlan>& plan,
+                                                   const std::filesystem::path& cuePath) {
+  if (!plan.has_value()) {
+    return ScanItemOrigin::ScannedFull;
+  }
+  const auto origin = plan->cueReaderOriginsByPath.find(pathKey(cuePath));
+  return origin == plan->cueReaderOriginsByPath.end() ? ScanItemOrigin::CueTrackScannedNew : origin->second;
+}
 
 [[nodiscard]] std::optional<std::uint64_t> fileSizeBytes(const std::filesystem::path& path) {
   std::error_code error;
@@ -276,38 +339,136 @@ struct IncrementalExecutionPlan {
   return entry.kind == PathEntryKind::AudioCandidate || entry.kind == PathEntryKind::SingleFileRoot;
 }
 
-using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_wrapper<const cache::CachedLocation>>;
+using CachedLocationRefs = std::vector<std::reference_wrapper<const cache::CachedLocation>>;
+
+struct CachedLocationPathIndex {
+  std::unordered_map<std::string, std::reference_wrapper<const cache::CachedLocation>> audioLocationByPath;
+  std::unordered_map<std::string, CachedLocationRefs> cueLocationsByCuePath;
+};
+
+[[nodiscard]] bool isCueCachedLocation(const cache::CachedLocation& location) {
+  const auto hasDistinctSource = !location.sourceFilePath.empty() && pathKey(location.sourceFilePath) != pathKey(location.filePath);
+  return location.cueTrackOffset.has_value() || location.cueTrackIndex.has_value() || hasDistinctSource;
+}
 
 [[nodiscard]] CachedLocationPathIndex buildCachedLocationPathIndex(const std::filesystem::path& rootPath,
                                                                    const std::vector<cache::CachedLocation>& locations) {
   CachedLocationPathIndex index;
-  index.reserve(locations.size());
+  index.audioLocationByPath.reserve(locations.size());
+  index.cueLocationsByCuePath.reserve(locations.size());
   for (const auto& location : locations) {
     if (pathKey(location.rootPath) != pathKey(rootPath)) {
       continue;
     }
-    index.try_emplace(pathKey(location.filePath), std::cref(location));
+    const auto locationPathKey = pathKey(location.filePath);
+    if (isCueCachedLocation(location)) {
+      index.cueLocationsByCuePath[locationPathKey].push_back(std::cref(location));
+      continue;
+    }
+    index.audioLocationByPath.try_emplace(locationPathKey, std::cref(location));
   }
   return index;
+}
+
+[[nodiscard]] bool cueLocationMatchesCueFile(const cache::CachedLocation& location,
+                                             const std::filesystem::path& cuePath,
+                                             std::optional<std::uint64_t> cueFileSize,
+                                             std::optional<std::int64_t> cueFileMtimeNs) {
+  if (!cueFileSize.has_value() || !cueFileMtimeNs.has_value()) {
+    return false;
+  }
+  const auto cachedCueSize = location.cueFileSizeBytes.value_or(location.fileSizeBytes);
+  const auto cachedCueMtime = location.cueFileMtimeNs.value_or(location.fileMtimeNs);
+  return pathKey(location.filePath) == pathKey(cuePath) && cachedCueSize == *cueFileSize && cachedCueMtime == *cueFileMtimeNs;
+}
+
+[[nodiscard]] std::optional<std::uint32_t> cueTrackIndexFromLogicalTrackId(const std::filesystem::path& cuePath,
+                                                                            std::string_view logicalTrackId) {
+  const auto prefix = cuePath.generic_string() + "#track";
+  if (!logicalTrackId.starts_with(prefix)) {
+    return std::nullopt;
+  }
+  const auto suffix = logicalTrackId.substr(prefix.size());
+  if (suffix.empty()) {
+    return std::nullopt;
+  }
+  std::uint64_t value = 0;
+  const auto* first = suffix.data();
+  const auto* last = suffix.data() + suffix.size();
+  const auto [parsed, error] = std::from_chars(first, last, value);
+  if (error != std::errc{} || parsed != last || value > std::numeric_limits<std::uint32_t>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+[[nodiscard]] bool cueSourceAudioMatchesCachedLocation(const cache::CachedLocation& location) {
+  if (location.sourceFilePath.empty() || pathKey(location.sourceFilePath) == pathKey(location.filePath) ||
+      !location.sourceFileSizeBytes.has_value() || !location.sourceFileMtimeNs.has_value()) {
+    return false;
+  }
+  const auto currentSourceSize = fileSizeBytes(location.sourceFilePath);
+  const auto currentSourceMtimeNs = fileTimeNanoseconds(fileMtime(location.sourceFilePath));
+  return currentSourceSize.has_value() && currentSourceMtimeNs.has_value() &&
+         *currentSourceSize == *location.sourceFileSizeBytes && *currentSourceMtimeNs == *location.sourceFileMtimeNs;
+}
+
+[[nodiscard]] bool cueLocationMatchesCacheHitIdentity(const cache::CachedLocation& location,
+                                                       const std::filesystem::path& cuePath,
+                                                       std::optional<std::uint64_t> cueFileSize,
+                                                       std::optional<std::filesystem::file_time_type> cueFileMtime,
+                                                       std::optional<std::int64_t> cueFileMtimeNs) {
+  if (!location.cueTrackIndex.has_value() || !location.cueTrackOffset.has_value() || !cueFileSize.has_value() ||
+      !cueFileMtimeNs.has_value()) {
+    return false;
+  }
+  if (!cueLocationMatchesCueFile(location, cuePath, cueFileSize, cueFileMtimeNs)) {
+    return false;
+  }
+  if (!cueSourceAudioMatchesCachedLocation(location)) {
+    return false;
+  }
+  const auto expectedLocationId = computeLocationId(cuePath, *cueFileSize, cueFileMtime, location.cueTrackOffset);
+  return location.locationId == expectedLocationId;
 }
 
 [[nodiscard]] IncrementalScanPlan planIncrementalScan(const std::filesystem::path& rootPath,
                                                       const std::vector<ClassifiedPath>& fileSystemEntries,
                                                       const std::vector<cache::CachedLocation>& cachedLocations,
-                                                      bool treeHashMatches = false) {
+                                                      [[maybe_unused]] bool treeHashMatches = false) {
   const auto cachedLocationsByPath = buildCachedLocationPathIndex(rootPath, cachedLocations);
   std::unordered_set<std::string> observedFilePaths;
   observedFilePaths.reserve(fileSystemEntries.size());
 
   IncrementalScanPlan plan;
   for (const auto& entry : fileSystemEntries) {
-    if (!isPlanAudioCandidate(entry)) {
+    if (!isPlanAudioCandidate(entry) && entry.kind != PathEntryKind::CueSheet) {
       continue;
     }
     const auto normalizedPathKey = pathKey(entry.path);
     observedFilePaths.insert(normalizedPathKey);
-    const auto cachedLocation = cachedLocationsByPath.find(normalizedPathKey);
-    if (cachedLocation == cachedLocationsByPath.end()) {
+
+    if (entry.kind == PathEntryKind::CueSheet) {
+      const auto cachedCueLocations = cachedLocationsByPath.cueLocationsByCuePath.find(normalizedPathKey);
+      if (cachedCueLocations == cachedLocationsByPath.cueLocationsByCuePath.end() || cachedCueLocations->second.empty()) {
+        plan.cueAdded.push_back(entry);
+        continue;
+      }
+      const auto cueFileSize = fileSizeBytes(entry.path);
+      const auto cueFileMtimeNs = fileTimeNanoseconds(fileMtime(entry.path));
+      const auto cueMatches = std::ranges::all_of(cachedCueLocations->second, [&](const auto& locationRef) {
+        return cueLocationMatchesCueFile(locationRef.get(), entry.path, cueFileSize, cueFileMtimeNs);
+      });
+      if (cueMatches) {
+        plan.cueUnchanged.push_back(entry);
+      } else {
+        plan.cueChanged.push_back(entry);
+      }
+      continue;
+    }
+
+    const auto cachedLocation = cachedLocationsByPath.audioLocationByPath.find(normalizedPathKey);
+    if (cachedLocation == cachedLocationsByPath.audioLocationByPath.end()) {
       plan.added.push_back(entry);
       continue;
     }
@@ -335,40 +496,92 @@ using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_w
 
 [[nodiscard]] IncrementalExecutionPlan incrementalExecutionPlan(const std::filesystem::path& rootPath,
                                                                const std::vector<ClassifiedPath>& entries,
-                                                               const std::filesystem::path& databasePath,
                                                                const std::vector<cache::CachedLocation>& cachedLocations,
                                                                bool treeHashMatches) {
-  cache::SQLiteCacheV3 cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath)}};
   const auto plan = planIncrementalScan(rootPath, entries, cachedLocations, treeHashMatches);
   const auto cachedLocationsByPath = buildCachedLocationPathIndex(rootPath, cachedLocations);
-  std::vector<std::string> retainedLocationIds;
-  retainedLocationIds.reserve(plan.unchanged.size() + plan.changed.size() + plan.added.size());
   IncrementalExecutionPlan executionPlan;
   executionPlan.unchangedPaths.reserve(plan.unchanged.size());
   executionPlan.workerPaths.reserve(plan.changed.size() + plan.added.size());
+  executionPlan.workerOriginsByPath.reserve(plan.changed.size() + plan.added.size());
+  executionPlan.cueReaderOriginsByPath.reserve(plan.cueUnchanged.size() + plan.cueChanged.size() + plan.cueAdded.size());
+  executionPlan.cueLocationsByCuePath.reserve(plan.cueUnchanged.size());
+  executionPlan.cueRetainedLocationIdsByCuePath.reserve(plan.cueUnchanged.size());
   for (const auto& entry : plan.unchanged) {
     executionPlan.unchangedPaths.insert(pathKey(entry.path));
-    const auto cachedIt = cachedLocationsByPath.find(pathKey(entry.path));
-    if (cachedIt != cachedLocationsByPath.end()) {
-      retainedLocationIds.push_back(cachedIt->second.get().locationId);
-    }
   }
   for (const auto& entry : plan.changed) {
-    executionPlan.workerPaths.insert(pathKey(entry.path));
-    const auto size = fileSizeBytes(entry.path);
-    if (size.has_value()) {
-      retainedLocationIds.push_back(computeLocationId(entry.path, *size, fileMtime(entry.path)));
-    }
+    const auto entryKey = pathKey(entry.path);
+    executionPlan.workerPaths.insert(entryKey);
+    executionPlan.workerOriginsByPath.emplace(entryKey, ScanItemOrigin::RescannedChanged);
   }
   for (const auto& entry : plan.added) {
-    executionPlan.workerPaths.insert(pathKey(entry.path));
-    const auto size = fileSizeBytes(entry.path);
-    if (size.has_value()) {
-      retainedLocationIds.push_back(computeLocationId(entry.path, *size, fileMtime(entry.path)));
+    const auto entryKey = pathKey(entry.path);
+    executionPlan.workerPaths.insert(entryKey);
+    executionPlan.workerOriginsByPath.emplace(entryKey, ScanItemOrigin::ScannedNew);
+  }
+  for (const auto& entry : plan.cueAdded) {
+    executionPlan.cueReaderOriginsByPath.emplace(pathKey(entry.path), ScanItemOrigin::CueTrackScannedNew);
+  }
+  for (const auto& entry : plan.cueChanged) {
+    executionPlan.cueReaderOriginsByPath.emplace(pathKey(entry.path), ScanItemOrigin::CueTrackRescannedChanged);
+  }
+  for (const auto& entry : plan.cueUnchanged) {
+    const auto entryKey = pathKey(entry.path);
+    executionPlan.cueReaderOriginsByPath.emplace(entryKey, ScanItemOrigin::CueTrackRescannedChanged);
+    const auto cueLocations = cachedLocationsByPath.cueLocationsByCuePath.find(entryKey);
+    if (cueLocations == cachedLocationsByPath.cueLocationsByCuePath.end()) {
+      continue;
+    }
+    auto& plannedCueLocations = executionPlan.cueLocationsByCuePath[entryKey];
+    auto& retainedCueLocationIds = executionPlan.cueRetainedLocationIdsByCuePath[entryKey];
+    plannedCueLocations.reserve(cueLocations->second.size());
+    retainedCueLocationIds.reserve(cueLocations->second.size());
+    for (const auto& locationRef : cueLocations->second) {
+      const auto& location = locationRef.get();
+      plannedCueLocations.push_back(location);
+      retainedCueLocationIds.push_back(location.locationId);
     }
   }
-  cache.pruneDeletedLocations(rootPath, retainedLocationIds);
   return executionPlan;
+}
+
+[[nodiscard]] std::unordered_set<std::string> cachedCueSourceAudioPathKeys(const std::optional<IncrementalExecutionPlan>& plan) {
+  std::unordered_set<std::string> sourcePathKeys;
+  if (!plan.has_value()) {
+    return sourcePathKeys;
+  }
+  for (const auto& [cuePathKey, cueLocations] : plan->cueLocationsByCuePath) {
+    for (const auto& location : cueLocations) {
+      if (!location.sourceFilePath.empty() && pathKey(location.sourceFilePath) != cuePathKey) {
+        sourcePathKeys.insert(pathKey(location.sourceFilePath));
+      }
+    }
+  }
+  return sourcePathKeys;
+}
+
+void publishIncrementalPlanSnapshot(const std::optional<IncrementalExecutionPlan>& plan) {
+  if (g_incrementalPlanObserver == nullptr || !plan.has_value()) {
+    return;
+  }
+  g_incrementalPlanObserver(incrementalPlanSnapshotFrom(*plan));
+}
+
+void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
+                               const std::unordered_map<std::string, ScanItemOrigin>& originsByPath) {
+  if (g_workerTaskObserver == nullptr) {
+    return;
+  }
+  std::vector<WorkerTaskSnapshot> snapshots;
+  snapshots.reserve(tasks.size());
+  for (const auto& task : tasks) {
+    snapshots.push_back(WorkerTaskSnapshot{.filePath = task.filePath,
+                                           .origin = workerOriginForPath(originsByPath, task.filePath),
+                                           .hasCachedLocation = task.cachedLocation.has_value(),
+                                           .nodeIndex = task.nodeIndex});
+  }
+  g_workerTaskObserver(snapshots);
 }
 
 [[nodiscard]] cache::CachedLocation cachedLocationFromSong(const cache::CachedSong& song,
@@ -377,23 +590,38 @@ using CachedLocationPathIndex = std::unordered_map<std::string, std::reference_w
   const auto filesystemMtime = fileMtime(filePath);
   const auto stableMtime = filesystemMtime.has_value() ? filesystemMtime : song.metadata.fileMtime;
   const auto mtime = fileTimeNanoseconds(stableMtime).value_or(0);
-  const auto fileSize = song.metadata.fileSizeBytes.value_or(0);
+  const auto filesystemFileSize = fileSizeBytes(filePath);
+  const auto fileSize = filesystemFileSize.value_or(song.metadata.fileSizeBytes.value_or(0));
   const auto cueTrackOffset = !song.metadata.sourceFilePath.empty() && pathKey(song.metadata.sourceFilePath) != pathKey(filePath)
                               ? song.metadata.offset
                               : std::optional<std::chrono::milliseconds>{};
+  const auto sourceFilePath = song.metadata.sourceFilePath.empty() ? filePath : song.metadata.sourceFilePath;
+  const auto isCueTrack = cueTrackOffset.has_value();
+  const auto cueFileSize = isCueTrack ? filesystemFileSize : std::optional<std::uint64_t>{};
+  const auto sourceFileSize = isCueTrack ? fileSizeBytes(sourceFilePath) : std::optional<std::uint64_t>{};
+  const auto sourceFileMtime = isCueTrack ? fileTimeNanoseconds(fileMtime(sourceFilePath)) : std::optional<std::int64_t>{};
+  const auto cueTrackIndex = isCueTrack ? cueTrackIndexFromLogicalTrackId(filePath, song.metadata.logicalTrackId)
+                                       : std::optional<std::uint32_t>{};
   return {.locationId = computeLocationId(filePath, fileSize, stableMtime, cueTrackOffset),
           .contentId = song.metadata.contentHash,
           .rootPath = rootPath,
           .filePath = filePath,
-          .fileSizeBytes = song.metadata.fileSizeBytes.value_or(0),
+          .fileSizeBytes = fileSize,
           .fileMtimeNs = mtime,
-          .sourceFilePath = song.metadata.sourceFilePath.empty() ? filePath : song.metadata.sourceFilePath,
-          .cueTrackOffset = song.metadata.offset,
+          .sourceFilePath = sourceFilePath,
+          .cueTrackOffset = cueTrackOffset,
+          .cueTrackIndex = cueTrackIndex,
+          .cueTrackDuration = isCueTrack ? song.metadata.duration : std::optional<std::chrono::milliseconds>{},
+          .cueFileSizeBytes = cueFileSize,
+          .cueFileMtimeNs = isCueTrack ? std::optional<std::int64_t>{mtime} : std::optional<std::int64_t>{},
+          .sourceFileSizeBytes = sourceFileSize,
+          .sourceFileMtimeNs = sourceFileMtime,
           .artworkPath = song.metadata.artworkPath,
           .thumbnailPath = song.metadata.thumbnailPath,
           .lyricsSource = song.metadata.effectiveLyricsSource,
           .externalLrcPath = song.metadata.externalLyricsPath,
           .externalLrcMtimeNs = fileTimeNanoseconds(song.metadata.externalLyricsMtime),
+          .externalLrcHash = song.metadata.externalLyricsHash,
           .discoveredAt = {},
           .scannedAt = {}};
 }
@@ -441,9 +669,97 @@ void applyCachedLocation(cache::CachedSong& song,
                                                 std::filesystem::file_time_type{std::chrono::nanoseconds{
                                                     *location.externalLrcMtimeNs}}}
                                           : std::nullopt;
+  song.metadata.externalLyricsHash = location.externalLrcHash;
   song.metadata.trackId = filePath.generic_string();
   song.metadata.logicalTrackId = filePath.generic_string();
   selectEffectiveLyrics(song);
+}
+
+void hydrateCachedCueTrack(cache::CachedSong& song,
+                           const cache::CachedLocation& location,
+                           const std::filesystem::path& cuePath,
+                           std::uint32_t trackIndex) {
+  song.metadata.filePath = cuePath;
+  song.metadata.sourceFilePath = location.sourceFilePath;
+  song.metadata.fileSizeBytes = location.fileSizeBytes;
+  song.metadata.fileMtime = std::filesystem::file_time_type{std::chrono::nanoseconds{location.fileMtimeNs}};
+  song.metadata.contentHash = location.contentId;
+  song.metadata.offset = location.cueTrackOffset;
+  if (location.cueTrackDuration.has_value()) {
+    song.metadata.duration = location.cueTrackDuration;
+  }
+  song.metadata.artworkPath = location.artworkPath;
+  song.metadata.thumbnailPath = location.thumbnailPath;
+  song.metadata.externalLyricsPath = location.externalLrcPath;
+  song.metadata.externalLyricsMtime = location.externalLrcMtimeNs.has_value()
+                                          ? std::optional<std::filesystem::file_time_type>{
+                                                std::filesystem::file_time_type{std::chrono::nanoseconds{
+                                                    *location.externalLrcMtimeNs}}}
+                                          : std::nullopt;
+  song.metadata.externalLyricsHash = location.externalLrcHash;
+  const auto trackIdentity = cuePath.generic_string() + "#track" + std::to_string(trackIndex);
+  song.metadata.logicalTrackId = trackIdentity;
+  song.metadata.trackId = trackIdentity;
+  selectEffectiveLyrics(song);
+}
+
+[[nodiscard]] std::optional<std::vector<CachedCueTrack>> loadCachedCueTracksForHit(
+    const std::filesystem::path& cuePath,
+    const std::vector<cache::CachedLocation>& cueLocations,
+    const cache::SQLiteCache& cache) {
+  if (cueLocations.empty()) {
+    return std::nullopt;
+  }
+  const auto cueFileSize = fileSizeBytes(cuePath);
+  const auto cueFileMtime = fileMtime(cuePath);
+  const auto cueFileMtimeNs = fileTimeNanoseconds(cueFileMtime);
+  std::unordered_set<std::uint32_t> seenTrackIndexes;
+  std::vector<CachedCueTrack> tracks;
+  tracks.reserve(cueLocations.size());
+  for (const auto& location : cueLocations) {
+    if (!cueLocationMatchesCacheHitIdentity(location, cuePath, cueFileSize, cueFileMtime, cueFileMtimeNs)) {
+      return std::nullopt;
+    }
+    if (!seenTrackIndexes.insert(*location.cueTrackIndex).second) {
+      return std::nullopt;
+    }
+    auto cachedSong = cache.loadContent(location.contentId);
+    if (!cachedSong.has_value()) {
+      return std::nullopt;
+    }
+    cachedSong->embeddedLyrics = cache.loadLyrics(location.locationId, "embedded");
+    cachedSong->externalLyrics = cache.loadLyrics(location.locationId, "external");
+    hydrateCachedCueTrack(*cachedSong, location, cuePath, *location.cueTrackIndex);
+    tracks.push_back(CachedCueTrack{.location = location,
+                                    .song = std::move(*cachedSong),
+                                    .trackIndex = *location.cueTrackIndex});
+  }
+  std::ranges::sort(tracks, {}, &CachedCueTrack::trackIndex);
+  for (std::size_t index = 0; index < tracks.size(); ++index) {
+    if (tracks[index].trackIndex != index) {
+      return std::nullopt;
+    }
+  }
+  return tracks;
+}
+
+[[nodiscard]] CachedCueTracksByPath buildCachedCueTracksByCuePath(const std::optional<IncrementalExecutionPlan>& plan,
+                                                                  const cache::SQLiteCache& cache) {
+  CachedCueTracksByPath tracksByCuePath;
+  if (!plan.has_value()) {
+    return tracksByCuePath;
+  }
+  tracksByCuePath.reserve(plan->cueLocationsByCuePath.size());
+  for (const auto& [cuePathKey, cueLocations] : plan->cueLocationsByCuePath) {
+    if (cueLocations.empty()) {
+      continue;
+    }
+    const auto cachedTracks = loadCachedCueTracksForHit(cueLocations.front().filePath, cueLocations, cache);
+    if (cachedTracks.has_value()) {
+      tracksByCuePath.emplace(cuePathKey, *cachedTracks);
+    }
+  }
+  return tracksByCuePath;
 }
 
 void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint64_t version, ScannerEventPayload payload) {
@@ -685,7 +1001,7 @@ public:
       return;
     }
 
-    cache::SQLiteCacheV3 cache{cache::ScannerCacheConfig{.databasePath = databasePath_}};
+    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = databasePath_}};
     std::vector<RootResult::PublishedSong> allSongs;
     std::vector<ScannerError> allErrors;
     std::uint64_t discovered = 0;
@@ -707,6 +1023,10 @@ public:
       const auto rootScanStartTime = std::chrono::steady_clock::now();
       auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, totalTagReaderTimeMs);
       const auto rootScanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - rootScanStartTime);
+      if (rootResult.cancelled) {
+        publishCancelled(sink, scanVersion);
+        return;
+      }
       recordScanRootDecision(rootPathFor(root), decision, rootResult.songs, rootScanDuration);
       allErrors.insert(allErrors.end(), rootResult.errors.begin(), rootResult.errors.end());
       allSongs.insert(allSongs.end(), rootResult.songs.begin(), rootResult.songs.end());
@@ -903,16 +1223,18 @@ public:
 
 private:
   struct RootResult {
-    struct PublishedSong {
-      cache::CachedSong song;
-      std::filesystem::path treeRelativePath;
-      ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
-      std::optional<std::string> locationId;
-    };
+	    struct PublishedSong {
+	      cache::CachedSong song;
+	      std::filesystem::path treeRelativePath;
+	      ScanItemOrigin origin{ScanItemOrigin::ScannedFull};
+	      std::optional<std::string> locationId;
+	      ExternalLyricsCacheAction externalLyricsCacheAction{ExternalLyricsCacheAction::None};
+	    };
 
-    std::vector<PublishedSong> songs;
-    std::vector<ScannerError> errors;
-  };
+	    std::vector<PublishedSong> songs;
+	    std::vector<ScannerError> errors;
+	    bool cancelled{false};
+	  };
 
   struct AudioReconcileTask {
     std::filesystem::path path;
@@ -978,7 +1300,7 @@ private:
   }
 
   [[nodiscard]] RootResult reconcileRoot(const ScannerRoot& root, const ScanModeDecision& decision, const EffectiveScannerConfig& config,
-                                         cache::SQLiteCacheV3& cache,
+                         [[maybe_unused]] cache::SQLiteCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
                                          std::uint64_t& totalTagReaderTimeMs) {
     // Phase timing
@@ -994,41 +1316,53 @@ private:
     const auto pathConfig = PathClassificationConfig{.allowedExtensions = config.scanner.allowedExtensions,
                                                      .followSymlinks = config.scanner.followSymlinks,
                                                      .readExternalLyrics = config.scanner.readExternalLyrics};
-    cache::SQLiteCacheV3 v3cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    cache::SQLiteCache scanRootCache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
 
     std::vector<ClassifiedPath> entries;
     std::vector<cache::CachedLocation> cachedLocations;
     bool treeHashMatches = false;
     
-    // Load v3 cache locations for incremental planning
     if (decision.mode == ScanMode::Incremental && decision.directoryTreeHash.has_value()) {
       try {
-        const auto cachedScanRoot = v3cache.loadScanRoot(rootPath);
+        const auto cachedScanRoot = scanRootCache.loadScanRoot(rootPath);
         if (cachedScanRoot.has_value()) {
-          cachedLocations = v3cache.loadLocationsByRoot(rootPath);
+          cachedLocations = scanRootCache.loadLocationsByRoot(rootPath);
           if (decision.directoryTreeHash.has_value() && 
               cachedScanRoot->directoryTreeHash == *decision.directoryTreeHash) {
             treeHashMatches = true;
           }
         }
       } catch (const std::exception& error) {
-        spdlog::warn("reconcileRoot: failed to load v3 cache for incremental planning: {}", error.what());
+        spdlog::warn("reconcileRoot: failed to load scanner cache for incremental planning: {}", error.what());
       }
     }
     
     entries = discoverScannerPaths(ScannerRoot{.path = rootPath, .recursive = root.recursive}, pathConfig);
     phase1End = std::chrono::steady_clock::now();
 
-    const auto incrementalPlan = decision.mode == ScanMode::Incremental
-                                     ? std::optional<IncrementalExecutionPlan>{incrementalExecutionPlan(rootPath, entries, databasePath_, cachedLocations, treeHashMatches)}
-                                     : std::nullopt;
-    
-    std::size_t nodeCount = 0;
-    std::unordered_set<std::string> failedCuePaths;
-    for (const auto& entry : entries) {
-      if (entry.kind == PathEntryKind::AudioCandidate || entry.kind == PathEntryKind::SingleFileRoot) {
-        ++nodeCount;
-      } else if (entry.kind == PathEntryKind::CueSheet) {
+	    auto incrementalPlan = decision.mode == ScanMode::Incremental
+	                               ? std::optional<IncrementalExecutionPlan>{incrementalExecutionPlan(rootPath, entries, cachedLocations, treeHashMatches)}
+	                               : std::nullopt;
+	    auto cachedCueTracksByCuePath = buildCachedCueTracksByCuePath(incrementalPlan, scanRootCache);
+	    const auto cachedCueSourcePathKeys = cachedCueSourceAudioPathKeys(incrementalPlan);
+	    const auto isCachedCueSourceAudio = [&cachedCueSourcePathKeys](const ClassifiedPath& entry) {
+	      return entry.kind == PathEntryKind::AudioCandidate && cachedCueSourcePathKeys.contains(pathKey(entry.path));
+	    };
+	    
+	    std::size_t nodeCount = 0;
+	    std::unordered_set<std::string> failedCuePaths;
+	    for (const auto& entry : entries) {
+	      if (isCachedCueSourceAudio(entry)) {
+	        continue;
+	      }
+	      if (entry.kind == PathEntryKind::AudioCandidate || entry.kind == PathEntryKind::SingleFileRoot) {
+	        ++nodeCount;
+	      } else if (entry.kind == PathEntryKind::CueSheet) {
+	        const auto cachedCueTracks = cachedCueTracksByCuePath.find(pathKey(entry.path));
+	        if (cachedCueTracks != cachedCueTracksByCuePath.end()) {
+	          nodeCount += 1 + cachedCueTracks->second.size();
+	          continue;
+	        }
         try {
           const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
           nodeCount += 1 + tracks.size();
@@ -1052,11 +1386,14 @@ private:
     audioTasks.reserve(entries.size());
     workerTasks.reserve(entries.size());
 
-    auto discoveryIndex = std::size_t{0};
-    for (const auto& entry : entries) {
-      for (const auto& error : entry.errors) {
-        result.errors.push_back(scannerErrorFrom(error));
-      }
+	    auto discoveryIndex = std::size_t{0};
+	    for (const auto& entry : entries) {
+	      if (isCachedCueSourceAudio(entry)) {
+	        continue;
+	      }
+	      for (const auto& error : entry.errors) {
+	        result.errors.push_back(scannerErrorFrom(error));
+	      }
       
       if (entry.kind == PathEntryKind::CueSheet) {
         if (failedCuePaths.contains(pathKey(entry.path))) {
@@ -1076,10 +1413,43 @@ private:
         indexedSongs[cueContainerIndex].discoveryIndex = cueContainerIndex;
         indexedSongs[cueContainerIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
         indexedSongs[cueContainerIndex].nodeType = NodeType::CueContainer;
-        indexedSongs[cueContainerIndex].origin = ScanItemOrigin::VirtualContainer;
-        indexedSongs[cueContainerIndex].isVirtualFolder = true;
-        
-        const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+	        indexedSongs[cueContainerIndex].origin = ScanItemOrigin::VirtualContainer;
+	        indexedSongs[cueContainerIndex].isVirtualFolder = true;
+	        const auto cachedCueTracks = cachedCueTracksByCuePath.find(pathKey(entry.path));
+	        if (cachedCueTracks != cachedCueTracksByCuePath.end()) {
+	          for (const auto& cachedTrack : cachedCueTracks->second) {
+	            const auto trackNodeIndex = discoveryIndex++;
+	            ++discovered;
+	            ++skipped;
+
+	            const auto offset = cachedTrack.location.cueTrackOffset.value_or(std::chrono::milliseconds{0});
+	            const auto duration = cachedTrack.location.cueTrackDuration.value_or(
+	                cachedTrack.song.metadata.duration.value_or(std::chrono::milliseconds{0}));
+	            indexedSongs[trackNodeIndex].discoveryIndex = trackNodeIndex;
+	            indexedSongs[trackNodeIndex].treeRelativePath = relativePathFor(rootPath, entry.path);
+	            indexedSongs[trackNodeIndex].nodeType = NodeType::CueTrack;
+	            indexedSongs[trackNodeIndex].cueInfo = CueInfo{
+	              .cueFilePath = entry.path,
+	              .audioFilePath = cachedTrack.location.sourceFilePath,
+	              .offset = std::chrono::duration_cast<std::chrono::microseconds>(offset),
+	              .duration = std::chrono::duration_cast<std::chrono::microseconds>(duration),
+	              .trackIndex = static_cast<std::size_t>(cachedTrack.trackIndex)
+	            };
+	            indexedSongs[trackNodeIndex].song = cachedTrack.song;
+	            indexedSongs[trackNodeIndex].origin = ScanItemOrigin::CueTrackCacheHit;
+	            indexedSongs[trackNodeIndex].locationId = cachedTrack.location.locationId;
+	            indexedSongs[trackNodeIndex].filled.store(true);
+	            if (incrementalPlan.has_value()) {
+	              incrementalPlan->retainedLocationIds.push_back(cachedTrack.location.locationId);
+	            }
+	          }
+	          continue;
+	        }
+	        
+	        const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+	        const auto cueTrackOrigin = cueReaderOriginForPath(incrementalPlan, entry.path);
+	        const auto cueFileSizeForLocation = fileSizeBytes(entry.path);
+	        const auto cueFileMtimeForLocation = fileMtime(entry.path);
         for (std::size_t trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
             const auto trackNodeIndex = discoveryIndex++;
             ++discovered;
@@ -1108,10 +1478,17 @@ private:
             mapped.metadata.logicalTrackId = entry.path.generic_string() + "#track" + std::to_string(trackIdx);
             mapped.metadata.trackId = mapped.metadata.logicalTrackId;
             
-            auto cachedSong = cachedSongFrom(std::move(mapped));
-            indexedSongs[trackNodeIndex].song = std::move(cachedSong);
-            indexedSongs[trackNodeIndex].filled.store(true);
-          }
+	            auto cachedSong = cachedSongFrom(std::move(mapped));
+	            indexedSongs[trackNodeIndex].song = std::move(cachedSong);
+	            indexedSongs[trackNodeIndex].origin = cueTrackOrigin;
+	            if (cueFileSizeForLocation.has_value()) {
+	              indexedSongs[trackNodeIndex].locationId = computeLocationId(entry.path,
+	                                                                          *cueFileSizeForLocation,
+	                                                                          cueFileMtimeForLocation,
+	                                                                          indexedSongs[trackNodeIndex].song.metadata.offset);
+	            }
+	            indexedSongs[trackNodeIndex].filled.store(true);
+	          }
         continue;
       }
       
@@ -1123,37 +1500,40 @@ private:
       const auto entryKey = pathKey(entry.path);
       bool shouldProcessViaWorker = true;
       if (incrementalPlan.has_value() && incrementalPlan->unchangedPaths.contains(entryKey)) {
-        // V3: Try to load from cache by locationId
-        const auto fileSize = fileSizeBytes(entry.path);
-        const auto fileMtimeValue = fileMtime(entry.path);
-        const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
-        const auto cachedLocation = locationId.empty() ? std::optional<cache::CachedLocation>{} : v3cache.loadLocation(locationId);
-        if (cachedLocation.has_value()) {
-          const auto cachedSong = v3cache.loadContent(cachedLocation->contentId);
-          if (cachedSong.has_value()) {
-            ++skipped;
-            spdlog::debug("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
-            auto hydratedSong = *cachedSong;
-            hydratedSong.embeddedLyrics = v3cache.loadLyrics(cachedLocation->locationId, "embedded");
-            hydratedSong.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
-            applyCachedLocation(hydratedSong, *cachedLocation, entry.path);
-            indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, std::move(hydratedSong), relativePathFor(rootPath, entry.path)};
-            indexedSongs[currentDiscoveryIndex].origin = ScanItemOrigin::CacheHit;
-            indexedSongs[currentDiscoveryIndex].locationId = cachedLocation->locationId;
-            indexedSongs[currentDiscoveryIndex].filled.store(true);
-            shouldProcessViaWorker = false;
+        try {
+          const auto fileSize = fileSizeBytes(entry.path);
+          const auto fileMtimeValue = fileMtime(entry.path);
+          const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
+          const auto cachedLocation = locationId.empty() ? std::optional<cache::CachedLocation>{} : scanRootCache.loadLocation(locationId);
+          if (cachedLocation.has_value()) {
+            const auto cachedSong = scanRootCache.loadContent(cachedLocation->contentId);
+            if (cachedSong.has_value()) {
+              ++skipped;
+              spdlog::debug("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+              auto hydratedSong = *cachedSong;
+              hydratedSong.embeddedLyrics = scanRootCache.loadLyrics(cachedLocation->locationId, "embedded");
+              hydratedSong.externalLyrics = scanRootCache.loadLyrics(cachedLocation->locationId, "external");
+              applyCachedLocation(hydratedSong, *cachedLocation, entry.path);
+              indexedSongs[currentDiscoveryIndex] = IndexedPublishedSong{currentDiscoveryIndex, std::move(hydratedSong), relativePathFor(rootPath, entry.path)};
+              indexedSongs[currentDiscoveryIndex].origin = ScanItemOrigin::CacheHit;
+              indexedSongs[currentDiscoveryIndex].locationId = cachedLocation->locationId;
+              indexedSongs[currentDiscoveryIndex].filled.store(true);
+              incrementalPlan->retainedLocationIds.push_back(cachedLocation->locationId);
+              shouldProcessViaWorker = false;
+            }
           }
+        } catch (const std::exception& error) {
+          spdlog::warn("failed to hydrate scanner cache hit for {}: {}", entry.path.generic_string(), error.what());
         }
       }
       if (!shouldProcessViaWorker) {
         continue;
       }
-      const auto fileSize = fileSizeBytes(entry.path);
-      const auto fileMtimeValue = fileMtime(entry.path);
-      const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
-      const auto cachedLocation = fileSize.has_value() ? v3cache.loadLocation(locationId) : std::optional<cache::CachedLocation>{};
-      spdlog::trace("Preparing audio task: nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
-      auto audioTask = prepareAudioTask(entry.path, rootPath, result.errors, skipped, scanned);
+	      const auto fileSize = fileSizeBytes(entry.path);
+	      const auto fileMtimeValue = fileMtime(entry.path);
+	      const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
+	      spdlog::trace("Preparing audio task: nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+	      auto audioTask = prepareAudioTask(entry.path, rootPath, result.errors, skipped, scanned);
       if (!audioTask.has_value()) {
         spdlog::warn("prepareAudioTask returned nullopt for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
         continue;
@@ -1161,11 +1541,11 @@ private:
       audioTask->discoveryIndex = currentDiscoveryIndex;
       audioTasks.push_back(*audioTask);
       
-      workerTasks.push_back(WorkerTask{.rootPath = rootPath,
-                                       .filePath = entry.path,
-                                       .locationId = locationId,
-                                       .cachedLocation = cachedLocation,
-                                       .nodeIndex = currentDiscoveryIndex});
+	      workerTasks.push_back(WorkerTask{.rootPath = rootPath,
+	                                       .filePath = entry.path,
+	                                       .locationId = locationId,
+	                                       .cachedLocation = std::nullopt,
+	                                       .nodeIndex = currentDiscoveryIndex});
       spdlog::trace("Queued worker task: nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
     }
     phase2End = std::chrono::steady_clock::now();
@@ -1178,15 +1558,20 @@ private:
 
     std::vector<std::size_t> workerTaskNodeIndices;
     workerTaskNodeIndices.reserve(workerTasks.size());
-    for (const auto& task : workerTasks) {
-      workerTaskNodeIndices.push_back(task.nodeIndex);
-    }
+	    for (const auto& task : workerTasks) {
+	      workerTaskNodeIndices.push_back(task.nodeIndex);
+	    }
+	    const auto workerOriginsByPath = incrementalPlan.has_value()
+	                                      ? incrementalPlan->workerOriginsByPath
+	                                      : std::unordered_map<std::string, ScanItemOrigin>{};
+	    publishWorkerTaskSnapshot(workerTasks, workerOriginsByPath);
 
-    auto workerSongs = std::make_shared<WorkerSongStore>();
-    ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
-                                                           .tagReaderSlots = config.tagReaderSlots,
-                                                           .tagReader = [this, workerSongs, &v3cache, &audioTasks, &audioTaskIndexByPath, &indexedSongs, &rootPath](const WorkerTask& task) {
-                                                             auto metadata = readWorkerSong(task, v3cache, audioTasks, audioTaskIndexByPath, workerSongs);
+	    auto workerSongs = std::make_shared<WorkerSongStore>();
+	    ScannerWorkerPool workerPool{ScannerWorkerPool::Config{.workerCount = config.workerCount,
+	                                                           .tagReaderSlots = config.tagReaderSlots,
+	      .tagReader = [this, workerSongs, &audioTasks, &audioTaskIndexByPath, &indexedSongs, &rootPath, workerOriginsByPath](const WorkerTask& task) {
+	        const auto workerOrigin = workerOriginForPath(workerOriginsByPath, task.filePath);
+	        auto metadata = readWorkerSong(task, audioTasks, audioTaskIndexByPath, workerOrigin, workerSongs);
                                                              if (task.nodeIndex < indexedSongs.size()) {
                                                                auto song = workerSongs->take(task.filePath);
                                                                if (song.has_value()) {
@@ -1263,17 +1648,44 @@ private:
                      indexedSong.treeRelativePath.generic_string());
       }
     }
-    if (unfilledCount > 0) {
-      spdlog::warn("reconcileRoot: {} filled, {} unfilled nodes after worker completion", filledCount, unfilledCount);
-    }
+	    if (unfilledCount > 0) {
+	      spdlog::warn("reconcileRoot: {} filled, {} unfilled nodes after worker completion", filledCount, unfilledCount);
+	    }
 
-    for (auto& publishedSong : result.songs) {
-      reconcileLyrics(publishedSong.song, config.scanner, result.errors, skipped);
+	    if (g_publishedSongObserver != nullptr) {
+	      std::vector<PublishedSongSnapshot> snapshots;
+	      snapshots.reserve(result.songs.size());
+	      for (const auto& publishedSong : result.songs) {
+	        snapshots.push_back(PublishedSongSnapshot{.filePath = publishedSong.song.metadata.filePath,
+	                                                  .treeRelativePath = publishedSong.treeRelativePath,
+	                                                  .origin = publishedSong.origin,
+	                                                  .locationId = publishedSong.locationId});
+	      }
+	      g_publishedSongObserver(snapshots);
+	    }
+
+	    for (auto& publishedSong : result.songs) {
+      publishedSong.externalLyricsCacheAction = reconcileLyrics(publishedSong.song, config.scanner, result.errors);
+      if (publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::Cancelled) {
+        result.cancelled = true;
+        publishIncrementalPlanSnapshot(incrementalPlan);
+        return result;
+      }
+      if (incrementalPlan.has_value() && publishedSong.origin == ScanItemOrigin::CacheHit &&
+          publishedSong.locationId.has_value() && publishedSong.externalLyricsCacheAction != ExternalLyricsCacheAction::None) {
+        incrementalPlan->lyricsOnlyUpdates.push_back(
+            cache::LyricsCacheUpdate{.locationId = *publishedSong.locationId,
+                                     .externalLrcPath = publishedSong.song.metadata.externalLyricsPath,
+                                     .externalLrcMtimeNs = fileTimeNanoseconds(publishedSong.song.metadata.externalLyricsMtime),
+                                     .externalLrcHash = publishedSong.song.metadata.externalLyricsHash,
+                                     .externalLyrics = publishedSong.song.externalLyrics,
+                                     .removeExternalLyrics = publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::RemoveExternal});
+      }
     }
+    publishIncrementalPlanSnapshot(incrementalPlan);
     
     phase4End = std::chrono::steady_clock::now();
     
-    // V3 Cache: No need for saveRoot, data is already saved via upsertContent/upsertLocation
     phase5End = std::chrono::steady_clock::now();
 
     const auto phase1Ms = std::chrono::duration_cast<std::chrono::milliseconds>(phase1End - phaseStart).count();
@@ -1297,7 +1709,7 @@ private:
       return;
     }
     try {
-      cache::SQLiteCacheV3 cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
       cache.updateScanRoot(scanRootRecord(rootPath, decision, songs.size(), scanDuration));
       std::vector<std::string> retainedLocationIds;
       retainedLocationIds.reserve(songs.size());
@@ -1305,14 +1717,21 @@ private:
         if (!publishedSong.song.metadata.duration.has_value() || publishedSong.song.metadata.contentHash.empty()) {
           continue;
         }
-        cache.upsertContent(publishedSong.song.metadata.contentHash, publishedSong.song.metadata);
         const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath);
         retainedLocationIds.push_back(location.locationId);
+        if (publishedSong.origin == ScanItemOrigin::CacheHit &&
+            publishedSong.externalLyricsCacheAction != ExternalLyricsCacheAction::None) {
+          cache.upsertLocation(location);
+          cache.replaceLyrics(location.locationId, "external", publishedSong.song.externalLyrics);
+          continue;
+        }
+        cache.upsertContent(publishedSong.song.metadata.contentHash, publishedSong.song.metadata);
         cache.upsertLocation(location);
         if (!publishedSong.song.embeddedLyrics.empty()) {
           cache.replaceLyrics(location.locationId, "embedded", publishedSong.song.embeddedLyrics);
         }
-        if (!publishedSong.song.externalLyrics.empty()) {
+        if (!publishedSong.song.externalLyrics.empty() ||
+            publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::RemoveExternal) {
           cache.replaceLyrics(location.locationId, "external", publishedSong.song.externalLyrics);
         }
       }
@@ -1335,44 +1754,19 @@ private:
                               .cachedSong = std::nullopt};
   }
 
-  [[nodiscard]] SongMetadata readWorkerSong(const WorkerTask& task,
-                                            const cache::SQLiteCacheV3& v3cache,
-                                            const std::vector<AudioReconcileTask>& audioTasks,
-                                            const std::unordered_map<std::string, std::size_t>& audioTaskIndexByPath,
-                                            const std::shared_ptr<WorkerSongStore>& workerSongs) {
-    spdlog::trace("readWorkerSong called: nodeIndex={}, filePath={}, hasCachedLocation={}", 
-                 task.nodeIndex, task.filePath.generic_string(), task.cachedLocation.has_value());
+	  [[nodiscard]] SongMetadata readWorkerSong(const WorkerTask& task,
+	                                            const std::vector<AudioReconcileTask>& audioTasks,
+	                                            const std::unordered_map<std::string, std::size_t>& audioTaskIndexByPath,
+	                                            ScanItemOrigin workerOrigin,
+	                                            const std::shared_ptr<WorkerSongStore>& workerSongs) {
+	    spdlog::trace("readWorkerSong called: nodeIndex={}, filePath={}, hasCachedLocation={}", 
+	                 task.nodeIndex, task.filePath.generic_string(), task.cachedLocation.has_value());
     const auto audioTask = audioTaskByPath(audioTasks, audioTaskIndexByPath, task.filePath);
     if (audioTask == nullptr) {
-      throw std::runtime_error{"missing scanner worker task context"};
-    }
+	      throw std::runtime_error{"missing scanner worker task context"};
+	    }
 
-    if (task.cachedLocation.has_value() && task.locationId == task.cachedLocation->locationId) {
-      spdlog::trace("readWorkerSong cache-hit path: trying to load location and content for locationId={}", task.locationId);
-      const auto cachedLocation = v3cache.loadLocation(task.locationId);
-      if (cachedLocation.has_value()) {
-        const auto cachedSong = v3cache.loadContent(cachedLocation->contentId);
-        if (cachedSong.has_value()) {
-          spdlog::trace("readWorkerSong cache-hit path: successfully loaded content, will call workerSongs->put()");
-        } else {
-          spdlog::warn("readWorkerSong cache-hit path: loadContent returned nullopt for contentId={}", cachedLocation->contentId);
-        }
-        if (cachedSong.has_value()) {
-          auto song = *cachedSong;
-          song.embeddedLyrics = v3cache.loadLyrics(cachedLocation->locationId, "embedded");
-          song.externalLyrics = v3cache.loadLyrics(cachedLocation->locationId, "external");
-          applyCachedLocation(song, *cachedLocation, task.filePath);
-          auto metadata = song.metadata;
-          workerSongs->put(task.filePath,
-                           WorkerSongPublication{.song = std::move(song),
-                                                 .origin = ScanItemOrigin::CacheHit,
-                                                 .locationId = cachedLocation->locationId});
-          return metadata;
-        }
-      }
-    }
-
-    auto raw = metadataReader_->read(task.filePath, coverExportDir_);
+	    auto raw = metadataReader_->read(task.filePath, coverExportDir_);
     raw.filePath = task.filePath;
     auto mapped = mapRawTagMetadata(raw,
                                     computeContentId(std::chrono::duration_cast<std::chrono::milliseconds>(raw.duration),
@@ -1393,12 +1787,12 @@ private:
     }
     song.metadata.trackId = task.filePath.generic_string();
     song.metadata.logicalTrackId = task.filePath.generic_string();
-    auto metadata = song.metadata;
-    workerSongs->put(task.filePath,
-                     WorkerSongPublication{.song = std::move(song),
-                                           .origin = ScanItemOrigin::ScannedFull,
-                                           .locationId = task.locationId.empty() ? std::optional<std::string>{}
-                                                                              : std::optional<std::string>{task.locationId}});
+	    auto metadata = song.metadata;
+	    workerSongs->put(task.filePath,
+	                     WorkerSongPublication{.song = std::move(song),
+	                                           .origin = workerOrigin,
+	                                           .locationId = task.locationId.empty() ? std::optional<std::string>{}
+	                                                                              : std::optional<std::string>{task.locationId}});
     return metadata;
   }
 
@@ -1423,36 +1817,66 @@ private:
     return audioTask->cachedSong;
   }
 
-  void reconcileLyrics(cache::CachedSong& song, const ScannerConfig& config,
-                      std::vector<ScannerError>& errors, std::uint64_t& skipped) {
-    const auto sidecar = expectedLyricsSidecarPath(song.metadata.filePath);
-    if (!config.readExternalLyrics || !std::filesystem::is_regular_file(sidecar)) {
-      song.externalLyrics.clear();
-      selectEffectiveLyrics(song);
-      return;
-    }
-    const auto lrcHash = hashLyricsSidecar(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
-    for (const auto& error : lrcHash.errors) {
-      errors.push_back(scannerErrorFrom(error));
-    }
-    const auto relativeSidecar = relativePathFor(song.metadata.filePath.parent_path(), sidecar);
-    
-    // V3: Skip cache check for external lyrics, always reparse
-    const auto parsed = parseLrcFile(sidecar);
-    for (const auto& error : parsed.errors) {
-      errors.push_back(scannerErrorFrom(error));
-    }
-    if (!parsed.errors.empty()) {
-      song.externalLyrics.clear();
-      selectEffectiveLyrics(song);
-      return;
-    }
-    song.externalLyrics = parsed.lines;
-    song.metadata.externalLyricsPath = relativeSidecar;
-    song.metadata.externalLyricsHash = lrcHash.hash;
-    song.metadata.externalLyricsMtime = fileMtime(sidecar);
-    selectEffectiveLyrics(song);
-  }
+	  ExternalLyricsCacheAction reconcileLyrics(cache::CachedSong& song, const ScannerConfig& config,
+	                                            std::vector<ScannerError>& errors) {
+	    const auto sidecar = expectedLyricsSidecarPath(song.metadata.filePath);
+	    const auto hadExternalCache = !song.externalLyrics.empty() || song.metadata.externalLyricsPath.has_value() ||
+	                                  song.metadata.externalLyricsHash.has_value();
+	    auto clearExternalLyrics = [&song, hadExternalCache] {
+	      song.externalLyrics.clear();
+	      selectEffectiveLyrics(song);
+	      return hadExternalCache ? ExternalLyricsCacheAction::RemoveExternal : ExternalLyricsCacheAction::None;
+	    };
+
+	    if (!config.readExternalLyrics) {
+	      song.externalLyrics.clear();
+	      selectEffectiveLyrics(song);
+	      return ExternalLyricsCacheAction::None;
+	    }
+	    if (!std::filesystem::is_regular_file(sidecar)) {
+	      return clearExternalLyrics();
+	    }
+
+	    const auto lrcHash = hashLyricsSidecarWithTestSeam(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
+	    const auto hashCancelled = std::ranges::any_of(lrcHash.errors, [](const HashError& error) {
+	      return error.code == HashErrorCode::Cancelled;
+	    });
+	    if (hashCancelled) {
+	      return ExternalLyricsCacheAction::Cancelled;
+	    }
+	    for (const auto& error : lrcHash.errors) {
+	      errors.push_back(scannerErrorFrom(error));
+	    }
+	    if (!lrcHash.hash.has_value()) {
+	      return clearExternalLyrics();
+	    }
+
+	    const auto relativeSidecar = relativePathFor(song.metadata.filePath.parent_path(), sidecar);
+	    if (song.metadata.externalLyricsHash == lrcHash.hash && !song.externalLyrics.empty()) {
+	      song.metadata.externalLyricsPath = relativeSidecar;
+	      song.metadata.externalLyricsMtime = fileMtime(sidecar);
+	      selectEffectiveLyrics(song);
+	      return ExternalLyricsCacheAction::None;
+	    }
+
+	    const auto parsed = parseLrcFileWithTestSeam(sidecar);
+	    for (const auto& error : parsed.errors) {
+	      errors.push_back(scannerErrorFrom(error));
+	    }
+	    if (!parsed.errors.empty()) {
+	      return clearExternalLyrics();
+	    }
+
+	    song.externalLyrics = parsed.lines;
+	    if (song.externalLyrics.empty()) {
+	      return clearExternalLyrics();
+	    }
+	    song.metadata.externalLyricsPath = relativeSidecar;
+	    song.metadata.externalLyricsHash = lrcHash.hash;
+	    song.metadata.externalLyricsMtime = fileMtime(sidecar);
+	    selectEffectiveLyrics(song);
+	    return ExternalLyricsCacheAction::UpdateExternal;
+	  }
 
   void debounceLoop(const std::shared_ptr<WatchRuntimeState>& state) {
     std::uint64_t processedGeneration = 0;
@@ -1574,12 +1998,52 @@ void clearPreallocationObserver() {
   g_preallocationObserver = nullptr;
 }
 
+void setWorkerTaskObserver(WorkerTaskObserver observer) {
+  g_workerTaskObserver = std::move(observer);
+}
+
+void clearWorkerTaskObserver() {
+  g_workerTaskObserver = nullptr;
+}
+
+void setPublishedSongObserver(PublishedSongObserver observer) {
+  g_publishedSongObserver = std::move(observer);
+}
+
+void clearPublishedSongObserver() {
+  g_publishedSongObserver = nullptr;
+}
+
 void setTestCueSheetProvider(TestCueSheetProvider provider) {
   g_testCueSheetProvider = std::move(provider);
 }
 
 void clearTestCueSheetProvider() {
   g_testCueSheetProvider = nullptr;
+}
+
+void setLrcParseObserver(LrcParseObserver observer) {
+  g_lrcParseObserver = std::move(observer);
+}
+
+void clearLrcParseObserver() {
+  g_lrcParseObserver = nullptr;
+}
+
+void setTestLyricsSidecarHashProvider(TestLyricsSidecarHashProvider provider) {
+  g_testLyricsSidecarHashProvider = std::move(provider);
+}
+
+void clearTestLyricsSidecarHashProvider() {
+  g_testLyricsSidecarHashProvider = nullptr;
+}
+
+void setIncrementalPlanObserver(IncrementalPlanObserver observer) {
+  g_incrementalPlanObserver = std::move(observer);
+}
+
+void clearIncrementalPlanObserver() {
+  g_incrementalPlanObserver = nullptr;
 }
 
 }

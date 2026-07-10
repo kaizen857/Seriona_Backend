@@ -3,13 +3,15 @@
 #include "file_scanner_orchestrator_test_access.h"
 #include "file_scanner_service_internal.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
 
 #include <doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -106,6 +108,24 @@ public:
   TestCueProviderGuard& operator=(const TestCueProviderGuard&) = delete;
 };
 
+class WorkerTaskObserverGuard {
+public:
+  explicit WorkerTaskObserverGuard(WorkerTaskObserver observer) { setWorkerTaskObserver(std::move(observer)); }
+  ~WorkerTaskObserverGuard() { clearWorkerTaskObserver(); }
+
+  WorkerTaskObserverGuard(const WorkerTaskObserverGuard&) = delete;
+  WorkerTaskObserverGuard& operator=(const WorkerTaskObserverGuard&) = delete;
+};
+
+class PublishedSongObserverGuard {
+public:
+  explicit PublishedSongObserverGuard(PublishedSongObserver observer) { setPublishedSongObserver(std::move(observer)); }
+  ~PublishedSongObserverGuard() { clearPublishedSongObserver(); }
+
+  PublishedSongObserverGuard(const PublishedSongObserverGuard&) = delete;
+  PublishedSongObserverGuard& operator=(const PublishedSongObserverGuard&) = delete;
+};
+
 struct TimedSnapshot {
   PlaylistTreeSnapshot snapshot;
   std::chrono::milliseconds elapsed{0};
@@ -137,7 +157,13 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
 }
 
 [[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
-  return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots-v3.sqlite"};
+  return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots.sqlite"};
+}
+
+[[nodiscard]] std::int64_t filesystemMtimeNs(const std::filesystem::path& path) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::filesystem::last_write_time(path).time_since_epoch())
+    .count();
 }
 
 [[nodiscard]] std::filesystem::path canonicalRootPath(const std::filesystem::path& path) {
@@ -153,7 +179,7 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
   const auto rootPath = canonicalRootPath(temp.path());
   const auto treeHash = computeDirectoryTreeHash(rootPath);
   REQUIRE(treeHash.hash.has_value());
-  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   auto scanRoot = sidecar.loadScanRoot(rootPath);
   REQUIRE(scanRoot.has_value());
   scanRoot->directoryTreeHash = *treeHash.hash;
@@ -171,12 +197,38 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
   return songs;
 }
 
+[[nodiscard]] std::vector<PlaylistNode> songNodesByPath(const PlaylistTreeSnapshot& snapshot,
+                                                        const std::filesystem::path& path) {
+  std::vector<PlaylistNode> nodes;
+  for (const auto& node : snapshot.nodes) {
+    if (node.song.has_value() && node.song->filePath == path) {
+      nodes.push_back(node);
+    }
+  }
+  std::ranges::sort(nodes, [](const PlaylistNode& left, const PlaylistNode& right) {
+    return left.song->offset.value_or(std::chrono::milliseconds{-1}) <
+           right.song->offset.value_or(std::chrono::milliseconds{-1});
+  });
+  return nodes;
+}
+
 [[nodiscard]] const SongMetadata& songByPath(const std::vector<SongMetadata>& songs, const std::filesystem::path& path) {
   const auto iterator = std::ranges::find(songs, path, &SongMetadata::filePath);
   if (iterator == songs.end()) {
     throw std::runtime_error("missing song in incremental e2e test");
   }
   return *iterator;
+}
+
+[[nodiscard]] std::size_t publishedOriginCount(const std::vector<PublishedSongSnapshot>& songs,
+                                               ScanItemOrigin origin) {
+  return static_cast<std::size_t>(std::ranges::count(songs, origin, &PublishedSongSnapshot::origin));
+}
+
+[[nodiscard]] const PublishedSongSnapshot* publishedByOrigin(const std::vector<PublishedSongSnapshot>& songs,
+                                                            ScanItemOrigin origin) {
+  const auto iterator = std::ranges::find(songs, origin, &PublishedSongSnapshot::origin);
+  return iterator == songs.end() ? nullptr : &*iterator;
 }
 
 template <typename Predicate>
@@ -235,8 +287,8 @@ TEST_CASE("scanner incremental e2e covers full unchanged changed added and delet
                                               });
   songs = songsIn(addedAndChanged.snapshot);
 
-  REQUIRE(songs.size() == 4U);
-  CHECK(reader->readCount() == 5U);
+	  REQUIRE(songs.size() == 4U);
+	  CHECK(reader->readCount() == 7U);
   CHECK(songByPath(songs, stable).title == "Stable");
   CHECK(songByPath(songs, changed).title == "Changed After");
   CHECK(songByPath(songs, deleted).title == "Deleted");
@@ -249,8 +301,8 @@ TEST_CASE("scanner incremental e2e covers full unchanged changed added and delet
                                        });
   songs = songsIn(deletion.snapshot);
 
-  REQUIRE(songs.size() == 3U);
-  CHECK(reader->readCount() == 5U);
+	  REQUIRE(songs.size() == 3U);
+	  CHECK(reader->readCount() == 10U);
   CHECK(songByPath(songs, stable).title == "Stable");
   CHECK(songByPath(songs, changed).title == "Changed After");
   CHECK(songByPath(songs, added).title == "Added");
@@ -269,7 +321,7 @@ TEST_CASE("scanner incremental e2e covers full unchanged changed added and delet
   CHECK(fileScannedSongs[8].filePath == changed);
   CHECK(fileScannedSongs[9].filePath == added);
 
-  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
   CHECK(locations.size() == 3U);
   CHECK(std::ranges::none_of(locations, [&deleted](const cache::CachedLocation& location) { return location.filePath == deleted; }));
@@ -331,7 +383,7 @@ TEST_CASE("scanner incremental e2e relies on scan-root directory tree hash befor
   CHECK(songByPath(songs, audio).title == "Stable Before Stale Hash");
   CHECK(reader->readCount() == 1U);
 
-  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());
   auto scanRoot = sidecar.loadScanRoot(rootPath);
   REQUIRE(scanRoot.has_value());
@@ -364,6 +416,404 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
   const auto referencedAudio = test::writeAudioFixture(temp.path(), "album.flac");
   const auto standalone = test::writeAudioFixture(temp.path(), "bonus.flac");
   writeText(cueFile, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n  TRACK 02 AUDIO\n");
+  const auto fixtureNow = std::filesystem::file_time_type::clock::now();
+  std::filesystem::last_write_time(cueFile, fixtureNow - std::chrono::hours{2});
+  std::filesystem::last_write_time(referencedAudio, fixtureNow - std::chrono::hours{1});
+
+  std::atomic_size_t cueReadCount{0};
+  const TestCueProviderGuard cueProvider{[&referencedAudio, &cueReadCount](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "album.cue") {
+      return {};
+    }
+    cueReadCount.fetch_add(1U, std::memory_order_relaxed);
+    return {{.audioFilePath = referencedAudio,
+             .offset = 0,
+             .duration = 180000000,
+             .title = "Cue Track 1",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1},
+            {.audioFilePath = referencedAudio,
+             .offset = 180000000,
+             .duration = 200000000,
+             .title = "Cue Track 2",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 2}};
+  }};
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(referencedAudio, rawMetadata("Bare Album File"));
+  reader->put(standalone, rawMetadata("Bonus Track"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 3U;
+  });
+  const auto fullReadCount = reader->readCount();
+  const auto fullCueReadCount = cueReadCount.load(std::memory_order_relaxed);
+
+  auto songs = songsIn(full.snapshot);
+  auto fullCueNodes = songNodesByPath(full.snapshot, cueFile);
+  REQUIRE(songs.size() == 3U);
+  REQUIRE(fullCueNodes.size() == 2U);
+  CHECK(std::ranges::count(songs, cueFile, &SongMetadata::filePath) == 2U);
+  CHECK(songByPath(songs, standalone).title == "Bonus Track");
+  std::vector<SongMetadata> cueTracks;
+  for (const auto& song : songs) {
+    if (song.filePath == cueFile) {
+      cueTracks.push_back(song);
+    }
+  }
+  std::ranges::sort(cueTracks, {}, &SongMetadata::offset);
+  REQUIRE(cueTracks.size() == 2U);
+  CHECK(cueTracks[0].sourceFilePath == referencedAudio);
+  CHECK(cueTracks[0].logicalTrackId == cueFile.generic_string() + "#track0");
+  CHECK(cueTracks[0].trackId == cueTracks[0].logicalTrackId);
+  CHECK(cueTracks[0].offset == std::chrono::milliseconds{0});
+  CHECK(cueTracks[0].duration == std::chrono::milliseconds{180000});
+  CHECK(cueTracks[1].sourceFilePath == referencedAudio);
+  CHECK(cueTracks[1].logicalTrackId == cueFile.generic_string() + "#track1");
+  CHECK(cueTracks[1].trackId == cueTracks[1].logicalTrackId);
+  CHECK(cueTracks[1].offset == std::chrono::milliseconds{180000});
+  CHECK(cueTracks[1].duration == std::chrono::milliseconds{200000});
+
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto rootPath = canonicalRootPath(temp.path());
+  auto locations = sidecar.loadLocationsByRoot(rootPath);
+  CHECK(std::ranges::count(locations, cueFile, &cache::CachedLocation::filePath) == 2U);
+  CHECK(std::ranges::any_of(locations, [&standalone](const cache::CachedLocation& location) {
+    return location.filePath == standalone;
+  }));
+  std::vector<cache::CachedLocation> cueLocations;
+  for (const auto& location : locations) {
+    if (location.filePath == cueFile) {
+      cueLocations.push_back(location);
+    }
+  }
+  std::ranges::sort(cueLocations, [](const cache::CachedLocation& left, const cache::CachedLocation& right) {
+    return left.cueTrackOffset.value_or(std::chrono::milliseconds{0}) <
+           right.cueTrackOffset.value_or(std::chrono::milliseconds{0});
+  });
+  REQUIRE(cueLocations.size() == 2U);
+  const auto cueFileSize = std::filesystem::file_size(cueFile);
+  const auto sourceFileSize = std::filesystem::file_size(referencedAudio);
+  REQUIRE(cueFileSize != sourceFileSize);
+  const auto cueFileMtimeNs = filesystemMtimeNs(cueFile);
+  const auto sourceFileMtimeNs = filesystemMtimeNs(referencedAudio);
+  REQUIRE(cueFileMtimeNs != sourceFileMtimeNs);
+  for (std::size_t index = 0; index < cueLocations.size(); ++index) {
+    auto location = cueLocations[index];
+    CHECK(location.sourceFilePath == referencedAudio);
+    CHECK(location.fileSizeBytes == cueFileSize);
+    CHECK(location.fileMtimeNs == cueFileMtimeNs);
+    REQUIRE(location.cueTrackIndex.has_value());
+    CHECK(*location.cueTrackIndex == index);
+    REQUIRE(location.cueFileSizeBytes.has_value());
+    CHECK(*location.cueFileSizeBytes == cueFileSize);
+    REQUIRE(location.cueFileMtimeNs.has_value());
+    CHECK(*location.cueFileMtimeNs == cueFileMtimeNs);
+    REQUIRE(location.sourceFileSizeBytes.has_value());
+    CHECK(*location.sourceFileSizeBytes == sourceFileSize);
+    REQUIRE(location.sourceFileMtimeNs.has_value());
+    CHECK(*location.sourceFileMtimeNs == sourceFileMtimeNs);
+
+    const auto artwork = temp.dbPath("art-" + std::to_string(index) + ".jpg");
+    const auto thumbnail = temp.dbPath("thumb-" + std::to_string(index) + ".jpg");
+    writeText(artwork, "artwork");
+    writeText(thumbnail, "thumbnail");
+    location.artworkPath = artwork;
+    location.thumbnailPath = thumbnail;
+    location.lyricsSource = LyricsSource::EmbeddedTag;
+    sidecar.upsertLocation(location);
+	    sidecar.replaceLyrics(location.locationId,
+	                          "embedded",
+	                          {LyricLine{.timestamp = std::chrono::milliseconds{static_cast<std::int64_t>(index) * 1000},
+	                                     .text = "cached embedded lyric " + std::to_string(index)}});
+	  }
+
+	  std::vector<WorkerTaskSnapshot> cacheHitWorkerTasks;
+	  std::vector<PublishedSongSnapshot> cacheHitPublishedSongs;
+	  const WorkerTaskObserverGuard workerObserver{[&cacheHitWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+	    cacheHitWorkerTasks = tasks;
+	  }};
+	  const PublishedSongObserverGuard publishedObserver{[&cacheHitPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+	    cacheHitPublishedSongs = songs;
+	  }};
+
+	  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) {
+	    return songsIn(snapshot).size() == 3U;
+	  });
+
+  songs = songsIn(incremental.snapshot);
+  const auto incrementalCueNodes = songNodesByPath(incremental.snapshot, cueFile);
+  REQUIRE(songs.size() == 3U);
+  REQUIRE(incrementalCueNodes.size() == 2U);
+  CHECK(std::ranges::count(songs, cueFile, &SongMetadata::filePath) == 2U);
+  CHECK(std::ranges::none_of(songs, [&referencedAudio](const SongMetadata& song) {
+    return song.filePath == referencedAudio;
+  }));
+	  CHECK(songByPath(songs, standalone).title == "Bonus Track");
+	  CHECK(reader->readCount() == fullReadCount);
+	  CHECK(cueReadCount.load(std::memory_order_relaxed) == fullCueReadCount);
+	  CHECK(cacheHitWorkerTasks.empty());
+	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
+	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CueTrackCacheHit) == 2U);
+	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CacheHit) == 1U);
+	  for (const auto& publishedSong : cacheHitPublishedSongs) {
+	    if (publishedSong.origin == ScanItemOrigin::CacheHit || publishedSong.origin == ScanItemOrigin::CueTrackCacheHit) {
+	      REQUIRE(publishedSong.locationId.has_value());
+	      CHECK_FALSE(publishedSong.locationId->empty());
+	    }
+	  }
+	  for (std::size_t index = 0; index < incrementalCueNodes.size(); ++index) {
+    const auto& fullNode = fullCueNodes[index];
+    const auto& cachedNode = incrementalCueNodes[index];
+    REQUIRE(fullNode.song.has_value());
+    REQUIRE(cachedNode.song.has_value());
+    CHECK(cachedNode.nodeId == fullNode.nodeId);
+    CHECK(cachedNode.parentNodeId == fullNode.parentNodeId);
+    CHECK(cachedNode.song->trackId == fullNode.song->trackId);
+    CHECK(cachedNode.song->logicalTrackId == fullNode.song->logicalTrackId);
+    CHECK(cachedNode.song->filePath == cueFile);
+    CHECK(cachedNode.song->sourceFilePath == referencedAudio);
+    CHECK(cachedNode.song->offset == fullNode.song->offset);
+    CHECK(cachedNode.song->duration == fullNode.song->duration);
+    CHECK(cachedNode.song->artworkPath == temp.dbPath("art-" + std::to_string(index) + ".jpg"));
+    CHECK(cachedNode.song->thumbnailPath == temp.dbPath("thumb-" + std::to_string(index) + ".jpg"));
+    CHECK(cachedNode.song->effectiveLyricsSource == LyricsSource::EmbeddedTag);
+    REQUIRE(cachedNode.song->effectiveLyrics.size() == 1U);
+	    CHECK(cachedNode.song->effectiveLyrics[0].text == "cached embedded lyric " + std::to_string(index));
+	  }
+}
+
+TEST_CASE("scanner incremental e2e marks newly added cue reader tracks as cue scanned new") {
+  test::TempScannerRoot temp{"scanner-incremental-cue-new-origin"};
+  const auto standalone = test::writeAudioFixture(temp.path(), "standalone.flac");
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(standalone, rawMetadata("Standalone Before Cue"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 1U;
+  });
+  auto songs = songsIn(full.snapshot);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songByPath(songs, standalone).title == "Standalone Before Cue");
+
+  const auto cueFile = temp.path() / "new-album.cue";
+  const auto referencedAudio = test::writeAudioFixture(temp.path(), "new-album.flac");
+  writeText(cueFile, "FILE \"new-album.flac\" WAVE\n  TRACK 01 AUDIO\n");
+  forceNextScanIncrementalForCurrentTree(temp);
+  const TestCueProviderGuard cueProvider{[&referencedAudio](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "new-album.cue") {
+      return {};
+    }
+    return {{.audioFilePath = referencedAudio,
+             .offset = 0,
+             .duration = 180000000,
+             .title = "New Cue Track",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  }};
+
+  std::vector<WorkerTaskSnapshot> newCueWorkerTasks;
+  std::vector<PublishedSongSnapshot> newCuePublishedSongs;
+  const WorkerTaskObserverGuard workerObserver{[&newCueWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+    newCueWorkerTasks = tasks;
+  }};
+  const PublishedSongObserverGuard publishedObserver{[&newCuePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
+    newCuePublishedSongs = publishedSongs;
+  }};
+
+  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                          [](const PlaylistTreeSnapshot& snapshot) {
+                                            return songsIn(snapshot).size() == 2U;
+                                          });
+
+  songs = songsIn(incremental.snapshot);
+  REQUIRE(songs.size() == 2U);
+  CHECK(songByPath(songs, cueFile).title == "New Cue Track");
+  CHECK(std::ranges::none_of(songs, [&referencedAudio](const SongMetadata& song) {
+    return song.filePath == referencedAudio;
+  }));
+  CHECK(newCueWorkerTasks.empty());
+  CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::CacheHit) == 1U);
+  CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
+  CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::CueTrackScannedNew) == 1U);
+  const auto* newCueTrack = publishedByOrigin(newCuePublishedSongs, ScanItemOrigin::CueTrackScannedNew);
+  REQUIRE(newCueTrack != nullptr);
+  REQUIRE(newCueTrack->locationId.has_value());
+  CHECK_FALSE(newCueTrack->locationId->empty());
+}
+
+TEST_CASE("scanner incremental e2e falls back to cue reader when cue or source fingerprint changes") {
+  test::TempScannerRoot temp{"scanner-incremental-cue-cache-miss"};
+  const auto cueFile = temp.path() / "album.cue";
+  const auto referencedAudio = test::writeAudioFixture(temp.path(), "album.flac");
+  writeText(cueFile, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n");
+  const auto fixtureNow = std::filesystem::file_time_type::clock::now();
+  std::filesystem::last_write_time(cueFile, fixtureNow - std::chrono::hours{2});
+  std::filesystem::last_write_time(referencedAudio, fixtureNow - std::chrono::hours{1});
+
+  std::atomic_size_t cueReadCount{0};
+  std::string cueTitle = "Cue Before";
+  const TestCueProviderGuard cueProvider{[&referencedAudio, &cueReadCount, &cueTitle](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "album.cue") {
+      return {};
+    }
+    cueReadCount.fetch_add(1U, std::memory_order_relaxed);
+    return {{.audioFilePath = referencedAudio,
+             .offset = 0,
+             .duration = 180000000,
+             .title = cueTitle,
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  }};
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(referencedAudio, rawMetadata("Bare Album File"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 1U;
+  });
+  auto songs = songsIn(full.snapshot);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songByPath(songs, cueFile).title == "Cue Before");
+  const auto fullCueReadCount = cueReadCount.load(std::memory_order_relaxed);
+
+	  cueTitle = "Cue After Source Change";
+	  writeText(referencedAudio, "changed source bytes for cue cache miss");
+	  std::vector<WorkerTaskSnapshot> sourceChangeWorkerTasks;
+	  std::vector<PublishedSongSnapshot> sourceChangePublishedSongs;
+	  {
+	    const WorkerTaskObserverGuard workerObserver{[&sourceChangeWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+	      sourceChangeWorkerTasks = tasks;
+	    }};
+	    const PublishedSongObserverGuard publishedObserver{[&sourceChangePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
+	      sourceChangePublishedSongs = publishedSongs;
+	    }};
+	    const auto afterSourceChange = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+	                                                 [](const PlaylistTreeSnapshot& snapshot) {
+	                                                   return songsIn(snapshot).size() == 1U;
+	                                                 });
+	    songs = songsIn(afterSourceChange.snapshot);
+	  }
+	  REQUIRE(songs.size() == 1U);
+	  CHECK(songByPath(songs, cueFile).title == "Cue After Source Change");
+	  CHECK(sourceChangeWorkerTasks.empty());
+	  CHECK(publishedOriginCount(sourceChangePublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
+	  CHECK(publishedOriginCount(sourceChangePublishedSongs, ScanItemOrigin::CueTrackRescannedChanged) == 1U);
+	  const auto* changedCueTrack = publishedByOrigin(sourceChangePublishedSongs, ScanItemOrigin::CueTrackRescannedChanged);
+	  REQUIRE(changedCueTrack != nullptr);
+	  REQUIRE(changedCueTrack->locationId.has_value());
+	  CHECK_FALSE(changedCueTrack->locationId->empty());
+	  const auto afterSourceCueReadCount = cueReadCount.load(std::memory_order_relaxed);
+	  CHECK(afterSourceCueReadCount > fullCueReadCount);
+
+  cueTitle = "Cue After Cue Change";
+  writeText(cueFile, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\nREM changed cue fingerprint\n");
+  const auto afterCueChange = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                            [](const PlaylistTreeSnapshot& snapshot) {
+                                              return songsIn(snapshot).size() == 1U;
+                                            });
+  songs = songsIn(afterCueChange.snapshot);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songByPath(songs, cueFile).title == "Cue After Cue Change");
+  CHECK(cueReadCount.load(std::memory_order_relaxed) > afterSourceCueReadCount);
+}
+
+TEST_CASE("scanner incremental e2e preserves readable cue tracks on partial cache miss") {
+  test::TempScannerRoot temp{"scanner-incremental-cue-partial-miss"};
+  const auto cueFile = temp.path() / "album.cue";
+  const auto firstAudio = test::writeAudioFixture(temp.path(), "disc-a.flac");
+  const auto secondAudio = test::writeAudioFixture(temp.path(), "disc-b.flac");
+  writeText(cueFile,
+            "FILE \"disc-a.flac\" WAVE\n  TRACK 01 AUDIO\n"
+            "FILE \"disc-b.flac\" WAVE\n  TRACK 02 AUDIO\n");
+  const auto fixtureNow = std::filesystem::file_time_type::clock::now();
+  std::filesystem::last_write_time(cueFile, fixtureNow - std::chrono::hours{2});
+  std::filesystem::last_write_time(firstAudio, fixtureNow - std::chrono::hours{1});
+  std::filesystem::last_write_time(secondAudio, fixtureNow - std::chrono::minutes{30});
+
+  std::atomic_size_t cueReadCount{0};
+  bool partialMode = false;
+  const TestCueProviderGuard cueProvider{[&](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "album.cue") {
+      return {};
+    }
+    cueReadCount.fetch_add(1U, std::memory_order_relaxed);
+    std::vector<TestCueTrackData> tracks{{.audioFilePath = firstAudio,
+                                          .offset = 0,
+                                          .duration = 180000000,
+                                          .title = partialMode ? "Readable Track After Miss" : "Readable Track Before Miss",
+                                          .artist = "Cue Artist",
+                                          .album = "Cue Album",
+                                          .trackNumber = 1}};
+    if (!partialMode) {
+      tracks.push_back({.audioFilePath = secondAudio,
+                        .offset = 180000000,
+                        .duration = 200000000,
+                        .title = "Removed Source Track",
+                        .artist = "Cue Artist",
+                        .album = "Cue Album",
+                        .trackNumber = 2});
+    }
+    return tracks;
+  }};
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(firstAudio, rawMetadata("Bare Disc A"));
+  reader->put(secondAudio, rawMetadata("Bare Disc B"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 2U;
+  });
+  auto songs = songsIn(full.snapshot);
+  REQUIRE(songs.size() == 2U);
+  const auto fullCueReadCount = cueReadCount.load(std::memory_order_relaxed);
+
+  partialMode = true;
+  std::filesystem::remove(secondAudio);
+  const auto partial = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                      [](const PlaylistTreeSnapshot& snapshot) {
+                                        return songsIn(snapshot).size() == 1U;
+                                      });
+
+  songs = songsIn(partial.snapshot);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songByPath(songs, cueFile).title == "Readable Track After Miss");
+  CHECK(songByPath(songs, cueFile).sourceFilePath == firstAudio);
+  CHECK(std::ranges::none_of(songs, [&](const SongMetadata& song) {
+    return song.filePath == firstAudio || song.filePath == secondAudio;
+  }));
+  CHECK(cueReadCount.load(std::memory_order_relaxed) > fullCueReadCount);
+}
+
+TEST_CASE("scanner incremental e2e hides cached cue source audio before worker scheduling") {
+  test::TempScannerRoot temp{"scanner-incremental-cue-source-hide"};
+  const auto cueFile = temp.path() / "album.cue";
+  const auto referencedAudio = test::writeAudioFixture(temp.path(), "album.flac");
+  const auto standalone = test::writeAudioFixture(temp.path(), "bonus.flac");
+  const std::string originalCueText = "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n  TRACK 02 AUDIO\n";
+  writeText(cueFile, originalCueText);
+  const auto fixtureNow = std::filesystem::file_time_type::clock::now();
+  const auto cachedCueMtime = fixtureNow - std::chrono::hours{2};
+  std::filesystem::last_write_time(cueFile, cachedCueMtime);
+  std::filesystem::last_write_time(referencedAudio, fixtureNow - std::chrono::hours{1});
 
   const TestCueProviderGuard cueProvider{[&referencedAudio](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
     if (cuePath.filename() != "album.cue") {
@@ -395,46 +845,29 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
   const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
     return songsIn(snapshot).size() == 3U;
   });
-  const auto fullReadCount = reader->readCount();
-
   auto songs = songsIn(full.snapshot);
+
   REQUIRE(songs.size() == 3U);
   CHECK(std::ranges::count(songs, cueFile, &SongMetadata::filePath) == 2U);
   CHECK(songByPath(songs, standalone).title == "Bonus Track");
-  std::vector<SongMetadata> cueTracks;
-  for (const auto& song : songs) {
-    if (song.filePath == cueFile) {
-      cueTracks.push_back(song);
-    }
-  }
-  std::ranges::sort(cueTracks, {}, &SongMetadata::offset);
-  REQUIRE(cueTracks.size() == 2U);
-  CHECK(cueTracks[0].sourceFilePath == referencedAudio);
-  CHECK(cueTracks[0].logicalTrackId == cueFile.generic_string() + "#track0");
-  CHECK(cueTracks[0].trackId == cueTracks[0].logicalTrackId);
-  CHECK(cueTracks[0].offset == std::chrono::milliseconds{0});
-  CHECK(cueTracks[0].duration == std::chrono::milliseconds{180000});
-  CHECK(cueTracks[1].sourceFilePath == referencedAudio);
-  CHECK(cueTracks[1].logicalTrackId == cueFile.generic_string() + "#track1");
-  CHECK(cueTracks[1].trackId == cueTracks[1].logicalTrackId);
-  CHECK(cueTracks[1].offset == std::chrono::milliseconds{180000});
-  CHECK(cueTracks[1].duration == std::chrono::milliseconds{200000});
+  const auto fullReadCount = reader->readCount();
 
-  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
-  const auto rootPath = canonicalRootPath(temp.path());
-  auto locations = sidecar.loadLocationsByRoot(rootPath);
-  CHECK(std::ranges::count(locations, cueFile, &cache::CachedLocation::filePath) == 2U);
-  CHECK(std::ranges::any_of(locations, [&standalone](const cache::CachedLocation& location) {
-    return location.filePath == standalone;
-  }));
+  std::string cueTextWithoutFileCommand = "REM cached source path fallback";
+  cueTextWithoutFileCommand.resize(originalCueText.size(), ' ');
+  writeText(cueFile, cueTextWithoutFileCommand);
+  std::filesystem::last_write_time(cueFile, cachedCueMtime);
 
-  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) {
-    return songsIn(snapshot).size() == 3U;
-  });
+  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                          [](const PlaylistTreeSnapshot&) {
+                                            return true;
+                                          });
 
   songs = songsIn(incremental.snapshot);
   REQUIRE(songs.size() == 3U);
   CHECK(std::ranges::count(songs, cueFile, &SongMetadata::filePath) == 2U);
+  CHECK(std::ranges::none_of(songs, [&referencedAudio](const SongMetadata& song) {
+    return song.filePath == referencedAudio;
+  }));
   CHECK(songByPath(songs, standalone).title == "Bonus Track");
   CHECK(reader->readCount() == fullReadCount);
 }

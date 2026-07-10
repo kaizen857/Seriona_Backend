@@ -6,6 +6,7 @@
 #include "file_scanner_service_internal.h"
 #include "file_scanner_orchestrator_test_access.h"
 
+#include "seriona/scanner/directory_tree_hash.h"
 #include "seriona/scanner/file_scanner_service.h"
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
 
@@ -101,6 +102,60 @@ struct ScanEvents {
   return meta;
 }
 
+class WorkerTaskObserverGuard {
+public:
+  explicit WorkerTaskObserverGuard(WorkerTaskObserver observer) { setWorkerTaskObserver(std::move(observer)); }
+  ~WorkerTaskObserverGuard() { clearWorkerTaskObserver(); }
+
+  WorkerTaskObserverGuard(const WorkerTaskObserverGuard&) = delete;
+  WorkerTaskObserverGuard& operator=(const WorkerTaskObserverGuard&) = delete;
+};
+
+class PublishedSongObserverGuard {
+public:
+  explicit PublishedSongObserverGuard(PublishedSongObserver observer) { setPublishedSongObserver(std::move(observer)); }
+  ~PublishedSongObserverGuard() { clearPublishedSongObserver(); }
+
+  PublishedSongObserverGuard(const PublishedSongObserverGuard&) = delete;
+  PublishedSongObserverGuard& operator=(const PublishedSongObserverGuard&) = delete;
+};
+
+[[nodiscard]] const WorkerTaskSnapshot* workerSnapshotByPath(const std::vector<WorkerTaskSnapshot>& snapshots,
+                                                            const std::filesystem::path& path) {
+  const auto iterator = std::ranges::find(snapshots, path, &WorkerTaskSnapshot::filePath);
+  return iterator == snapshots.end() ? nullptr : &*iterator;
+}
+
+[[nodiscard]] const PublishedSongSnapshot* publishedSnapshotByPath(const std::vector<PublishedSongSnapshot>& snapshots,
+                                                                   const std::filesystem::path& path) {
+  const auto iterator = std::ranges::find(snapshots, path, &PublishedSongSnapshot::filePath);
+  return iterator == snapshots.end() ? nullptr : &*iterator;
+}
+
+[[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
+  return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots.sqlite"};
+}
+
+[[nodiscard]] std::filesystem::path canonicalRootPath(const std::filesystem::path& path) {
+  std::error_code error;
+  auto canonical = std::filesystem::weakly_canonical(path, error);
+  if (error) {
+    canonical = path.lexically_normal();
+  }
+  return canonical;
+}
+
+void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
+  const auto rootPath = canonicalRootPath(temp.path());
+  const auto treeHash = computeDirectoryTreeHash(rootPath);
+  REQUIRE(treeHash.hash.has_value());
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  auto scanRoot = sidecar.loadScanRoot(rootPath);
+  REQUIRE(scanRoot.has_value());
+  scanRoot->directoryTreeHash = *treeHash.hash;
+  sidecar.updateScanRoot(*scanRoot);
+}
+
 } // namespace
 
 TEST_CASE("IndexedPublishedSong: preallocated array supports CueContainer nodes") {
@@ -158,6 +213,10 @@ TEST_CASE("reconcileRoot: worker-filled song keeps default origin and computed l
 
   std::vector<ScanItemOrigin> observedOrigins;
   std::vector<std::optional<std::string>> observedLocationIds;
+  std::vector<PublishedSongSnapshot> observedPublishedSongs;
+  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+    observedPublishedSongs = songs;
+  }};
   setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
     for (const auto& node : nodes) {
       if (node.nodeType == NodeType::Song) {
@@ -188,6 +247,10 @@ TEST_CASE("reconcileRoot: worker-filled song keeps default origin and computed l
   REQUIRE(observedLocationIds.size() == 1);
   REQUIRE(observedLocationIds[0].has_value());
   CHECK_FALSE(observedLocationIds[0]->empty());
+  REQUIRE(observedPublishedSongs.size() == 1U);
+  CHECK(observedPublishedSongs[0].origin == ScanItemOrigin::ScannedFull);
+  REQUIRE(observedPublishedSongs[0].locationId.has_value());
+  CHECK_FALSE(observedPublishedSongs[0].locationId->empty());
 }
 
 TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location id") {
@@ -216,6 +279,14 @@ TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location
 
   std::vector<ScanItemOrigin> observedOrigins;
   std::vector<std::optional<std::string>> observedLocationIds;
+  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
+  std::vector<PublishedSongSnapshot> observedPublishedSongs;
+  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+    observedWorkerTasks = tasks;
+  }};
+  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+    observedPublishedSongs = songs;
+  }};
   setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
     for (const auto& node : nodes) {
       if (node.nodeType == NodeType::Song) {
@@ -235,6 +306,89 @@ TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location
   REQUIRE(observedLocationIds.size() == 1);
   REQUIRE(observedLocationIds[0].has_value());
   CHECK_FALSE(observedLocationIds[0]->empty());
+  CHECK(observedWorkerTasks.empty());
+  REQUIRE(observedPublishedSongs.size() == 1U);
+  CHECK(observedPublishedSongs[0].origin == ScanItemOrigin::CacheHit);
+  REQUIRE(observedPublishedSongs[0].locationId.has_value());
+  CHECK_FALSE(observedPublishedSongs[0].locationId->empty());
+}
+
+TEST_CASE("reconcileRoot: incremental worker paths preserve changed and new origins into root results") {
+  test::TempScannerRoot temp{"scanner-preallocate-worker-origin-delta"};
+
+  const auto unchangedFile = temp.path() / "unchanged.flac";
+  const auto changedFile = temp.path() / "changed.flac";
+  std::ofstream{unchangedFile} << "unchanged original audio";
+  std::ofstream{changedFile} << "changed original audio";
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(unchangedFile, makeMetadata("Unchanged Before"));
+  reader->put(changedFile, makeMetadata("Changed Before"));
+
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+    .metadataReader = reader,
+    .databasePath = temp.dbPath(),
+    .coverExportDir = temp.path() / "covers"
+  });
+
+  ScanEvents events;
+  service->setEventSink([&events](ScannerEvent event) {
+    events.onEvent(event);
+  });
+
+  auto beforeScan = events.completedCount();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  std::ofstream{changedFile, std::ios::binary | std::ios::trunc} << "changed updated audio with a different size";
+  const auto addedFile = temp.path() / "added.flac";
+  std::ofstream{addedFile} << "added audio";
+  reader->put(changedFile, makeMetadata("Changed After"));
+  reader->put(addedFile, makeMetadata("Added After"));
+  forceNextScanIncrementalForCurrentTree(temp);
+
+  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
+  std::vector<PublishedSongSnapshot> observedPublishedSongs;
+  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+    observedWorkerTasks = tasks;
+  }};
+  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+    observedPublishedSongs = songs;
+  }};
+
+  beforeScan = events.completedCount();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+
+  REQUIRE(observedWorkerTasks.size() == 2U);
+  const auto* changedWorker = workerSnapshotByPath(observedWorkerTasks, changedFile);
+  REQUIRE(changedWorker != nullptr);
+  CHECK(changedWorker->origin == ScanItemOrigin::RescannedChanged);
+  CHECK_FALSE(changedWorker->hasCachedLocation);
+  const auto* addedWorker = workerSnapshotByPath(observedWorkerTasks, addedFile);
+  REQUIRE(addedWorker != nullptr);
+  CHECK(addedWorker->origin == ScanItemOrigin::ScannedNew);
+  CHECK_FALSE(addedWorker->hasCachedLocation);
+  CHECK(workerSnapshotByPath(observedWorkerTasks, unchangedFile) == nullptr);
+
+  const auto* unchangedPublished = publishedSnapshotByPath(observedPublishedSongs, unchangedFile);
+  REQUIRE(unchangedPublished != nullptr);
+  CHECK(unchangedPublished->origin == ScanItemOrigin::CacheHit);
+  REQUIRE(unchangedPublished->locationId.has_value());
+  CHECK_FALSE(unchangedPublished->locationId->empty());
+
+  const auto* changedPublished = publishedSnapshotByPath(observedPublishedSongs, changedFile);
+  REQUIRE(changedPublished != nullptr);
+  CHECK(changedPublished->origin == ScanItemOrigin::RescannedChanged);
+  REQUIRE(changedPublished->locationId.has_value());
+  CHECK_FALSE(changedPublished->locationId->empty());
+
+  const auto* addedPublished = publishedSnapshotByPath(observedPublishedSongs, addedFile);
+  REQUIRE(addedPublished != nullptr);
+  CHECK(addedPublished->origin == ScanItemOrigin::ScannedNew);
+  REQUIRE(addedPublished->locationId.has_value());
+  CHECK_FALSE(addedPublished->locationId->empty());
 }
 
 TEST_CASE("IndexedPublishedSong: CueContainer with 0 tracks creates single node") {
