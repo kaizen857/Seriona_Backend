@@ -4,7 +4,7 @@
 
 #include "file_scanner_service_internal.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
 
 #include <algorithm>
@@ -145,7 +145,7 @@ void createLibrary(const std::filesystem::path& root, std::size_t count, PerfMet
 }
 
 [[nodiscard]] std::filesystem::path sidecarPath(const std::filesystem::path& databasePath) {
-  return std::filesystem::path{databasePath.generic_string() + ".scan-roots-v3.sqlite"};
+  return std::filesystem::path{databasePath.generic_string() + ".scan-roots.sqlite"};
 }
 
 [[nodiscard]] std::filesystem::path canonicalPath(const std::filesystem::path& path) {
@@ -161,7 +161,7 @@ void forceIncrementalDecisionForCurrentTree(const std::filesystem::path& root, c
   }
   auto config = cache::ScannerCacheConfig{};
   config.databasePath = sidecarPath(databasePath);
-  cache::SQLiteCacheV3 sidecar{config};
+  cache::SQLiteCache sidecar{config};
   auto scanRoot = sidecar.loadScanRoot(canonicalPath(root));
   if (!scanRoot.has_value()) {
     throw std::runtime_error("missing scan root sidecar state for incremental perf fixture");

@@ -3,7 +3,7 @@
 
 #include "file_scanner_service_internal.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
 #include "seriona/scanner/hash_utils.h"
 #include "seriona/scanner/path_utils.h"
@@ -276,7 +276,7 @@ void mutateLibrary(const std::filesystem::path& root, std::size_t baseCount,
 }
 
 [[nodiscard]] std::filesystem::path sidecarDbPath(const std::filesystem::path& dbPath) {
-  return std::filesystem::path{dbPath.generic_string() + ".scan-roots-v3.sqlite"};
+  return std::filesystem::path{dbPath.generic_string() + ".scan-roots.sqlite"};
 }
 
 [[nodiscard]] std::filesystem::path canonicalize(const std::filesystem::path& path) {
@@ -292,7 +292,7 @@ void forceIncrementalMode(const std::filesystem::path& root,
     throw std::runtime_error("failed to compute tree hash for incremental setup");
   }
   
-  cache::SQLiteCacheV3 sidecar{cache::ScannerCacheConfig{.databasePath = sidecarDbPath(dbPath)}};
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = sidecarDbPath(dbPath)}};
   auto scanRoot = sidecar.loadScanRoot(canonicalize(root));
   if (!scanRoot.has_value()) {
     throw std::runtime_error("missing scan root for incremental setup");

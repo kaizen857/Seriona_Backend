@@ -126,6 +126,15 @@ public:
   PublishedSongObserverGuard& operator=(const PublishedSongObserverGuard&) = delete;
 };
 
+class CacheWriteObserverGuard {
+public:
+  explicit CacheWriteObserverGuard(CacheWriteObserver observer) { setCacheWriteObserver(std::move(observer)); }
+  ~CacheWriteObserverGuard() { clearCacheWriteObserver(); }
+
+  CacheWriteObserverGuard(const CacheWriteObserverGuard&) = delete;
+  CacheWriteObserverGuard& operator=(const CacheWriteObserverGuard&) = delete;
+};
+
 struct TimedSnapshot {
   PlaylistTreeSnapshot snapshot;
   std::chrono::milliseconds elapsed{0};
@@ -334,7 +343,7 @@ TEST_CASE("scanner incremental e2e covers full unchanged changed added and delet
             << "final_playlist_songs=" << songs.size() << '\n';
 }
 
-TEST_CASE("scanner incremental e2e characterizes cache-hit FileScanned events") {
+TEST_CASE("scanner incremental e2e emits no cache-hit FileScanned events and reports skipped progress") {
   test::TempScannerRoot temp{"scanner-incremental-cache-hit-events"};
   const auto audio = test::writeAudioFixture(temp.path(), "stable.flac");
   auto reader = std::make_shared<FakeMetadataReader>();
@@ -360,9 +369,14 @@ TEST_CASE("scanner incremental e2e characterizes cache-hit FileScanned events") 
   REQUIRE(songs.size() == 1U);
   CHECK(reader->readCount() == 1U);
   const auto fileScannedSongs = eventLog.fileScannedSongs();
-  REQUIRE(fileScannedSongs.size() == 2U);
+  REQUIRE(fileScannedSongs.size() == 1U);
   CHECK(fileScannedSongs[0].filePath == audio);
-  CHECK(fileScannedSongs[1].filePath == audio);
+  const auto progressEvents = eventLog.progressEvents();
+  REQUIRE(progressEvents.size() >= 2U);
+  CHECK(progressEvents.back().filesDiscovered == 1U);
+  CHECK(progressEvents.back().filesScanned == 0U);
+  CHECK(progressEvents.back().filesSkipped == 1U);
+  CHECK(progressEvents.back().filesScanned + progressEvents.back().filesSkipped == progressEvents.back().filesDiscovered);
 }
 
 TEST_CASE("scanner incremental e2e relies on scan-root directory tree hash before cache hit") {
@@ -434,7 +448,7 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
              .album = "Cue Album",
              .trackNumber = 1},
             {.audioFilePath = referencedAudio,
-             .offset = 180000000,
+             .offset = 0,
              .duration = 200000000,
              .title = "Cue Track 2",
              .artist = "Cue Artist",
@@ -467,7 +481,7 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
       cueTracks.push_back(song);
     }
   }
-  std::ranges::sort(cueTracks, {}, &SongMetadata::offset);
+  std::ranges::sort(cueTracks, {}, &SongMetadata::logicalTrackId);
   REQUIRE(cueTracks.size() == 2U);
   CHECK(cueTracks[0].sourceFilePath == referencedAudio);
   CHECK(cueTracks[0].logicalTrackId == cueFile.generic_string() + "#track0");
@@ -477,8 +491,9 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
   CHECK(cueTracks[1].sourceFilePath == referencedAudio);
   CHECK(cueTracks[1].logicalTrackId == cueFile.generic_string() + "#track1");
   CHECK(cueTracks[1].trackId == cueTracks[1].logicalTrackId);
-  CHECK(cueTracks[1].offset == std::chrono::milliseconds{180000});
+  CHECK(cueTracks[1].offset == std::chrono::milliseconds{0});
   CHECK(cueTracks[1].duration == std::chrono::milliseconds{200000});
+  CHECK(cueTracks[0].offset == cueTracks[1].offset);
 
   cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());
@@ -493,11 +508,17 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
       cueLocations.push_back(location);
     }
   }
-  std::ranges::sort(cueLocations, [](const cache::CachedLocation& left, const cache::CachedLocation& right) {
-    return left.cueTrackOffset.value_or(std::chrono::milliseconds{0}) <
-           right.cueTrackOffset.value_or(std::chrono::milliseconds{0});
-  });
   REQUIRE(cueLocations.size() == 2U);
+  REQUIRE(std::ranges::all_of(cueLocations, [](const cache::CachedLocation& location) {
+    return location.cueTrackIndex.has_value();
+  }));
+  std::ranges::sort(cueLocations, [](const cache::CachedLocation& left, const cache::CachedLocation& right) {
+    return *left.cueTrackIndex < *right.cueTrackIndex;
+  });
+  REQUIRE(cueLocations[0].cueTrackOffset.has_value());
+  REQUIRE(cueLocations[1].cueTrackOffset.has_value());
+  CHECK(cueLocations[0].cueTrackOffset == cueLocations[1].cueTrackOffset);
+  CHECK(cueLocations[0].locationId != cueLocations[1].locationId);
   const auto cueFileSize = std::filesystem::file_size(cueFile);
   const auto sourceFileSize = std::filesystem::file_size(referencedAudio);
   REQUIRE(cueFileSize != sourceFileSize);
@@ -511,6 +532,8 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
     CHECK(location.fileMtimeNs == cueFileMtimeNs);
     REQUIRE(location.cueTrackIndex.has_value());
     CHECK(*location.cueTrackIndex == index);
+    REQUIRE(location.cueTrackOffset.has_value());
+    CHECK(*location.cueTrackOffset == std::chrono::milliseconds{0});
     REQUIRE(location.cueFileSizeBytes.has_value());
     CHECK(*location.cueFileSizeBytes == cueFileSize);
     REQUIRE(location.cueFileMtimeNs.has_value());
@@ -528,20 +551,26 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
     location.thumbnailPath = thumbnail;
     location.lyricsSource = LyricsSource::EmbeddedTag;
     sidecar.upsertLocation(location);
-	    sidecar.replaceLyrics(location.locationId,
+ 	    sidecar.replaceLyrics(location.locationId,
 	                          "embedded",
 	                          {LyricLine{.timestamp = std::chrono::milliseconds{static_cast<std::int64_t>(index) * 1000},
 	                                     .text = "cached embedded lyric " + std::to_string(index)}});
-	  }
+		  }
 
-	  std::vector<WorkerTaskSnapshot> cacheHitWorkerTasks;
-	  std::vector<PublishedSongSnapshot> cacheHitPublishedSongs;
-	  const WorkerTaskObserverGuard workerObserver{[&cacheHitWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
-	    cacheHitWorkerTasks = tasks;
-	  }};
-	  const PublishedSongObserverGuard publishedObserver{[&cacheHitPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
-	    cacheHitPublishedSongs = songs;
-	  }};
+          const auto fileScannedCountBeforeCacheHit = eventLog.fileScannedSongs().size();
+	
+			  std::vector<WorkerTaskSnapshot> cacheHitWorkerTasks;
+		  std::vector<PublishedSongSnapshot> cacheHitPublishedSongs;
+		  std::vector<cache::ScanRootCacheWrite> cacheHitWrites;
+		  const WorkerTaskObserverGuard workerObserver{[&cacheHitWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+		    cacheHitWorkerTasks = tasks;
+		  }};
+		  const PublishedSongObserverGuard publishedObserver{[&cacheHitPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+		    cacheHitPublishedSongs = songs;
+		  }};
+		  const CacheWriteObserverGuard cacheWriteObserver{[&cacheHitWrites](const cache::ScanRootCacheWrite& write) {
+		    cacheHitWrites.push_back(write);
+		  }};
 
 	  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) {
 	    return songsIn(snapshot).size() == 3U;
@@ -559,12 +588,19 @@ TEST_CASE("scanner incremental e2e persists cache after cue container pseudo nod
 	  CHECK(reader->readCount() == fullReadCount);
 	  CHECK(cueReadCount.load(std::memory_order_relaxed) == fullCueReadCount);
 	  CHECK(cacheHitWorkerTasks.empty());
-	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
-	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CueTrackCacheHit) == 2U);
-	  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CacheHit) == 1U);
-	  for (const auto& publishedSong : cacheHitPublishedSongs) {
-	    if (publishedSong.origin == ScanItemOrigin::CacheHit || publishedSong.origin == ScanItemOrigin::CueTrackCacheHit) {
-	      REQUIRE(publishedSong.locationId.has_value());
+		  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
+		  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CueTrackCacheHit) == 2U);
+		  CHECK(publishedOriginCount(cacheHitPublishedSongs, ScanItemOrigin::CacheHit) == 1U);
+		  REQUIRE(cacheHitWrites.size() == 1U);
+		  CHECK(cacheHitWrites.back().root.totalFiles == cacheHitPublishedSongs.size());
+		  CHECK(cacheHitWrites.back().changedSongs.empty());
+			  CHECK(cacheHitWrites.back().changedCueTracks.empty());
+			  CHECK(cacheHitWrites.back().lyricsUpdates.empty());
+			  CHECK(cacheHitWrites.back().retainedLocationIds.size() == 3U);
+			  CHECK(eventLog.fileScannedSongs().size() == fileScannedCountBeforeCacheHit);
+			  for (const auto& publishedSong : cacheHitPublishedSongs) {
+		    if (publishedSong.origin == ScanItemOrigin::CacheHit || publishedSong.origin == ScanItemOrigin::CueTrackCacheHit) {
+		      REQUIRE(publishedSong.locationId.has_value());
 	      CHECK_FALSE(publishedSong.locationId->empty());
 	    }
 	  }
@@ -623,14 +659,18 @@ TEST_CASE("scanner incremental e2e marks newly added cue reader tracks as cue sc
              .trackNumber = 1}};
   }};
 
-  std::vector<WorkerTaskSnapshot> newCueWorkerTasks;
-  std::vector<PublishedSongSnapshot> newCuePublishedSongs;
-  const WorkerTaskObserverGuard workerObserver{[&newCueWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
-    newCueWorkerTasks = tasks;
-  }};
-  const PublishedSongObserverGuard publishedObserver{[&newCuePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
-    newCuePublishedSongs = publishedSongs;
-  }};
+	  std::vector<WorkerTaskSnapshot> newCueWorkerTasks;
+	  std::vector<PublishedSongSnapshot> newCuePublishedSongs;
+	  std::vector<cache::ScanRootCacheWrite> newCueCacheWrites;
+	  const WorkerTaskObserverGuard workerObserver{[&newCueWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+	    newCueWorkerTasks = tasks;
+	  }};
+	  const PublishedSongObserverGuard publishedObserver{[&newCuePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
+	    newCuePublishedSongs = publishedSongs;
+	  }};
+	  const CacheWriteObserverGuard cacheWriteObserver{[&newCueCacheWrites](const cache::ScanRootCacheWrite& write) {
+	    newCueCacheWrites.push_back(write);
+	  }};
 
   const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
                                           [](const PlaylistTreeSnapshot& snapshot) {
@@ -647,11 +687,16 @@ TEST_CASE("scanner incremental e2e marks newly added cue reader tracks as cue sc
   CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::CacheHit) == 1U);
   CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::VirtualContainer) == 1U);
   CHECK(publishedOriginCount(newCuePublishedSongs, ScanItemOrigin::CueTrackScannedNew) == 1U);
-  const auto* newCueTrack = publishedByOrigin(newCuePublishedSongs, ScanItemOrigin::CueTrackScannedNew);
-  REQUIRE(newCueTrack != nullptr);
-  REQUIRE(newCueTrack->locationId.has_value());
-  CHECK_FALSE(newCueTrack->locationId->empty());
-}
+	  const auto* newCueTrack = publishedByOrigin(newCuePublishedSongs, ScanItemOrigin::CueTrackScannedNew);
+	  REQUIRE(newCueTrack != nullptr);
+	  REQUIRE(newCueTrack->locationId.has_value());
+	  CHECK_FALSE(newCueTrack->locationId->empty());
+	  REQUIRE(newCueCacheWrites.size() == 1U);
+	  CHECK(newCueCacheWrites.back().changedSongs.empty());
+	  REQUIRE(newCueCacheWrites.back().changedCueTracks.size() == 1U);
+	  CHECK(newCueCacheWrites.back().changedCueTracks[0].location.filePath == cueFile);
+	  CHECK(newCueCacheWrites.back().retainedLocationIds.size() == 2U);
+	}
 
 TEST_CASE("scanner incremental e2e falls back to cue reader when cue or source fingerprint changes") {
   test::TempScannerRoot temp{"scanner-incremental-cue-cache-miss"};
@@ -696,16 +741,20 @@ TEST_CASE("scanner incremental e2e falls back to cue reader when cue or source f
 	  writeText(referencedAudio, "changed source bytes for cue cache miss");
 	  std::vector<WorkerTaskSnapshot> sourceChangeWorkerTasks;
 	  std::vector<PublishedSongSnapshot> sourceChangePublishedSongs;
-	  {
-	    const WorkerTaskObserverGuard workerObserver{[&sourceChangeWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
-	      sourceChangeWorkerTasks = tasks;
-	    }};
-	    const PublishedSongObserverGuard publishedObserver{[&sourceChangePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
-	      sourceChangePublishedSongs = publishedSongs;
-	    }};
-	    const auto afterSourceChange = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
-	                                                 [](const PlaylistTreeSnapshot& snapshot) {
-	                                                   return songsIn(snapshot).size() == 1U;
+		  std::vector<cache::ScanRootCacheWrite> sourceChangeCacheWrites;
+		  {
+		    const WorkerTaskObserverGuard workerObserver{[&sourceChangeWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+		      sourceChangeWorkerTasks = tasks;
+		    }};
+		    const PublishedSongObserverGuard publishedObserver{[&sourceChangePublishedSongs](const std::vector<PublishedSongSnapshot>& publishedSongs) {
+		      sourceChangePublishedSongs = publishedSongs;
+		    }};
+		    const CacheWriteObserverGuard cacheWriteObserver{[&sourceChangeCacheWrites](const cache::ScanRootCacheWrite& write) {
+		      sourceChangeCacheWrites.push_back(write);
+		    }};
+		    const auto afterSourceChange = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+		                                                 [](const PlaylistTreeSnapshot& snapshot) {
+		                                                   return songsIn(snapshot).size() == 1U;
 	                                                 });
 	    songs = songsIn(afterSourceChange.snapshot);
 	  }
@@ -717,9 +766,13 @@ TEST_CASE("scanner incremental e2e falls back to cue reader when cue or source f
 	  const auto* changedCueTrack = publishedByOrigin(sourceChangePublishedSongs, ScanItemOrigin::CueTrackRescannedChanged);
 	  REQUIRE(changedCueTrack != nullptr);
 	  REQUIRE(changedCueTrack->locationId.has_value());
-	  CHECK_FALSE(changedCueTrack->locationId->empty());
-	  const auto afterSourceCueReadCount = cueReadCount.load(std::memory_order_relaxed);
-	  CHECK(afterSourceCueReadCount > fullCueReadCount);
+		  CHECK_FALSE(changedCueTrack->locationId->empty());
+		  REQUIRE(sourceChangeCacheWrites.size() == 1U);
+		  CHECK(sourceChangeCacheWrites.back().changedSongs.empty());
+		  REQUIRE(sourceChangeCacheWrites.back().changedCueTracks.size() == 1U);
+		  CHECK(sourceChangeCacheWrites.back().changedCueTracks[0].location.filePath == cueFile);
+		  const auto afterSourceCueReadCount = cueReadCount.load(std::memory_order_relaxed);
+		  CHECK(afterSourceCueReadCount > fullCueReadCount);
 
   cueTitle = "Cue After Cue Change";
   writeText(cueFile, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\nREM changed cue fingerprint\n");

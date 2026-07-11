@@ -1,6 +1,6 @@
 #pragma once
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <cstddef>
 #include <cstdint>

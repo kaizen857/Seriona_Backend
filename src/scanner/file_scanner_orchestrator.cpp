@@ -58,6 +58,7 @@ static TestLyricsSidecarHashProvider g_testLyricsSidecarHashProvider = nullptr;
 static IncrementalPlanObserver g_incrementalPlanObserver = nullptr;
 static WorkerTaskObserver g_workerTaskObserver = nullptr;
 static PublishedSongObserver g_publishedSongObserver = nullptr;
+static CacheWriteObserver g_cacheWriteObserver = nullptr;
 
 [[nodiscard]] std::vector<RawTagMetadata> readCueSheetWithTestSeam(const std::filesystem::path& cuePath,
                                                                    const std::filesystem::path& coverExportDir) {
@@ -146,6 +147,70 @@ enum class ExternalLyricsCacheAction {
   RemoveExternal,
   Cancelled,
 };
+
+[[nodiscard]] bool shouldRetainLocationForOrigin(ScanItemOrigin origin) {
+  switch (origin) {
+    case ScanItemOrigin::CacheHit:
+    case ScanItemOrigin::CueTrackCacheHit:
+    case ScanItemOrigin::RescannedChanged:
+    case ScanItemOrigin::ScannedNew:
+    case ScanItemOrigin::ScannedFull:
+    case ScanItemOrigin::CueTrackRescannedChanged:
+    case ScanItemOrigin::CueTrackScannedNew:
+      return true;
+    case ScanItemOrigin::VirtualContainer:
+      return false;
+  }
+  return false;
+}
+
+[[nodiscard]] bool shouldWriteSongForOrigin(ScanItemOrigin origin) {
+  switch (origin) {
+    case ScanItemOrigin::RescannedChanged:
+    case ScanItemOrigin::ScannedNew:
+    case ScanItemOrigin::ScannedFull:
+      return true;
+    case ScanItemOrigin::CacheHit:
+    case ScanItemOrigin::CueTrackCacheHit:
+    case ScanItemOrigin::CueTrackRescannedChanged:
+    case ScanItemOrigin::CueTrackScannedNew:
+    case ScanItemOrigin::VirtualContainer:
+      return false;
+  }
+  return false;
+}
+
+[[nodiscard]] bool shouldWriteCueTrackForOrigin(ScanItemOrigin origin) {
+  switch (origin) {
+    case ScanItemOrigin::CueTrackRescannedChanged:
+    case ScanItemOrigin::CueTrackScannedNew:
+      return true;
+    case ScanItemOrigin::CacheHit:
+    case ScanItemOrigin::CueTrackCacheHit:
+    case ScanItemOrigin::RescannedChanged:
+    case ScanItemOrigin::ScannedNew:
+    case ScanItemOrigin::ScannedFull:
+    case ScanItemOrigin::VirtualContainer:
+      return false;
+  }
+  return false;
+}
+
+[[nodiscard]] bool shouldPublishFileScanned(ScanItemOrigin origin) {
+  switch (origin) {
+    case ScanItemOrigin::ScannedFull:
+    case ScanItemOrigin::ScannedNew:
+    case ScanItemOrigin::RescannedChanged:
+    case ScanItemOrigin::CueTrackScannedNew:
+    case ScanItemOrigin::CueTrackRescannedChanged:
+      return true;
+    case ScanItemOrigin::CacheHit:
+    case ScanItemOrigin::CueTrackCacheHit:
+    case ScanItemOrigin::VirtualContainer:
+      return false;
+  }
+  return false;
+}
 
 [[nodiscard]] std::optional<std::size_t> parsePositiveSizeEnv(std::string_view name) {
   const auto* raw = std::getenv(std::string{name}.c_str());
@@ -428,7 +493,7 @@ struct CachedLocationPathIndex {
   if (!cueSourceAudioMatchesCachedLocation(location)) {
     return false;
   }
-  const auto expectedLocationId = computeLocationId(cuePath, *cueFileSize, cueFileMtime, location.cueTrackOffset);
+  const auto expectedLocationId = computeLocationId(cuePath, *cueFileSize, cueFileMtime, location.cueTrackOffset, location.cueTrackIndex);
   return location.locationId == expectedLocationId;
 }
 
@@ -568,6 +633,13 @@ void publishIncrementalPlanSnapshot(const std::optional<IncrementalExecutionPlan
   g_incrementalPlanObserver(incrementalPlanSnapshotFrom(*plan));
 }
 
+void publishCacheWriteSnapshot(const cache::ScanRootCacheWrite& write) {
+  if (g_cacheWriteObserver == nullptr) {
+    return;
+  }
+  g_cacheWriteObserver(write);
+}
+
 void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
                                const std::unordered_map<std::string, ScanItemOrigin>& originsByPath) {
   if (g_workerTaskObserver == nullptr) {
@@ -602,7 +674,7 @@ void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
   const auto sourceFileMtime = isCueTrack ? fileTimeNanoseconds(fileMtime(sourceFilePath)) : std::optional<std::int64_t>{};
   const auto cueTrackIndex = isCueTrack ? cueTrackIndexFromLogicalTrackId(filePath, song.metadata.logicalTrackId)
                                        : std::optional<std::uint32_t>{};
-  return {.locationId = computeLocationId(filePath, fileSize, stableMtime, cueTrackOffset),
+  return {.locationId = computeLocationId(filePath, fileSize, stableMtime, cueTrackOffset, cueTrackIndex),
           .contentId = song.metadata.contentHash,
           .rootPath = rootPath,
           .filePath = filePath,
@@ -1033,9 +1105,11 @@ public:
       for (const auto& error : rootResult.errors) {
         publishEvent(sink, ScannerEventType::ScanError, ++eventVersion_, error);
       }
-      for (const auto& publishedSong : rootResult.songs) {
-        publishEvent(sink, ScannerEventType::FileScanned, ++eventVersion_, publishedSong.song.metadata);
-      }
+	      for (const auto& publishedSong : rootResult.songs) {
+	        if (shouldPublishFileScanned(publishedSong.origin)) {
+	          publishEvent(sink, ScannerEventType::FileScanned, ++eventVersion_, publishedSong.song.metadata);
+	        }
+	      }
     }
 
     const auto phaseEnumEnd = std::chrono::steady_clock::now();
@@ -1485,7 +1559,8 @@ private:
 	              indexedSongs[trackNodeIndex].locationId = computeLocationId(entry.path,
 	                                                                          *cueFileSizeForLocation,
 	                                                                          cueFileMtimeForLocation,
-	                                                                          indexedSongs[trackNodeIndex].song.metadata.offset);
+	                                                                          indexedSongs[trackNodeIndex].song.metadata.offset,
+	                                                                          static_cast<std::uint32_t>(trackIdx));
 	            }
 	            indexedSongs[trackNodeIndex].filled.store(true);
 	          }
@@ -1701,45 +1776,51 @@ private:
     return result;
   }
 
-  void recordScanRootDecision(const std::filesystem::path& rootPath,
-                              const ScanModeDecision& decision,
-                              const std::vector<RootResult::PublishedSong>& songs,
-                              const std::chrono::milliseconds scanDuration) const {
-    if (!decision.directoryTreeHash.has_value()) {
-      return;
-    }
-    try {
-    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
-      cache.updateScanRoot(scanRootRecord(rootPath, decision, songs.size(), scanDuration));
-      std::vector<std::string> retainedLocationIds;
-      retainedLocationIds.reserve(songs.size());
-      for (const auto& publishedSong : songs) {
-        if (!publishedSong.song.metadata.duration.has_value() || publishedSong.song.metadata.contentHash.empty()) {
-          continue;
-        }
-        const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath);
-        retainedLocationIds.push_back(location.locationId);
-        if (publishedSong.origin == ScanItemOrigin::CacheHit &&
-            publishedSong.externalLyricsCacheAction != ExternalLyricsCacheAction::None) {
-          cache.upsertLocation(location);
-          cache.replaceLyrics(location.locationId, "external", publishedSong.song.externalLyrics);
-          continue;
-        }
-        cache.upsertContent(publishedSong.song.metadata.contentHash, publishedSong.song.metadata);
-        cache.upsertLocation(location);
-        if (!publishedSong.song.embeddedLyrics.empty()) {
-          cache.replaceLyrics(location.locationId, "embedded", publishedSong.song.embeddedLyrics);
-        }
-        if (!publishedSong.song.externalLyrics.empty() ||
-            publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::RemoveExternal) {
-          cache.replaceLyrics(location.locationId, "external", publishedSong.song.externalLyrics);
-        }
-      }
-      cache.pruneDeletedLocations(rootPath, retainedLocationIds);
-    } catch (const std::exception& error) {
-      spdlog::warn("failed to record scanner scan-root state: {}", error.what());
-    }
-  }
+	  void recordScanRootDecision(const std::filesystem::path& rootPath,
+	                              const ScanModeDecision& decision,
+	                              const std::vector<RootResult::PublishedSong>& songs,
+	                              const std::chrono::milliseconds scanDuration) const {
+	    if (!decision.directoryTreeHash.has_value()) {
+	      return;
+	    }
+	    try {
+	      cache::ScanRootCacheWrite write;
+	      write.root = scanRootRecord(rootPath, decision, songs.size(), scanDuration);
+	      write.retainedLocationIds.reserve(songs.size());
+	      for (const auto& publishedSong : songs) {
+	        if (!shouldRetainLocationForOrigin(publishedSong.origin)) {
+	          continue;
+	        }
+	        if (!publishedSong.song.metadata.duration.has_value() || publishedSong.song.metadata.contentHash.empty()) {
+	          continue;
+	        }
+	        const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath);
+	        write.retainedLocationIds.push_back(location.locationId);
+	        if (publishedSong.origin == ScanItemOrigin::CacheHit &&
+	            publishedSong.externalLyricsCacheAction != ExternalLyricsCacheAction::None) {
+	          write.lyricsUpdates.push_back(cache::LyricsCacheUpdate{
+	            .locationId = location.locationId,
+	            .externalLrcPath = publishedSong.song.metadata.externalLyricsPath,
+	            .externalLrcMtimeNs = fileTimeNanoseconds(publishedSong.song.metadata.externalLyricsMtime),
+	            .externalLrcHash = publishedSong.song.metadata.externalLyricsHash,
+	            .externalLyrics = publishedSong.song.externalLyrics,
+	            .effectiveLyricsSource = publishedSong.song.metadata.effectiveLyricsSource,
+	            .removeExternalLyrics = publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::RemoveExternal});
+	          continue;
+	        }
+	        if (shouldWriteSongForOrigin(publishedSong.origin)) {
+	          write.changedSongs.push_back(cache::CacheWriteSong{.song = publishedSong.song, .location = location});
+	        } else if (shouldWriteCueTrackForOrigin(publishedSong.origin)) {
+	          write.changedCueTracks.push_back(cache::CacheWriteSong{.song = publishedSong.song, .location = location});
+	        }
+	      }
+	      publishCacheWriteSnapshot(write);
+	      cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+	      cache.recordScanRootCacheWrite(write);
+	    } catch (const std::exception& error) {
+	      spdlog::warn("failed to record scanner scan-root state: {}", error.what());
+	    }
+	  }
 
   [[nodiscard]] std::optional<AudioReconcileTask> prepareAudioTask(const std::filesystem::path& audioPath,
                                                                    const std::filesystem::path& rootPath,
@@ -2044,6 +2125,14 @@ void setIncrementalPlanObserver(IncrementalPlanObserver observer) {
 
 void clearIncrementalPlanObserver() {
   g_incrementalPlanObserver = nullptr;
+}
+
+void setCacheWriteObserver(CacheWriteObserver observer) {
+  g_cacheWriteObserver = std::move(observer);
+}
+
+void clearCacheWriteObserver() {
+  g_cacheWriteObserver = nullptr;
 }
 
 }

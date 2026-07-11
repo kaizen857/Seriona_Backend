@@ -39,16 +39,23 @@ struct CachedLocation {
   std::int64_t fileMtimeNs{0};
   std::filesystem::path sourceFilePath;
   std::optional<std::chrono::milliseconds> cueTrackOffset;
+  std::optional<std::uint32_t> cueTrackIndex;
+  std::optional<std::chrono::milliseconds> cueTrackDuration;
+  std::optional<std::uint64_t> cueFileSizeBytes;
+  std::optional<std::int64_t> cueFileMtimeNs;
+  std::optional<std::uint64_t> sourceFileSizeBytes;
+  std::optional<std::int64_t> sourceFileMtimeNs;
   std::optional<std::filesystem::path> artworkPath;
   std::optional<std::filesystem::path> thumbnailPath;
   LyricsSource lyricsSource{LyricsSource::None};
   std::optional<std::filesystem::path> externalLrcPath;
   std::optional<std::int64_t> externalLrcMtimeNs;
+  std::optional<std::string> externalLrcHash;
   std::chrono::system_clock::time_point discoveredAt{};
   std::chrono::system_clock::time_point scannedAt{};
 };
 
-struct CachedScanRootV3 {
+struct CachedScanRoot {
   std::filesystem::path rootPath;
   std::string directoryTreeHash;
   std::uint64_t totalFiles{0};
@@ -57,7 +64,7 @@ struct CachedScanRootV3 {
   std::chrono::system_clock::time_point lastScanAt{};
 };
 
-struct CachedScanErrorV3 {
+struct CachedScanError {
   std::filesystem::path rootPath;
   std::optional<std::filesystem::path> filePath;
   ScannerErrorCode errorCode{ScannerErrorCode::MetadataReadFailed};
@@ -65,7 +72,30 @@ struct CachedScanErrorV3 {
   std::chrono::system_clock::time_point occurredAt{};
 };
 
-class SQLiteCacheV3 {
+struct CacheWriteSong {
+  CachedSong song;
+  CachedLocation location;
+};
+
+struct LyricsCacheUpdate {
+  std::string locationId;
+  std::optional<std::filesystem::path> externalLrcPath;
+  std::optional<std::int64_t> externalLrcMtimeNs;
+  std::optional<std::string> externalLrcHash;
+  std::vector<LyricLine> externalLyrics;
+  LyricsSource effectiveLyricsSource{LyricsSource::ExternalLrc};
+  bool removeExternalLyrics{false};
+};
+
+struct ScanRootCacheWrite {
+  CachedScanRoot root;
+  std::vector<CacheWriteSong> changedSongs;
+  std::vector<CacheWriteSong> changedCueTracks;
+  std::vector<LyricsCacheUpdate> lyricsUpdates;
+  std::vector<std::string> retainedLocationIds;
+};
+
+class SQLiteCache {
 public:
   class WriterTransaction {
   public:
@@ -77,18 +107,18 @@ public:
     void commit();
 
   private:
-    friend class SQLiteCacheV3;
-    explicit WriterTransaction(SQLiteCacheV3& cache);
-    SQLiteCacheV3* cache_{nullptr};
+    friend class SQLiteCache;
+    explicit WriterTransaction(SQLiteCache& cache);
+    SQLiteCache* cache_{nullptr};
     std::unique_lock<std::mutex> lock_;
     bool active_{false};
   };
 
-  explicit SQLiteCacheV3(ScannerCacheConfig config);
-  ~SQLiteCacheV3();
+  explicit SQLiteCache(ScannerCacheConfig config);
+  ~SQLiteCache();
 
-  SQLiteCacheV3(const SQLiteCacheV3&) = delete;
-  SQLiteCacheV3& operator=(const SQLiteCacheV3&) = delete;
+  SQLiteCache(const SQLiteCache&) = delete;
+  SQLiteCache& operator=(const SQLiteCache&) = delete;
 
   [[nodiscard]] int schemaVersion() const;
   [[nodiscard]] std::string journalMode() const;
@@ -101,16 +131,17 @@ public:
   void pruneDeletedLocations(const std::filesystem::path& rootPath, const std::vector<std::string>& retainedLocationIds);
   void replaceLyrics(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics);
   [[nodiscard]] std::vector<LyricLine> loadLyrics(const std::string& locationId, const std::string& kind) const;
-  void updateScanRoot(const CachedScanRootV3& root);
-  [[nodiscard]] std::optional<CachedScanRootV3> loadScanRoot(const std::filesystem::path& rootPath) const;
-  void saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanErrorV3>& errors);
-  [[nodiscard]] std::vector<CachedScanErrorV3> loadErrors(const std::filesystem::path& rootPath) const;
+  void updateScanRoot(const CachedScanRoot& root);
+  void recordScanRootCacheWrite(const ScanRootCacheWrite& write);
+  [[nodiscard]] std::optional<CachedScanRoot> loadScanRoot(const std::filesystem::path& rootPath) const;
+  void saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors);
+  [[nodiscard]] std::vector<CachedScanError> loadErrors(const std::filesystem::path& rootPath) const;
   void clearErrors(const std::filesystem::path& rootPath);
   [[nodiscard]] WriterTransaction beginWriter();
 
 private:
   void open();
-  void initializeSchemaV3();
+  void initializeSchema();
 
   [[nodiscard]] int readUserVersion() const;
   [[nodiscard]] std::string readJournalMode() const;
@@ -118,10 +149,21 @@ private:
 
   static void configureConnection(sqlite3* db, std::chrono::milliseconds busyTimeout);
   static void exec(sqlite3* db, const char* sql);
-  static std::string schemaV3Sql();
+  static std::string schemaSql();
   
   void prepareStatements();
   void finalizeStatements();
+
+  void upsertContentNoTransaction(const std::string& contentId, const SongMetadata& metadata);
+  void upsertLocationNoTransaction(const CachedLocation& location);
+  void pruneDeletedLocationsNoTransaction(const std::filesystem::path& rootPath,
+                                          const std::vector<std::string>& retainedLocationIds);
+  void replaceLyricsNoTransaction(const std::string& locationId, const std::string& kind,
+                                  const std::vector<LyricLine>& lyrics);
+  void updateScanRootNoTransaction(const CachedScanRoot& root);
+  void saveErrorsNoTransaction(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors);
+  void clearErrorsNoTransaction(const std::filesystem::path& rootPath);
+  void applyLyricsCacheUpdateNoTransaction(const LyricsCacheUpdate& update);
 
   std::filesystem::path databasePath_;
   std::chrono::milliseconds busyTimeout_{500};

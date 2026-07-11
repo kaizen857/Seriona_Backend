@@ -17,8 +17,8 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   output << text;
 }
 
-[[nodiscard]] cache::SQLiteCacheV3 openScanRootCache(const std::filesystem::path& databasePath) {
-  return cache::SQLiteCacheV3{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath),
+[[nodiscard]] cache::SQLiteCache openScanRootCache(const std::filesystem::path& databasePath) {
+  return cache::SQLiteCache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath),
                                                         }};
 }
 
@@ -117,7 +117,7 @@ TEST_CASE("scan mode decision falls back to full when scan-root cache cannot be 
   const auto audioPath = test::writeAudioFixture(temp.path(), "song.flac");
   const auto blockedDatabasePath = temp.path() / "blocked" / "scanner-cache.sqlite";
   std::filesystem::create_directories(blockedDatabasePath.parent_path());
-  writeText(blockedDatabasePath.parent_path() / "scanner-cache.sqlite.scan-roots-v3.sqlite", "not sqlite");
+  writeText(blockedDatabasePath.parent_path() / "scanner-cache.sqlite.scan-roots.sqlite", "not sqlite");
 
   const auto decision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, blockedDatabasePath);
 

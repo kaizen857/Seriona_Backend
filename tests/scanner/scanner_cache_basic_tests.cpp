@@ -1,6 +1,6 @@
 #include "scanner_test_harness.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <doctest.h>
 
@@ -11,9 +11,9 @@
 namespace seriona::scanner::cache {
 namespace {
 
-TEST_CASE("SQLiteCacheV3: initializes with schema version 3 and WAL journal mode") {
-  test::TempScannerRoot temp{"scanner-cache-v3-init"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: initializes with schema version 3 and WAL journal mode") {
+  test::TempScannerRoot temp{"scanner-cache-init"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   CHECK(cache.schemaVersion() == 3);
   CHECK(cache.journalMode() == "wal");
@@ -21,19 +21,19 @@ TEST_CASE("SQLiteCacheV3: initializes with schema version 3 and WAL journal mode
   CHECK(std::filesystem::exists(temp.dbPath()));
 }
 
-TEST_CASE("SQLiteCacheV3: rejects directory path as invalid database file") {
-  test::TempScannerRoot temp{"scanner-cache-v3-invalid-path"};
+TEST_CASE("SQLiteCache: rejects directory path as invalid database file") {
+  test::TempScannerRoot temp{"scanner-cache-invalid-path"};
 
   CHECK_THROWS_AS(([&temp] {
-    SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.path()}};
+    SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.path()}};
     static_cast<void>(cache);
   }()),
                   std::runtime_error);
 }
 
-TEST_CASE("SQLiteCacheV3: upsertContent stores and retrieves data") {
-  test::TempScannerRoot temp{"scanner-cache-v3-upsert"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: upsertContent stores and retrieves data") {
+  test::TempScannerRoot temp{"scanner-cache-upsert"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   SongMetadata metadata;
   metadata.title = "Test Song";
@@ -49,9 +49,9 @@ TEST_CASE("SQLiteCacheV3: upsertContent stores and retrieves data") {
   CHECK(loaded->metadata.artist == "Test Artist");
 }
 
-TEST_CASE("SQLiteCacheV3: multiple upserts work correctly") {
-  test::TempScannerRoot temp{"scanner-cache-v3-multi-upsert"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: multiple upserts work correctly") {
+  test::TempScannerRoot temp{"scanner-cache-multi-upsert"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   SongMetadata meta1, meta2;
   meta1.title = "Song 1";
@@ -72,18 +72,18 @@ TEST_CASE("SQLiteCacheV3: multiple upserts work correctly") {
   CHECK(content2->metadata.title == "Song 2");
 }
 
-TEST_CASE("SQLiteCacheV3: handles empty database gracefully") {
-  test::TempScannerRoot temp{"scanner-cache-v3-empty"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: handles empty database gracefully") {
+  test::TempScannerRoot temp{"scanner-cache-empty"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   CHECK_FALSE(cache.loadContent("non-existent").has_value());
   CHECK_FALSE(cache.loadLocation("non-existent").has_value());
   CHECK_FALSE(cache.loadScanRoot(temp.path()).has_value());
 }
 
-TEST_CASE("SQLiteCacheV3: upsert updates existing content") {
-  test::TempScannerRoot temp{"scanner-cache-v3-update"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: upsert updates existing content") {
+  test::TempScannerRoot temp{"scanner-cache-update"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   SongMetadata meta1;
   meta1.title = "Old Title";
@@ -100,9 +100,9 @@ TEST_CASE("SQLiteCacheV3: upsert updates existing content") {
   CHECK(loaded->metadata.title == "New Title");
 }
 
-TEST_CASE("SQLiteCacheV3: beginWriter transaction can be committed") {
-  test::TempScannerRoot temp{"scanner-cache-v3-writer"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: beginWriter transaction can be committed") {
+  test::TempScannerRoot temp{"scanner-cache-writer"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
   // When using beginWriter, don't call upsert methods that create their own transactions
   {
@@ -115,11 +115,11 @@ TEST_CASE("SQLiteCacheV3: beginWriter transaction can be committed") {
   CHECK_FALSE(cache.loadContent("test").has_value());
 }
 
-TEST_CASE("SQLiteCacheV3: prepared statements reused across multiple queries") {
-  test::TempScannerRoot temp{"scanner-cache-v3-prepared-stmts"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: prepared statements reused across multiple queries") {
+  test::TempScannerRoot temp{"scanner-cache-prepared-stmts"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
-  CachedScanRootV3 root;
+  CachedScanRoot root;
   root.rootPath = temp.path();
   root.directoryTreeHash = "test-hash";
   root.totalFiles = 3;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "scanner_internal_types.h"
+
+#include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/hash_utils.h"
 
 #include <filesystem>
@@ -97,5 +99,10 @@ using IncrementalPlanObserver = std::function<void(const IncrementalPlanSnapshot
 
 void setIncrementalPlanObserver(IncrementalPlanObserver observer);
 void clearIncrementalPlanObserver();
+
+using CacheWriteObserver = std::function<void(const cache::ScanRootCacheWrite& write)>;
+
+void setCacheWriteObserver(CacheWriteObserver observer);
+void clearCacheWriteObserver();
 
 } // namespace seriona::scanner

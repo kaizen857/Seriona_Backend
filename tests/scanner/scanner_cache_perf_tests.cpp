@@ -1,6 +1,6 @@
 #include "scanner_test_harness.h"
 
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <doctest.h>
 
@@ -11,11 +11,11 @@
 namespace seriona::scanner::cache {
 namespace {
 
-TEST_CASE("SQLiteCacheV3: performance benchmark with prepared statements") {
-  test::TempScannerRoot temp{"scanner-cache-v3-perf"};
-  SQLiteCacheV3 cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+TEST_CASE("SQLiteCache: performance benchmark with prepared statements") {
+  test::TempScannerRoot temp{"scanner-cache-perf"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
 
-  CachedScanRootV3 root;
+  CachedScanRoot root;
   root.rootPath = temp.path();
   root.directoryTreeHash = "perf-test-hash";
   root.totalFiles = 1000;
@@ -66,7 +66,7 @@ TEST_CASE("SQLiteCacheV3: performance benchmark with prepared statements") {
   auto endLocation = std::chrono::high_resolution_clock::now();
   auto locationDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endLocation - startLocation);
 
-  std::cout << "\n=== SQLiteCacheV3 Performance (with prepared statements) ===\n";
+  std::cout << "\n=== SQLiteCache Performance (with prepared statements) ===\n";
   std::cout << "Database entries: " << numEntries << "\n";
   std::cout << "Total queries: " << numQueries << " per query type\n";
   std::cout << "loadContent: " << contentDuration.count() << " ms (" 

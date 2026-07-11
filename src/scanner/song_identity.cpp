@@ -80,12 +80,18 @@ std::string computeContentId(std::chrono::milliseconds durationMs, std::string_v
 std::string computeLocationId(const std::filesystem::path& path,
                               std::uint64_t fileSize,
                               std::optional<std::filesystem::file_time_type> mtime,
-                              std::optional<std::chrono::milliseconds> cueTrackOffset) {
+                              std::optional<std::chrono::milliseconds> cueTrackOffset,
+                              std::optional<std::uint32_t> cueTrackIndex) {
   const auto normalizedPath = canonicalPathText(path);
   const auto mtimeCount = mtime.has_value() ? toStableText(mtime->time_since_epoch().count()) : std::string{"missing"};
   
   if (cueTrackOffset.has_value()) {
-    return hashTextParts({normalizedPath, toStableText(fileSize), mtimeCount, "offset", toStableText(cueTrackOffset->count())});
+    const auto offsetCount = toStableText(cueTrackOffset->count());
+    if (cueTrackIndex.has_value()) {
+      const auto indexCount = toStableText(static_cast<std::uint64_t>(*cueTrackIndex));
+      return hashTextParts({normalizedPath, toStableText(fileSize), mtimeCount, "offset", offsetCount, "index", indexCount});
+    }
+    return hashTextParts({normalizedPath, toStableText(fileSize), mtimeCount, "offset", offsetCount});
   }
   
   return hashTextParts({normalizedPath, toStableText(fileSize), mtimeCount});

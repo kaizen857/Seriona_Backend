@@ -1,5 +1,5 @@
 #include "seriona/control/folder_sort_settings_store.h"
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <doctest.h>
 #include <sqlite3.h>
@@ -185,11 +185,11 @@ void insertMalformedRules(const std::filesystem::path& databasePath,
 
 }
 
-TEST_CASE("folder sort settings characterization: scanner cache alone keeps runtime schema v3 unchanged") {
+TEST_CASE("folder sort settings characterization: scanner cache alone keeps runtime schema version unchanged") {
   TempDatabase temp{"seriona-folder-sort-settings-characterization"};
 
   {
-    seriona::scanner::cache::SQLiteCacheV3 cache{
+    seriona::scanner::cache::SQLiteCache cache{
         seriona::scanner::cache::ScannerCacheConfig{.databasePath = temp.path()}};
     CHECK(cache.schemaVersion() == 3);
   }
@@ -300,7 +300,7 @@ TEST_CASE("SQLite folder sort settings store keeps scanner user_version stable a
   TempDatabase temp{"seriona-folder-sort-settings-scanner-db"};
 
   {
-    seriona::scanner::cache::SQLiteCacheV3 cache{
+    seriona::scanner::cache::SQLiteCache cache{
         seriona::scanner::cache::ScannerCacheConfig{.databasePath = temp.path()}};
     CHECK(cache.schemaVersion() == 3);
   }

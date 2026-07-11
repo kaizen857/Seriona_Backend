@@ -21,7 +21,7 @@ std::string renderReport(const std::vector<LibraryMeasurement>& measurements) {
   output << "- `cache hit rate`: derived from `filesSkipped / filesDiscovered` in `ScanProgress`.\n";
   output << "- `TagReader calls/time`: measured in the benchmark fake `TagMetadataReader`; this is the scanner seam time, not real TagReaderCore parsing.\n";
   output << "- `cumulative worker time`: captured from production scanner logs as worker hash ms and worker TagReader parse ms.\n";
-  output << "- Incremental runs mutate one changed file, one added file, and one deleted file after warm cache. The harness updates the V3 scan-root sidecar hash to force the existing incremental execution path for this shape, matching prior Phase 3 integration-test practice.\n\n";
+  output << "- Incremental runs mutate one changed file, one added file, and one deleted file after warm cache. The harness updates the scan-root sidecar hash to force the existing incremental execution path for this shape, matching prior Phase 3 integration-test practice.\n\n";
   output << "## Results\n\n";
   output << "| fixture songs | scan | harness wall ms | scanner wall ms | phase1 ms | phase2 ms | worker hash ms | worker TagReader ms | discovered | scanned | skipped | cache hit % | seam TagReader calls | seam TagReader ms | snapshot songs | errors |\n";
   output << "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n";

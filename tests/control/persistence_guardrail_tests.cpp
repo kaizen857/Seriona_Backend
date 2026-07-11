@@ -2,7 +2,7 @@
 
 #include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/control/media_controller.h"
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <doctest.h>
 #include <sqlite3.h>
@@ -232,8 +232,8 @@ void initializeEmptySqliteDatabase(const std::filesystem::path& databasePath) {
   CHECK(sqliteTableNames(db.get()).empty());
 }
 
-void initializeScannerV3Database(const std::filesystem::path& databasePath) {
-  scanner_cache::SQLiteCacheV3 cache{scanner_cache::ScannerCacheConfig{.databasePath = databasePath}};
+void initializeScannerCacheDatabase(const std::filesystem::path& databasePath) {
+  scanner_cache::SQLiteCache cache{scanner_cache::ScannerCacheConfig{.databasePath = databasePath}};
   CHECK(cache.schemaVersion() == 3);
 }
 
@@ -318,9 +318,9 @@ TEST_CASE("persistence guardrail: controller sort command on fresh DB persists o
   CHECK(loaded->rules.front().field == control::FolderSortField::Title);
 }
 
-TEST_CASE("persistence guardrail: controller sort command on scanner-v3 DB does not migrate or bump user_version") {
-  TempDatabase temp{"seriona-control-persistence-guardrail-scanner-v3"};
-  initializeScannerV3Database(temp.path());
+TEST_CASE("persistence guardrail: controller sort command on scanner cache DB does not migrate or bump user_version") {
+  TempDatabase temp{"seriona-control-persistence-guardrail-scanner-cache"};
+  initializeScannerCacheDatabase(temp.path());
 
   {
     SqliteHandle before{temp.path()};
@@ -362,7 +362,7 @@ CREATE TABLE shuffle_history(id INTEGER PRIMARY KEY);
   }
 }
 
-TEST_CASE("persistence guardrail proof fixture creates scanner-v3 database for external inspection") {
+TEST_CASE("persistence guardrail proof fixture creates scanner cache database for external inspection") {
   const char* proofPath = std::getenv("SERIONA_PERSISTENCE_GUARDRAIL_PROOF_DB");
   if (proofPath == nullptr || std::string_view{proofPath}.empty()) {
     return;
@@ -374,7 +374,7 @@ TEST_CASE("persistence guardrail proof fixture creates scanner-v3 database for e
   }
   removeSqliteArtifacts(databasePath);
 
-  initializeScannerV3Database(databasePath);
+  initializeScannerCacheDatabase(databasePath);
   runControllerApplySortCommand(databasePath, databasePath.parent_path() / "library");
 
   SqliteHandle db{databasePath};

@@ -207,6 +207,20 @@ scanner::ScannerEvent scanStartedEvent(std::uint64_t version) {
                                .payload = scanner::ScanProgress{}};
 }
 
+scanner::ScannerEvent progressUpdatedEvent(scanner::ScanProgress progress, std::uint64_t version) {
+  return scanner::ScannerEvent{.type = scanner::ScannerEventType::ProgressUpdated,
+                               .monotonicVersion = version,
+                               .timestamp = {},
+                               .payload = std::move(progress)};
+}
+
+scanner::ScannerEvent fileScannedEvent(scanner::SongMetadata metadata, std::uint64_t version) {
+  return scanner::ScannerEvent{.type = scanner::ScannerEventType::FileScanned,
+                               .monotonicVersion = version,
+                               .timestamp = {},
+                               .payload = std::move(metadata)};
+}
+
 scanner::ScannerEvent scannerErrorEvent(std::string message, std::uint64_t version) {
   return scanner::ScannerEvent{.type = scanner::ScannerEventType::ScanError,
                                .monotonicVersion = version,
@@ -440,6 +454,17 @@ bool hasNotificationKind(const std::vector<ControlDomainNotification>& notificat
   return std::ranges::any_of(notifications, [kind](const ControlDomainNotification& notification) {
     return notification.kind == kind;
   });
+}
+
+std::size_t notificationKindCount(const std::vector<ControlDomainNotification>& notifications,
+                                  ControlDomainNotificationKind kind) {
+  std::size_t count = 0;
+  for (const auto& notification : notifications) {
+    if (notification.kind == kind) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 struct ControllerFixture {
@@ -1679,6 +1704,55 @@ TEST_CASE("media controller facade scans library, starts watching, and publishes
     CHECK(librarySnapshots.back().libraryTree->version == 33U);
   }
   librarySubscription.unsubscribe();
+}
+
+TEST_CASE("media controller scan progress uses aggregate skipped progress events instead of FileScanned") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  fixture.fakeScanner->emit(scanStartedEvent(1));
+  fixture.controller->drainForTests();
+  fixture.fakeScanner->emit(fileScannedEvent(song("cache-hit", "music/cache-hit.flac"), 2));
+  fixture.controller->drainForTests();
+
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK(notificationKindCount(notifications, ControlDomainNotificationKind::LibraryScanProgressUpdated) == 0U);
+  }
+
+  scanner::ScanProgress skippedOnly{};
+  skippedOnly.filesDiscovered = 5;
+  skippedOnly.filesScanned = 0;
+  skippedOnly.filesSkipped = 5;
+  fixture.fakeScanner->emit(progressUpdatedEvent(skippedOnly, 3));
+  fixture.controller->drainForTests();
+
+  const auto progressSnapshot = fixture.controller->libraryStateSnapshot();
+  REQUIRE(progressSnapshot.scanProgress.has_value());
+  CHECK(progressSnapshot.scanProgress->filesDiscovered == 5U);
+  CHECK(progressSnapshot.scanProgress->filesScanned == 0U);
+  CHECK(progressSnapshot.scanProgress->filesSkipped == 5U);
+	  CHECK(progressSnapshot.scanProgress->filesScanned + progressSnapshot.scanProgress->filesSkipped ==
+	        progressSnapshot.scanProgress->filesDiscovered);
+	  CHECK(waitUntil([&] {
+	    std::lock_guard lock{notificationMutex};
+	    return notificationKindCount(notifications, ControlDomainNotificationKind::LibraryScanProgressUpdated) == 1U;
+	  }));
+
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("restored", "music/restored.flac")}, 44), 4));
+  fixture.controller->drainForTests();
+
+  const auto snapshot = fixture.controller->libraryStateSnapshot();
+  REQUIRE(snapshot.libraryTree.has_value());
+  CHECK(snapshot.libraryTree->version == 44U);
+
+  notificationSubscription.unsubscribe();
 }
 
 TEST_CASE("media controller repeated full scans restart watching through the scanner facade") {

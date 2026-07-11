@@ -184,8 +184,8 @@ endif()
 add_library(seriona_scanner STATIC
   src/scanner/file_scanner_service.cpp
   src/scanner/file_scanner_orchestrator.cpp
-  src/scanner/cache/sqlite_cache_v3.cpp
-  src/scanner/cache/sqlite_cache_v3_connection.cpp
+  src/scanner/cache/sqlite_cache.cpp
+  src/scanner/cache/sqlite_cache_connection.cpp
   src/scanner/directory_tree_hash.cpp
   src/scanner/hash_utils.cpp
   src/scanner/lrc_parser.cpp

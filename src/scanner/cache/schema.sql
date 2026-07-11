@@ -32,16 +32,23 @@ CREATE TABLE IF NOT EXISTS locations(
   location_id TEXT PRIMARY KEY,
   content_id TEXT NOT NULL,
   root_path TEXT NOT NULL,
-  file_path TEXT NOT NULL UNIQUE,
+  file_path TEXT NOT NULL,
   file_size_bytes INTEGER NOT NULL,
   file_mtime_ns INTEGER NOT NULL,
   source_file_path TEXT NOT NULL,
   cue_track_offset_ms INTEGER,
+  cue_track_index INTEGER,
+  cue_track_duration_ms INTEGER,
+  cue_file_size_bytes INTEGER,
+  cue_file_mtime_ns INTEGER,
+  source_file_size_bytes INTEGER,
+  source_file_mtime_ns INTEGER,
   artwork_path TEXT,
   thumbnail_path TEXT,
   lyrics_source TEXT NOT NULL,
   external_lrc_path TEXT,
   external_lrc_mtime_ns INTEGER,
+  external_lrc_hash TEXT,
   discovered_at_ms INTEGER NOT NULL,
   scanned_at_ms INTEGER NOT NULL,
   FOREIGN KEY(content_id) REFERENCES content(content_id) ON DELETE CASCADE,
@@ -73,6 +80,7 @@ CREATE INDEX IF NOT EXISTS idx_content_artist ON content(artist);
 CREATE INDEX IF NOT EXISTS idx_locations_content ON locations(content_id);
 CREATE INDEX IF NOT EXISTS idx_locations_root ON locations(root_path);
 CREATE INDEX IF NOT EXISTS idx_locations_path ON locations(file_path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_root_file_cue_identity ON locations(root_path, file_path, COALESCE(cue_track_offset_ms, -1), COALESCE(cue_track_index, -1));
 CREATE INDEX IF NOT EXISTS idx_lyrics_location ON lyrics(location_id);
 CREATE INDEX IF NOT EXISTS idx_errors_root ON scan_errors(root_path);
 

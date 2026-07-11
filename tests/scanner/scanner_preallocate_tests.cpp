@@ -120,6 +120,15 @@ public:
   PublishedSongObserverGuard& operator=(const PublishedSongObserverGuard&) = delete;
 };
 
+class CacheWriteObserverGuard {
+public:
+  explicit CacheWriteObserverGuard(CacheWriteObserver observer) { setCacheWriteObserver(std::move(observer)); }
+  ~CacheWriteObserverGuard() { clearCacheWriteObserver(); }
+
+  CacheWriteObserverGuard(const CacheWriteObserverGuard&) = delete;
+  CacheWriteObserverGuard& operator=(const CacheWriteObserverGuard&) = delete;
+};
+
 [[nodiscard]] const WorkerTaskSnapshot* workerSnapshotByPath(const std::vector<WorkerTaskSnapshot>& snapshots,
                                                             const std::filesystem::path& path) {
   const auto iterator = std::ranges::find(snapshots, path, &WorkerTaskSnapshot::filePath);
@@ -277,19 +286,23 @@ TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
 
-  std::vector<ScanItemOrigin> observedOrigins;
-  std::vector<std::optional<std::string>> observedLocationIds;
-  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
-  std::vector<PublishedSongSnapshot> observedPublishedSongs;
-  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
-    observedWorkerTasks = tasks;
-  }};
-  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
-    observedPublishedSongs = songs;
-  }};
-  setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
-    for (const auto& node : nodes) {
-      if (node.nodeType == NodeType::Song) {
+	  std::vector<ScanItemOrigin> observedOrigins;
+	  std::vector<std::optional<std::string>> observedLocationIds;
+	  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
+	  std::vector<PublishedSongSnapshot> observedPublishedSongs;
+	  std::vector<cache::ScanRootCacheWrite> observedCacheWrites;
+	  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+	    observedWorkerTasks = tasks;
+	  }};
+	  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+	    observedPublishedSongs = songs;
+	  }};
+	  const CacheWriteObserverGuard cacheWriteObserver{[&observedCacheWrites](const cache::ScanRootCacheWrite& write) {
+	    observedCacheWrites.push_back(write);
+	  }};
+	  setPreallocationObserver([&](const std::vector<IndexedPublishedSong>& nodes) {
+	    for (const auto& node : nodes) {
+	      if (node.nodeType == NodeType::Song) {
         observedOrigins.push_back(node.origin);
         observedLocationIds.push_back(node.locationId);
       }
@@ -306,12 +319,20 @@ TEST_CASE("reconcileRoot: unchanged cache hit carries origin and cached location
   REQUIRE(observedLocationIds.size() == 1);
   REQUIRE(observedLocationIds[0].has_value());
   CHECK_FALSE(observedLocationIds[0]->empty());
-  CHECK(observedWorkerTasks.empty());
-  REQUIRE(observedPublishedSongs.size() == 1U);
-  CHECK(observedPublishedSongs[0].origin == ScanItemOrigin::CacheHit);
-  REQUIRE(observedPublishedSongs[0].locationId.has_value());
-  CHECK_FALSE(observedPublishedSongs[0].locationId->empty());
-}
+	  CHECK(observedWorkerTasks.empty());
+	  REQUIRE(observedPublishedSongs.size() == 1U);
+	  CHECK(observedPublishedSongs[0].origin == ScanItemOrigin::CacheHit);
+	  REQUIRE(observedPublishedSongs[0].locationId.has_value());
+	  CHECK_FALSE(observedPublishedSongs[0].locationId->empty());
+	  REQUIRE(observedCacheWrites.size() == 1U);
+	  const auto& cacheWrite = observedCacheWrites.back();
+	  CHECK(cacheWrite.root.totalFiles == 1U);
+	  CHECK(cacheWrite.changedSongs.empty());
+	  CHECK(cacheWrite.changedCueTracks.empty());
+	  CHECK(cacheWrite.lyricsUpdates.empty());
+	  REQUIRE(cacheWrite.retainedLocationIds.size() == 1U);
+	  CHECK(cacheWrite.retainedLocationIds[0] == *observedPublishedSongs[0].locationId);
+	}
 
 TEST_CASE("reconcileRoot: incremental worker paths preserve changed and new origins into root results") {
   test::TempScannerRoot temp{"scanner-preallocate-worker-origin-delta"};
@@ -348,18 +369,22 @@ TEST_CASE("reconcileRoot: incremental worker paths preserve changed and new orig
   reader->put(addedFile, makeMetadata("Added After"));
   forceNextScanIncrementalForCurrentTree(temp);
 
-  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
-  std::vector<PublishedSongSnapshot> observedPublishedSongs;
-  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
-    observedWorkerTasks = tasks;
-  }};
-  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
-    observedPublishedSongs = songs;
-  }};
+	  std::vector<WorkerTaskSnapshot> observedWorkerTasks;
+	  std::vector<PublishedSongSnapshot> observedPublishedSongs;
+	  std::vector<cache::ScanRootCacheWrite> observedCacheWrites;
+	  const WorkerTaskObserverGuard workerObserver{[&observedWorkerTasks](const std::vector<WorkerTaskSnapshot>& tasks) {
+	    observedWorkerTasks = tasks;
+	  }};
+	  const PublishedSongObserverGuard publishedSongObserver{[&observedPublishedSongs](const std::vector<PublishedSongSnapshot>& songs) {
+	    observedPublishedSongs = songs;
+	  }};
+	  const CacheWriteObserverGuard cacheWriteObserver{[&observedCacheWrites](const cache::ScanRootCacheWrite& write) {
+	    observedCacheWrites.push_back(write);
+	  }};
 
-  beforeScan = events.completedCount();
-  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
+	  beforeScan = events.completedCount();
+	  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+	  REQUIRE(events.waitForScanCompletionAfter(beforeScan, std::chrono::seconds{5}));
 
   REQUIRE(observedWorkerTasks.size() == 2U);
   const auto* changedWorker = workerSnapshotByPath(observedWorkerTasks, changedFile);
@@ -386,10 +411,27 @@ TEST_CASE("reconcileRoot: incremental worker paths preserve changed and new orig
 
   const auto* addedPublished = publishedSnapshotByPath(observedPublishedSongs, addedFile);
   REQUIRE(addedPublished != nullptr);
-  CHECK(addedPublished->origin == ScanItemOrigin::ScannedNew);
-  REQUIRE(addedPublished->locationId.has_value());
-  CHECK_FALSE(addedPublished->locationId->empty());
-}
+	  CHECK(addedPublished->origin == ScanItemOrigin::ScannedNew);
+	  REQUIRE(addedPublished->locationId.has_value());
+	  CHECK_FALSE(addedPublished->locationId->empty());
+
+	  REQUIRE(observedCacheWrites.size() == 1U);
+	  const auto& cacheWrite = observedCacheWrites.back();
+	  CHECK(cacheWrite.root.totalFiles == 3U);
+	  REQUIRE(cacheWrite.changedSongs.size() == 2U);
+	  CHECK(cacheWrite.changedCueTracks.empty());
+	  CHECK(cacheWrite.lyricsUpdates.empty());
+	  CHECK(cacheWrite.retainedLocationIds.size() == 3U);
+	  CHECK(std::ranges::any_of(cacheWrite.changedSongs, [&changedFile](const cache::CacheWriteSong& songWrite) {
+	    return songWrite.location.filePath == changedFile;
+	  }));
+	  CHECK(std::ranges::any_of(cacheWrite.changedSongs, [&addedFile](const cache::CacheWriteSong& songWrite) {
+	    return songWrite.location.filePath == addedFile;
+	  }));
+	  CHECK_FALSE(std::ranges::any_of(cacheWrite.changedSongs, [&unchangedFile](const cache::CacheWriteSong& songWrite) {
+	    return songWrite.location.filePath == unchangedFile;
+	  }));
+	}
 
 TEST_CASE("IndexedPublishedSong: CueContainer with 0 tracks creates single node") {
   std::vector<IndexedPublishedSong> nodes(1);

@@ -252,8 +252,8 @@ add_executable(seriona_scanner_phase2_tsan_stress_tests
 add_executable(seriona_scanner_scan_mode_decision_tests
   scanner/scanner_scan_mode_decision_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/directory_tree_hash.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/hash_utils.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/lrc_parser.cpp
@@ -266,8 +266,8 @@ add_executable(seriona_scanner_scan_mode_decision_tests
 add_executable(seriona_scanner_incremental_plan_tests
   scanner/scanner_incremental_plan_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/directory_tree_hash.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/hash_utils.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/lrc_parser.cpp
@@ -300,70 +300,70 @@ add_executable(seriona_scanner_detailed_perf_test
 #   scanner/scanner_cache_tests.cpp
 #   scanner/scanner_test_harness.cpp
 # )
-add_executable(seriona_scanner_cache_v3_basic_tests
-  scanner/scanner_cache_v3_basic_tests.cpp
+add_executable(seriona_scanner_cache_basic_tests
+  scanner/scanner_cache_basic_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 )
 # DISABLED
-# add_executable(seriona_scanner_cache_v3_content_tests
-#   scanner/scanner_cache_v3_content_tests.cpp
+# add_executable(seriona_scanner_cache_content_tests
+#   scanner/scanner_cache_content_tests.cpp
 #   scanner/scanner_test_harness.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
 #   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 # )
-add_executable(seriona_scanner_cache_v3_locations_tests
-  scanner/scanner_cache_v3_locations_tests.cpp
+add_executable(seriona_scanner_cache_locations_tests
+  scanner/scanner_cache_locations_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 )
-add_executable(seriona_scanner_cache_v3_auxiliary_tests
-  scanner/scanner_cache_v3_auxiliary_tests.cpp
+add_executable(seriona_scanner_cache_auxiliary_tests
+  scanner/scanner_cache_auxiliary_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 )
-add_executable(seriona_scanner_cache_v3_perf_tests
-  scanner/scanner_cache_v3_perf_tests.cpp
+add_executable(seriona_scanner_cache_perf_tests
+  scanner/scanner_cache_perf_tests.cpp
   scanner/scanner_test_harness.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 )
 # DISABLED
 # add_executable(seriona_scanner_migration_v2_to_v3_tests
 #   scanner/scanner_migration_v2_to_v3_tests.cpp
 #   scanner/scanner_test_harness.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
 #   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 # )
 # DISABLED
 # add_executable(seriona_scanner_backup_rollback_tests
 #   scanner/scanner_backup_rollback_tests.cpp
 #   scanner/scanner_test_harness.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
 #   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 # )
 # DISABLED
 # add_executable(seriona_scanner_phase1_integration_tests
 #   scanner/scanner_phase1_integration_tests.cpp
 #   scanner/scanner_test_harness.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3.cpp
-#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_v3_connection.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache.cpp
+#   ${PROJECT_SOURCE_DIR}/src/scanner/cache/sqlite_cache_connection.cpp
 #   ${PROJECT_SOURCE_DIR}/src/scanner/song_identity.cpp
 # )
-add_executable(seriona_scanner_cache_schema_v3_tests
-  scanner/scanner_cache_schema_v3_tests.cpp
+add_executable(seriona_scanner_cache_schema_tests
+  scanner/scanner_cache_schema_tests.cpp
 )
-target_link_libraries(seriona_scanner_cache_schema_v3_tests PRIVATE sqlite3)
+target_link_libraries(seriona_scanner_cache_schema_tests PRIVATE sqlite3)
 add_executable(seriona_scanner_tagreader_tests
   scanner/scanner_tagreader_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
@@ -460,15 +460,15 @@ target_compile_definitions(seriona_scanner_scan_mode_decision_tests PRIVATE DOCT
 target_compile_definitions(seriona_scanner_incremental_plan_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_incremental_e2e_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_cache_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_scanner_cache_v3_basic_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-# target_compile_definitions(seriona_scanner_cache_v3_content_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_scanner_cache_v3_locations_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_scanner_cache_v3_auxiliary_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_scanner_cache_v3_perf_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_basic_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+# target_compile_definitions(seriona_scanner_cache_content_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_locations_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_auxiliary_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_perf_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_migration_v2_to_v3_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_backup_rollback_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_phase1_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_scanner_cache_schema_v3_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_cache_schema_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tagreader_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tagreader_concurrency_stress_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -721,23 +721,23 @@ target_include_directories(seriona_scanner_detailed_perf_test PRIVATE
 #   ${PROJECT_SOURCE_DIR}/inc
 #   ${PROJECT_SOURCE_DIR}/third_party/doctest
 # )
-target_include_directories(seriona_scanner_cache_v3_basic_tests PRIVATE
+target_include_directories(seriona_scanner_cache_basic_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
-# target_include_directories(seriona_scanner_cache_v3_content_tests PRIVATE
+# target_include_directories(seriona_scanner_cache_content_tests PRIVATE
 #   ${PROJECT_SOURCE_DIR}/inc
 #   ${PROJECT_SOURCE_DIR}/third_party/doctest
 # )
-target_include_directories(seriona_scanner_cache_v3_locations_tests PRIVATE
+target_include_directories(seriona_scanner_cache_locations_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
-target_include_directories(seriona_scanner_cache_v3_auxiliary_tests PRIVATE
+target_include_directories(seriona_scanner_cache_auxiliary_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
-target_include_directories(seriona_scanner_cache_v3_perf_tests PRIVATE
+target_include_directories(seriona_scanner_cache_perf_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -753,10 +753,10 @@ target_include_directories(seriona_scanner_cache_v3_perf_tests PRIVATE
 #   ${PROJECT_SOURCE_DIR}/inc
 #   ${PROJECT_SOURCE_DIR}/third_party/doctest
 # )
-target_include_directories(seriona_scanner_cache_schema_v3_tests PRIVATE
+target_include_directories(seriona_scanner_cache_schema_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
-target_link_libraries(seriona_scanner_cache_schema_v3_tests PRIVATE sqlite3)
+target_link_libraries(seriona_scanner_cache_schema_tests PRIVATE sqlite3)
 target_include_directories(seriona_scanner_tagreader_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1015,11 +1015,11 @@ seriona_enable_warnings(seriona_scanner_incremental_e2e_tests)
 seriona_enable_warnings(seriona_scanner_perf_test)
 seriona_enable_warnings(seriona_scanner_detailed_perf_test)
 # seriona_enable_warnings(seriona_scanner_cache_tests)
-seriona_enable_warnings(seriona_scanner_cache_v3_basic_tests)
-# seriona_enable_warnings(seriona_scanner_cache_v3_content_tests)
-seriona_enable_warnings(seriona_scanner_cache_v3_locations_tests)
-seriona_enable_warnings(seriona_scanner_cache_v3_auxiliary_tests)
-seriona_enable_warnings(seriona_scanner_cache_v3_perf_tests)
+seriona_enable_warnings(seriona_scanner_cache_basic_tests)
+# seriona_enable_warnings(seriona_scanner_cache_content_tests)
+seriona_enable_warnings(seriona_scanner_cache_locations_tests)
+seriona_enable_warnings(seriona_scanner_cache_auxiliary_tests)
+seriona_enable_warnings(seriona_scanner_cache_perf_tests)
 # seriona_enable_warnings(seriona_scanner_migration_v2_to_v3_tests)
 # seriona_enable_warnings(seriona_scanner_backup_rollback_tests)
 # seriona_enable_warnings(seriona_scanner_phase1_integration_tests)
@@ -1040,23 +1040,23 @@ target_link_libraries(seriona_scanner_hash_tests PRIVATE
 #   SQLite3::SQLite3
 #   spdlog::spdlog
 # )
-target_link_libraries(seriona_scanner_cache_v3_basic_tests PRIVATE
+target_link_libraries(seriona_scanner_cache_basic_tests PRIVATE
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
 )
-# target_link_libraries(seriona_scanner_cache_v3_content_tests PRIVATE
+# target_link_libraries(seriona_scanner_cache_content_tests PRIVATE
 #   SQLite3::SQLite3
 #   PkgConfig::SERIONA_XXHASH
 # )
-target_link_libraries(seriona_scanner_cache_v3_locations_tests PRIVATE
+target_link_libraries(seriona_scanner_cache_locations_tests PRIVATE
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
 )
-target_link_libraries(seriona_scanner_cache_v3_auxiliary_tests PRIVATE
+target_link_libraries(seriona_scanner_cache_auxiliary_tests PRIVATE
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
 )
-target_link_libraries(seriona_scanner_cache_v3_perf_tests PRIVATE
+target_link_libraries(seriona_scanner_cache_perf_tests PRIVATE
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
 )
@@ -1239,11 +1239,12 @@ add_test(NAME seriona.scanner.scan_mode_decision COMMAND seriona_scanner_scan_mo
 add_test(NAME seriona.scanner.incremental_plan COMMAND seriona_scanner_incremental_plan_tests)
 add_test(NAME seriona.scanner.incremental_e2e COMMAND seriona_scanner_incremental_e2e_tests)
 # add_test(NAME seriona.scanner_cache COMMAND seriona_scanner_cache_tests)
-add_test(NAME seriona.scanner.cache_v3_basic COMMAND seriona_scanner_cache_v3_basic_tests)
-# add_test(NAME seriona.scanner.cache_v3_content COMMAND seriona_scanner_cache_v3_content_tests)
-add_test(NAME seriona.scanner.cache_v3_locations COMMAND seriona_scanner_cache_v3_locations_tests)
-add_test(NAME seriona.scanner.cache_v3_auxiliary COMMAND seriona_scanner_cache_v3_auxiliary_tests)
-add_test(NAME seriona.scanner.cache_v3_perf COMMAND seriona_scanner_cache_v3_perf_tests)
+add_test(NAME seriona.scanner.cache.basic COMMAND seriona_scanner_cache_basic_tests)
+# add_test(NAME seriona.scanner.cache.content COMMAND seriona_scanner_cache_content_tests)
+add_test(NAME seriona.scanner.cache.locations COMMAND seriona_scanner_cache_locations_tests)
+add_test(NAME seriona.scanner.cache.auxiliary COMMAND seriona_scanner_cache_auxiliary_tests)
+add_test(NAME seriona.scanner.cache.perf COMMAND seriona_scanner_cache_perf_tests)
+add_test(NAME seriona.scanner.cache.schema COMMAND seriona_scanner_cache_schema_tests)
 # add_test(NAME seriona.scanner.migration_v2_to_v3 COMMAND seriona_scanner_migration_v2_to_v3_tests)
 # add_test(NAME seriona.scanner.migration_phase1_integration COMMAND seriona_scanner_phase1_integration_tests)
 # add_test(NAME seriona.scanner.backup_rollback COMMAND seriona_scanner_backup_rollback_tests)

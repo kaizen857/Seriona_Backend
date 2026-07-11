@@ -1,4 +1,4 @@
-#include "seriona/scanner/cache/sqlite_cache_v3.h"
+#include "seriona/scanner/cache/sqlite_cache.h"
 
 #include <sqlite3.h>
 
@@ -61,6 +61,8 @@ public:
   void bind(const int index, const std::int64_t value) { if (sqlite3_bind_int64(statement_, index, value) != SQLITE_OK) { throw sqliteError(db_, "bind int64"); } }
   void bindNull(const int index) { if (sqlite3_bind_null(statement_, index) != SQLITE_OK) { throw sqliteError(db_, "bind null"); } }
   void bindOptionalPath(const int index, const std::optional<std::filesystem::path>& value) { value.has_value() ? bind(index, pathText(*value)) : bindNull(index); }
+  void bindOptionalInt64(const int index, const std::optional<std::int64_t> value) { value.has_value() ? bind(index, *value) : bindNull(index); }
+  void bindOptionalString(const int index, const std::optional<std::string>& value) { value.has_value() ? bind(index, *value) : bindNull(index); }
   void stepDone() { if (sqlite3_step(statement_) != SQLITE_DONE) { throw sqliteError(db_, "step done"); } }
   [[nodiscard]] int columnType(const int index) const { return sqlite3_column_type(statement_, index); }
 
@@ -75,6 +77,7 @@ private:
 [[nodiscard]] std::chrono::system_clock::time_point msToSystemTime(const std::int64_t value) { return std::chrono::system_clock::time_point{std::chrono::milliseconds{value}}; }
 [[nodiscard]] std::string scanModeText(const ScanMode mode) { return mode == ScanMode::Full ? "full" : "incremental"; }
 [[nodiscard]] ScanMode parseScanMode(const std::string& value) { if (value == "full") { return ScanMode::Full; } if (value == "incremental") { return ScanMode::Incremental; } throw std::runtime_error("unknown cached scan mode"); }
+[[nodiscard]] std::string lyricsSourceText(const LyricsSource source) { switch (source) { case LyricsSource::None: return "none"; case LyricsSource::EmbeddedTag: return "embedded_tag"; case LyricsSource::ExternalLrc: return "external_lrc"; } throw std::runtime_error("unknown lyrics source"); }
 [[nodiscard]] std::string errorCodeText(const ScannerErrorCode code) {
   switch (code) { case ScannerErrorCode::RootUnavailable: return "root_unavailable"; case ScannerErrorCode::PermissionDenied: return "permission_denied"; case ScannerErrorCode::UnsupportedFile: return "unsupported_file"; case ScannerErrorCode::MetadataReadFailed: return "metadata_read_failed"; case ScannerErrorCode::CacheUnavailable: return "cache_unavailable"; case ScannerErrorCode::Cancelled: return "cancelled"; }
   throw std::runtime_error("unknown scanner error code");
@@ -87,7 +90,7 @@ private:
 
 }
 
-std::string SQLiteCacheV3::schemaV3Sql() {
+std::string SQLiteCache::schemaSql() {
   return R"sql(CREATE TABLE IF NOT EXISTS content(
   content_id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -127,11 +130,18 @@ CREATE TABLE IF NOT EXISTS locations(
   file_mtime_ns INTEGER NOT NULL,
   source_file_path TEXT NOT NULL,
   cue_track_offset_ms INTEGER,
+  cue_track_index INTEGER,
+  cue_track_duration_ms INTEGER,
+  cue_file_size_bytes INTEGER,
+  cue_file_mtime_ns INTEGER,
+  source_file_size_bytes INTEGER,
+  source_file_mtime_ns INTEGER,
   artwork_path TEXT,
   thumbnail_path TEXT,
   lyrics_source TEXT NOT NULL,
   external_lrc_path TEXT,
   external_lrc_mtime_ns INTEGER,
+  external_lrc_hash TEXT,
   discovered_at_ms INTEGER NOT NULL,
   scanned_at_ms INTEGER NOT NULL,
   FOREIGN KEY(content_id) REFERENCES content(content_id) ON DELETE CASCADE,
@@ -163,16 +173,16 @@ CREATE INDEX IF NOT EXISTS idx_content_artist ON content(artist);
 CREATE INDEX IF NOT EXISTS idx_locations_content ON locations(content_id);
 CREATE INDEX IF NOT EXISTS idx_locations_root ON locations(root_path);
 CREATE INDEX IF NOT EXISTS idx_locations_path ON locations(file_path);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_file_offset ON locations(file_path, COALESCE(cue_track_offset_ms, 0));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_locations_root_file_cue_identity ON locations(root_path, file_path, COALESCE(cue_track_offset_ms, -1), COALESCE(cue_track_index, -1));
 CREATE INDEX IF NOT EXISTS idx_lyrics_location ON lyrics(location_id);
 CREATE INDEX IF NOT EXISTS idx_errors_root ON scan_errors(root_path);
 
 PRAGMA user_version=3;)sql";
 }
 
-void SQLiteCacheV3::exec(sqlite3* db, const char* sql) { ::seriona::scanner::cache::exec(db, sql); }
+void SQLiteCache::exec(sqlite3* db, const char* sql) { ::seriona::scanner::cache::exec(db, sql); }
 
-void SQLiteCacheV3::configureConnection(sqlite3* db, const std::chrono::milliseconds busyTimeout) {
+void SQLiteCache::configureConnection(sqlite3* db, const std::chrono::milliseconds busyTimeout) {
   if (sqlite3_busy_timeout(db, static_cast<int>(busyTimeout.count())) != SQLITE_OK) {
     throw sqliteError(db, "set busy timeout");
   }
@@ -183,27 +193,27 @@ void SQLiteCacheV3::configureConnection(sqlite3* db, const std::chrono::millisec
   exec(db, "PRAGMA foreign_keys=ON;");
 }
 
-SQLiteCacheV3::SQLiteCacheV3(ScannerCacheConfig config)
+SQLiteCache::SQLiteCache(ScannerCacheConfig config)
     : databasePath_(std::move(config.databasePath)) {
   open();
   prepareStatements();
 }
 
-SQLiteCacheV3::~SQLiteCacheV3() {
+SQLiteCache::~SQLiteCache() {
   finalizeStatements();
   if (db_ != nullptr) {
     sqlite3_close(asDb(db_));
   }
 }
 
-void SQLiteCacheV3::open() {
+void SQLiteCache::open() {
   if (!databasePath_.parent_path().empty()) {
     std::filesystem::create_directories(databasePath_.parent_path());
   }
 
   sqlite3* db = nullptr;
   if (sqlite3_open_v2(pathText(databasePath_).c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
-    const std::string message = db == nullptr ? "failed to open scanner cache v3" : sqlite3_errmsg(db);
+    const std::string message = db == nullptr ? "failed to open scanner cache" : sqlite3_errmsg(db);
     sqlite3_close(db);
     throw std::runtime_error(message);
   }
@@ -213,7 +223,7 @@ void SQLiteCacheV3::open() {
 
   const auto version = readUserVersion();
   if (version == 0) {
-    initializeSchemaV3();
+    initializeSchema();
   }
 
   if (readUserVersion() != kSchemaVersion) {
@@ -221,35 +231,35 @@ void SQLiteCacheV3::open() {
   }
 }
 
-void SQLiteCacheV3::initializeSchemaV3() { exec(asDb(db_), schemaV3Sql().c_str()); }
+void SQLiteCache::initializeSchema() { exec(asDb(db_), schemaSql().c_str()); }
 
-int SQLiteCacheV3::readUserVersion() const {
+int SQLiteCache::readUserVersion() const {
   Statement statement{asDb(db_), "PRAGMA user_version;"};
   return statement.stepRow() ? static_cast<int>(statement.int64Column(0)) : 0;
 }
 
-std::string SQLiteCacheV3::readJournalMode() const {
+std::string SQLiteCache::readJournalMode() const {
   Statement statement{asDb(db_), "PRAGMA journal_mode;"};
   return statement.stepRow() ? statement.textColumn(0) : std::string{};
 }
 
-SQLiteCacheV3::WriterTransaction::WriterTransaction(SQLiteCacheV3& cache)
+SQLiteCache::WriterTransaction::WriterTransaction(SQLiteCache& cache)
     : cache_(&cache), lock_(cache.writerMutex_) {
   exec(asDb(cache_->db_), "BEGIN IMMEDIATE;");
   active_ = true;
 }
 
-SQLiteCacheV3::WriterTransaction::~WriterTransaction() {
+SQLiteCache::WriterTransaction::~WriterTransaction() {
   if (!active_ || cache_ == nullptr) {
     return;
   }
   rollbackNoThrow(asDb(cache_->db_));
 }
 
-SQLiteCacheV3::WriterTransaction::WriterTransaction(WriterTransaction&& other) noexcept
+SQLiteCache::WriterTransaction::WriterTransaction(WriterTransaction&& other) noexcept
     : cache_(std::exchange(other.cache_, nullptr)), lock_(std::move(other.lock_)), active_(std::exchange(other.active_, false)) {}
 
-SQLiteCacheV3::WriterTransaction& SQLiteCacheV3::WriterTransaction::operator=(WriterTransaction&& other) noexcept {
+SQLiteCache::WriterTransaction& SQLiteCache::WriterTransaction::operator=(WriterTransaction&& other) noexcept {
   if (this == &other) {
     return *this;
   }
@@ -262,7 +272,7 @@ SQLiteCacheV3::WriterTransaction& SQLiteCacheV3::WriterTransaction::operator=(Wr
   return *this;
 }
 
-void SQLiteCacheV3::WriterTransaction::commit() {
+void SQLiteCache::WriterTransaction::commit() {
   if (!active_ || cache_ == nullptr) {
     return;
   }
@@ -270,15 +280,18 @@ void SQLiteCacheV3::WriterTransaction::commit() {
   active_ = false;
 }
 
-SQLiteCacheV3::WriterTransaction SQLiteCacheV3::beginWriter() { return WriterTransaction{*this}; }
+SQLiteCache::WriterTransaction SQLiteCache::beginWriter() { return WriterTransaction{*this}; }
 
-void SQLiteCacheV3::replaceLyrics(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics) {
-  auto transaction = beginWriter(); Statement remove{asDb(db_), "DELETE FROM lyrics WHERE location_id=?1 AND kind=?2;"}; remove.bind(1, locationId); remove.bind(2, kind); remove.stepDone();
-  for (std::size_t index = 0; index < lyrics.size(); ++index) { Statement insert{asDb(db_), "INSERT INTO lyrics(location_id, kind, line_index, timestamp_ms, text) VALUES(?1, ?2, ?3, ?4, ?5);"}; insert.bind(1, locationId); insert.bind(2, kind); insert.bind(3, static_cast<std::int64_t>(index)); insert.bind(4, lyrics[index].timestamp.count()); insert.bind(5, lyrics[index].text); insert.stepDone(); }
-  transaction.commit();
+void SQLiteCache::replaceLyrics(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics) {
+  auto transaction = beginWriter(); replaceLyricsNoTransaction(locationId, kind, lyrics); transaction.commit();
 }
 
-std::vector<LyricLine> SQLiteCacheV3::loadLyrics(const std::string& locationId, const std::string& kind) const {
+void SQLiteCache::replaceLyricsNoTransaction(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics) {
+  Statement remove{asDb(db_), "DELETE FROM lyrics WHERE location_id=?1 AND kind=?2;"}; remove.bind(1, locationId); remove.bind(2, kind); remove.stepDone();
+  for (std::size_t index = 0; index < lyrics.size(); ++index) { Statement insert{asDb(db_), "INSERT INTO lyrics(location_id, kind, line_index, timestamp_ms, text) VALUES(?1, ?2, ?3, ?4, ?5);"}; insert.bind(1, locationId); insert.bind(2, kind); insert.bind(3, static_cast<std::int64_t>(index)); insert.bind(4, lyrics[index].timestamp.count()); insert.bind(5, lyrics[index].text); insert.stepDone(); }
+}
+
+std::vector<LyricLine> SQLiteCache::loadLyrics(const std::string& locationId, const std::string& kind) const {
   std::lock_guard<std::mutex> lock(readerMutex_);
   
   Statement select{asDb(db_), "SELECT timestamp_ms, text FROM lyrics WHERE location_id=?1 AND kind=?2 ORDER BY line_index;"}; select.bind(1, locationId); select.bind(2, kind); std::vector<LyricLine> lyrics;
@@ -286,41 +299,75 @@ std::vector<LyricLine> SQLiteCacheV3::loadLyrics(const std::string& locationId, 
   return lyrics;
 }
 
-void SQLiteCacheV3::updateScanRoot(const CachedScanRootV3& root) {
-  auto transaction = beginWriter(); Statement upsert{asDb(db_), "INSERT INTO scan_roots(root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(root_path) DO UPDATE SET directory_tree_hash=excluded.directory_tree_hash, total_files=excluded.total_files, last_scan_mode=excluded.last_scan_mode, last_scan_duration_ms=excluded.last_scan_duration_ms, last_scan_at_ms=excluded.last_scan_at_ms;"};
-  upsert.bind(1, pathText(root.rootPath)); upsert.bind(2, root.directoryTreeHash); upsert.bind(3, static_cast<std::int64_t>(root.totalFiles)); upsert.bind(4, scanModeText(root.lastScanMode)); upsert.bind(5, root.lastScanDuration.count()); upsert.bind(6, systemTimeToMs(root.lastScanAt)); upsert.stepDone(); transaction.commit();
+void SQLiteCache::updateScanRoot(const CachedScanRoot& root) {
+  auto transaction = beginWriter(); updateScanRootNoTransaction(root); transaction.commit();
 }
 
-std::optional<CachedScanRootV3> SQLiteCacheV3::loadScanRoot(const std::filesystem::path& rootPath) const {
+void SQLiteCache::updateScanRootNoTransaction(const CachedScanRoot& root) {
+  Statement upsert{asDb(db_), "INSERT INTO scan_roots(root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(root_path) DO UPDATE SET directory_tree_hash=excluded.directory_tree_hash, total_files=excluded.total_files, last_scan_mode=excluded.last_scan_mode, last_scan_duration_ms=excluded.last_scan_duration_ms, last_scan_at_ms=excluded.last_scan_at_ms;"};
+  upsert.bind(1, pathText(root.rootPath)); upsert.bind(2, root.directoryTreeHash); upsert.bind(3, static_cast<std::int64_t>(root.totalFiles)); upsert.bind(4, scanModeText(root.lastScanMode)); upsert.bind(5, root.lastScanDuration.count()); upsert.bind(6, systemTimeToMs(root.lastScanAt)); upsert.stepDone();
+}
+
+std::optional<CachedScanRoot> SQLiteCache::loadScanRoot(const std::filesystem::path& rootPath) const {
   std::lock_guard<std::mutex> lock(readerMutex_);
   
   Statement select{asDb(db_), "SELECT root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms FROM scan_roots WHERE root_path=?1;"}; select.bind(1, pathText(rootPath)); if (!select.stepRow()) { return std::nullopt; }
-  return CachedScanRootV3{.rootPath = select.textColumn(0), .directoryTreeHash = select.textColumn(1), .totalFiles = static_cast<std::uint64_t>(select.int64Column(2)), .lastScanMode = parseScanMode(select.textColumn(3)), .lastScanDuration = std::chrono::milliseconds{select.int64Column(4)}, .lastScanAt = msToSystemTime(select.int64Column(5))};
+  return CachedScanRoot{.rootPath = select.textColumn(0), .directoryTreeHash = select.textColumn(1), .totalFiles = static_cast<std::uint64_t>(select.int64Column(2)), .lastScanMode = parseScanMode(select.textColumn(3)), .lastScanDuration = std::chrono::milliseconds{select.int64Column(4)}, .lastScanAt = msToSystemTime(select.int64Column(5))};
 }
 
-void SQLiteCacheV3::saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanErrorV3>& errors) {
-  auto transaction = beginWriter(); Statement remove{asDb(db_), "DELETE FROM scan_errors WHERE root_path=?1;"}; remove.bind(1, pathText(rootPath)); remove.stepDone();
+void SQLiteCache::saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors) {
+  auto transaction = beginWriter(); saveErrorsNoTransaction(rootPath, errors); transaction.commit();
+}
+
+void SQLiteCache::saveErrorsNoTransaction(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors) {
+  clearErrorsNoTransaction(rootPath);
   for (const auto& error : errors) { Statement insert{asDb(db_), "INSERT INTO scan_errors(root_path, file_path, error_code, error_message, occurred_at_ms) VALUES(?1, ?2, ?3, ?4, ?5);"}; insert.bind(1, pathText(rootPath)); insert.bindOptionalPath(2, error.filePath); insert.bind(3, errorCodeText(error.errorCode)); insert.bind(4, error.errorMessage); insert.bind(5, systemTimeToMs(error.occurredAt)); insert.stepDone(); }
-  transaction.commit();
 }
 
-std::vector<CachedScanErrorV3> SQLiteCacheV3::loadErrors(const std::filesystem::path& rootPath) const {
+std::vector<CachedScanError> SQLiteCache::loadErrors(const std::filesystem::path& rootPath) const {
   std::lock_guard<std::mutex> lock(readerMutex_);
   
-  Statement select{asDb(db_), "SELECT root_path, file_path, error_code, error_message, occurred_at_ms FROM scan_errors WHERE root_path=?1 ORDER BY id;"}; select.bind(1, pathText(rootPath)); std::vector<CachedScanErrorV3> errors;
+  Statement select{asDb(db_), "SELECT root_path, file_path, error_code, error_message, occurred_at_ms FROM scan_errors WHERE root_path=?1 ORDER BY id;"}; select.bind(1, pathText(rootPath)); std::vector<CachedScanError> errors;
   while (select.stepRow()) { errors.push_back({.rootPath = select.textColumn(0), .filePath = select.columnType(1) == SQLITE_TEXT ? std::optional<std::filesystem::path>{select.textColumn(1)} : std::nullopt, .errorCode = parseErrorCode(select.textColumn(2)), .errorMessage = select.textColumn(3), .occurredAt = msToSystemTime(select.int64Column(4))}); }
   return errors;
 }
 
-void SQLiteCacheV3::clearErrors(const std::filesystem::path& rootPath) {
-  auto transaction = beginWriter(); Statement remove{asDb(db_), "DELETE FROM scan_errors WHERE root_path=?1;"}; remove.bind(1, pathText(rootPath)); remove.stepDone(); transaction.commit();
+void SQLiteCache::clearErrors(const std::filesystem::path& rootPath) {
+  auto transaction = beginWriter(); clearErrorsNoTransaction(rootPath); transaction.commit();
 }
 
-void SQLiteCacheV3::prepareStatements() {
+void SQLiteCache::clearErrorsNoTransaction(const std::filesystem::path& rootPath) {
+  Statement remove{asDb(db_), "DELETE FROM scan_errors WHERE root_path=?1;"}; remove.bind(1, pathText(rootPath)); remove.stepDone();
+}
+
+void SQLiteCache::applyLyricsCacheUpdateNoTransaction(const LyricsCacheUpdate& update) {
+  const auto nextSource = update.removeExternalLyrics ? update.effectiveLyricsSource : LyricsSource::ExternalLrc;
+  Statement updateLocation{asDb(db_),
+                           "UPDATE locations "
+                           "SET lyrics_source=?1, external_lrc_path=?2, external_lrc_mtime_ns=?3, external_lrc_hash=?4 "
+                           "WHERE location_id=?5;"};
+  updateLocation.bind(1, lyricsSourceText(nextSource));
+  if (update.removeExternalLyrics) {
+    updateLocation.bindNull(2);
+    updateLocation.bindNull(3);
+    updateLocation.bindNull(4);
+  } else {
+    updateLocation.bindOptionalPath(2, update.externalLrcPath);
+    updateLocation.bindOptionalInt64(3, update.externalLrcMtimeNs);
+    updateLocation.bindOptionalString(4, update.externalLrcHash);
+  }
+  updateLocation.bind(5, update.locationId);
+  updateLocation.stepDone();
+  replaceLyricsNoTransaction(update.locationId, "external", update.removeExternalLyrics ? std::vector<LyricLine>{} : update.externalLyrics);
+}
+
+void SQLiteCache::prepareStatements() {
   constexpr const char* locationSql = 
     "SELECT location_id, content_id, root_path, file_path, file_size_bytes, file_mtime_ns, "
-    "source_file_path, cue_track_offset_ms, artwork_path, thumbnail_path, lyrics_source, "
-    "external_lrc_path, external_lrc_mtime_ns, discovered_at_ms, scanned_at_ms "
+    "source_file_path, cue_track_offset_ms, cue_track_index, cue_track_duration_ms, "
+    "cue_file_size_bytes, cue_file_mtime_ns, source_file_size_bytes, source_file_mtime_ns, "
+    "artwork_path, thumbnail_path, lyrics_source, external_lrc_path, external_lrc_mtime_ns, "
+    "external_lrc_hash, discovered_at_ms, scanned_at_ms "
     "FROM locations WHERE location_id=?1;";
   
   constexpr const char* contentSql = 
@@ -342,7 +389,7 @@ void SQLiteCacheV3::prepareStatements() {
   contentStmt_ = contStmt;
 }
 
-void SQLiteCacheV3::finalizeStatements() {
+void SQLiteCache::finalizeStatements() {
   if (locationStmt_ != nullptr) {
     sqlite3_finalize(static_cast<sqlite3_stmt*>(locationStmt_));
     locationStmt_ = nullptr;

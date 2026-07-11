@@ -49,3 +49,19 @@ TEST_CASE("scanner song identity location ids handle path normalization and miss
   CHECK(first != missingMtime);
   CHECK(isHexId(first));
 }
+
+TEST_CASE("scanner song identity CUE location ids include track index") {
+  using seriona::scanner::computeLocationId;
+
+  const auto mtime = std::filesystem::file_time_type::clock::now();
+  const auto offset = std::chrono::milliseconds{30000};
+  const auto track0 = computeLocationId("/music/album.cue", 2048U, mtime, offset, 0U);
+  const auto track1 = computeLocationId("/music/album.cue", 2048U, mtime, offset, 1U);
+  const auto withoutIndex = computeLocationId("/music/album.cue", 2048U, mtime, offset);
+
+  CHECK(track0 != track1);
+  CHECK(track0 != withoutIndex);
+  CHECK(track1 != withoutIndex);
+  CHECK(isHexId(track0));
+  CHECK(isHexId(track1));
+}

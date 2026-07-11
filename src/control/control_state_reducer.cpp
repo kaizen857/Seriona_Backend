@@ -641,13 +641,16 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
 }
 
 ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerEvent& event) {
-  if (event.monotonicVersion <= lastScannerVersion_) {
-    return {};
-  }
-  lastScannerVersion_ = event.monotonicVersion;
+	if (event.monotonicVersion <= lastScannerVersion_) {
+	  return {};
+	}
+	lastScannerVersion_ = event.monotonicVersion;
+	if (event.type == scanner::ScannerEventType::FileScanned) {
+	  return {};
+	}
 
-  auto reduction = accept();
-  library_.version = event.monotonicVersion;
+	auto reduction = accept();
+	library_.version = event.monotonicVersion;
 
   switch (event.type) {
   case scanner::ScannerEventType::ScanStarted:
@@ -657,16 +660,17 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
                                                     "Library scan started",
                                                     library_.scanStatus));
     break;
-  case scanner::ScannerEventType::ProgressUpdated:
-  case scanner::ScannerEventType::FileScanned:
-    if (const auto* progress = std::get_if<scanner::ScanProgress>(&event.payload)) {
-      library_.scanProgress = *progress;
-    }
-    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanProgressUpdated,
-                                                    "Library scan progress updated",
-                                                    library_.scanStatus));
-    break;
-  case scanner::ScannerEventType::PlaylistSnapshotUpdated:
+	  case scanner::ScannerEventType::ProgressUpdated:
+	    if (const auto* progress = std::get_if<scanner::ScanProgress>(&event.payload)) {
+	      library_.scanProgress = *progress;
+	    }
+	    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanProgressUpdated,
+	                                                    "Library scan progress updated",
+	                                                    library_.scanStatus));
+	    break;
+	  case scanner::ScannerEventType::FileScanned:
+	    return {};
+	  case scanner::ScannerEventType::PlaylistSnapshotUpdated:
     if (const auto* snapshot = std::get_if<scanner::PlaylistTreeSnapshot>(&event.payload)) {
       library_.libraryTree = *snapshot;
       library_.version = snapshot->version;
