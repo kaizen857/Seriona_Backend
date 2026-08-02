@@ -41,6 +41,7 @@ enum class ControlIntentKind : std::uint8_t {
   Seek,
   SetVolume,
   SetMuted,
+  ResolveArtwork,
 };
 
 struct ControlIntent {
@@ -49,6 +50,7 @@ struct ControlIntent {
   std::optional<std::chrono::milliseconds> position;
   std::optional<float> volume;
   std::optional<bool> muted;
+  std::optional<ArtworkResolveRequest> artworkRequest;
 };
 
 struct ControlReduction {
@@ -70,6 +72,7 @@ public:
   ControlReduction reduceCommand(const MediaControlCommand& command);
   ControlReduction reduceAudioEvent(const audio::BackendEvent& event);
   ControlReduction reduceScannerEvent(const scanner::ScannerEvent& event);
+  ControlReduction reduceArtworkResolved(const ArtworkResolveResultView& result);
 
 private:
   struct PlayableTrack {
@@ -77,6 +80,8 @@ private:
     audio::TrackPlaybackRequest request{};
     DisplayMetadata display{};
     std::optional<ArtworkRef> artwork{};
+    std::filesystem::path artworkSourcePath;
+    std::filesystem::path fallbackThumbnailPath;
   };
 
   struct PlaybackContextState {
@@ -122,6 +127,7 @@ private:
   std::mt19937_64 shuffleRandom_;
   ShuffleHistory shuffleHistory_;
   std::size_t shuffleHistorySize_{50};
+  std::uint64_t artworkGeneration_{0};
 };
 
 }

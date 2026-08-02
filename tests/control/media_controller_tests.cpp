@@ -388,6 +388,61 @@ TrackIdentity track(std::string id, std::string path) {
   return TrackIdentity{.trackId = std::move(id), .filePath = std::filesystem::path{std::move(path)}, .sourceId = {}, .libraryId = {}};
 }
 
+class FakeArtworkResolveService final : public ArtworkResolveService {
+public:
+  void request(ArtworkResolveRequest request) noexcept override {
+    std::lock_guard lock{mutex_};
+    requests_.push_back(std::move(request));
+  }
+
+  void setResultCallback(ArtworkResolveCallback callback) noexcept override {
+    std::lock_guard lock{mutex_};
+    callback_ = std::move(callback);
+  }
+
+  void stop() noexcept override {
+    std::lock_guard lock{mutex_};
+    stopped_ = true;
+  }
+
+  void complete(ArtworkResolveResultView view) {
+    ArtworkResolveCallback callback;
+    {
+      std::lock_guard lock{mutex_};
+      callback = callback_;
+    }
+    if (callback) {
+      callback(std::move(view));
+    }
+  }
+
+  [[nodiscard]] std::size_t requestCount() const {
+    std::lock_guard lock{mutex_};
+    return requests_.size();
+  }
+
+  [[nodiscard]] ArtworkResolveRequest lastRequest() const {
+    std::lock_guard lock{mutex_};
+    return requests_.back();
+  }
+
+  [[nodiscard]] std::vector<ArtworkResolveRequest> requests() const {
+    std::lock_guard lock{mutex_};
+    return requests_;
+  }
+
+  [[nodiscard]] bool stopped() const {
+    std::lock_guard lock{mutex_};
+    return stopped_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::vector<ArtworkResolveRequest> requests_{};
+  ArtworkResolveCallback callback_{};
+  bool stopped_{false};
+};
+
 PlaybackContextDescriptor folderContextForRoot(std::filesystem::path rootPath, std::string folderNodeId, TrackIdentity anchor) {
   return PlaybackContextDescriptor{.scope = PlaybackContextScope::Folder,
                                    .rootPath = std::move(rootPath),
@@ -500,6 +555,72 @@ void installLibrary(ControllerFixture& fixture, std::uint64_t treeVersion = 20, 
                                                 eventVersion));
   fixture.controller->drainForTests();
 }
+
+scanner::SongMetadata songWithThumbnail(std::string id, std::string path, std::filesystem::path thumbnailPath) {
+  auto metadata = song(std::move(id), std::move(path));
+  metadata.thumbnailPath = std::move(thumbnailPath);
+  return metadata;
+}
+
+scanner::SongMetadata cueSong(std::string id,
+                              std::string cuePath,
+                              std::string audioPath,
+                              std::chrono::milliseconds offset,
+                              std::chrono::milliseconds duration,
+                              std::filesystem::path thumbnailPath) {
+  auto metadata = song(std::move(id), std::move(cuePath), duration);
+  metadata.sourceFilePath = std::move(audioPath);
+  metadata.offset = offset;
+  metadata.artist = "Cue Artist";
+  metadata.album = "Cue Album";
+  metadata.thumbnailPath = std::move(thumbnailPath);
+  return metadata;
+}
+
+ArtworkResolveResultView artworkResult(std::uint64_t generation,
+                                       TrackIdentity identity,
+                                       ArtworkResolveOutcomeKind kind,
+                                       std::filesystem::path fullPath = {}) {
+  ArtworkResolveOutcomeView outcome{};
+  outcome.kind = kind;
+  if (kind == ArtworkResolveOutcomeKind::FullPath) {
+    outcome.fullPath = std::move(fullPath);
+  }
+  return ArtworkResolveResultView{.generation = generation, .identity = std::move(identity), .outcome = std::move(outcome)};
+}
+
+audio::BackendEvent cueTrackChangedEvent(std::string id,
+                                         std::string audioPath,
+                                         std::chrono::milliseconds offset,
+                                         std::chrono::milliseconds duration,
+                                         std::uint64_t version) {
+  auto event = audioTrackChangedEvent(std::move(id), std::move(audioPath), version);
+  auto& changed = std::get<audio::TrackChanged>(event.payload);
+  changed.request.offset = offset;
+  changed.request.duration = duration;
+  changed.request.boundedSegment = true;
+  return event;
+}
+
+struct ArtworkControllerFixture {
+  std::shared_ptr<control_test::FakeAudioPlaybackService> fakeAudio{std::make_shared<control_test::FakeAudioPlaybackService>()};
+  std::shared_ptr<control_test::FakeFileScannerService> fakeScanner{std::make_shared<control_test::FakeFileScannerService>()};
+  std::shared_ptr<FakeFolderSortSettingsStore> fakeFolderSortSettingsStore{std::make_shared<FakeFolderSortSettingsStore>()};
+  std::shared_ptr<FakeArtworkResolveService> fakeArtwork{std::make_shared<FakeArtworkResolveService>()};
+  control_test::FakeMetadataSharingService* fakeMetadata{nullptr};
+  std::unique_ptr<MediaController> controller{};
+
+  ArtworkControllerFixture() {
+    auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+    fakeMetadata = metadataService.get();
+    controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                 .scanner = fakeScanner,
+                                                                 .metadata = std::move(metadataService),
+                                                                 .folderSortSettingsStore = fakeFolderSortSettingsStore,
+                                                                 .artworkResolver = fakeArtwork},
+                                     MediaControllerOptions{.runInlineForTests = true});
+  }
+};
 
 }
 
@@ -2226,4 +2347,192 @@ TEST_CASE("media controller facade subscribers receive committed snapshots not r
   CHECK(playerSnapshot.timeline.duration == std::chrono::milliseconds{3000});
   playerSubscription.unsubscribe();
   librarySubscription.unsubscribe();
+}
+
+TEST_CASE("media controller schedules an artwork intent and shows the thumbnail-first snapshot") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({songWithThumbnail("a", "music/a.flac", "/thumbs/a.png")}, 21), 21));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+
+  REQUIRE(fixture.fakeArtwork->requestCount() == 1U);
+  const auto request = fixture.fakeArtwork->lastRequest();
+  CHECK(request.generation == 1U);
+  CHECK(request.identity.trackId == "a");
+  CHECK(request.identity.filePath == std::filesystem::path{"music/a.flac"});
+  CHECK(request.artworkSourcePath == std::filesystem::path{"music/a.flac"});
+  CHECK(request.fallbackThumbnailPath == std::filesystem::path{"/thumbs/a.png"});
+
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/a.png"});
+  CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/a.png"});
+}
+
+TEST_CASE("media controller applies a resolved full path and retains the thumbnail fallback") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({songWithThumbnail("a", "music/a.flac", "/thumbs/a.png")}, 21), 21));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+
+  const auto before = fixture.controller->playerStateSnapshot();
+  REQUIRE(before.artwork.has_value());
+  CHECK(before.artwork->localPath == std::filesystem::path{"/thumbs/a.png"});
+
+  fixture.fakeArtwork->complete(artworkResult(1U, track("a", "music/a.flac"), ArtworkResolveOutcomeKind::FullPath, "/covers/full-a.png"));
+  fixture.controller->drainForTests();
+
+  const auto after = fixture.controller->playerStateSnapshot();
+  REQUIRE(after.artwork.has_value());
+  CHECK(after.artwork->localPath == std::filesystem::path{"/covers/full-a.png"});
+  CHECK(after.artwork->thumbnailPath == std::filesystem::path{"/thumbs/a.png"});
+  CHECK(after.freshness.version > before.freshness.version);
+}
+
+TEST_CASE("media controller keeps the thumbnail and player state on no-art cover error and resolver failure") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({songWithThumbnail("a", "music/a.flac", "/thumbs/a.png")}, 21), 21));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+
+  const auto identity = track("a", "music/a.flac");
+  const auto before = fixture.controller->playerStateSnapshot();
+
+  const std::vector<ArtworkResolveResultView> results = {
+      artworkResult(1U, identity, ArtworkResolveOutcomeKind::NoArt),
+      artworkResult(1U, identity, ArtworkResolveOutcomeKind::CoverError),
+      artworkResult(1U, identity, ArtworkResolveOutcomeKind::ResolverFailure),
+  };
+  for (const auto& result : results) {
+    fixture.fakeArtwork->complete(result);
+    fixture.controller->drainForTests();
+    const auto snapshot = fixture.controller->playerStateSnapshot();
+    REQUIRE(snapshot.artwork.has_value());
+    CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/a.png"});
+    CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/a.png"});
+    CHECK(snapshot.freshness.version == before.freshness.version);
+  }
+}
+
+TEST_CASE("media controller drops stale and identity-mismatched artwork resolutions") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({songWithThumbnail("a", "music/a.flac", "/thumbs/a.png"),
+                   songWithThumbnail("b", "music/b.flac", "/thumbs/b.png")},
+                  21),
+      21));
+  fixture.controller->drainForTests();
+
+  auto selectCommand = command(MediaControlCommandKind::SelectTrack);
+  selectCommand.track = track("a", "music/a.flac");
+  CHECK(fixture.controller->submitCommand(selectCommand).accepted);
+  selectCommand.track = track("b", "music/b.flac");
+  CHECK(fixture.controller->submitCommand(selectCommand).accepted);
+
+  REQUIRE(fixture.fakeArtwork->requestCount() == 2U);
+  CHECK(fixture.fakeArtwork->lastRequest().generation == 2U);
+  const auto afterSelectB = fixture.controller->playerStateSnapshot();
+  REQUIRE(afterSelectB.artwork.has_value());
+  CHECK(afterSelectB.artwork->localPath == std::filesystem::path{"/thumbs/b.png"});
+
+  // Old generation for A: dropped entirely.
+  fixture.fakeArtwork->complete(artworkResult(1U, track("a", "music/a.flac"), ArtworkResolveOutcomeKind::FullPath, "/covers/full-a.png"));
+  fixture.controller->drainForTests();
+  auto snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/b.png"});
+  CHECK(snapshot.freshness.version == afterSelectB.freshness.version);
+
+  // Current generation but wrong logical identity: dropped.
+  fixture.fakeArtwork->complete(artworkResult(2U, track("a", "music/a.flac"), ArtworkResolveOutcomeKind::FullPath, "/covers/full-a.png"));
+  fixture.controller->drainForTests();
+  snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/b.png"});
+  CHECK(snapshot.freshness.version == afterSelectB.freshness.version);
+
+  // Matching generation and identity: applied.
+  fixture.fakeArtwork->complete(artworkResult(2U, track("b", "music/b.flac"), ArtworkResolveOutcomeKind::FullPath, "/covers/full-b.png"));
+  fixture.controller->drainForTests();
+  snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/covers/full-b.png"});
+  CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/b.png"});
+}
+
+TEST_CASE("media controller preserves logical CUE identity and artwork across track changed") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  const auto cue = cueSong("cue-01", "music/cue/disc.cue", "music/cue/disc.flac",
+                           std::chrono::milliseconds{1000}, std::chrono::milliseconds{2000}, "/thumbs/cue-01.png");
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({cue}, 21), 21));
+  fixture.controller->drainForTests();
+
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+
+  // The artwork intent resolves from the referenced audio file while keeping
+  // the logical .cue identity.
+  REQUIRE(fixture.fakeArtwork->requestCount() == 1U);
+  const auto request = fixture.fakeArtwork->lastRequest();
+  CHECK(request.identity.trackId == "cue-01");
+  CHECK(request.identity.filePath == std::filesystem::path{"music/cue/disc.cue"});
+  CHECK(request.artworkSourcePath == std::filesystem::path{"music/cue/disc.flac"});
+  CHECK(request.fallbackThumbnailPath == std::filesystem::path{"/thumbs/cue-01.png"});
+
+  auto snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.currentTrack.has_value());
+  CHECK(snapshot.currentTrack->filePath == std::filesystem::path{"music/cue/disc.cue"});
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->album == "Cue Album");
+
+  // The audio backend confirms the segment request (audio source + offset/duration).
+  fixture.fakeAudio->emit(cueTrackChangedEvent("cue-01", "music/cue/disc.flac",
+                                               std::chrono::milliseconds{1000}, std::chrono::milliseconds{2000}, 25));
+  fixture.controller->drainForTests();
+
+  snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.currentTrack.has_value());
+  CHECK(snapshot.currentTrack->trackId == "cue-01");
+  CHECK(snapshot.currentTrack->filePath == std::filesystem::path{"music/cue/disc.cue"});
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/cue-01.png"});
+  CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/cue-01.png"});
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->album == "Cue Album");
+  CHECK(snapshot.timeline.position == std::chrono::milliseconds{1000});
+}
+
+TEST_CASE("media controller keeps logical CUE identity and artwork after a cache-hit re-scan") {
+  ArtworkControllerFixture fixture{};
+  fixture.controller->start();
+  const auto cue = cueSong("cue-01", "music/cue/disc.cue", "music/cue/disc.flac",
+                           std::chrono::milliseconds{1000}, std::chrono::milliseconds{2000}, "/thumbs/cue-01.png");
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({cue}, 21), 21));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
+
+  // Cache hit: the same tree is published again; reconcile keeps the current track.
+  fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({cue}, 22), 22));
+  fixture.controller->drainForTests();
+
+  fixture.fakeAudio->emit(cueTrackChangedEvent("cue-01", "music/cue/disc.flac",
+                                               std::chrono::milliseconds{1000}, std::chrono::milliseconds{2000}, 25));
+  fixture.controller->drainForTests();
+
+  const auto snapshot = fixture.controller->playerStateSnapshot();
+  REQUIRE(snapshot.currentTrack.has_value());
+  CHECK(snapshot.currentTrack->filePath == std::filesystem::path{"music/cue/disc.cue"});
+  REQUIRE(snapshot.artwork.has_value());
+  CHECK(snapshot.artwork->localPath == std::filesystem::path{"/thumbs/cue-01.png"});
+  CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/cue-01.png"});
+  REQUIRE(snapshot.display.has_value());
+  CHECK(snapshot.display->album == "Cue Album");
 }

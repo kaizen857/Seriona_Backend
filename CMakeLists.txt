@@ -213,6 +213,7 @@ add_library(seriona_app STATIC
 )
 
 add_library(seriona_control STATIC
+  src/control/artwork_resolver.cpp
   src/control/control_event_loop.cpp
   src/control/control_state_reducer.cpp
   src/control/media_controller.cpp

@@ -15,10 +15,9 @@ class FakeTagMetadataReader final : public TagMetadataReader {
 public:
   explicit FakeTagMetadataReader(std::vector<RawTagMetadata> results) : results_(std::move(results)) {}
 
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path& coverExportDir) override {
-    requestedPaths.push_back(path);
-    requestedCoverDirs.push_back(coverExportDir);
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
+    requestedPaths.push_back(request.path);
+    requestedCoverDirs.push_back(request.coverExportDir);
     if (throwOnRead) {
       throw std::runtime_error("fake tagreader failure");
     }
@@ -26,9 +25,13 @@ public:
       throw std::runtime_error("fake tagreader exhausted");
     }
     auto result = results_[next_++];
-    result.filePath = path;
+    result.filePath = request.path;
     return result;
+  
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
   bool throwOnRead{false};
   std::vector<std::filesystem::path> requestedPaths;

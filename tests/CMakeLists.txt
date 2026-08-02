@@ -202,6 +202,13 @@ add_executable(seriona_control_persistence_guardrail_tests
 add_executable(seriona_control_playback_context_builder_tests
   control/playback_context_builder_tests.cpp
 )
+add_executable(seriona_artwork_resolver_tests
+  control/artwork_resolver_tests.cpp
+)
+add_executable(seriona_media_controller_artwork_shutdown_tests
+  control/media_controller_artwork_shutdown_tests.cpp
+  control/control_test_harness.cpp
+)
 add_executable(seriona_terminal_controller_tests
   app/terminal_controller_tests.cpp
   control/control_test_harness.cpp
@@ -381,6 +388,10 @@ add_executable(seriona_scanner_watcher_tests
   scanner/scanner_watcher_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_lazy_cover_gateway_tests
+  scanner/scanner_lazy_cover_gateway_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 add_executable(seriona_scanner_error_logging_tests
   scanner/scanner_error_logging_tests.cpp
   scanner/scanner_test_harness.cpp
@@ -473,11 +484,14 @@ target_compile_definitions(seriona_scanner_tagreader_tests PRIVATE DOCTEST_CONFI
 target_compile_definitions(seriona_scanner_tagreader_concurrency_stress_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_watcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_lazy_cover_gateway_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_error_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_runtime_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_application_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_playback_context_builder_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_artwork_resolver_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_media_controller_artwork_shutdown_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -648,6 +662,14 @@ target_include_directories(seriona_control_playback_context_builder_tests PRIVAT
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_artwork_resolver_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_media_controller_artwork_shutdown_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_scanner_paths_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -771,6 +793,11 @@ target_include_directories(seriona_scanner_service_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_watcher_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_lazy_cover_gateway_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src/scanner
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -949,6 +976,16 @@ target_link_libraries(seriona_control_playback_context_builder_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_artwork_resolver_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  seriona_scanner
+)
+target_link_libraries(seriona_media_controller_artwork_shutdown_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  seriona_scanner
+)
 target_link_libraries(seriona_terminal_controller_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -982,6 +1019,8 @@ seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
 seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
 seriona_enable_warnings(seriona_control_playback_context_builder_tests)
+seriona_enable_warnings(seriona_artwork_resolver_tests)
+seriona_enable_warnings(seriona_media_controller_artwork_shutdown_tests)
 seriona_enable_warnings(seriona_terminal_controller_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
 seriona_enable_warnings(seriona_scanner_contract_tests)
@@ -1026,6 +1065,7 @@ seriona_enable_warnings(seriona_scanner_cache_perf_tests)
 seriona_enable_warnings(seriona_scanner_tagreader_tests)
 seriona_enable_warnings(seriona_scanner_service_tests)
 seriona_enable_warnings(seriona_scanner_watcher_tests)
+seriona_enable_warnings(seriona_scanner_lazy_cover_gateway_tests)
 seriona_enable_warnings(seriona_scanner_error_logging_tests)
 seriona_enable_warnings(seriona_runtime_paths_tests)
 seriona_enable_warnings(seriona_application_logging_tests)
@@ -1152,6 +1192,11 @@ target_link_libraries(seriona_scanner_service_tests PRIVATE
 target_link_libraries(seriona_scanner_watcher_tests PRIVATE
   seriona_scanner
 )
+target_link_libraries(seriona_scanner_lazy_cover_gateway_tests PRIVATE
+  seriona_scanner
+  SQLite3::SQLite3
+  PkgConfig::SERIONA_XXHASH
+)
 target_link_libraries(seriona_scanner_error_logging_tests PRIVATE
   seriona_scanner
 )
@@ -1221,6 +1266,9 @@ add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
 add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control_folder_sort_settings_store_tests)
 add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)
 add_test(NAME seriona.control_playback_context_builder COMMAND seriona_control_playback_context_builder_tests)
+add_test(NAME seriona.control_artwork_resolver COMMAND seriona_artwork_resolver_tests)
+add_test(NAME seriona.control_artwork_shutdown COMMAND seriona_media_controller_artwork_shutdown_tests)
+set_tests_properties(seriona.control_artwork_resolver PROPERTIES TIMEOUT 60)
 add_test(NAME seriona.terminal_controller COMMAND seriona_terminal_controller_tests)
 add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
@@ -1260,6 +1308,7 @@ add_test(NAME seriona.scanner.env_serial COMMAND seriona_scanner_service_tests -
 add_test(NAME seriona.scanner.env_malformed COMMAND seriona_scanner_service_tests --test-case=*malformed*env*)
 add_test(NAME seriona.scanner.config_scan_mode COMMAND seriona_scanner_service_tests --test-case=*force*full*)
 add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
+add_test(NAME seriona.scanner.lazy_cover_gateway COMMAND seriona_scanner_lazy_cover_gateway_tests)
 add_test(NAME seriona.scanner.error_logging COMMAND seriona_scanner_error_logging_tests)
 add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_tests)
 add_test(NAME seriona.scanner.two_pass_discovery COMMAND seriona_scanner_two_pass_discovery_tests)

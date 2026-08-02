@@ -29,6 +29,14 @@ constexpr char kHashSeparator = '\0';
   return options.cancellationRequested != nullptr && options.cancellationRequested->load();
 }
 
+// Local copy: some test binaries compile this file without path_utils.cpp.
+[[nodiscard]] bool isLyricsSidecarPath(const std::filesystem::path& path) {
+  auto extension = path.extension().generic_string();
+  std::ranges::transform(extension, extension.begin(),
+                         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return extension == ".lrc";
+}
+
 [[nodiscard]] HashError makeTreeHashError(HashErrorCode code, ScannerErrorCode scannerCode,
                                           const std::filesystem::path& path, std::string message,
                                           std::string detail = {}) {
@@ -163,6 +171,14 @@ constexpr char kHashSeparator = '\0';
       result.errors.push_back(makeTreeHashError(HashErrorCode::Cancelled, ScannerErrorCode::Cancelled, child.path(),
                                                "directory tree hash cancelled"));
       return result;
+    }
+
+    // Lyrics sidecar (.lrc) files are re-read from disk on every scan by the
+    // lyrics reconciliation path, so their presence must not invalidate the
+    // scan-mode tree hash: an lrc-only change should stay on the incremental
+    // path instead of forcing a full TagReader rescan of the paired audio.
+    if (isLyricsSidecarPath(child.path())) {
+      continue;
     }
 
     auto kind = treeEntryKind(child, error);

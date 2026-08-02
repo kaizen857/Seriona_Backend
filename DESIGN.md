@@ -1,752 +1,275 @@
-# seriona 后端设计文档
+# Seriona 后端当前实现架构
 
-## 1. 当前阶段
+本文记录仓库当前可构建、可执行的 C++23 音乐播放器后端。它以根目录 `CMakeLists.txt`、`inc/seriona/` 公共契约、`src/` 和 `app/` 实现、`tests/` 拓扑为事实来源。本文不记录计划中的功能，也不把旧设计或外部项目的接口当作现行实现。
 
-本文档记录 `seriona` 音乐播放器后端的设计基线，后续会随着需求补充持续更新。
+## 1. 系统边界
 
-当前仓库已经进入 C++23 后端实现阶段：根目录已有 `.gitignore`、CMake 构建、应用入口、测试目标和模块化源码。公开 API 主要在 `inc/seriona/...`，实现主要在 `src/...`；核心静态库目标为 `seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`，应用目标为 `seriona`。本文档同时记录设计目标和当前实现应遵守的架构约束；若文档与 CMake 或源码冲突，优先以可执行配置和源码为准，并回写修正文档。
+Seriona 是独立运行的音乐播放器后端，不依赖 Qt 或 QML。生产模块为：
 
-## 2. 项目目标
+- `app/`：CLI 入口和终端会话生命周期。
+- `src/control/`：跨模块编排、状态归并、播放上下文和订阅。
+- `src/audio/`：解码、PCM 缓冲、设备输出、播放时钟和波形。
+- `src/scanner/`：文件发现、标签读取、CUE、缓存、播放列表树和监听。
+- `src/metadata/`：平台媒体状态镜像和 Linux MPRIS。
 
-- `seriona` 是一个音乐播放器的纯 C++ 后端项目。
-- 项目采用前后端分离：后端可以脱离前端独立运行。
-- 前端计划使用 QML 编写，但后端不引入任何 Qt 相关依赖。
-- 最终目标支持 Windows 与 Linux 双端运行。
-- 当前开发环境为 Arch Linux，KDE Plasma，Wayland 会话。
-- 后端可以作为命令行程序独立运行；与前端整合时以后端源码合入完整应用的方式集成，不以动态库作为首选形态。
+日志、运行时路径、SQLite、TagReader 和 watcher 是基础设施，不是额外的业务边界。稳定模块契约位于 `inc/seriona/*/*_contracts.h` 等入口，不暴露 FFmpeg、miniaudio、TagReader、SQLite、watcher、sdbus-c++ 或平台类型。`inc/seriona/` 中仍存在 `scanner/cache`、`worker_pool`、TagReader adapter 和 FFmpeg pipeline 等实现导向头；它们不是跨模块稳定边界。
 
-## 3. 总体架构
+`thumbnail` 目录中的三个 Qt 文件未跟踪、未加入 CMake 或 CTest，也没有生产消费方。它们是游离草案，不属于当前运行架构。TagReader 和 scanner cache 会携带 `artworkPath` 与 `thumbnailPath`；control 和 metadata 当前只使用 `artworkPath` 发布系统封面，不会调用 `ThumbnailService`。
 
-后端分为一个顶层控制模块、三个底层能力模块和一个横切基础能力：
-
-```text
-mediaController
-  ├── 文件扫描模块
-  ├── 音频播放模块
-  └── 元数据共享模块
-
-应用程序日志
-  └── 为所有模块提供统一日志入口、格式、级别、文件轮转和诊断输出
+```mermaid
+flowchart TB
+    CLI[app: CLI / terminal] --> MC[control: MediaController]
+    MC --> A[audio]
+    MC --> S[scanner]
+    MC --> M[metadata]
+    A -->|BackendEvent| MC
+    S -->|ScannerEvent| MC
+    M -->|media command| MC
+    MC -->|PlayerStateSnapshot| M
+    MC -->|snapshots and notifications| CLI
+    S --> TR[TagReader]
+    S --> SC[(scanner sidecar SQLite)]
+    MC --> FS[(folder-sort SQLite)]
+    A --> FF[FFmpeg]
+    A --> MA[miniaudio]
+    M --> DBus[Linux MPRIS / D-Bus]
 ```
 
-### 3.1 mediaController
+`MediaController` 是唯一跨模块业务编排点。audio、scanner 和 metadata 不直接相互控制。控制命令向下发送，底层异步事件回到 control 的串行循环，再由 control 发布归并后的快照或领域通知。
 
-`mediaController` 是后端的顶层编排模块，负责把前端或外部控制入口的命令转换为后端内部操作，并维护当前播放器的权威状态视图。
+## 2. 构建与目标拓扑
 
-职责：
+根 `CMakeLists.txt` 要求 CMake 3.20+、C++23，并创建以下静态库：
 
-- 接收播放、暂停、停止、切歌、跳转进度、扫描媒体库等高层命令。
-- 协调文件扫描模块、音频播放模块和元数据共享模块。
-- 聚合播放状态、当前曲目、播放进度、错误状态等信息。
-- 对外提供稳定的控制接口和状态查询接口。
+| 目标 | 主要内容 | 依赖关系 |
+| --- | --- | --- |
+| `seriona_audio` | FFmpeg 解码和 filter、PCM 队列、miniaudio 设备、状态机、波形 | FFmpeg、`BS::thread_pool`、spdlog、头文件形式的 miniaudio |
+| `seriona_scanner` | 扫描编排、缓存、哈希、树、歌词、TagReader 适配和 watcher | SQLite3、xxHash、`TagReaderCore`、`BS::thread_pool`、watcher、spdlog |
+| `seriona_metadata` | 映射、同步、服务后端和 MPRIS | spdlog，Linux 另加 sdbus-c++ |
+| `seriona_control` | 事件循环、reducer、控制器、播放上下文和排序设置 | audio、scanner、metadata、SQLite3、spdlog |
+| `seriona_app` | `runtime_paths`、应用日志封装 | spdlog |
 
-约束：
+`seriona` 可执行文件由 `app/CMakeLists.txt` 直接编译 `main.cpp`、`terminal_controller.cpp`、`terminal_io.cpp`、`src/app/runtime_paths.cpp` 和 `src/logging/logging.cpp`，直接链接 `seriona_control`，Release 配置还直接链接 FFmpeg。`seriona_app` 虽会构建，但当前没有仓库内消费者；运行时和日志源码也存在重复编译。
 
-- 不直接依赖 QML 或 Qt 类型。
-- 不把平台相关 API 泄露到控制层接口中。
-- 不参与音频实时回调中的重负载工作。
+构建开关为 `SERIONA_BUILD_APP`、`SERIONA_BUILD_TESTS` 和 `SERIONA_BUILD_TOOLS`，默认分别为 ON、ON、OFF。TagReader 优先使用 `SERIONA_TAGREADER_SOURCE_DIR`，其次相邻的 `../TagReader`，最后通过 FetchContent 获取 `main`。线程池固定为 `bshoshany/thread-pool` v4.1.0。`waveform_simd_avx2.cpp` 是唯一带 AVX2/FMA 编译选项的源文件。
 
-### 3.2 文件扫描模块
+`tools/` 只有在 `SERIONA_BUILD_TOOLS=ON` 时加入：`seriona_scanner_cold_perf` 和标记为 `EXCLUDE_FROM_ALL` 的 `seriona_miniaudio_platform_probe`。后者必须显式构建。
 
-文件扫描模块负责把用户指定的音乐根目录转换为可供控制层使用的播放列表树。它不产出扁平歌曲列表，而是尽量还原文件系统目录层级：root 节点代表扫描根，目录节点代表文件夹，歌曲节点代表可播放音频文件或 CUE 分轨。
+## 3. 进程启动、运行时目录与关闭
 
-职责：
+`app/main.cpp` 只接受一个已存在的路径参数，形如 `build/seriona /path/to/music-root-or-file`。参数数量错误返回 2，路径不存在返回 1；顶层异常被记录后返回 1。
 
-- 遍历用户指定目录。
-- 识别当前 FFmpeg 构建可处理的纯音频文件。
-- 为目录和歌曲构建播放列表树节点，并维护父子关系、排序信息和聚合统计。
-- 调用独立的 `TagReader` 库读取 `MusicTag`，包括曲目信息、技术参数、歌词、封面导出路径、文件路径、时长、偏移量和最后修改时间。
-- 维护 SQLite 扫描缓存，用于启动时恢复播放列表树并做增量更新。
-- 在运行期间监听当前音乐根目录的文件变化，更新播放列表树和缓存。
-- 将扫描完成后的播放列表树根、增量变化和错误信息以事件或批次结果形式回传给 `mediaController`。
+`app/terminal_controller.cpp` 承担生产会话：检查交互终端，解析并创建运行时目录，初始化日志，创建带数据库路径和封面目录的生产 `MediaController`，订阅状态，启动并提交 Full 扫描，再处理终端输入。Unix 与 macOS 使用终端按键；其他平台当前显示键盘控制未实现。
 
-设计决策：
+运行时目录在 Linux 是可执行文件旁的 `SerionaData/`，其他平台回退到当前工作目录。其生产布局包括主数据库 `library.sqlite`、扫描 sidecar `library.sqlite.scan-roots.sqlite`、`artwork/` 和 `logs/`。生产启动为每次会话创建时间戳日志文件，并在日志目录总量超过 50MiB 时清理旧文件；文件 sink 内部按 5MiB、3 个轮转文件配置。文件 sink 创建失败时 console sink 对象仍存在，但生产传入的 console level 为 `off`，因此不能依赖终端获得回退日志。
 
-- 支持格式按“FFmpeg 可解码/解封装的纯音频格式”定义；扫描入口使用音频扩展白名单过滤，随后再用 FFmpeg probe 确认存在可解码音频流且不存在视频流。
-- 扫描完成事件返回不可变播放列表树快照，例如 `std::shared_ptr<const PlaylistNode>`，`mediaController` 持有该快照作为媒体库权威视图。
-- 歌曲节点的数据模型使用 `TagReader` 的 `MusicTag`，旧项目中的 `MetaData` 语义由 `MusicTag` 取代。
-- 文件监听当前通过仓库内 `third_party/watcher` 的 `wtr::watch` 适配实现；手动刷新/启动扫描路径仍必须保留为监听失效或溢出的兜底。
-- SQLite 缓存采用文件大小上限为主、root 数量和曲目数量为辅的限制策略；超限时按可重建数据优先、root 级 LRU 次之淘汰。
-
-### 3.3 音频播放模块
-
-音频播放模块负责真实的音频加载、解码、播放控制和播放状态产生。
-
-职责：
-
-- 打开并播放指定音频资源。
-- 使用 FFmpeg 完成音频解封装与解码。
-- 使用 FFmpeg filter graph 连接解码输出与音频输出前的处理链。
-- 支持播放、暂停、停止、跳转进度等基础控制。
-- 支持“直出”和“混音”两种输出模式。
-- 维护底层播放状态与播放时钟。
-- 向 `mediaController` 发布状态变化、曲目切换、播放结束、错误等事件。
-
-约束：
-
-- 音频实时回调路径必须尽量短，只做确定耗时的数据搬运和必要计算。
-- 不在音频实时回调中做磁盘 I/O、动态内存分配、阻塞锁、系统媒体 API 调用或前端通知。
-- 需要跨线程传递的信息应通过轻量事件、原子状态或无阻塞队列转交给普通工作线程处理。
-
-设计决策：
-
-- 音频输出库首选 `miniaudio` 低层设备 API，保留 `cubeb` 作为后续替代评估方向；音频输出库只负责与音频设备交互，不负责解码、重采样、声道转换、采样格式转换或混音处理。
-- `直出` 模式不承诺无缝切歌；`混音` 模式需要支持无缝切歌。
-- 无论 `直出` 还是 `混音`，`mediaController` 都会提前向音频播放模块提供下一首音频文件路径，用于预打开、预解码或预缓冲。
-
-### 3.4 元数据共享模块
-
-元数据共享模块负责把当前播放状态和媒体元数据同步给操作系统，让系统媒体控件、桌面环境或外部客户端知道当前音频流信息。
-
-本模块在架构上视为“操作系统代理者”，与 UI 处于同一等级：它订阅 `mediaController` 的状态，也把来自操作系统媒体控件的命令下传给 `mediaController`。
-
-职责：
-
-- 接收 `mediaController` 发布的当前曲目、播放状态、播放能力和进度信息。
-- 在 Linux 桌面环境上适配 MPRIS/D-Bus。
-- 在 Windows 上适配 System Media Transport Controls 相关能力。
-- 把系统媒体控件产生的播放、暂停、上一首、下一首、跳转等请求转换为内部控制命令，再交回 `mediaController`。
-- 与 UI 一样只通过 `mediaController` 观察和控制播放，不直接访问音频播放模块。
-
-约束：
-
-- 平台 API 只允许出现在本模块的平台适配层中。
-- 对 `mediaController` 暴露统一的、平台无关的接口。
-- 系统交互失败不应影响核心播放链路，只应降低系统媒体集成功能。
-
-设计决策：
-
-- Linux 侧使用 `sdbus-c++` 适配 MPRIS v2，平台细节限制在 metadata 私有实现层。
-- Windows 侧根据后续实际选定的音频输出/播放集成能力决定；如果没有自动集成 SMTC，则由本模块手动调用 SMTC。
-- 首期传输当前歌曲元数据和当前播放信息：歌名、歌手、专辑名、封面、时长、当前播放时间。
-
-### 3.5 应用程序日志
-
-应用程序日志是横切基础能力，不属于任一业务模块。它为 `mediaController`、文件扫描模块、音频播放模块和元数据共享模块提供统一日志入口，用于记录启动、配置、扫描、播放链路、设备协商、系统媒体集成、缓存维护和错误诊断信息。
-
-职责：
-
-- 提供模块级 logger，例如 `core`、`scanner`、`audio`、`metadata`、`storage`。
-- 统一日志级别、格式、时间戳、线程 ID、模块名和错误上下文。
-- 支持控制台输出和文件输出；文件输出需要支持大小轮转，避免日志无限增长。
-- 支持运行时调整日志级别，便于普通运行和问题排查切换。
-- 为崩溃前错误、扫描失败、设备协商失败、缓存异常和系统 API 失败提供可定位上下文。
-
-设计决策：
-
-- 日志库首选 `spdlog`。它是成熟的 C++ 日志库，支持 header-only 或 compiled 集成、基于 `fmt` 的格式化、多线程 logger、同步/异步模式、多 sink、控制台彩色输出、轮转文件、daily file、syslog、Windows event log 和 Windows debugger 输出。
-- 默认使用多线程 logger 和控制台 + 轮转文件两个 sink；开发期控制台可见，正式运行保留文件日志。
-- 异步日志可用于普通工作线程的高频诊断，但音频实时回调中仍不直接写日志、不格式化字符串、不访问全局 logger，也不触发可能阻塞的队列写入。
-- 日志初始化由后端启动入口或未来的应用上下文负责，业务模块只接收或获取已配置好的 logger，不自行创建全局日志策略。
-- 日志只记录诊断信息和必要状态变化，不作为模块间通信、状态同步或错误处理机制。
-
-## 4. 模块通信原则
-
-后端内部采用“命令向下、事件向上”的通信方向：
-
-- `mediaController` 向底层模块发送明确命令，例如播放、暂停、停止、扫描目录。
-- 底层模块不直接控制其它底层模块，而是向 `mediaController` 发布事件。
-- `mediaController` 依据事件更新权威状态，并决定是否通知其它模块。
-
-这样可以保持三个底层模块彼此独立，避免文件扫描、音频播放和系统元数据共享之间形成隐式耦合。
-
-本项目把 `mediaController` 定义为唯一的业务状态归并点和跨模块编排点。底层模块之间不互相持有业务接口，也不互相订阅事件；UI、QML 适配层和 OS 元数据共享模块也不直接观察音频播放模块或文件扫描模块。所有跨模块通信都必须经过 `mediaController`：下行使用显式命令，上行使用统一事件 sink，向 UI 和 OS 代理发布时只发布控制层状态快照和少量领域通知。
-
-模块通信原则固定为以下约束：
-
-- 下行命令只从 `mediaController` 发出，命令表达“要做什么”，不暴露调用方线程模型。
-- 上行事件只投递到 `mediaController` 的 `BackendEventSink`，事件表达“已经发生什么”，不直接触发 UI 或 OS API。
-- `BackendEventSink` 的实现只做 `post`，把事件转入 `mediaController` 串行执行器；它不在调用者线程内执行业务逻辑。
-- `mediaController` 在串行执行器中更新权威状态，再发布新的 `PlayerStateSnapshot`、`LibraryStateSnapshot` 或错误/完成类领域通知。
-- 上层只订阅 `mediaController` 的快照源；如果 QML 或平台 API 要求特定线程，由对应适配层在收到快照后自行切换线程。
-- 日志、SQLite、文件监听和系统媒体集成都不是通信总线，不能绕过 `mediaController` 改写播放器业务状态。
-
-## 5. 播放状态传递机制
-
-### 5.1 结论
-
-播放状态变化使用“音频模块事件上报 + `mediaController` 权威快照发布”机制，而不是让 `mediaController` 高频轮询音频播放模块，也不是让音频播放模块直接通知 UI 或 OS 代理。
-
-轮询适合低频、非关键、可容忍延迟的状态刷新；但播放状态属于离散事件，典型变化点包括开始播放、暂停、停止、曲目切换、播放结束、seek 完成、缓冲状态变化和错误发生。对这些变化使用事件通知可以减少无效查询、降低延迟，并让控制层只在真实变化发生时更新状态。
-
-### 5.2 推荐模型
-
-音频播放模块对外提供两类能力：
-
-1. 命令接口：由 `mediaController` 调用，例如 `play()`、`pause()`、`stop()`、`seek()`。
-2. 事件 sink 接口：由 `mediaController` 提供 `BackendEventSink`，音频播放模块只向该 sink 异步投递播放事件。
-
-播放事件按值语义传递，只携带本次变化所需的不可变数据，不传递音频模块内部可变对象指针。每个事件应携带单调递增版本号或产生时间戳，`mediaController` 用它丢弃过期事件，避免跨线程异步投递时旧状态覆盖新状态。基础事件包括：
-
-- `PlaybackStateChanged`：播放、暂停、停止、缓冲、错误等状态变化。
-- `TrackChanged`：当前曲目变化。
-- `PositionDiscontinuity`：seek、切歌或底层时钟跳变导致的非连续进度变化。
-- `PlaybackEnded`：当前曲目自然播放结束。
-- `PlaybackError`：播放链路错误。
-
-`mediaController` 收到事件后只在自己的串行执行器中更新 `PlayerStateSnapshot`。上层通知不转发原始 `PlaybackEvent`，而是发布新的状态快照；UI 和 OS 元数据共享模块都订阅这份快照。这样可以保证上层看到的是控制层归并后的完整状态，而不是音频模块内部事件流。
-
-`PlayerStateSnapshot` 至少应包含：
-
-- 当前曲目标识、文件路径、展示元数据和封面引用。
-- 播放状态：`Playing`、`Paused`、`Stopped`、`Buffering`、`Error`。
-- 当前真实播放位置、总时长、位置版本号和位置采样时间。
-- 音量、静音、循环模式、随机播放状态和可用控制能力。
-- 实际输出模式、实际设备格式、是否发生格式回退和最近播放错误摘要。
-
-快照是上层通知的唯一常规载荷。离散完成类通知，例如扫描完成、播放错误弹窗提示或输出模式回退提示，可以作为领域通知附带发布，但它们仍由 `mediaController` 产生，而不是由底层模块直接通知上层。
-
-### 5.3 进度信息的特殊处理
-
-播放进度是连续变化值，但真实进度的权威来源应是音频播放模块内部的播放时钟，而不是 `mediaController` 基于时间差自行推导出的估算值。推荐做法是：
-
-- 音频播放模块维护高精度播放时钟和当前真实播放位置。
-- 音频播放模块以节流后的 `PlaybackPositionUpdated` 事件上报真实进度快照；只有在处理 seek、暂停、恢复、切歌或系统媒体时间线同步等明确边界时，`mediaController` 才可以使用轻量查询接口做一次性校准。
-- `mediaController` 只缓存最近一次由音频播放模块提供的真实进度快照，并把它发布给 UI 与 OS 代理；它不把本地推导值作为权威播放进度。
-- UI 如果需要更平滑的视觉进度条，可以在前端显示层做短时间插值，但必须接受后端真实进度快照校正。
-- 发生 seek、暂停、恢复、切歌、播放结束等非连续变化时，由音频播放模块立即发送进度校正事件。
-- 对系统媒体时间线这类外部接口，可以由元数据共享模块按平台建议做低频节流更新；例如 Windows SMTC 文档建议播放期间约每 5 秒同步一次时间线，并在暂停或跳转等状态变化时再次同步。
-
-### 5.4 线程边界
-
-音频播放模块内部可能存在实时音频线程、解码线程和普通控制线程。事件设计必须保护实时音频线程：
-
-- 实时音频回调不直接执行 `mediaController` 回调函数。
-- 实时音频回调只写入原子状态或无阻塞队列，必要时唤醒普通事件分发线程。
-- 普通事件分发线程负责把事件投递给 `mediaController`。
-- `mediaController` 的事件处理函数不得反向阻塞音频实时线程。
-
-推荐事件流：
-
-```text
-音频实时/播放内部状态
-  -> 原子状态或无阻塞事件队列
-  -> 音频模块事件分发线程
-  -> mediaController BackendEventSink
-  -> mediaController 串行执行器更新 PlayerStateSnapshot
-  -> 上层快照订阅者
+```mermaid
+sequenceDiagram
+    participant Main as app/main.cpp
+    participant Terminal as terminal_controller
+    participant Control as MediaController
+    participant Scanner as FileScannerService
+    Main->>Terminal: 单个已存在路径
+    Terminal->>Terminal: runtime paths, logging
+    Terminal->>Control: makeProductionMediaController
+    Terminal->>Control: subscribe snapshots/notifications
+    Terminal->>Control: start()
+    Terminal->>Control: scanLibrary(Full)
+    Control->>Scanner: scan(roots, Full)
+    Terminal->>Control: submitCommand(...)
+    Terminal->>Control: Stop, shutdown()
+    Terminal->>Control: unsubscribe
 ```
 
-### 5.5 回调与消息队列的取舍
+关闭时，`MediaController` 先进入 stopping，清除 audio 和 scanner sink，停止 watcher，注销 metadata 命令回调，停止 metadata，最后停止 control event loop。随后对象析构继续完成模块自身的线程和资源清理：audio worker 在析构时 join 后清空 sink；scanner 析构停止 watcher 和 scan worker；Linux MPRIS 的 D-Bus event loop 在 bus 析构时离开。`ControlEventLoop::stop()` 若由其自身 worker 调用不会 join，正常生产关闭应从外部线程发起。
 
-“回调函数”可以作为订阅接口的外形，但它的语义必须是异步投递，而不是让底层模块在任意内部线程中同步执行控制层逻辑。更稳妥的设计是把回调收敛为 `post-only` 的事件 sink：
+## 4. Control 模块
 
-- 对外表现为回调订阅或 `setEventSink(...)`，便于使用。
-- 回调实现只负责把事件投递到目标执行器，不直接执行业务逻辑。
-- 内部通过队列把事件切换到 `mediaController` 所属线程或主控制循环。
-- 回调只接收值语义事件对象，避免生命周期问题。
-- 订阅关系需要支持注销，避免模块销毁后仍被调用。
+公共入口是 `inc/seriona/control/media_controller.h` 和 `control_contracts.h`：
 
-因此，本项目首选“回调外形 + 异步投递 + 状态快照”的组合，而不是直接同步回调或高频轮询。
+- `MediaController::start()`、`shutdown()`、`submitCommand()`、`scanLibrary()`。
+- `subscribePlayerState()`、`subscribeLibraryState()`、`subscribeDomainNotifications()` 返回 `SubscriptionHandle`。
+- `PlayerStateSnapshot`、`LibraryStateSnapshot` 和 `ControlDomainNotification` 是上层稳定状态载荷。
 
-不推荐设计成“音频播放模块每次变化时新建线程去调用 `mediaController::onTimeChange()`”。这种方式会让线程数量、事件顺序、生命周期和取消逻辑变得不可控，播放进度变化频繁时还会产生明显调度开销。更好的模型是固定一个事件消费点：
+`MediaControllerDependencies` 注入 `audio::AudioPlaybackService`、`scanner::FileScannerService`、`metadata::MetadataSharingService` 与 `FolderSortSettingsStore`。生产工厂 `makeProductionMediaController()` 组装 miniaudio audio、scanner、metadata 和 SQLite 文件夹排序存储；无路径重载使用 no-op 排序存储。
 
-```text
-audioPlayback
-  -> publish(PlaybackEvent)
-  -> PlaybackEventQueue
-  -> mediaController 事件循环 / 单一分发线程
-  -> handlePlaybackEvent(event)
+内部 `ControlEventLoop` 是一个 worker、无界 `std::deque` 的串行队列。`submitCommand()` 通过 promise/future 等待控制循环给出立即的 `MediaControllerCommandResult`，其含义仅为命令被接受或拒绝。打开文件、扫描、解码等异步结果通过 audio 或 scanner 事件再回流控制循环。`ControlStateReducer` 在这一点串行维护玩家快照、媒体库快照、播放上下文、选中曲目、随机历史和 repeat/shuffle 状态。
+
+订阅回调不运行在 control loop 上。`SubscriptionStore` 为每种订阅建立交付 worker，回调完成前会被追踪，`unsubscribe()` 等待其空闲，从而避免对象销毁后的通知。
+
+播放上下文由 root 或 folder 范围、锚点曲目和 `FolderSortRule` 描述。`SQLiteFolderSortSettingsStore` 以 `(root_path, folder_node_id)` 存储规则 JSON；它只影响构建播放上下文时的排序，不改写 scanner 的 `PlaylistTreeSnapshot`。
+
+```mermaid
+flowchart LR
+    Command[MediaControlCommand] --> Q[ControlEventLoop]
+    AudioEvent[BackendEvent] --> Q
+    ScanEvent[ScannerEvent] --> Q
+    Q --> R[ControlStateReducer]
+    R --> PS[PlayerStateSnapshot]
+    R --> LS[LibraryStateSnapshot]
+    R --> DN[ControlDomainNotification]
+    PS --> Delivery[subscription delivery workers]
+    LS --> Delivery
+    DN --> Delivery
 ```
 
-在这个模型里，`mediaController` 不需要把大量成员函数逐个注册到底层模块。更推荐只注册一个统一事件入口，例如 `publishBackendEvent(BackendEvent event)` 或等价的 `BackendEventSink`，再由控制层按事件类型分发到内部处理函数。这样可以避免回调接口随着事件类型膨胀，也更容易记录、测试、重放和调试事件流。
+`PlayerStateSnapshot.freshness` 和 `LibraryStateSnapshot.version` 属于 control 快照版本。audio `BackendEvent.monotonicVersion` 和 scanner `ScannerEvent.monotonicVersion` 用于丢弃 stale 事件。它们与播放时钟或扫描树版本互不构成全局版本序列。
 
-事件执行器和重任务线程池需要分离：`mediaController` 使用单一事件消费点或串行执行器处理状态机；文件扫描和波形计算可以使用各自的高性能线程池完成重任务；音频实时回调只通过原子状态或预分配无阻塞队列桥接到普通线程。线程池实现可以复用第三方库，但事件 sink 不应直接复用扫描池或波形计算池作为控制层状态机的执行环境。
+## 5. Audio 模块
 
-如果后续确实需要面向多个订阅者，可以在 `mediaController` 之上或内部增加轻量事件总线，但音频播放模块仍只面向一个稳定的事件 sink 发布事件，不直接认识元数据共享模块或前端接口。
+公共契约在 `inc/seriona/audio/audio_contracts.h`。生产稳定入口是 `AudioPlaybackService`，提供输出配置、加载、预载、播放、暂停、恢复、停止、seek、音量、静音、设备偏好与播放时钟查询。`AudioPlayer` 是公开转发门面，但其实现 `src/audio/audio_player.cpp` 当前只由测试目标直接编译，未加入生产 `seriona_audio`。
 
-## 6. 模块详细设计
+输入 `TrackPlaybackRequest` 可以包含普通文件，或同时带 `offset`、`duration` 和 `boundedSegment=true` 的 CUE 分段。只有三者都具备时才在播放链路中裁切分段。输出模式是 `AudioOutputMode::Direct` 或 `Mixed`，输出协商结果以 `AudioDeviceFormat` 及 `OutputFormatChanged`、`OutputModeFallback` 回报。
 
-### 6.1 音频播放模块
+内部链路由单个 audio worker 串行拥有 FFmpeg source、filter pipeline、`PlaybackStateMachine`、`PlaybackClock` 和设备生命周期。其实际数据流如下：
 
-音频播放模块负责把 `mediaController` 选择的曲目转换为可听见的音频输出，并产生播放状态、真实播放时钟、设备协商结果和错误事件。它是后端中唯一直接接触 FFmpeg 解码链路和音频输出设备的业务模块，但它不是跨模块协调者：它不选择下一首、不直接通知 UI、不直接同步 MPRIS/SMTC，也不读写媒体库数据库。
-
-#### 6.1.1 职责边界
-
-音频播放模块负责：
-
-- 接收 `mediaController` 下发的播放、暂停、恢复、停止、seek、预加载下一首、设置音量和设置输出模式等命令。
-- 使用 FFmpeg 完成文件打开、解封装、音频流选择、解码、filter graph 处理、重采样、采样格式转换、声道布局转换、增益和混音前的统一格式输出。
-- 使用跨平台音频输出库完成设备枚举、设备打开、设备关闭、输出流启动/停止和音频回调取样。
-- 维护音频播放模块内部状态机、当前真实播放位置、缓冲状态、当前设备格式和当前输出模式。
-- 通过 `BackendEventSink` 异步投递播放状态变化、曲目变化、进度快照、播放结束、输出模式回退、设备格式协商结果和播放错误。
-
-音频播放模块不负责：
-
-- 不决定播放队列、循环模式、随机模式或播放下一首的策略；这些属于 `mediaController`。
-- 不直接访问 UI、QML 对象、元数据共享模块、MPRIS、SMTC 或 SQLite 媒体库缓存。
-- 不在实时音频回调中写日志、分配内存、打开文件、调用 FFmpeg 解码、等待锁、调用 `BackendEventSink` 或执行任意可能阻塞的系统 API。
-- 不把内部可变对象、FFmpeg 原始指针或输出设备句柄暴露给其它模块。
-
-#### 6.1.2 对外接口草案
-
-当前实现已经把音频播放模块抽象为 `AudioPlaybackService`，并通过 `AudioPlayer` 提供对外门面。接口名称可随重构微调，但语义需要保持稳定：命令由 `mediaController` 调用，事件只投递到 `BackendEventSink`。
-
-建议命令接口：
-
-- `setEventSink(BackendEventSink sink)`：设置唯一上行事件 sink；模块销毁或停用前必须清空 sink。
-- `configureOutput(AudioOutputConfig config)`：设置输出模式、目标采样率、目标采样深度、设备偏好、暂停时是否保留设备等配置。
-- `loadTrack(TrackPlaybackRequest request)`：加载当前曲目，准备播放链路，但不必立即开始输出。
-- `play()` / `pause()` / `resume()` / `stop()`：控制播放状态。
-- `seek(std::chrono::milliseconds position)`：跳转到曲目内指定位置，完成后发布进度校正事件。
-- `prepareNext(TrackPlaybackRequest request)`：预加载下一首，用于降低切歌延迟；混音模式下用于无缝衔接。
-- `setVolume(float linearGain)` / `setMuted(bool muted)`：更新模块内部增益状态；实际音量状态仍由 `mediaController` 汇总进 `PlayerStateSnapshot`。
-- `selectOutputDevice(OutputDeviceId id)`：切换目标输出设备；切换失败时保持旧设备或进入错误状态，由事件告知控制层。
-- `queryPlaybackClock()`：只用于明确边界上的一次性校准，不作为 UI 高频轮询入口。
-
-建议核心数据对象：
-
-- `TrackPlaybackRequest`：包含曲目标识、文件路径、起始 offset、可选播放时长、展示用标题和扫描阶段已知的采样率/位深/声道/格式摘要。
-- `AudioOutputConfig`：包含输出模式、目标采样率、目标采样格式或位深、目标声道布局、设备偏好、缓冲时长策略、暂停设备策略和是否允许自动回退。
-- `AudioDeviceFormat`：记录实际设备 ID、设备名、后端类型、采样率、采样格式、声道数、缓冲帧数和实际输出模式。
-- `PlaybackClockSnapshot`：记录曲目标识、真实播放位置、采样时间、版本号、是否处于连续播放状态。
-- `PlaybackEvent`：作为 `BackendEvent` 的音频负载，按值语义传递，不持有音频模块内部可变对象。
-
-#### 6.1.3 内部组件划分
-
-音频播放模块内部建议拆为以下组件，便于后续把代码任务拆成独立实现单元：
-
-- `AudioPlaybackService`：模块门面，接收 `mediaController` 命令，维护命令队列和生命周期，拥有其它内部组件。
-- `PlaybackStateMachine`：串行处理播放命令和内部事件，维护 `Idle`、`Loading`、`Ready`、`Playing`、`Paused`、`Draining`、`Stopped`、`Error` 等状态。
-- `FfmpegAudioSource`：封装 FFmpeg 文件打开、音频流选择、packet 读取、frame 解码和 seek。
-- `FfmpegFilterPipeline`：封装 filter graph，输出已经符合目标 PCM 格式的连续帧。
-- `PcmBufferQueue`：普通线程写入、实时回调读取的 PCM 缓冲队列；需要预分配或分块复用，避免实时回调分配内存。
-- `AudioOutputDevice`：封装 `miniaudio` 低层设备 API，负责设备枚举、格式协商、打开、启动、停止和关闭。
-- `PlaybackClock`：根据已提交/已播放帧数、seek 基准和输出状态计算真实播放位置。
-- `PreloadSlot`：保存下一首的预打开、预解码或预缓冲结果；直出模式只作为降低延迟的准备，混音模式用于无缝衔接。
-- `AudioEventDispatcher`：位于普通线程，把内部事件转换为 `BackendEvent` 并投递到 `BackendEventSink`。
-
-FFmpeg 资源和音频设备资源必须由 RAII 对象管理。每个封装对象只负责一种资源生命周期：文件/格式上下文、解码器上下文、filter graph、frame/packet 缓冲、输出设备和输出流不能混在同一个大对象中，避免后续错误恢复和 seek 逻辑难以拆分。
-
-#### 6.1.4 播放链路
-
-音频播放链路按以下阶段组织：
-
-```text
-音频文件
-  -> FFmpeg demux/decode
-  -> FFmpeg filter graph
-  -> 已完成最终格式处理的 PCM 缓冲队列
-  -> 跨平台音频输出库设备层
-  -> 输出设备
+```mermaid
+flowchart LR
+    File[音频文件或 CUE 段] --> Source[FfmpegAudioSource]
+    Source --> Filter[FfmpegFilterPipeline]
+    Filter --> PCM[固定容量 PcmBufferQueue]
+    PCM --> Device[AudioOutputDevice]
+    Device --> Mini[miniaudio callback]
+    Mini --> Output[音频设备]
+    Worker[audio worker] --> Source
+    Worker --> Filter
+    Worker --> PCM
+    Worker --> State[PlaybackStateMachine]
+    State --> Clock[PlaybackClock]
+    State --> Dispatcher[AudioEventDispatcher]
+    Dispatcher --> Event[BackendEvent]
 ```
 
-FFmpeg 负责所有会改变或解析音频流内容的工作：解封装、解码、重采样、采样格式转换、声道布局转换、增益、混音路径中的统一输出格式转换，以及后续可能加入的音频处理。音频输出库只负责与音频设备交互，包括打开设备、关闭设备、启动/停止流、查询设备能力和在回调中取走已经处理好的 PCM 数据；它不负责解码、重采样、声道转换、采样格式转换、混音或业务状态管理。
+`PlaybackStateMachine` 使用 `Idle`、`Loading`、`Ready`、`Playing`、`Paused`、`Draining`、`Stopped`、`Error`，并以 generation 处理 seek 竞态。`PlaybackClock` 从帧计数生成真实位置。`AudioEventDispatcher` 为对外事件改写单调递增版本，control 用该版本判断陈旧事件。状态机 generation、时钟 version 与对外事件 version 的用途不同，时钟 version 当前没有生产消费者。
 
-播放链路建议采用生产者/消费者模型：解码线程或普通工作线程负责从 FFmpeg 拉取并处理音频帧，将目标 PCM 写入 `PcmBufferQueue`；音频输出回调只从队列取出已准备好的 PCM 并复制到设备缓冲。队列不足时输出静音并产生欠载计数，由普通线程汇总为 `PlaybackBufferUnderrun` 或调试日志；实时回调本身不直接投递事件。
+miniaudio 回调最终到 `AudioOutputDevice::renderCallback()`。它只从 PCM 队列读取，队列不足时填充静音，应用音量和静音，并更新原子计数。该实时路径不执行 FFmpeg、日志、动态分配、阻塞锁、事件回调或设备生命周期操作。
 
-文件打开阶段需要完成：
+`Direct` 尝试按源格式协商。失败且允许回退时转为 `Mixed`。`Mixed` 按候选采样率和格式协商。`prepareNext()` 有预载槽并能由下一曲接管。`selectOutputDevice()` 目前只更新偏好设备 ID，在下一次 `loadTrack()` 协商时生效；control 没有对应的媒体控制命令。`AudioOutputConfig::keepDeviceOpen` 存在于公共契约，但当前运行时没有消费它。
 
-1. 打开文件并读取容器信息。
-2. 选择首个可播放音频流，或按未来配置选择指定音频流。
-3. 初始化解码器并读取源采样率、采样格式、声道布局、时长和起始时间。
-4. 根据输出模式和设备协商结果构造 filter graph。
-5. 填充初始 PCM 缓冲，达到最低启动水位后再启动输出设备。
+波形功能也在 audio 内，由 FFmpeg、标量和 SIMD 策略组成。`inc/seriona/audio/waveform_generator.h` 的 `buildAudioWaveform()` 是已进入 `seriona_audio` 的独立公共工具 API；消费者应显式链接 `SerionaBackend::audio`。`seriona_audio` 私有链接 `BS::thread_pool`，用于波形生成，不应将其与音频实时回调混同。
 
-seek 阶段需要停止或暂停向输出队列写入，清空当前 PCM 队列，调用 FFmpeg seek，刷新解码器和 filter graph，再从新位置重新填充缓冲。seek 完成后发布 `PositionDiscontinuity` 和新的 `PlaybackPositionUpdated`，由 `mediaController` 更新 `PlayerStateSnapshot`。
+## 6. Scanner 模块
 
-#### 6.1.5 输出模式与格式协商
+scanner 的稳定 API 是 `inc/seriona/scanner/scanner_contracts.h` 和 `file_scanner_service.h`。`FileScanner` 是门面，`FileScannerService` 提供 `configure()`、`scan()`、监听启停、`stop()` 与 `snapshot()`。事件为 `ScannerEvent`，结果为扁平节点表表达的不可变 `PlaylistTreeSnapshot`。当前 builder 只生成 `Root`、`Directory` 和 `Track`；CUE 容器也表示为虚拟 `Directory`，公共枚举中的 `Album`、`Disc` 尚未由生产树构建器生成。
 
-音频输出库首选 `miniaudio` 低层设备 API。这里选择的是它的设备交互能力，而不是高层解码、资源管理或引擎混音能力。理由是它依赖少、易静态集成，官方低层 API 支持设备枚举、采样格式/声道/采样率配置、回调播放、`start`/`stop`/`uninit` 生命周期控制，并覆盖 Windows WASAPI 与 Linux ALSA/PulseAudio/JACK 等后端；旧项目也已验证过与 FFmpeg filter graph 组合的方向。`cubeb` 作为备选方案保留，适合未来更重视桌面后端一致性和设备切换时重新评估；`RtAudio` 因维护活跃度和引入收益不如前两者，暂不作为首选。
+`SongMetadata` 是 scanner 的公开歌曲模型，含文件和来源路径、逻辑曲目 ID、content hash、标签字段、技术字段、外部或内嵌歌词、CUE offset/duration、`artworkPath` 与 `thumbnailPath`。scanner 的公共边界不暴露 TagReader 或 SQLite 类型。
 
-输出模式分为两种：
+每次 `scan()` 进入容量为 16 的扫描队列，由单 scan worker 串行执行 `runScan`。单个 root 内创建临时 `ScannerWorkerPool` 并发读取元数据，TagReader 并发量再由 semaphore 限制。发现阶段为两遍：先解析 CUE 引用，再隐藏被 CUE 接管的音频文件。CUE 错误只隔离到对应文件或条目，不中断整个 root。
 
-- `直出`：以当前音频文件的源采样率、采样格式和声道布局作为目标输出格式。只有当输出库和设备能接受该格式时才保持直出；如果设备不支持，则自动回退到 `混音` 模式，并向 `mediaController` 发送输出模式回退通知。直出模式不承诺无缝切歌，切歌时可以关闭旧流后打开新流。
-- `混音`：以用户配置的输出采样率和采样深度作为目标格式，所有源音频都先经过 FFmpeg filter graph 统一转换和混音后再输出。若目标格式不被设备支持，则按“向下寻找最接近的受支持格式”回退，例如 192 kHz 不可用但 96 kHz 可用时回退到 96 kHz，并向上报告实际输出格式。混音模式必须支持无缝切歌。
+scanner 只进行路径、扩展名和视频容器排除。生产 TagReader 适配负责打开输入、读取 stream info、选择最佳音频流，以及签名或容器检测。audio 内的 FFmpeg 打开只服务播放和波形，不承担扫描格式验证。
 
-`mediaController` 在两种模式下都会提前把下一首音频文件路径传给音频播放模块。音频播放模块可以据此预打开、预解码或预缓冲；这些预处理仍由 FFmpeg 链路完成。直出模式只利用它降低切歌延迟，混音模式则利用它在统一输出格式下完成无缝衔接。
-
-输出格式协商应封装为独立步骤：
-
-1. 收集候选采样率和采样格式。
-2. 先尝试用户指定或源文件格式。
-3. 直出协商失败时自动进入混音协商，并产生可观察的回退事件。
-4. 混音协商失败时按同方向降级列表尝试更低但最接近的格式。
-5. 成功后把实际设备格式和实际输出模式写入播放状态快照。
-6. 全部失败时产生 `PlaybackError`，由 `mediaController` 决定 UI 呈现和后续操作。
-
-格式协商输出必须形成稳定结果对象，而不是散落在设备代码里。建议结果包含：请求模式、实际模式、设备 ID、设备名、后端类型、实际采样率、实际采样格式、实际声道数、缓冲帧数、是否发生回退和回退原因。`mediaController` 收到协商事件后把这些字段合并进 `PlayerStateSnapshot`，UI 和 OS 代理只观察快照。
-
-直出模式的目标是尽量保持源格式，但它仍要服从设备能力。直出失败时不把失败暴露为致命错误，而是默认回退到混音模式；只有混音模式也无法协商出可用格式时才进入播放错误。混音模式的目标是稳定输出格式和无缝切歌，因此切歌时不应因下一首源格式不同而重开设备，除非用户配置或设备变化要求重新协商。
-
-#### 6.1.6 播放状态机与命令时序
-
-状态机建议只在音频模块自己的普通控制线程或串行执行上下文中运行，避免命令并发修改 FFmpeg 和设备资源。基础状态含义：
-
-- `Idle`：尚未加载曲目或已经释放当前曲目资源。
-- `Loading`：正在打开文件、初始化解码链路、协商输出格式或填充初始缓冲。
-- `Ready`：曲目已准备好，可以开始播放，但设备尚未输出或处于停止状态。
-- `Playing`：设备正在请求 PCM，播放时钟连续前进。
-- `Paused`：播放状态暂停，播放时钟冻结；设备是否保留由暂停设备策略决定。
-- `Draining`：当前曲目已解码完毕，正在输出队列中剩余 PCM。
-- `Stopped`：用户或控制层停止播放，当前曲目可保留最小上下文，也可按策略释放。
-- `Error`：播放链路发生不可恢复错误，等待控制层下发新命令恢复。
-
-典型命令时序：
-
-- `loadTrack`：`Idle/Stopped/Error -> Loading -> Ready`；失败则进入 `Error` 并发布 `PlaybackError`。
-- `play`：`Ready/Paused -> Playing`；如果设备未打开则先完成设备打开和初始缓冲。
-- `pause`：`Playing -> Paused`；冻结播放时钟，并按策略停止或关闭输出设备。
-- `resume`：`Paused -> Playing`；必要时重新打开设备、恢复缓冲，然后校准播放时钟。
-- `stop`：任意可播放状态进入 `Stopped`；停止设备、取消解码任务、清空 PCM 队列并发布状态变化。
-- `seek`：`Playing/Paused/Ready -> Loading 或内部 Seeking 子状态 -> Ready/Playing/Paused`；恢复到 seek 前的播放意图。
-- 自然播放结束：`Playing -> Draining -> Stopped`，发布 `PlaybackEnded`，由 `mediaController` 决定是否下发下一首。
-
-命令需要有序执行。若 `mediaController` 连续下发 `seek`、`pause`、`stop`，音频模块应按串行命令队列处理，并允许新命令取消尚未完成的加载、预加载或 seek。取消只影响音频模块内部任务，不直接取消 `mediaController` 的状态机。
-
-#### 6.1.7 线程与实时回调模型
-
-音频播放模块至少涉及三类执行环境：
-
-- 控制线程或串行执行器：处理命令、状态机、资源切换和事件生成。
-- 解码/填充线程：执行 FFmpeg 读取、解码、filter graph 处理和 PCM 队列写入。
-- 音频实时回调线程：由输出库调用，只读取 PCM 队列并写入设备缓冲。
-
-实时回调硬性约束：
-
-- 不调用 FFmpeg。
-- 不打开、关闭或重新配置设备。
-- 不写日志、不格式化字符串、不调用 `BackendEventSink`。
-- 不申请堆内存，不等待互斥锁，不访问可能失效的共享对象。
-- 只读取预先准备好的原子状态和 PCM 队列；队列不足时输出静音并递增无锁诊断计数。
-
-普通线程负责把实时回调产生的诊断计数转成可观察事件或日志。例如连续欠载超过阈值时，普通线程可以发布缓冲不足事件或写入 `warn` 日志。播放位置也由普通线程按节流策略发布；实时回调只更新帧计数或原子时钟基准。
-
-#### 6.1.8 缓冲、预加载与无缝切歌
-
-PCM 缓冲应按“启动水位、低水位、高水位”管理：启动水位决定何时可以开始输出；低水位触发解码线程加速填充或报告缓冲中；高水位限制内存占用。具体帧数需要通过原型验证确定，但设计上必须允许按设备缓冲大小、目标采样率和输出模式配置。
-
-预加载下一首的策略：
-
-- `mediaController` 在确定下一首候选后调用 `prepareNext(...)`，音频模块在后台预打开文件并准备解码链路。
-- 直出模式下，下一首源格式可能不同，默认不承诺无缝；预加载只用于减少关闭旧设备和打开新设备之间的延迟。
-- 混音模式下，下一首会被转换到同一目标输出格式；当前曲目接近结束时，可以把下一首 PCM 接到同一输出队列后面，实现无缝衔接。
-- 如果下一首预加载失败，音频模块只发布错误事件；是否跳过、停止或继续播放由 `mediaController` 决定。
-
-无缝切歌只在混音模式作为必须能力。首版实现可以先完成“同一输出格式下的无缝衔接”，跨设备切换、跨输出模式切换和用户手动 seek 到下一首不要求无缝。
-
-#### 6.1.9 暂停、设备占用与恢复
-
-暂停语义需要区分“暂停播放状态”和“输出设备占用状态”。默认目标是在暂停时尽量释放或停止输出设备，使 KDE/PipeWire 等桌面环境不再显示当前应用正在播放；同时允许配置为“保留设备以换取更快恢复”。`miniaudio` 原型验证时必须确认：调用 `stop` 是否足以让系统认为音频流停止；如果不够，则默认策略需要在暂停时关闭设备、恢复播放时重新打开设备，并评估恢复延迟。
-
-暂停时必须冻结 `PlaybackClock`，并立即发布 `PlaybackStateChanged` 和进度校正。恢复时重新建立时钟基准，避免把暂停期间的墙钟时间计入播放进度。如果暂停策略选择关闭设备，恢复流程需要重新协商或验证设备格式；如果设备不可用，则发布 `PlaybackError` 或设备变化事件，由 `mediaController` 决定后续呈现。
-
-#### 6.1.10 错误处理与事件
-
-音频播放错误按阶段分类，便于后续 UI 和日志展示：
-
-- `OpenFailed`：文件不存在、无权限、无法打开容器。
-- `UnsupportedFormat`：没有可用音频流、解码器不可用或 filter graph 无法构造。
-- `DeviceUnavailable`：目标设备不存在、被占用或无法打开。
-- `FormatNegotiationFailed`：直出和混音协商都失败。
-- `DecodeFailed`：播放中解码失败且无法恢复。
-- `BufferUnderrun`：持续欠载导致可感知中断。
-- `SeekFailed`：目标位置无法跳转或 seek 后无法恢复解码。
-
-错误事件必须包含曲目标识、阶段、错误类别、可展示摘要和调试上下文。调试上下文可以包含 FFmpeg 错误码、设备后端和协商参数，但不应把大量用户路径或标签文本在默认级别泄露到日志。音频模块发布错误事件后，是否弹窗、跳过、重试或停止由 `mediaController` 决定。
-
-音频模块首期应发布的事件：
-
-- `PlaybackStateChanged`：状态机状态变化。
-- `TrackChanged`：当前曲目加载成功并成为当前播放对象。
-- `PlaybackPositionUpdated`：节流后的真实进度快照。
-- `PositionDiscontinuity`：seek、切歌、恢复或底层时钟校准导致的位置跳变。
-- `PlaybackEnded`：当前曲目自然播放结束。
-- `OutputFormatChanged`：实际设备格式或实际输出模式变化。
-- `OutputModeFallback`：直出失败并回退到混音，或目标混音格式降级。
-- `PlaybackError`：不可恢复或需要控制层决策的错误。
-
-#### 6.1.11 原型验证清单
-
-在正式拆代码任务前，音频播放模块至少需要以下原型验证：
-
-- `miniaudio` 在 Linux KDE/PipeWire/PulseAudio 环境下，`stop` 是否足以让系统不再显示应用正在播放；若不够，验证关闭并重开设备的恢复延迟。
-- `miniaudio` 设备格式协商在常见采样率、采样格式和声道数组合下的失败行为，以及回退到混音格式的路径。
-- FFmpeg filter graph 从常见源格式转换到统一混音格式的稳定性，包括 FLAC、MP3、AAC/M4A、Opus、WAV 和高采样率文件。
-- seek 后刷新解码器、filter graph 和 PCM 队列的时序，确认不会输出 seek 前残留 PCM。
-- 混音模式下同一目标输出格式的无缝切歌，确认两个文件衔接处没有明显静音、爆音或设备重开。
-- PCM 队列低水位和欠载计数策略，确认实时回调在压力下只输出静音和更新无锁计数。
-- 错误事件路径，确认打开失败、设备不可用、格式协商失败和解码失败都会通过 `BackendEventSink` 到达 `mediaController`。
-
-#### 6.1.12 已落地组件与后续拆分边界
-
-当前代码已经拆出 FFmpeg source、filter pipeline、PCM 队列、播放时钟、输出设备、事件分发器和播放状态机。后续继续重构或修复时，仍按以下边界推进，避免把整个播放器重新揉成单个大对象：
-
-1. 定义纯数据类型和接口：`TrackPlaybackRequest`、`AudioOutputConfig`、`AudioDeviceFormat`、`PlaybackClockSnapshot`、`PlaybackEvent`、`AudioPlaybackService` 抽象和 `BackendEventSink` 接入点。
-2. 实现不依赖 FFmpeg/miniaudio 的核心状态机：命令队列、状态迁移、取消语义、事件生成和基础单元测试。
-3. 实现 FFmpeg RAII 封装：文件打开、音频流选择、解码、seek、错误码转换；先输出解码帧，不接设备。
-4. 实现 filter graph 封装：源格式到目标 PCM 格式的转换，覆盖常见格式和错误路径。
-5. 实现 `PcmBufferQueue` 和 `PlaybackClock`：验证单生产者/单消费者或等价模型、欠载计数、seek 后清空和时钟校准。
-6. 实现 `miniaudio` 设备层原型：设备枚举、格式协商、打开/启动/停止/关闭，以及实时回调只读队列的约束。
-7. 串接单曲播放：`loadTrack -> play -> pause -> resume -> seek -> stop`，确认事件能经 `BackendEventSink` 到达控制层测试替身。
-8. 实现输出模式回退：直出失败回退混音，混音格式降级，协商结果进入 `OutputFormatChanged` 和 `OutputModeFallback`。
-9. 实现预加载和混音模式无缝切歌：先只覆盖同一目标输出格式下的下一首衔接。
-10. 补齐错误恢复、设备切换、压力测试和平台原型验证，再决定是否需要把 `cubeb` 作为替代设备层抽象落地。
-
-其中第 1 到第 5 项不依赖真实输出设备，可以优先在普通测试中验证；第 6、8、9、10 项依赖平台音频环境，需要单独原型和手工听感验证。任何代码任务都不应把 QML、MPRIS/SMTC 或媒体库缓存耦合进音频播放模块。
-
-旧项目中的 `AudioPlayer`、`AudioFilterChain` 可作为思路参考：它已经包含 FFmpeg filter graph、`miniaudio`、输出模式和混音参数设置等概念。但旧项目实现与 Qt 前端、旧控制层和历史状态耦合，不应直接复刻。
-
-### 6.2 文件扫描模块
-
-文件扫描模块的核心输出是一棵播放列表树，而不是歌曲数组。树根代表一次扫描的 root；目录节点代表文件系统目录；歌曲节点代表可播放音频条目；CUE 分轨也作为歌曲节点挂在 CUE 所在目录下。扫描完成后，文件扫描模块把树冻结为不可变结果，例如 `std::shared_ptr<const PlaylistNode>` 或等价快照对象，再通过事件 sink 交给 `mediaController`。`mediaController` 持有当前播放列表树快照，UI 浏览、播放控制、缓存持久化和增量更新都围绕树节点定位。
-
-旧项目的扫描模块分析见 `FILE_SCANNER_ANALYSIS.md`。旧实现中 `FileScanner` 持有 `std::shared_ptr<PlaylistNode> rootNode`，递归扫描完成后通过回调把树根交给 `MediaController`；数据库也通过目录表和歌曲表保存足够信息，再重建同一棵树。`seriona` 继承这种树状结果模型，但扫描完成回调只作为异步事件投递的外形，事件负载必须具备明确所有权和不可变语义；歌曲节点中的旧 `MetaData` 语义统一替换为 `TagReader` 的 `MusicTag`。
-
-#### 6.2.1 边界与数据模型
-
-文件扫描模块内部统一使用 `std::filesystem::path` 表达路径。内部路径对象保留平台原生表示；对外展示、SQLite 序列化和跨平台逻辑使用 UTF-8 字符串。Windows 上应使用宽字符路径进入 `std::filesystem::path`，只在序列化到 SQLite 或向前端输出时转换为 UTF-8，避免把本地编码假设写死到核心逻辑里。
-
-建议的节点模型：
-
-- `PlaylistNode` 表示树节点，至少包含节点类型、真实路径、相对逻辑路径、父节点关系、子节点列表、目录聚合统计和可选封面信息。
-- 目录节点不拥有歌曲元数据，只保存目录路径、子节点、聚合歌曲数、聚合总时长和目录封面选择结果。
-- 歌曲节点保存 `MusicTag`，它来自 `TagReader::Read(...)`，包含 title、artist、album、albumArtist、composer、genre、year、trackNumber、discNumber、lyrics、filePath、coverPath、duration、offset、lastModified、sampleRate、bitDepth、bitRate、channels、format、playCount、rating、lastPlayed 等信息。
-- 扫描模块只使用 `MusicTag` 作为读取结果，不再引入旧项目的 `MetaData` 类型。
-- `TagReader::Read(filePath, coverExportDir)` 是首选调用形式，封面导出目录由 `seriona` 后端统一管理；无封面导出需求的内部探测可以使用 `TagReader::Read(filePath)`。
-
-模块职责边界：
-
-- 扫描模块负责路径遍历、格式初筛、树节点构建、父子关系维护、缓存读写、增量变更归并和扫描事件上报。
-- `TagReader` 负责读取 `MusicTag`，包括标签、技术参数、歌词、封面导出路径和文件信息。
-- 扫描模块不直接依赖旧项目中的 TagLib、FFmpeg 技术信息读取工具或封面提取实现。
-- SQLite 缓存只用于加速恢复和增量判断；文件系统仍是最终真相。
-
-#### 6.2.2 支持格式策略
-
-支持的音频格式按“当前 FFmpeg 构建可解封装且可解码的纯音频文件”定义，而不是固定为某一份手写格式清单。扫描入口仍需要扩展名白名单，避免把视频文件、字幕、图片序列、网络播放列表和设备输入交给 `TagReader`。白名单应覆盖 FFmpeg 常见纯音频扩展，包括但不限于：
-
-- 常见音乐格式：`.mp3`、`.flac`、`.wav`、`.aiff`、`.aif`、`.aifc`、`.oga`、`.opus`、`.spx`、`.m4a`、`.m4b`、`.m4r`、`.isma`、`.aac`、`.alac`、`.ape`、`.wv`、`.wma`、`.tta`、`.tak`、`.shn`、`.caf`、`.au`、`.snd`、`.voc`、`.vqf`、`.qoa`。
-- 编码裸流和环绕格式：`.ac3`、`.eac3`、`.ac4`、`.dts`、`.dtshd`、`.truehd`、`.mlp`、`.spdif`、`.loas`、`.latm`、`.adts`、`.mp2`、`.mpa`。
-- 语音和游戏音频格式：`.amr`、`.awb`、`.gsm`、`.qcp`、`.dsf`、`.dff`、`.dss`、`.oma`、`.aa`、`.aax`、`.adx`、`.brstm`、`.bfstm`、`.bcstm`、`.hca`、`.vag`、`.xvag`、`.rsd`、`.rso`、`.xa`、`.xwma`、`.fsb`。
-- Tracker/模块音乐格式：`.mod`、`.s3m`、`.xm`、`.it`、`.mptm`、`.stm`、`.669`、`.mtm`、`.ult`、`.far`、`.amf`、`.ams`、`.dbm`、`.dsm`、`.med`、`.okt`。
-- 原始 PCM/压缩音频裸流：`.s8`、`.u8`、`.s16le`、`.s16be`、`.u16le`、`.u16be`、`.s24le`、`.s24be`、`.u24le`、`.u24be`、`.s32le`、`.s32be`、`.u32le`、`.u32be`、`.f32le`、`.f32be`、`.f64le`、`.f64be`、`.alaw`、`.mulaw`、`.g722`、`.g723`、`.g726`、`.g728`、`.g729`、`.sbc`、`.aptx`、`.aptxhd`、`.lc3`、`.codec2`、`.c2`。
-
-混合容器需要按“音乐播放器语义”筛选扩展名。`mov/mp4/3gp` 这类 FFmpeg demuxer 同时注册 `mov`、`mp4`、`m4a`、`3gp`、`m4b` 等扩展；本项目应包含 `.m4a`、`.m4b`、`.m4r`、`.isma`，但排除 `.mp4`、`.mov`、`.m4v`、`.3gp`、`.3g2`、`.mj2`、`.f4v`、`.ismv` 等视频或通用容器扩展。类似地，`.wma` 可作为 ASF 音频入口，`.wmv` 和 `.asf` 不作为默认音乐扫描入口；`.oga`、`.opus`、`.spx`、`.mka`、`.weba` 可作为 Ogg/WebM/Matroska 音频入口，`.ogg` 仅作为历史上常见的 Vorbis 音频扩展保留并必须通过 probe 排除视频流；`.webm`、`.mkv`、`.avi`、`.flv`、`.ts`、`.m2ts`、`.mpg`、`.mpeg`、`.vob` 不作为默认音乐扫描入口。
-
-扩展名只作为第一层过滤。实际入库前仍需用 FFmpeg probe 或 `TagReader` 读取结果确认：至少存在一个可解码音频流，且不存在视频流；若存在封面图片流，不视为视频内容。这样既能跟随 FFmpeg 支持范围扩展，又能避免把视频文件误加入音乐库。
-
-#### 6.2.3 扫描流程
-
-启动扫描流程：
-
-```text
-mediaController 提供音乐根目录
-  -> 规范化 root path
-  -> 查询 SQLite 中是否已有该 root 的缓存
-  -> 命中缓存：先加载缓存重建播放列表树，再扫描文件系统差异并修正缓存
-  -> 未命中缓存：并行全量扫描，调用 TagReader 读取音频元数据，生成播放列表树并写入缓存
+```mermaid
+flowchart TD
+    Request[scan roots] --> SQ[容量 16 的 scan queue]
+    SQ --> SW[单 scan worker]
+    SW --> Discover[两遍发现与 CUE 分类]
+    Discover --> Plan[Full / Incremental 决策]
+    Plan --> Hydrate[未变条目从 sidecar hydrate]
+    Plan --> Pool[临时 ScannerWorkerPool]
+    Pool --> Tags[TagReader metadata]
+    Hydrate --> Tree[PlaylistTreeBuilder]
+    Tags --> Tree
+    Tree --> Write[sidecar writer transaction]
+    Write --> Snapshot[PlaylistTreeSnapshot]
+    Snapshot --> Event[ScannerEvent]
 ```
 
-全量扫描建议分为两个阶段：
+Full 与 Incremental 的选择使用 sidecar root state、目录 tree hash、当前文件枚举与缓存 location 记录。未变化条目从缓存 hydrate，变化项才进入 worker。每次写入以一个 writer transaction 更新 root、content、location 和 lyrics，再依据本次保留集合 prune；未 commit 自动 rollback。
 
-1. 结构扫描：遍历目录、创建目录节点和候选歌曲节点、记录相对路径、父子关系和扫描错误。
-2. 元数据填充：对候选歌曲节点调用 `TagReader::Read(...)` 获取 `MusicTag`，再把有效歌曲节点挂入树或更新节点内容。
+watcher 回调写入共享状态，debounce 线程以 50ms 去抖后提交 Incremental 请求。文件系统事件仅是需要复查的信号。`FileScannerService::stop()` 当前只设置协作取消标记，不调用 `ScannerWorkerPool::cancel()`，因此不提供对已运行 worker 的硬取消。析构时才停止 watcher 与 scan worker。
 
-目录节点应保留空目录裁剪策略：默认只把包含可播放歌曲或有效子目录的目录放入播放列表树；如果后续 UI 需要展示空目录，可以把该策略变成配置项。CUE 分轨若进入首版范围，应作为同一真实音频文件上的多个歌曲节点表达，通过 `MusicTag::offset()` 和 `MusicTag::duration()` 区分分轨。
+## 7. Scanner 缓存与持久化边界
 
-扫描完成后，文件扫描模块向 `mediaController` 发布 `ScanCompleted` 事件，事件中携带不可变播放列表树快照，例如 `std::shared_ptr<const PlaylistNode>`，或携带可由控制层接管的独占结果对象。增量变化则发布目录或节点级变更事件，避免每次小变更都强制重建整棵树。事件负载不得暴露扫描线程仍会继续修改的内部节点对象。
+scanner 使用 schema v3，表为 `content`、`locations`、`lyrics`、`scan_roots` 和 `scan_errors`。内容身份只使用时长、规范化标题和规范化艺术家；位置身份基于路径、大小、修改时间，CUE 再加入 offset 与 index。文件系统仍是事实来源，SQLite 是扫描重建与增量判断缓存。
 
-#### 6.2.4 SQLite 缓存
+生产配置具有两个容易混淆的数据库文件：
 
-在扫描模块内部，用户给定的音乐根目录可视为逻辑 `/`。缓存中同时保存真实绝对路径和相对逻辑路径：真实路径用于访问文件系统，相对路径用于播放列表树节点、移动根目录后的差异判断和 UI 展示。
-
-SQLite 缓存设计目标：
-
-- 支持多个不同音乐根目录的缓存。
-- 每个 root 记录根路径、根路径指纹、最后扫描时间、缓存版本和统计信息。
-- 每个目录条目记录相对路径、父节点关系、目录封面信息、聚合歌曲数和聚合总时长。
-- 每个歌曲条目记录相对路径、父节点关系、文件大小、最后修改时间、扫描错误和 `MusicTag` 摘要，确保 SQLite 能重建播放列表树。
-- `MusicTag` 中适合缓存的字段包括标题、艺术家、专辑、专辑艺术家、作曲家、流派、年份、音轨号、碟号、歌词摘要或歌词引用、文件路径、封面路径、时长、偏移、最后修改时间、采样率、位深、码率、声道数和格式。
-- 播放统计字段 `playCount`、`rating`、`lastPlayed` 可以跟随歌曲节点保存，但它们属于用户数据，不应在文件重扫时被无条件覆盖。
-- 数据库需要有大小上限；默认建议主 SQLite 数据库软上限 256 MiB、硬上限 512 MiB，封面导出和其它派生文件单独目录软上限 1 GiB。
-- 限制维度以文件大小为主，同时记录 root 数量和曲目数量作为保护阈值；建议默认最多保留 8 个 root 缓存，单 root 默认不限制曲目数，只在极端情况下按最近访问时间触发清理。
-- 超限时优先淘汰可重建的派生数据，其次淘汰最久未访问且当前未挂载/未启用的 root 缓存，再按 root 内条目最近扫描/访问时间清理陈旧错误记录。
-- SQLite 建议使用 WAL；写入批量扫描结果后在空闲时做 checkpoint。大量删除后再按需做 `VACUUM` 或增量 vacuum，避免每次扫描都重写数据库。
-- 数据库只作为可重建缓存，不作为唯一真相；文件系统始终是最终真相。
-
-#### 6.2.5 增量扫描与监听
-
-增量扫描规则：
-
-- 若目录或文件的修改时间、大小或存在性未变化，可以复用缓存。
-- 新增或修改的音频文件交给 `TagReader` 重新读取。
-- 删除的文件从播放列表树和缓存中移除，同时向上更新祖先目录的聚合统计。
-- 目录新增、删除或重命名时，按子树级别更新播放列表树，必要时重新扫描受影响目录。
-- 无法读取或不支持的文件记录为扫描错误，但不应中断整个目录扫描。
-
-运行时监听：
-
-- 当前实现已经包含启动扫描、缓存读写和运行时监听适配；手动刷新/启动扫描仍是监听异常时的兜底路径。
-- 监听当前音乐根目录，捕获创建、删除、修改、重命名事件。
-- 文件系统事件只作为“需要复查”的提示；收到事件后仍以 `std::filesystem` 重新确认当前状态。
-- 对编辑器写入、下载中临时文件、批量移动等情况需要做去抖和合并，避免同一文件被短时间重复扫描。
-- 变更影响音频文件或目录时，更新 SQLite、播放列表树，并向 `mediaController` 发布文件库变化事件。
-
-文件监听当前使用仓库内 `third_party/watcher` 的 `wtr::watch` 适配层，并在 scanner 内部做事件归一化、去抖和重新扫描触发。后续如果要替换 watcher 库，必须保持 scanner 公共契约不变，并保留手动刷新/启动扫描兜底路径。
-
-无论使用哪种监听库，都必须保留“手动刷新/启动增量扫描”路径作为可靠兜底；监听事件丢失、队列溢出、网络文件系统行为异常时，统一退化为对受影响目录或 root 的重新扫描。
-
-#### 6.2.6 与旧项目的继承关系
-
-旧项目中的 `FileScanner` 和 `PlaylistNode` 可参考其后台扫描、协作式停止、扫描完成回调和播放列表树构建思路；但旧实现把元数据读取、封面处理、FFmpeg 技术信息和播放列表构建耦合在一起。新项目中元数据读取应由 `TagReader::Read(const std::filesystem::path&, const std::filesystem::path&)` 或 `TagReader::Read(const std::filesystem::path&)` 负责，扫描模块只负责调度、树构建、缓存和变更归并。
-
-迁移时应保留的旧设计：
-
-- 扫描完成后返回播放列表树根快照。
-- 目录节点和歌曲节点共用同一种树节点抽象。
-- 子节点挂接时维护父指针。
-- 扫描结束后自底向上聚合歌曲数和总时长。
-- `mediaController` 持有根节点，作为 UI 浏览和播放控制的入口。
-
-需要替换的旧设计：
-
-- 旧 `MetaData` 类型替换为 `MusicTag`。
-- 旧扫描器内部直接读取标签、技术参数和封面的逻辑替换为 `TagReader` 调用。
-- 旧 Qt/前端相关类型不进入 `seriona` 后端扫描模块。
-
-### 6.3 元数据共享模块
-
-元数据共享模块作为操作系统代理者，而不是音频播放模块的一部分。它与 UI 一样位于 `mediaController` 上方：
-
-```text
-UI                    OS 元数据共享模块
- |                         |
- | 控制命令                 | 系统媒体键 / MPRIS / SMTC 控制命令
- v                         v
-mediaController <--- 状态订阅 / 快照发布 ---> UI 与 OS 代理
+```mermaid
+flowchart LR
+    Main[(library.sqlite)] --> FS[folder_sort_rules<br/>control 业务数据]
+    Main --> Empty[scanner v3 schema<br/>当前无扫描业务行]
+    Sidecar[(library.sqlite.scan-roots.sqlite)] --> Scan[scan_roots, content,<br/>locations, lyrics, scan_errors]
+    Scan --> Tree[scanner hydrate / reconcile / prune]
 ```
 
-来自操作系统的播放、暂停、上一首、下一首、seek、音量、循环和随机播放请求都转换为 `mediaController` 命令。`mediaController` 再通过统一状态快照把当前曲目、播放状态、播放能力、进度、音量、循环和随机播放状态发布给 UI 与 OS 代理。
+- 主库 `library.sqlite` 被 scanner 打开并初始化同一份 v3 schema，但当前 scanner 业务行不写入这里。它实际被 control 的 `folder_sort_rules` 使用。
+- sidecar `library.sqlite.scan-roots.sqlite` 承担 scanner 的 root 状态、content、locations、lyrics 和错误数据。retained location IDs 只存在于单次写事务的请求与临时表中，用来驱动 prune，不是持久化业务表。
 
-元数据共享模块对外同步两类信息：歌曲元数据包括歌名、歌手、专辑名和封面；当前播放信息包括时长、当前播放时间、播放状态和可用控制能力。封面导出目录由 `seriona` 后端统一管理，元数据共享模块只使用后端提供的本地路径或 URI。
+`SQLiteCache` 使用 WAL、`synchronous=NORMAL`、500ms busy timeout、外键、64MiB SQLite page cache 和内存临时表。writer transaction 使用 `BEGIN IMMEDIATE`，异常或未提交析构会 rollback。`PRAGMA user_version=0` 直接初始化 v3；非 0 且非 3 的版本报 unsupported。没有 v2 到 v3 迁移桥、备份回滚或应用层缓存容量淘汰。
 
-Linux 适配层使用 `sdbus-c++` 对接 MPRIS/D-Bus。MPRIS 字段映射优先使用 `xesam:title`、`xesam:artist`、`xesam:album`、`mpris:artUrl`、`mpris:length`、`mpris:trackid` 和 `xesam:url`；平台相关类型限制在 `src/metadata/` 私有实现中，不进入公共契约。
+control 只持久化文件夹排序规则。播放器状态、播放上下文、audio PCM/clock、metadata 镜像和 control 快照不会落盘。`TrackIdentity.sourceId` 与 `libraryId` 在当前生产路径仍可为空。
 
-Windows 适配层以 SMTC 为目标。当前仓库保留了 Windows 私有实现入口，但主要落地和验证集中在 Linux MPRIS；后续如果音频输出/播放集成方案能自动接入 SMTC，则复用自动集成，否则由本模块手动调用 SMTC，写入音乐元数据、封面缩略图、播放状态和时间线属性，并处理系统按钮事件。
+## 8. Metadata 模块与平台行为
 
-旧项目的 `SysMediaService` 可参考其“内部状态同步到 MPRIS、MPRIS 回调再下传控制命令”的结构，但旧实现依赖 Qt 项目结构、sdbus-c++ 和旧控制层接口，不能直接迁移。
+公共入口 `MetadataSharingService` 位于 `inc/seriona/metadata/metadata_contracts.h`。服务暴露 backend kind、capabilities、命令回调注册、`start()`、`update()`、`stop()`，承载 `PlatformMediaState` 和 `MetadataSyncResult`。
 
-### 6.4 向上通知通道
+control 将最新 `PlayerStateSnapshot` 包装为 `PlatformMediaState`，直接调用 `MetadataSharingService::update()`。服务后端 worker 只保留一条最新 pending update，较早的待发布状态会被覆盖；Linux MPRIS backend 在发布时映射平台 DTO。`MetadataSynchronizer` 和 mapper 源会编入 `seriona_metadata`，但 `MetadataSynchronizer::synchronize()` 当前没有生产调用方，不属于实际发布主链。平台发布失败只记录或返回失败结果，不阻断音频和 control 主链路，control 也不会依据同步结果回滚播放状态。
 
-向上通知通道采用“底层模块事件 sink + `mediaController` 串行执行器 + 上层状态快照订阅”的模型。底层模块不直接认识 UI、元数据共享模块或其它底层模块，只把值语义事件发布到 `mediaController` 提供的稳定事件 sink；`mediaController` 在自己的事件循环、单一分发线程或等价串行执行器中消费事件，更新权威状态，再把聚合后的状态快照发布给 UI 和 OS 代理。这里的“回调”只描述 API 外形；它必须是异步投递语义，不代表在调用者线程同步执行控制层逻辑。
-
-总体事件流：
-
-```text
-音频播放模块 / 文件扫描模块
-  -> 模块内部事件队列或普通工作线程
-  -> mediaController 提供的事件 sink
-  -> mediaController 事件队列 / 串行执行器
-  -> mediaController 事件循环 / 单一分发线程 / strand
-  -> 权威状态快照
-  -> UI 订阅者 / OS 元数据共享模块
+```mermaid
+flowchart LR
+    PS[PlayerStateSnapshot] --> State[PlatformMediaState]
+    State --> Worker[latest-only metadata worker]
+    Worker --> Backend[platform backend]
+    Backend --> Linux[Linux MPRIS mapping and publish]
+    Backend --> Noop[Noop]
+    Linux --> Cmd[MediaControlCommand]
+    Cmd --> Control[MediaController event loop]
 ```
 
-底层模块向上发布统一的后端事件对象。事件对象按值传递，必须可安全跨线程移动或复制，不携带可变内部对象指针；大对象可通过不可变共享快照或明确所有权的移动对象承载。每个事件至少包含事件类型、来源模块、产生时间或单调递增版本号，以及事件负载。`mediaController` 使用版本号或时间戳丢弃过期事件，避免异步投递时旧状态覆盖新状态。
+Linux 在 `src/metadata/metadata_mpris_backend.cpp` 和 `metadata_mpris_linux.cpp` 连接 sdbus-c++，实现 MPRIS 的属性、方法、`PropertiesChanged`、状态发布和命令回流。它可处理 play、pause、toggle、stop、next、previous、seek、set position、volume、repeat 和 shuffle，并通过注册的 control command sink 回到 `MediaController`。
 
-首期事件来源包括：
+Windows 的 `metadata_windows_private.cpp` 只在 WIN32 编译，是 inert stub：能力全为 false，不发布、不接收命令，生命周期没有平台副作用。生产工厂只在 Linux 自动选择平台 backend，Windows 生产默认仍为 Noop。因此当前没有 Windows SMTC 集成。
 
-- 音频播放模块：播放状态变化、曲目变化、真实进度快照、进度非连续修正、播放结束、设备格式协商结果、输出模式回退和播放错误。
-- 文件扫描模块：扫描开始、扫描进度、缓存加载完成、全量扫描完成、增量节点变更、扫描错误和扫描取消。
-- 元数据共享模块：系统媒体按键、外部播放控制请求、系统媒体集成初始化失败和同步失败。
+`MetadataSharingOptions::allowNoopFallback`、`PlatformMediaState::timelineUpdateInterval` 和同名 options 字段目前未被运行时消费。`platformExtension` 只用于 Windows 工厂可用性门控。未接入生产链的 `MetadataSynchronizer` 按播放位置的整数秒桶判断 cadence，这也不是当前平台发布时间策略。
 
-`mediaController` 对底层事件只暴露一个稳定入口，例如 `publishBackendEvent(BackendEvent event)` 或等价 `BackendEventSink`。底层模块可以用回调形式拿到这个入口，但不能在自己的任意内部线程里同步执行控制层业务逻辑；入口实现只负责把事件投递到 `mediaController` 事件队列或串行执行器。真正的状态更新、模块协调和上层通知只发生在 `mediaController` 的事件消费点。
+## 9. 线程、队列与状态归属
 
-`mediaController` 面向 UI 与 OS 代理不转发原始底层事件，而是发布聚合后的状态快照和必要的领域通知。状态快照包含当前曲目、播放状态、播放能力、来自音频播放模块的真实进度快照、音量、循环/随机状态、媒体库树根版本、扫描状态和最近错误摘要。UI 和 OS 代理订阅同一个控制层状态源；OS 代理只根据快照同步 MPRIS/SMTC，不直接订阅音频播放模块。
+| 执行环境 | 队列或同步方式 | 责任 |
+| --- | --- | --- |
+| 终端主线程 | 终端输入与会话状态 mutex | CLI 渲染、用户命令、启动和关闭 |
+| control worker | 无界 `ControlEventLoop` 队列 | reducer、命令、底层事件归并 |
+| subscription workers | 每类订阅独立交付队列 | 异步执行上层回调 |
+| audio worker | 无界命令队列，约 2ms tick | 解码、filter、状态机、时钟和设备生命周期 |
+| miniaudio callback | 固定容量 PCM 队列和原子计数 | 拷贝 PCM、静音、音量、静音 |
+| scanner scan worker | 容量 16 请求队列 | 串行编排扫描 |
+| 临时 scanner pool | worker pool 和 TagReader semaphore | 单 root 内并发元数据读取 |
+| watcher callbacks / debounce thread | 共享观察状态和 50ms debounce | 合并变更并请求 Incremental |
+| metadata worker | 单个 latest-only pending slot | 异步平台发布 |
+| Linux sdbus event loop | sdbus 异步 event loop | D-Bus 请求与信号 |
 
-项目中通知上层的固定方式是“快照订阅”，不是“底层事件透传”。`mediaController` 暴露上层订阅接口，例如 `subscribeStateSnapshot(...)` 和按需的 `subscribeDomainNotification(...)`；订阅回调只接收不可变快照或值语义通知对象。订阅接口必须返回可注销的订阅句柄，或要求调用方显式注销。初次订阅时应立即获得当前快照，后续只在快照版本变化或领域通知产生时收到异步通知。
+状态的真源分层清晰：scanner 树由 scanner 生成，audio clock 和 PCM 由 audio 持有，面向上层的 player/library 状态由 control reducer 持有，metadata 仅是 player snapshot 的派生平台镜像。不存在全局事件版本。
 
-上层通知分为两类：
+## 10. 错误、退化与可观察性
 
-- 状态快照：常规 UI 渲染、QML 属性同步和 MPRIS/SMTC 同步都使用它；这是项目默认通知方式。
-- 领域通知：只用于一次性语义，例如播放失败、输出模式回退、扫描完成、扫描错误或需要用户确认的恢复动作；它不替代状态快照。
+`MediaControllerCommandResult` 表达同步接受或拒绝，例如控制器停止、无可播放曲目、曲目不在库、无效命令或 backend 拒绝。异步问题通过 `BackendEvent`、`ScannerEvent` 被 reducer 归并为状态或 `ControlDomainNotification`。
 
-上层适配层收到通知后负责自己的线程切换。QML 适配层需要把快照投递到 QML/GUI 线程再更新属性；OS 元数据共享模块需要投递到对应平台 API 所要求的线程或事件循环。`mediaController` 不直接调用 QML 对象、D-Bus 对象或 Windows UI/COM 对象，也不等待这些适配层完成外部同步。
+audio 错误码覆盖打开、格式、设备、协商、解码、欠载和 seek。scanner 对单文件、CUE、标签读取和缓存写错误尽量局部隔离，必要时回退 Full；若容量 16 的请求队列满，会同步发布 `ScanError`。metadata 失败不影响核心播放。真实音频设备行为仍需要宿主环境验证，测试 fake backend 不能证明操作系统设备可见性或设备 ID 映射。
 
-连续变化值不做高频事件洪泛。播放进度由音频播放模块作为权威来源按固定间隔、平台时间线需求或上层查询需求提供真实进度快照；`mediaController` 只缓存和转发这些快照，不自行估算真实进度。扫描进度可以合并或节流后上报，例如按时间间隔、目录批次或百分比变化发布，避免大目录扫描时挤占控制层事件队列。
+日志由 `src/logging/logging.cpp` 初始化。生产会话使用时间戳轮转文件，目录级清理阈值为 50MiB；scanner 另有独立的 `tagreader-errors.log` 轮转日志。当前日志可能记录完整音乐路径、数据库路径、封面路径、CUE/TagReader 错误细节和部分媒体元数据，没有统一脱敏层。日志不是模块通信机制，音频实时回调不写日志。
 
-线程边界必须保持清晰：音频实时回调不直接调用 `mediaController`，也不直接调用订阅者；它只写入原子状态或预分配无阻塞队列，必要时唤醒音频模块普通事件分发线程。文件扫描和波形计算使用各自的高性能计算线程池，不把这些线程池作为控制层状态机的执行环境；扫描池完成任务后只投递事件，SQLite 写入仍按批量事务和受控写入阶段处理。系统媒体适配层同样不直接调用 UI 或其它底层模块。所有跨模块通知最终都经过 `mediaController` 事件队列或串行执行器完成串行化处理。
+## 11. 测试与工具拓扑
 
-订阅关系需要支持显式注销，避免 UI、OS 代理或测试对象销毁后仍被通知。上层订阅者的回调不得反向阻塞 `mediaController` 事件循环；如果前端或平台 API 需要切换线程，应在对应适配层内部再次投递到自己的线程或主循环。
+测试基于 doctest。当前源码配置的验证拓扑为：70 个 active 测试可执行文件，其中 68 个承载共 100 个 CTest，另有 2 个仅构建不注册的 scanner 性能目标：`seriona_scanner_perf_test` 和 `seriona_scanner_detailed_perf_test`。`seriona.audio.waveform.perf` 的 CTest 超时为 240 秒，播放状态机 cancellation 有单独注册规则。
 
-### 6.5 应用程序日志
+5 个目标被明确禁用：旧 cache、cache content、v2 到 v3 migration、backup rollback、phase1 integration。`tests/control/shuffle_playback_tests.cpp` 是孤立源文件，未进入 CMake；`scanner_song_identity_tests.cpp` 由 `scanner_hash_tests.cpp` include，实际通过 `seriona.scanner.song_identity` 注册。
 
-日志系统建议在后端启动早期完成初始化，随后把模块级 logger 注入到各模块构造参数，或通过受控的日志注册表按模块名获取。核心代码不应在任意位置临时创建 logger，也不应把 `spdlog` 细节扩散到所有业务接口；必要时可在项目内部封装极薄的日志门面，以便统一命名、级别和初始化顺序。
+测试以 fake `AudioOutputDeviceBackend` 或现场生成的短音频 fixture 覆盖音频，避免真实硬件与受版权媒体依赖。扫描、缓存、CUE、监听、线程池、metadata、control、运行时路径、日志和终端会话都有相应测试。生命周期和并发聚焦测试覆盖 control、audio、订阅、scanner 与 metadata 的关闭顺序，但不能替代真实 Linux 音频设备和 D-Bus 环境验证。
 
-推荐输出目标：
+本次架构审阅重新配置并构建后，全量 CTest 为 98/100：`seriona.scanner.error_logging` 因测试数据库缺少 `cue_track_index` 而 abort，`seriona.scanner_watcher` 的 LRC 场景中 TagReader 调用次数超过断言。其余 audio 38/38、metadata 6/6、control/app 9/9，以及 scanner 其余 44/46 通过。这是当前验证状态，不改变上面的注册拓扑。
 
-- 控制台 sink：开发、CLI 独立运行和调试时默认开启，输出简洁彩色日志。
-- 轮转文件 sink：正式运行默认开启，例如按大小轮转并限制保留文件数，避免长期运行占满磁盘。
-- 平台诊断 sink：Linux 后续可评估 syslog；Windows 后续可评估 Windows event log 或 debugger sink，但首期不强制实现。
+## 12. 当前限制与设计债务
 
-推荐日志级别：
+以下是已有源码或构建证据的当前限制，不是已落地功能：
 
-- `trace`：极细粒度流程，仅用于临时深度排查，默认关闭。
-- `debug`：扫描决策、格式协商细节、缓存命中情况等开发诊断。
-- `info`：启动、关闭、扫描完成、曲目切换、输出模式变化、监听启停等关键状态。
-- `warn`：可恢复异常，例如单个文件读取失败、设备格式回退、监听事件丢失后触发全量复查。
-- `error`：用户可感知或模块功能失败，例如播放失败、数据库打开失败、系统媒体接口初始化失败。
-- `critical`：后端无法继续提供核心能力的严重错误。
+- `seriona_app` 没有仓库内消费者，`runtime_paths` 和 logging 源被 app、静态库或测试重复编译。
+- scanner 主库仅留下 v3 schema 副作用，实际扫描业务全部在 `.scan-roots.sqlite` sidecar，数据库边界不直观。
+- scanner 没有应用层容量上限、LRU eviction 或缓存迁移桥；不支持从非 v3 schema 迁移。
+- `FileScannerService::stop()` 是协作取消，未把取消传播至已运行的 worker pool，不提供硬取消。
+- `selectOutputDevice()` 不会立即切换设备，且 control 尚无设备选择命令；`keepDeviceOpen` 未消费。
+- metadata 的 Windows backend 是编译桩，生产不自动选择，没有 SMTC；`allowNoopFallback` 和 timeline interval 配置未消费。
+- `MetadataSynchronizer` 当前虽编入 metadata 库但没有生产调用方；其整数秒桶 cadence 不代表实际平台发布节流。
+- 非 Unix 终端键盘控制退化，Windows 还存在 `localtime_r`、POSIX 日志测试和 MPRIS 测试目标的构建兼容性缺口。
+- `thumbnail` Qt 草案不属于生产后端，且违反当前无 Qt 生产依赖的系统边界。
+- shuffle 测试源孤立，五个已禁用的 cache、迁移和集成测试不提供当前回归保障。
 
-日志边界：
-
-- 音频实时回调不直接调用 `spdlog`，即使使用异步 logger 也不例外；实时线程只更新原子状态或无阻塞诊断计数，由普通线程按需汇总输出。
-- 文件扫描可以记录 root、相对路径、耗时、错误原因和缓存行为，但不应把完整歌词、大量标签文本或用户隐私路径在默认级别中过度输出。
-- 系统媒体集成记录平台 API 初始化、命令回调和同步失败原因，但不把系统 API 类型泄露到通用日志接口。
-- 日志文件目录、保留数量、单文件大小和默认级别未来应进入配置文件；在配置系统确定前，设计文档只记录策略，不写死工程实现。
-
-## 7. 跨平台设计边界
-
-### 7.1 Linux
-
-Linux 桌面侧系统媒体集成优先按 MPRIS v2 设计。MPRIS 使用 D-Bus 暴露 `org.mpris.MediaPlayer2` 与 `org.mpris.MediaPlayer2.Player`，并通过 `PropertiesChanged` 信号通知播放状态和元数据变化。
-
-对内部架构的影响：
-
-- 内部状态模型应能表达 `Playing`、`Paused`、`Stopped`。
-- 当前曲目需要稳定 ID，以便映射到 MPRIS `mpris:trackid`。
-- 元数据需要能映射到 MPRIS/Xesam 字段，例如标题、艺术家、专辑、时长、封面 URI。
-
-### 7.2 Windows
-
-Windows 侧系统媒体集成优先按 System Media Transport Controls 设计。该机制可以显示当前媒体信息，接收系统播放控制按钮事件，并同步播放状态和时间线。
-
-对内部架构的影响：
-
-- 元数据共享模块需要能设置播放状态、标题、艺术家、专辑、封面和时间线。
-- 系统按钮事件需要转换为内部播放命令。
-- 时间线同步应节流，避免无意义高频更新。
-
-## 8. 当前不做决定的事项
-
-以下事项需要后续单独讨论，本文档暂不写死：
-
-- 后端对前端暴露的具体 API 形式和线程投递策略。
-- 配置文件格式、默认日志目录、日志轮转大小和运行时级别调整入口。
-- scanner 缓存容量控制、checkpoint/vacuum 调度和淘汰策略的具体执行时机。
-- 音频模块内部命令队列、seek 事务化和输出设备释放策略的最终实现细节。
-- Windows 与 Linux 的最小支持版本。
-
-## 9. 已确认问题
-
-以下问题本轮已收敛为设计约束：
-
-1. 暂停默认尽量释放或停止输出设备，但允许配置为“保留设备以换取更快恢复”。
-2. 直出模式下如果源格式不被设备支持，则自动回退到混音模式，并通知上层实际输出模式发生回退。
-3. SQLite 缓存大小上限以文件大小为主，root 数量和曲目数量为辅；默认建议主库软上限 256 MiB、硬上限 512 MiB，封面与派生文件目录软上限 1 GiB。
-4. 当前实现已经包含启动扫描、SQLite 缓存和运行时监听适配；手动刷新/启动扫描仍是监听异常时的兜底路径。
-5. `TagReader` 的封面导出目录由 `seriona` 后端统一管理。
-6. 应用程序日志作为横切基础能力加入设计，日志库首选 `spdlog`；音频实时回调中不直接写日志。
-7. 向上通知通道采用“底层模块事件 sink + `mediaController` 串行执行器 + 上层状态快照订阅”的模型；回调只作为 API 外形，语义是异步投递。
-
-## 10. 下一步建议
-
-下一轮设计优先继续明确以下问题：
-
-1. 后端与 QML 前端之间已确定采用 `mediaController` 状态快照订阅方式；后续只需明确订阅 API 命名、快照字段映射和 QML 线程投递方式。
-2. 构建系统、目录细分和核心依赖已经落地在 CMake 与源码中；后续设计应聚焦当前实现与架构约束的偏差，而不是重新讨论项目骨架。
-3. 音频输出和文件监听已有实现方向；后续需要用回归测试和压力测试验证暂停设备释放、格式协商、监听溢出和大目录行为。
-4. 暂不考虑收藏；播放列表以实际文件列表和目录结构呈现为主，不做虚拟歌单作为首期目标。
-5. 后端可以作为命令行程序独立运行；与前端整合时以后端项目源码合入前端应用形成完整应用，不以动态库形式作为首选集成方式。
-6. 日志系统后续需要在配置文件设计时补充默认日志目录、轮转大小、保留数量和运行时级别调整入口。
+这些限制应在变更时作为边界条件处理，不应被本文解释为已经支持的行为。

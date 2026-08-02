@@ -105,9 +105,22 @@ namespace {
 
 }
 
-RawTagMetadata ProductionTagMetadataReader::read(const std::filesystem::path& path,
-                                                const std::filesystem::path& coverExportDir) {
-  return rawFromMusicTag(TagReader::Read(path, coverExportDir));
+RawTagMetadata ProductionTagMetadataReader::read(const TagReadRequest& request) {
+  return rawFromMusicTag(TagReader::Read(request.path, request.coverExportDir, request.options));
+}
+
+std::vector<RawTagMetadata> ProductionTagMetadataReader::readCueSheet(const TagReadRequest& request) {
+  std::vector<RawTagMetadata> results;
+  try {
+    const auto tags = TagReader::ReadCueSheet(request.path, request.coverExportDir, request.options);
+    results.reserve(tags.size());
+    for (const auto& tag : tags) {
+      results.push_back(rawFromMusicTag(tag));
+    }
+  } catch (const std::exception& error) {
+    spdlog::warn("CUE sheet parse failed for {}: {}", request.path.generic_string(), error.what());
+  }
+  return results;
 }
 
 MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
@@ -165,7 +178,7 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
   successes.reserve(paths.size());
   for (const auto& path : paths) {
     try {
-      auto raw = reader.read(path, coverExportDir);
+      auto raw = reader.read(thumbnailOnlyRequest(path, coverExportDir));
       successes.push_back({.metadata = mapRawTagMetadata(raw, std::string{contentHashSeed} + ":" + path.generic_string(),
                                                          std::nullopt, false)});
     } catch (const std::exception& error) {
@@ -178,17 +191,7 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
 
 std::vector<RawTagMetadata> readCueSheet(const std::filesystem::path& cuePath,
                                          const std::filesystem::path& coverExportDir) {
-  std::vector<RawTagMetadata> results;
-  try {
-    const auto tags = TagReader::ReadCueSheet(cuePath, coverExportDir);
-    results.reserve(tags.size());
-    for (const auto& tag : tags) {
-      results.push_back(rawFromMusicTag(tag));
-    }
-  } catch (const std::exception& error) {
-    spdlog::warn("CUE sheet parse failed for {}: {}", cuePath.generic_string(), error.what());
-  }
-  return results;
+  return ProductionTagMetadataReader{}.readCueSheet(thumbnailOnlyRequest(cuePath, coverExportDir));
 }
 
 }

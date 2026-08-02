@@ -272,5 +272,59 @@ TEST_CASE("SQLiteCache: updates existing location") {
   CHECK(loaded->thumbnailPath == temp.path() / "new-thumb.png");
 }
 
+TEST_CASE("SQLiteCache: round trip keeps identical metadata lyrics and thumbnail with empty artwork") {
+  test::TempScannerRoot temp{"cache-round-trip-thumbnail"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+
+  cache.updateScanRoot(CachedScanRoot{.rootPath = temp.path()});
+
+  SongMetadata meta;
+  meta.title = "Round Trip Song";
+  meta.artist = "Round Trip Artist";
+  meta.duration = std::chrono::milliseconds{240000};
+  cache.upsertContent("content-round-trip", meta);
+
+  const auto filePath = temp.path() / "music" / "song.flac";
+  const auto locationId = computeLocationId(filePath, 4096, std::nullopt);
+  const auto thumbnail = temp.path() / "covers" / "thumbnails" / "ab" / "thumb.png";
+
+  cache.upsertLocation(CachedLocation{
+    .locationId = locationId,
+    .contentId = "content-round-trip",
+    .rootPath = temp.path(),
+    .filePath = filePath,
+    .fileSizeBytes = 4096,
+    .fileMtimeNs = 123456789,
+    .sourceFilePath = filePath,
+    .cueTrackOffset = std::nullopt,
+    .artworkPath = std::nullopt,
+    .thumbnailPath = thumbnail,
+    .lyricsSource = LyricsSource::EmbeddedTag
+  });
+  cache.replaceLyrics(locationId,
+                      "embedded",
+                      {LyricLine{.timestamp = std::chrono::milliseconds{1000}, .text = "first line"},
+                       LyricLine{.timestamp = std::chrono::milliseconds{2000}, .text = "second line"}});
+
+  const auto content = cache.loadContent("content-round-trip");
+  REQUIRE(content.has_value());
+  CHECK(content->metadata.title == "Round Trip Song");
+  CHECK(content->metadata.artist == "Round Trip Artist");
+  CHECK(content->metadata.duration == std::chrono::milliseconds{240000});
+
+  const auto loaded = cache.loadLocation(locationId);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->thumbnailPath == thumbnail);
+  CHECK_FALSE(loaded->artworkPath.has_value());
+  CHECK(loaded->lyricsSource == LyricsSource::EmbeddedTag);
+
+  const auto lyrics = cache.loadLyrics(locationId, "embedded");
+  REQUIRE(lyrics.size() == 2U);
+  CHECK(lyrics[0].timestamp == std::chrono::milliseconds{1000});
+  CHECK(lyrics[0].text == "first line");
+  CHECK(lyrics[1].timestamp == std::chrono::milliseconds{2000});
+  CHECK(lyrics[1].text == "second line");
+}
+
 }  // namespace
 }  // namespace seriona::scanner::cache

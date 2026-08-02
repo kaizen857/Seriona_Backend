@@ -140,10 +140,20 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 }
 
 [[nodiscard]] std::optional<ArtworkRef> artworkFromSong(const scanner::SongMetadata& song) {
-  if (!song.artworkPath.has_value() || song.artworkPath->empty()) {
+  const auto hasArtworkPath = song.artworkPath.has_value() && !song.artworkPath->empty();
+  const auto hasThumbnail = song.thumbnailPath.has_value() && !song.thumbnailPath->empty();
+  if (!hasArtworkPath && !hasThumbnail) {
     return std::nullopt;
   }
-  return ArtworkRef{.localPath = *song.artworkPath, .uri = {}, .contentHash = song.contentHash.empty() ? std::optional<std::string>{} : std::optional<std::string>{song.contentHash}};
+  ArtworkRef ref{};
+  // Thumbnail-first: preferred path starts at the thumbnail and is upgraded
+  // by the async resolver; legacy full artwork stays available.
+  ref.localPath = hasThumbnail ? song.thumbnailPath : song.artworkPath;
+  ref.thumbnailPath = hasThumbnail ? song.thumbnailPath : std::nullopt;
+  if (!song.contentHash.empty()) {
+    ref.contentHash = song.contentHash;
+  }
+  return ref;
 }
 
 [[nodiscard]] TrackIdentity identityFromRequest(const audio::TrackPlaybackRequest& request) {
@@ -197,6 +207,21 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   auto intent = makeIntent(ControlIntentKind::LoadTrack);
   intent.track = std::move(request);
   return intent;
+}
+
+[[nodiscard]] ControlIntent makeArtworkResolveIntent(ArtworkResolveRequest request) {
+  auto intent = makeIntent(ControlIntentKind::ResolveArtwork);
+  intent.artworkRequest = std::move(request);
+  return intent;
+}
+
+// The audio backend confirms the track we already selected when the playback
+// request matches on the fields that define the segment (CUE offset/duration
+// and the referenced audio source). Title/artist are echoed verbatim by the
+// backend and carry no identity information, so they are not compared.
+[[nodiscard]] bool matchesRequest(const audio::TrackPlaybackRequest& lhs, const audio::TrackPlaybackRequest& rhs) {
+  return lhs.trackId == rhs.trackId && lhs.filePath == rhs.filePath && lhs.offset == rhs.offset &&
+         lhs.duration == rhs.duration && lhs.boundedSegment == rhs.boundedSegment;
 }
 
 [[nodiscard]] ControlIntent makeSeekIntent(std::chrono::milliseconds position) {
@@ -542,14 +567,22 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           }
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::TrackChanged>) {
-          const auto identity = identityFromRequest(payload.request);
-          selectedTrack_ = identity;
-          player_.currentTrack = selectedTrack_;
-          if (const auto track = findPlayableTrack(identity); track.has_value()) {
-            player_.display = track->display;
-            player_.artwork = track->artwork;
+          const auto selected = selectedPlaybackContextTrack();
+          if (selected.has_value() && matchesRequest(payload.request, selected->request)) {
+            // The audio backend confirms the already-selected track (including
+            // CUE offset/duration/source): keep the logical identity, display
+            // and artwork instead of replacing them with identityFromRequest.
+            spdlog::debug("track changed matches selected track '{}'", payload.request.trackId);
           } else {
-            player_.display = displayFromRequest(payload.request);
+            const auto identity = identityFromRequest(payload.request);
+            selectedTrack_ = identity;
+            player_.currentTrack = selectedTrack_;
+            if (const auto track = findPlayableTrack(identity); track.has_value()) {
+              player_.display = track->display;
+              player_.artwork = track->artwork;
+            } else {
+              player_.display = displayFromRequest(payload.request);
+            }
           }
           player_.timeline.position = payload.request.offset.value_or(std::chrono::milliseconds{0});
           player_.timeline.duration = payload.request.duration;
@@ -731,7 +764,9 @@ std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::playableTra
       tracks.push_back(PlayableTrack{.identity = identityFromSong(*node.song),
                                      .request = requestFromSong(*node.song),
                                      .display = displayFromSong(*node.song),
-                                     .artwork = artworkFromSong(*node.song)});
+                                     .artwork = artworkFromSong(*node.song),
+                                     .artworkSourcePath = !node.song->sourceFilePath.empty() ? node.song->sourceFilePath : node.song->filePath,
+                                     .fallbackThumbnailPath = node.song->thumbnailPath.value_or(std::filesystem::path{})});
     }
   };
 
@@ -839,7 +874,9 @@ std::optional<ControlStateReducer::PlaybackContextState> ControlStateReducer::bu
     state.order.push_back(PlayableTrack{.identity = item.identity,
                                         .request = requestFromSong(item.metadata),
                                         .display = displayFromSong(item.metadata),
-                                        .artwork = artworkFromSong(item.metadata)});
+                                        .artwork = artworkFromSong(item.metadata),
+                                        .artworkSourcePath = !item.metadata.sourceFilePath.empty() ? item.metadata.sourceFilePath : item.metadata.filePath,
+                                        .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{})});
   }
   return state;
 }
@@ -1093,7 +1130,9 @@ void ControlStateReducer::reconcilePlaybackContextAfterSnapshot(ControlReduction
     rebuilt.order.push_back(PlayableTrack{.identity = item.identity,
                                           .request = requestFromSong(item.metadata),
                                           .display = displayFromSong(item.metadata),
-                                          .artwork = artworkFromSong(item.metadata)});
+                                          .artwork = artworkFromSong(item.metadata),
+                                          .artworkSourcePath = !item.metadata.sourceFilePath.empty() ? item.metadata.sourceFilePath : item.metadata.filePath,
+                                          .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{})});
   }
 
   std::optional<std::size_t> currentIndex{};
@@ -1149,6 +1188,23 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
   markPlayerChanged(reduction);
 }
 
+ControlReduction ControlStateReducer::reduceArtworkResolved(const ArtworkResolveResultView& result) {
+  auto reduction = accept();
+  if (result.generation != artworkGeneration_ || !selectedTrack_.has_value() ||
+      !sameTrack(result.identity, *selectedTrack_)) {
+    spdlog::debug("stale artwork resolution dropped (generation {} vs {})", result.generation, artworkGeneration_);
+    return reduction;
+  }
+  if (result.outcome.kind != ArtworkResolveOutcomeKind::FullPath || !result.outcome.fullPath.has_value() ||
+      result.outcome.fullPath->empty() || !player_.artwork.has_value()) {
+    // No-art / cover error / resolver failure keep the thumbnail fallback.
+    return reduction;
+  }
+  player_.artwork->localPath = *result.outcome.fullPath;
+  markPlayerChanged(reduction);
+  return reduction;
+}
+
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
   visibleStateDuringSeek_.reset();
   selectedTrack_ = track.identity;
@@ -1163,6 +1219,13 @@ void ControlStateReducer::selectTrack(ControlReduction& reduction, const Playabl
   player_.playback.errorMessage.reset();
   spdlog::debug("state: {}", playbackStatusName(player_.playback.state));
   reduction.intents.push_back(makeTrackIntent(track.request));
+  ++artworkGeneration_;
+  ArtworkResolveRequest artworkRequest{};
+  artworkRequest.generation = artworkGeneration_;
+  artworkRequest.identity = track.identity;
+  artworkRequest.artworkSourcePath = track.artworkSourcePath;
+  artworkRequest.fallbackThumbnailPath = track.fallbackThumbnailPath;
+  reduction.intents.push_back(makeArtworkResolveIntent(std::move(artworkRequest)));
   if (startPlayback) {
     reduction.intents.push_back(makeIntent(ControlIntentKind::Play));
   }

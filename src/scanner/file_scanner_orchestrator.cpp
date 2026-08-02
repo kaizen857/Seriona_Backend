@@ -60,30 +60,6 @@ static WorkerTaskObserver g_workerTaskObserver = nullptr;
 static PublishedSongObserver g_publishedSongObserver = nullptr;
 static CacheWriteObserver g_cacheWriteObserver = nullptr;
 
-[[nodiscard]] std::vector<RawTagMetadata> readCueSheetWithTestSeam(const std::filesystem::path& cuePath,
-                                                                   const std::filesystem::path& coverExportDir) {
-  if (g_testCueSheetProvider) {
-    const auto testTracks = g_testCueSheetProvider(cuePath);
-    if (!testTracks.empty()) {
-      std::vector<RawTagMetadata> results;
-      results.reserve(testTracks.size());
-      for (const auto& track : testTracks) {
-        RawTagMetadata raw{};
-        raw.filePath = track.audioFilePath;
-        raw.offset = std::chrono::microseconds{track.offset};
-        raw.duration = std::chrono::microseconds{track.duration};
-        raw.title = track.title;
-        raw.artist = track.artist;
-        raw.album = track.album;
-        raw.trackNumber = track.trackNumber;
-        results.push_back(raw);
-      }
-      return results;
-    }
-  }
-  return readCueSheet(cuePath, coverExportDir);
-}
-
 [[nodiscard]] FileHashResult hashLyricsSidecarWithTestSeam(const std::filesystem::path& path,
                                                            const HashOptions& options) {
   if (g_testLyricsSidecarHashProvider) {
@@ -1373,6 +1349,30 @@ private:
     publishEvent(sink, ScannerEventType::ScanStopped, scanVersion, error);
   }
 
+  // Test seam first, then the TagMetadataReader gateway for production CUE reads.
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheetWithTestSeam(const TagReadRequest& request) {
+    if (g_testCueSheetProvider) {
+      const auto testTracks = g_testCueSheetProvider(request.path);
+      if (!testTracks.empty()) {
+        std::vector<RawTagMetadata> results;
+        results.reserve(testTracks.size());
+        for (const auto& track : testTracks) {
+          RawTagMetadata raw{};
+          raw.filePath = track.audioFilePath;
+          raw.offset = std::chrono::microseconds{track.offset};
+          raw.duration = std::chrono::microseconds{track.duration};
+          raw.title = track.title;
+          raw.artist = track.artist;
+          raw.album = track.album;
+          raw.trackNumber = track.trackNumber;
+          results.push_back(raw);
+        }
+        return results;
+      }
+    }
+    return metadataReader_->readCueSheet(request);
+  }
+
   [[nodiscard]] RootResult reconcileRoot(const ScannerRoot& root, const ScanModeDecision& decision, const EffectiveScannerConfig& config,
                          [[maybe_unused]] cache::SQLiteCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
@@ -1438,7 +1438,7 @@ private:
 	          continue;
 	        }
         try {
-          const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+          const auto tracks = readCueSheetWithTestSeam(thumbnailOnlyRequest(entry.path, coverExportDir_));
           nodeCount += 1 + tracks.size();
         } catch (const std::exception& error) {
           result.errors.push_back(ScannerError{
@@ -1520,7 +1520,7 @@ private:
 	          continue;
 	        }
 	        
-	        const auto tracks = readCueSheetWithTestSeam(entry.path, coverExportDir_);
+	        const auto tracks = readCueSheetWithTestSeam(thumbnailOnlyRequest(entry.path, coverExportDir_));
 	        const auto cueTrackOrigin = cueReaderOriginForPath(incrementalPlan, entry.path);
 	        const auto cueFileSizeForLocation = fileSizeBytes(entry.path);
 	        const auto cueFileMtimeForLocation = fileMtime(entry.path);
@@ -1847,7 +1847,7 @@ private:
 	      throw std::runtime_error{"missing scanner worker task context"};
 	    }
 
-	    auto raw = metadataReader_->read(task.filePath, coverExportDir_);
+	    auto raw = metadataReader_->read(thumbnailOnlyRequest(task.filePath, coverExportDir_));
     raw.filePath = task.filePath;
     auto mapped = mapRawTagMetadata(raw,
                                     computeContentId(std::chrono::duration_cast<std::chrono::milliseconds>(raw.duration),

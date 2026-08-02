@@ -68,6 +68,47 @@ struct ArtworkRef {
   std::optional<std::filesystem::path> localPath;
   std::optional<std::string> uri;
   std::optional<std::string> contentHash;
+  // Retained thumbnail fallback: pending/error artwork keeps this while only
+  // localPath is upgraded to the full-resolution cover.
+  std::optional<std::filesystem::path> thumbnailPath;
+};
+
+struct ArtworkResolveRequest {
+  std::uint64_t generation{0};
+  TrackIdentity identity;
+  std::filesystem::path artworkSourcePath;
+  std::filesystem::path fallbackThumbnailPath;
+};
+
+enum class ArtworkResolveOutcomeKind : std::uint8_t {
+  FullPath,
+  NoArt,
+  CoverError,
+  ResolverFailure,
+};
+
+struct ArtworkResolveOutcomeView {
+  ArtworkResolveOutcomeKind kind{ArtworkResolveOutcomeKind::NoArt};
+  std::optional<std::filesystem::path> fullPath;
+  // CoverError only: the typed cover-processing code as text; empty otherwise.
+  std::string detail;
+};
+
+struct ArtworkResolveResultView {
+  std::uint64_t generation{0};
+  TrackIdentity identity;
+  ArtworkResolveOutcomeView outcome;
+};
+
+using ArtworkResolveCallback = std::function<void(ArtworkResolveResultView)>;
+
+class ArtworkResolveService {
+public:
+  virtual ~ArtworkResolveService() = default;
+
+  virtual void request(ArtworkResolveRequest request) noexcept = 0;
+  virtual void setResultCallback(ArtworkResolveCallback callback) noexcept = 0;
+  virtual void stop() noexcept = 0;
 };
 
 struct PlaybackTimeline {
@@ -227,6 +268,8 @@ struct MediaControllerDependencies {
   std::shared_ptr<scanner::FileScannerService> scanner;
   std::unique_ptr<::seriona::metadata::MetadataSharingService> metadata;
   std::shared_ptr<FolderSortSettingsStore> folderSortSettingsStore;
+  // Optional artwork resolver; when null, artwork resolve intents are dropped.
+  std::shared_ptr<ArtworkResolveService> artworkResolver;
 };
 
 enum class MediaControlCommandKind {

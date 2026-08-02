@@ -31,15 +31,18 @@ class FakeMetadataReader final : public TagMetadataReader {
 public:
   void put(fs::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
 
-  [[nodiscard]] RawTagMetadata read(const fs::path& path, const fs::path&) override {
-    const auto iterator = metadataByPath_.find(path);
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
+    const auto iterator = metadataByPath_.find(request.path);
     if (iterator == metadataByPath_.end()) {
-      throw std::runtime_error("missing fake metadata for: " + path.string());
+      throw std::runtime_error("missing fake metadata for: " + request.path.string());
     }
     auto metadata = iterator->second;
-    metadata.filePath = path;
+    metadata.filePath = request.path;
     return metadata;
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
 private:
   std::map<fs::path, RawTagMetadata> metadataByPath_;

@@ -1,5 +1,6 @@
 #include "media_controller_module.h"
 
+#include "artwork_resolver.h"
 #include "seriona/audio/audio_playback_service.h"
 #include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/control/media_controller.h"
@@ -104,6 +105,9 @@ MediaControllerDependencies makeProductionMediaControllerDependencies(
   scanner::FileScannerServiceDependencies scannerDeps{};
   auto sortSettingsDatabasePath = databasePath;
   scannerDeps.databasePath = std::move(databasePath);
+  if (!coverExportDir.empty()) {
+    dependencies.artworkResolver = std::make_shared<ArtworkResolver>(coverExportDir, ArtworkResolverCompletion{});
+  }
   scannerDeps.coverExportDir = std::move(coverExportDir);
   dependencies.scanner = scanner::makeFileScannerService(std::move(scannerDeps));
   dependencies.metadata = metadata::makeMetadataSharingService(makeProductionMetadataOptions());

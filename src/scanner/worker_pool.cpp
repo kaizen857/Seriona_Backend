@@ -1,7 +1,6 @@
-#include "seriona/scanner/worker_pool.h"
-
 #include "seriona/scanner/song_identity.h"
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
+#include "seriona/scanner/worker_pool.h"
 
 #include <BS_thread_pool.hpp>
 
@@ -91,7 +90,7 @@ private:
 
 [[nodiscard]] SongMetadata readProductionMetadata(const WorkerTask& task) {
   ProductionTagMetadataReader reader;
-  const auto raw = reader.read(task.filePath, task.rootPath);
+  const auto raw = reader.read(thumbnailOnlyRequest(task.filePath, task.rootPath));
   return mapRawTagMetadata(raw, {}, std::nullopt, false).metadata;
 }
 

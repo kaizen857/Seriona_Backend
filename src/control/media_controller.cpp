@@ -139,6 +139,11 @@ public:
       : dependencies_(std::move(dependencies)), options_(options), eventLoop_(options), reducer_(options) {
     normalizeMediaControllerDependencies(dependencies_);
     installSinks();
+    if (dependencies_.artworkResolver) {
+      dependencies_.artworkResolver->setResultCallback([this](ArtworkResolveResultView view) {
+        postArtworkResolved(std::move(view));
+      });
+    }
   }
 
   ~Impl() { shutdown(); }
@@ -191,6 +196,9 @@ public:
       (void)stopResult;
     }
     eventLoop_.stop();
+    if (dependencies_.artworkResolver) {
+      dependencies_.artworkResolver->stop();
+    }
     spdlog::info("media controller stopped");
   }
 
@@ -333,6 +341,22 @@ private:
     auto posted = eventLoop_.post([this, command = std::move(command)] {
       if (isRunning()) {
         reduceCommand(command);
+      }
+    });
+    (void)posted;
+  }
+
+  void postArtworkResolved(ArtworkResolveResultView view) {
+    if (!isRunning()) {
+      return;
+    }
+
+    // The resolver callback runs on the resolver worker thread; serialize the
+    // result through the control event loop before touching reducer state.
+    auto posted = eventLoop_.post([this, view = std::move(view)] {
+      if (isRunning()) {
+        auto reduction = reducer_.reduceArtworkResolved(view);
+        commitReduction(reduction);
       }
     });
     (void)posted;
@@ -522,6 +546,11 @@ private:
       case ControlIntentKind::SetMuted:
         if (intent.muted.has_value()) {
           dependencies_.audio->setMuted(*intent.muted);
+        }
+        break;
+      case ControlIntentKind::ResolveArtwork:
+        if (intent.artworkRequest.has_value() && dependencies_.artworkResolver) {
+          dependencies_.artworkResolver->request(*intent.artworkRequest);
         }
         break;
       }

@@ -39,28 +39,31 @@ class PerfMetadataReader final : public TagMetadataReader {
 public:
   void put(std::filesystem::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
 
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path& coverExportDir) override {
-    static_cast<void>(coverExportDir);
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
+    static_cast<void>(request.coverExportDir);
     const auto start = Clock::now();
     auto metadata = RawTagMetadata{};
     {
       std::lock_guard lock{mutex_};
       ++stats_.calls;
-      const auto iterator = metadataByPath_.find(path);
+      const auto iterator = metadataByPath_.find(request.path);
       if (iterator == metadataByPath_.end()) {
-        throw std::runtime_error("missing perf metadata for " + path.string());
+        throw std::runtime_error("missing perf metadata for " + request.path.string());
       }
       metadata = iterator->second;
     }
-    metadata.filePath = path;
+    metadata.filePath = request.path;
     const auto elapsed = Clock::now() - start;
     {
       std::lock_guard lock{mutex_};
       stats_.totalTime += elapsed;
     }
     return metadata;
+  
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
   [[nodiscard]] ReaderStats stats() const {
     std::lock_guard lock{mutex_};

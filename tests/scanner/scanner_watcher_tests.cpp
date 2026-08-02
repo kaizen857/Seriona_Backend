@@ -31,8 +31,7 @@ public:
 
   void setReadDelay(std::chrono::milliseconds delay) noexcept { readDelay_ = delay; }
 
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path&) override {
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
     const auto active = activeReads_.fetch_add(1U) + 1U;
     maxConcurrentReads_.store(std::max(maxConcurrentReads_.load(), active));
     if (readDelay_ > std::chrono::milliseconds{0}) {
@@ -41,20 +40,24 @@ public:
 
     try {
       std::scoped_lock lock{mutex_};
-      requestedPaths.push_back(path);
-      auto iterator = metadataByPath_.find(path);
+      requestedPaths.push_back(request.path);
+      auto iterator = metadataByPath_.find(request.path);
       if (iterator == metadataByPath_.end()) {
         throw std::runtime_error("missing fake metadata");
       }
       auto metadata = iterator->second;
-      metadata.filePath = path;
+      metadata.filePath = request.path;
       activeReads_.fetch_sub(1U);
       return metadata;
     } catch (...) {
       activeReads_.fetch_sub(1U);
       throw;
     }
+  
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
   [[nodiscard]] std::size_t readCount() const noexcept {
     std::scoped_lock lock{mutex_};

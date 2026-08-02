@@ -59,32 +59,35 @@ public:
     return changed_.wait_for(lock, timeout, [this, expectedCount] { return requestedPaths.size() >= expectedCount; });
   }
 
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path& coverExportDir) override {
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
     {
       std::lock_guard lock{mutex_};
-      requestedPaths.push_back(path);
-      requestedCoverDirs.push_back(coverExportDir);
+      requestedPaths.push_back(request.path);
+      requestedCoverDirs.push_back(request.coverExportDir);
     }
     changed_.notify_all();
-    if (blockReads_ || path == blockPath_) {
+    if (blockReads_ || request.path == blockPath_) {
       std::unique_lock lock{mutex_};
       blocked_ = true;
       changed_.notify_all();
       changed_.wait(lock, [this] { return released_; });
     }
-    const auto failure = failures_.find(path);
+    const auto failure = failures_.find(request.path);
     if (failure != failures_.end()) {
       throw std::runtime_error(failure->second);
     }
-    auto iterator = metadataByPath_.find(path);
+    auto iterator = metadataByPath_.find(request.path);
     if (iterator == metadataByPath_.end()) {
       throw std::runtime_error("missing fake metadata");
     }
     auto metadata = iterator->second;
-    metadata.filePath = path;
+    metadata.filePath = request.path;
     return metadata;
+  
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
   [[nodiscard]] std::size_t readCount() const {
     std::lock_guard lock{mutex_};

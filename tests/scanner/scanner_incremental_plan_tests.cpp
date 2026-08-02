@@ -256,5 +256,37 @@ TEST_CASE("cached location from song preserves thumbnail path") {
   CHECK(location.thumbnailPath == temp.path() / "artwork" / "thumbnails" / "thumb.png");
 }
 
+TEST_CASE("thumbnail path survives tree publish and cached location apply with artwork empty") {
+  test::TempScannerRoot temp{"incremental-plan-thumbnail-apply"};
+  const auto filePath = test::writeAudioFixture(temp.path(), "song.flac");
+  const auto thumbnail = temp.path() / "covers" / "thumbnails" / "ab" / "thumb.png";
+
+  cache::CachedSong song{};
+  song.metadata.contentHash = "content-id";
+  song.metadata.fileSizeBytes = fileSizeBytes(filePath);
+  song.metadata.fileMtime = fileMtime(filePath);
+  song.metadata.sourceFilePath = filePath;
+  song.metadata.artworkPath = std::nullopt;
+  song.metadata.thumbnailPath = thumbnail;
+
+  const auto location = cachedLocationFromSong(song, temp.path(), filePath);
+
+  CHECK(location.contentId == "content-id");
+  CHECK(location.sourceFilePath == filePath);
+  CHECK(location.thumbnailPath == thumbnail);
+  CHECK_FALSE(location.artworkPath.has_value());
+
+  cache::CachedSong restored{};
+  restored.metadata.title = "Restored Title";
+  applyCachedLocation(restored, location, filePath);
+
+  CHECK(restored.metadata.title == "Restored Title");
+  CHECK(restored.metadata.contentHash == "content-id");
+  CHECK(restored.metadata.filePath == filePath);
+  CHECK(restored.metadata.sourceFilePath == filePath);
+  CHECK(restored.metadata.thumbnailPath == thumbnail);
+  CHECK_FALSE(restored.metadata.artworkPath.has_value());
+}
+
 }
 }

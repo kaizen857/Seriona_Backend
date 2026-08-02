@@ -35,16 +35,18 @@ public:
     metadataByPath_[std::move(path)] = std::move(metadata); 
   }
 
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path& /* coverExportDir */) override {
-    const auto iterator = metadataByPath_.find(path);
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
+    const auto iterator = metadataByPath_.find(request.path);
     if (iterator == metadataByPath_.end()) {
-      throw std::runtime_error("missing fake metadata for: " + path.string());
+      throw std::runtime_error("missing fake metadata for: " + request.path.string());
     }
     auto metadata = iterator->second;
-    metadata.filePath = path;
+    metadata.filePath = request.path;
     return metadata;
+
   }
+
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest&) override { return {}; }
 
 private:
   std::map<std::filesystem::path, RawTagMetadata> metadataByPath_;

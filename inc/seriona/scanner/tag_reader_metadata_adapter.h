@@ -2,15 +2,35 @@
 
 #include "seriona/scanner/scanner_contracts.h"
 
+#include <TagReader.hpp>
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace seriona::scanner {
+
+// Internal metadata-read request; options pass through to the TagReader overload verbatim.
+struct TagReadRequest {
+  std::filesystem::path path;
+  std::filesystem::path coverExportDir;
+  CoverProcessingOptions options{};
+};
+
+// Scanner-wide cover policy: thumbnail PNGs only; cover failures never remove songs/lyrics/CUE tracks.
+[[nodiscard]] inline TagReadRequest thumbnailOnlyRequest(std::filesystem::path path, std::filesystem::path coverExportDir) {
+  CoverProcessingOptions options;
+  options.mode = CoverProcessingOptions::CoverProcessingMode::ThumbnailOnly;
+  options.failurePolicy = CoverProcessingOptions::CoverFailurePolicy::Ignore;
+  return TagReadRequest{.path = std::move(path),
+                        .coverExportDir = std::move(coverExportDir),
+                        .options = options};
+}
 
 struct RawTagLyricLine {
   std::chrono::microseconds timestamp{0};
@@ -72,14 +92,14 @@ struct TagReaderFailure {
 class TagMetadataReader {
 public:
   virtual ~TagMetadataReader() = default;
-  [[nodiscard]] virtual RawTagMetadata read(const std::filesystem::path& path,
-                                            const std::filesystem::path& coverExportDir) = 0;
+  [[nodiscard]] virtual RawTagMetadata read(const TagReadRequest& request) = 0;
+  [[nodiscard]] virtual std::vector<RawTagMetadata> readCueSheet(const TagReadRequest& request) = 0;
 };
 
 class ProductionTagMetadataReader final : public TagMetadataReader {
 public:
-  [[nodiscard]] RawTagMetadata read(const std::filesystem::path& path,
-                                    const std::filesystem::path& coverExportDir) override;
+  [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override;
+  [[nodiscard]] std::vector<RawTagMetadata> readCueSheet(const TagReadRequest& request) override;
 };
 
 [[nodiscard]] MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,

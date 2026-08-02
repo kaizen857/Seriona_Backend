@@ -110,7 +110,7 @@ void runConcurrencyStress(const int tagReaderSlots) {
                                                            .tagReader = [&probe, &tagReader, &attemptedReads, &temp](const WorkerTask& task) {
                                                              ActiveReadGuard guard{probe};
                                                              attemptedReads.fetch_add(1U, std::memory_order_relaxed);
-                                                             const auto raw = tagReader.read(task.filePath, temp.path() / "covers");
+                                                             const auto raw = tagReader.read(thumbnailOnlyRequest(task.filePath, temp.path() / "covers"));
                                                              return mapRawTagMetadata(raw, "tagreader-stress:" + task.filePath.generic_string(),
                                                                                       std::nullopt, false).metadata;
                                                            }}};
