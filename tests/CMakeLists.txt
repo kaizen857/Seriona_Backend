@@ -266,6 +266,7 @@ add_executable(seriona_scanner_scan_mode_decision_tests
   ${PROJECT_SOURCE_DIR}/src/scanner/lrc_parser.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/path_utils.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/playlist_tree_builder.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/folder_thumbnail_resolver.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/worker_pool.cpp
   ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
@@ -280,6 +281,7 @@ add_executable(seriona_scanner_incremental_plan_tests
   ${PROJECT_SOURCE_DIR}/src/scanner/lrc_parser.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/path_utils.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/playlist_tree_builder.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/folder_thumbnail_resolver.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/worker_pool.cpp
   ${PROJECT_SOURCE_DIR}/src/logging/logging.cpp
@@ -1333,6 +1335,21 @@ target_link_libraries(seriona_scanner_cue_parsing_tests PRIVATE
 )
 seriona_enable_warnings(seriona_scanner_cue_parsing_tests)
 add_test(NAME seriona.scanner.cue_parsing COMMAND seriona_scanner_cue_parsing_tests)
+
+add_executable(seriona_scanner_folder_thumbnail_tests
+  scanner/folder_thumbnail_tests.cpp
+)
+target_compile_definitions(seriona_scanner_folder_thumbnail_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_include_directories(seriona_scanner_folder_thumbnail_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_link_libraries(seriona_scanner_folder_thumbnail_tests PRIVATE
+  seriona_scanner
+)
+seriona_enable_warnings(seriona_scanner_folder_thumbnail_tests)
+add_test(NAME seriona.scanner.folder_thumbnail COMMAND seriona_scanner_folder_thumbnail_tests)
 
 add_test(NAME seriona.logging COMMAND seriona_logging_tests)
 add_test(NAME seriona.runtime_paths COMMAND seriona_runtime_paths_tests)

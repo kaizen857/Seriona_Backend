@@ -191,6 +191,7 @@ add_library(seriona_scanner STATIC
   src/scanner/lrc_parser.cpp
   src/scanner/path_utils.cpp
   src/scanner/playlist_tree_builder.cpp
+  src/scanner/folder_thumbnail_resolver.cpp
   src/scanner/tag_reader_metadata_adapter.cpp
   src/scanner/scanner_module.cpp
   src/scanner/worker_pool.cpp

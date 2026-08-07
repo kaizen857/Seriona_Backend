@@ -106,6 +106,13 @@ public:
                                                   std::string contentHash,
                                                   std::optional<TagUserStats> cachedUserStats,
                                                   bool externalLyricsOverrideActive);
+// 文件夹封面导出（文件夹缩略图 case 1 的生产 seam 核心）：
+// 调 TagReader::ExportFolderCover，显式 ThumbnailOnly + Ignore（与 thumbnailOnlyRequest 同策略），
+// 只产出缩略图不写全尺寸 artwork；thumbnailPath 为空映射为 nullopt。API 契约不抛错。
+[[nodiscard]] std::optional<std::filesystem::path> exportFolderCoverThumbnail(
+    const std::filesystem::path& folderPath,
+    const std::filesystem::path& coverExportDir);
+
 [[nodiscard]] std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
                                                                  const std::vector<std::filesystem::path>& paths,
                                                                  const std::filesystem::path& coverExportDir,

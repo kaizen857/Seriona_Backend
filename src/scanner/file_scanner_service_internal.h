@@ -3,6 +3,8 @@
 #include "seriona/scanner/file_scanner_service.h"
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
 
+#include "folder_thumbnail_resolver.h"
+
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -55,6 +57,9 @@ struct FileScannerServiceDependencies {
   std::shared_ptr<FolderWatcherFactory> watcherFactory;
   std::filesystem::path databasePath;
   std::filesystem::path coverExportDir;
+  // 文件夹缩略图导出 seam：null 时 orchestrator 装配生产 adapter（TagReader::ExportFolderCover，
+  // ThumbnailOnly + Ignore）；测试注入 fake 断言接线。
+  FolderThumbnailExportSeam folderThumbnailSeam;
   std::chrono::milliseconds watcherDebounce{50};
 };
 

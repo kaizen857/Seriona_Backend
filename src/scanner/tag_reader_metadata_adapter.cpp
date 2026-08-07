@@ -194,4 +194,17 @@ std::vector<RawTagMetadata> readCueSheet(const std::filesystem::path& cuePath,
   return ProductionTagMetadataReader{}.readCueSheet(thumbnailOnlyRequest(cuePath, coverExportDir));
 }
 
+std::optional<std::filesystem::path> exportFolderCoverThumbnail(const std::filesystem::path& folderPath,
+                                                                const std::filesystem::path& coverExportDir) {
+  CoverProcessingOptions options;
+  options.mode = CoverProcessingOptions::CoverProcessingMode::ThumbnailOnly;
+  options.failurePolicy = CoverProcessingOptions::CoverFailurePolicy::Ignore;
+  const auto tag = TagReader::ExportFolderCover(folderPath.generic_string(), coverExportDir.generic_string(), options);
+  const auto thumbnail = tag.thumbnailPath();
+  if (thumbnail.empty()) {
+    return std::nullopt;
+  }
+  return std::filesystem::path{thumbnail};
+}
+
 }

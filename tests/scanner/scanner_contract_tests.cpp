@@ -145,6 +145,23 @@ TEST_CASE("playlist nodes distinguish structural and track-like kinds") {
   CHECK(*directory.parentNodeId == root.nodeId);
   REQUIRE(track.parentNodeId.has_value());
   CHECK(*track.parentNodeId == directory.nodeId);
+
+  // node-level thumbnailPath：默认空；仅 Directory 节点使用，填充语义由 resolver（任务 6/7）落实
+  CHECK_FALSE(root.thumbnailPath.has_value());
+  CHECK_FALSE(directory.thumbnailPath.has_value());
+  CHECK_FALSE(track.thumbnailPath.has_value());
+}
+
+TEST_CASE("playlist node thumbnail path is settable without touching other fields") {
+  using namespace seriona::scanner;
+
+  PlaylistNode directory{};
+  directory.kind = PlaylistNodeKind::Directory;
+  directory.thumbnailPath = "folder.png";
+  CHECK(directory.thumbnailPath.has_value());
+  CHECK(*directory.thumbnailPath == "folder.png");
+  CHECK_FALSE(directory.song.has_value());
+  CHECK(directory.childNodeIds.empty());
 }
 
 TEST_CASE("scanner events keep declared type and payload alternative consistent") {

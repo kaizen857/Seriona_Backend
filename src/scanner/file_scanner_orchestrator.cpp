@@ -962,6 +962,7 @@ public:
   explicit OrchestratedFileScannerService(FileScannerServiceDependencies dependencies)
       : metadataReader_(std::move(dependencies.metadataReader)), databasePath_(std::move(dependencies.databasePath)),
         coverExportDir_(std::move(dependencies.coverExportDir)), watcherFactory_(std::move(dependencies.watcherFactory)),
+        folderThumbnailSeam_(std::move(dependencies.folderThumbnailSeam)),
         watcherDebounce_(dependencies.watcherDebounce) {
     if (!metadataReader_) {
       metadataReader_ = std::make_shared<ProductionTagMetadataReader>();
@@ -974,6 +975,11 @@ public:
     }
     if (coverExportDir_.empty()) {
       coverExportDir_ = defaultCoverExportDir();
+    }
+    if (!folderThumbnailSeam_) {
+      folderThumbnailSeam_ = [this](const std::filesystem::path& folderPath) {
+        return exportFolderCoverThumbnail(folderPath, coverExportDir_);
+      };
     }
     spdlog::info("scanner configured: database={} artwork={}", databasePath_.generic_string(),
                  coverExportDir_.generic_string());
@@ -1101,6 +1107,9 @@ public:
       builder.addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
     }
     auto published = builder.publish();
+    // 文件夹缩略图解析：publish 之后、快照锁之外 —— seam（TagReader 导出写缓存）的 I/O 不持锁；
+    // 单文件夹失败在 resolver 内隔离（回退树内兜底/空），不阻断扫描、不新增 error 事件。
+    resolveFolderThumbnails(published, allSongs);
     {
       std::scoped_lock lock{mutex_};
       snapshot_ = published;
@@ -1281,10 +1290,115 @@ private:
 	      ExternalLyricsCacheAction externalLyricsCacheAction{ExternalLyricsCacheAction::None};
 	    };
 
-	    std::vector<PublishedSong> songs;
-	    std::vector<ScannerError> errors;
-	    bool cancelled{false};
-	  };
+    std::vector<PublishedSong> songs;
+    std::vector<ScannerError> errors;
+    bool cancelled{false};
+  };
+
+  // 扫描收尾：为快照中全部非根 Directory 节点解析 node-level 缩略图（填 thumbnailPath）。
+  // 相对路径由 displayName 父链重建（builder 保证 Directory displayName == relativePath 末段）；
+  // 物理目录 = 歌曲物理路径反推的根目录 + 相对路径；根节点跳过（恒空）。
+  // seam 的导出 I/O 在此发生，调用点在快照锁之外；失败由 resolver 隔离。
+  void resolveFolderThumbnails(PlaylistTreeSnapshot& snapshot,
+                               const std::vector<RootResult::PublishedSong>& songs) {
+    if (!snapshot.rootNodeId.has_value() || snapshot.nodes.empty()) {
+      return;
+    }
+    std::unordered_map<std::string, std::filesystem::path> physicalRootByRelPrefix;
+    for (const auto& publishedSong : songs) {
+      const auto& relative = publishedSong.treeRelativePath;
+      const auto& physical = publishedSong.song.metadata.filePath;
+      if (relative.empty() || physical.empty() || !physical.is_absolute()) {
+        continue;
+      }
+      std::vector<std::string> components;
+      for (const auto& component : relative) {
+        components.push_back(component.generic_string());
+      }
+      if (components.empty()) {
+        continue;
+      }
+      auto root = physical;
+      for (std::size_t index = 0; index < components.size(); ++index) {
+        root = root.parent_path();
+      }
+      std::filesystem::path prefix;
+      for (const auto& component : components) {
+        prefix /= component;
+        physicalRootByRelPrefix.emplace(prefix.lexically_normal().generic_string(), root);
+      }
+    }
+
+    std::unordered_map<std::string, PlaylistNode*> nodeById;
+    nodeById.reserve(snapshot.nodes.size());
+    for (auto& node : snapshot.nodes) {
+      nodeById.emplace(node.nodeId, &node);
+    }
+
+    for (auto& node : snapshot.nodes) {
+      if (node.kind != PlaylistNodeKind::Directory) {
+        continue;
+      }
+      std::filesystem::path relativePath;
+      {
+        std::vector<std::string> names;
+        const auto* cursor = &node;
+        while (cursor->nodeId != *snapshot.rootNodeId) {
+          names.push_back(cursor->displayName);
+          if (!cursor->parentNodeId.has_value()) {
+            break;
+          }
+          const auto parentIterator = nodeById.find(*cursor->parentNodeId);
+          if (parentIterator == nodeById.end()) {
+            break;
+          }
+          cursor = parentIterator->second;
+        }
+        for (auto iterator = names.rbegin(); iterator != names.rend(); ++iterator) {
+          relativePath /= *iterator;
+        }
+      }
+      const auto relKey = relativePath.lexically_normal().generic_string();
+      const auto rootIterator = physicalRootByRelPrefix.find(relKey);
+      if (rootIterator == physicalRootByRelPrefix.end()) {
+        continue;
+      }
+      const auto physicalDirectory = rootIterator->second / relativePath;
+
+      std::vector<FolderThumbnailCandidate> candidates;
+      const std::function<void(const PlaylistNode&)> collectDescendants = [&](const PlaylistNode& parent) {
+        for (const auto& childId : parent.childNodeIds) {
+          const auto childIterator = nodeById.find(childId);
+          if (childIterator == nodeById.end()) {
+            continue;
+          }
+          const auto& child = *childIterator->second;
+          if (child.kind == PlaylistNodeKind::Track) {
+            if (!child.song.has_value() || child.song->filePath.empty()) {
+              continue;
+            }
+            FolderThumbnailCandidate candidate;
+            candidate.filePath = child.song->filePath;
+            const auto trackDirectory = child.song->filePath.parent_path();
+            const auto relativeDirectory = trackDirectory.lexically_relative(physicalDirectory);
+            candidate.relativeDirectory = (relativeDirectory.empty() || relativeDirectory == std::filesystem::path{"."})
+                                              ? std::string{}
+                                              : relativeDirectory.generic_string();
+            candidate.thumbnailPath = child.song->thumbnailPath;
+            candidates.push_back(std::move(candidate));
+          } else if (child.kind == PlaylistNodeKind::Directory) {
+            collectDescendants(child);
+          }
+        }
+      };
+      collectDescendants(node);
+
+      const auto resolved = resolveFolderThumbnail(physicalDirectory, candidates, folderThumbnailSeam_);
+      if (resolved.has_value()) {
+        node.thumbnailPath = resolved->generic_string();
+      }
+    }
+  }
 
   struct AudioReconcileTask {
     std::filesystem::path path;
@@ -2047,6 +2161,7 @@ private:
   std::filesystem::path databasePath_;
   std::filesystem::path coverExportDir_;
   std::shared_ptr<FolderWatcherFactory> watcherFactory_;
+  FolderThumbnailExportSeam folderThumbnailSeam_;
   std::chrono::milliseconds watcherDebounce_{50};
   PlaylistTreeSnapshot snapshot_{};
   mutable std::mutex mutex_;

@@ -136,6 +136,8 @@ struct PlaylistNode {
   std::string displayName;
   std::optional<SongMetadata> song;
   std::vector<std::string> childNodeIds{};
+  // node-level：仅 Directory 节点使用（文件夹缩略图），Track 节点留空（song 内已有 song-level thumbnailPath）
+  std::optional<std::string> thumbnailPath;
 };
 
 struct PlaylistTreeSnapshot {

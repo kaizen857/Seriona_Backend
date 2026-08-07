@@ -63,6 +63,33 @@ private:
   mutable std::mutex mutex_;
 };
 
+class FakeFolderThumbnailSeam {
+public:
+  void setResult(std::filesystem::path folder, std::optional<std::filesystem::path> result) {
+    std::lock_guard lock{mutex_};
+    results_[std::move(folder)] = std::move(result);
+  }
+
+  [[nodiscard]] FolderThumbnailExportSeam makeSeam() {
+    return [this](const std::filesystem::path& folder) -> std::optional<std::filesystem::path> {
+      std::lock_guard lock{mutex_};
+      calledFolders.push_back(folder);
+      const auto iterator = results_.find(folder);
+      return iterator == results_.end() ? std::nullopt : iterator->second;
+    };
+  }
+
+  [[nodiscard]] std::vector<std::filesystem::path> called() const {
+    std::lock_guard lock{mutex_};
+    return calledFolders;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::vector<std::filesystem::path> calledFolders;
+  std::map<std::filesystem::path, std::optional<std::filesystem::path>> results_;
+};
+
 class ScannerEventLog {
 public:
   void push(ScannerEvent event) {
@@ -168,6 +195,16 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
                                                                .coverExportDir = temp.path() / "covers"});
 }
 
+[[nodiscard]] std::shared_ptr<FileScannerService> makeServiceWithSeam(test::TempScannerRoot& temp,
+                                                                      std::shared_ptr<FakeMetadataReader> reader,
+                                                                      FolderThumbnailExportSeam seam) {
+  return makeFileScannerService(FileScannerServiceDependencies{.metadataReader = std::move(reader),
+                                                               .watcherFactory = nullptr,
+                                                               .databasePath = temp.dbPath(),
+                                                               .coverExportDir = temp.path() / "covers",
+                                                               .folderThumbnailSeam = std::move(seam)});
+}
+
 [[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
   return std::filesystem::path{temp.dbPath().generic_string() + ".scan-roots.sqlite"};
 }
@@ -222,6 +259,28 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
            right.song->offset.value_or(std::chrono::milliseconds{-1});
   });
   return nodes;
+}
+
+[[nodiscard]] const PlaylistNode* directoryNodeByDisplayName(const PlaylistTreeSnapshot& snapshot,
+                                                             const std::string& displayName) {
+  for (const auto& node : snapshot.nodes) {
+    if (node.kind == PlaylistNodeKind::Directory && node.displayName == displayName) {
+      return &node;
+    }
+  }
+  return nullptr;
+}
+
+[[nodiscard]] const PlaylistNode* rootNodeOf(const PlaylistTreeSnapshot& snapshot) {
+  if (!snapshot.rootNodeId.has_value()) {
+    return nullptr;
+  }
+  for (const auto& node : snapshot.nodes) {
+    if (node.nodeId == *snapshot.rootNodeId) {
+      return &node;
+    }
+  }
+  return nullptr;
 }
 
 [[nodiscard]] const SongMetadata& songByPath(const std::vector<SongMetadata>& songs, const std::filesystem::path& path) {
@@ -926,6 +985,150 @@ TEST_CASE("scanner incremental e2e hides cached cue source audio before worker s
   }));
   CHECK(songByPath(songs, standalone).title == "Bonus Track");
   CHECK(reader->readCount() == fullReadCount);
+}
+
+TEST_CASE("scanner e2e resolves folder thumbnails after full scan") {
+  test::TempScannerRoot temp{"scanner-folder-thumbnail-full"};
+  const auto folderA = temp.path() / "A";
+  const auto folderB = temp.path() / "B";
+  const auto folderBZ = folderB / "z";
+  const auto folderC = temp.path() / "C";
+  std::filesystem::create_directories(folderA);
+  std::filesystem::create_directories(folderBZ);
+  std::filesystem::create_directories(folderC);
+
+  const auto aTrack1 = test::writeAudioFixture(folderA, "01-a.flac");
+  const auto aTrack2 = test::writeAudioFixture(folderA, "02-b.flac");
+  const auto bTrack = test::writeAudioFixture(folderB, "01-b.flac");
+  const auto cTrack = test::writeAudioFixture(folderBZ, "03-c.flac");
+  const auto dTrack = test::writeAudioFixture(folderC, "01-d.flac");
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  auto aOne = rawMetadata("A One");
+  aOne.thumbnailPath = temp.path() / "art-a1.png";
+  reader->put(aTrack1, aOne);
+  auto aTwo = rawMetadata("A Two");
+  aTwo.thumbnailPath = temp.path() / "art-a2.png";
+  reader->put(aTrack2, aTwo);
+  auto bOne = rawMetadata("B One");
+  bOne.thumbnailPath = temp.path() / "art-b.png";
+  reader->put(bTrack, bOne);
+  auto cOne = rawMetadata("C One");
+  cOne.thumbnailPath = temp.path() / "art-c.png";
+  reader->put(cTrack, cOne);
+  reader->put(dTrack, rawMetadata("D One"));
+
+  auto seam = std::make_shared<FakeFolderThumbnailSeam>();
+  const auto exportedA = temp.path() / "covers" / "exported-a.png";
+  seam->setResult(folderA, exportedA);
+  seam->setResult(folderB, std::nullopt);
+  seam->setResult(folderBZ, std::nullopt);
+  seam->setResult(folderC, std::nullopt);
+
+  auto service = makeServiceWithSeam(temp, reader, seam->makeSeam());
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto result = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full,
+                                     [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 5U; });
+  const auto& snapshot = result.snapshot;
+  REQUIRE(songsIn(snapshot).size() == 5U);
+
+  const auto* nodeA = directoryNodeByDisplayName(snapshot, "A");
+  const auto* nodeB = directoryNodeByDisplayName(snapshot, "B");
+  const auto* nodeBZ = directoryNodeByDisplayName(snapshot, "z");
+  const auto* nodeC = directoryNodeByDisplayName(snapshot, "C");
+  REQUIRE(nodeA != nullptr);
+  REQUIRE(nodeB != nullptr);
+  REQUIRE(nodeBZ != nullptr);
+  REQUIRE(nodeC != nullptr);
+
+  CHECK(nodeA->thumbnailPath == exportedA.generic_string());
+  CHECK(nodeB->thumbnailPath == (temp.path() / "art-b.png").generic_string());
+  CHECK(nodeBZ->thumbnailPath == (temp.path() / "art-c.png").generic_string());
+  CHECK_FALSE(nodeC->thumbnailPath.has_value());
+  const auto* root = rootNodeOf(snapshot);
+  REQUIRE(root != nullptr);
+  CHECK_FALSE(root->thumbnailPath.has_value());
+
+  const auto called = seam->called();
+  REQUIRE(called.size() == 4U);
+  CHECK(called[0] == folderA);
+  CHECK(called[1] == folderB);
+  CHECK(called[2] == folderBZ);
+  CHECK(called[3] == folderC);
+}
+
+TEST_CASE("scanner e2e resolves folder thumbnails consistently after incremental scan") {
+  test::TempScannerRoot temp{"scanner-folder-thumbnail-incremental"};
+  const auto folderA = temp.path() / "A";
+  const auto folderB = temp.path() / "B";
+  std::filesystem::create_directories(folderA);
+  std::filesystem::create_directories(folderB);
+
+  const auto aTrack = test::writeAudioFixture(folderA, "01-a.flac");
+  const auto bTrack = test::writeAudioFixture(folderB, "01-b.flac");
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  auto aMeta = rawMetadata("A One");
+  aMeta.thumbnailPath = temp.path() / "art-a.png";
+  reader->put(aTrack, aMeta);
+  auto bMeta = rawMetadata("B One");
+  bMeta.thumbnailPath = temp.path() / "art-b.png";
+  reader->put(bTrack, bMeta);
+
+  auto seam = std::make_shared<FakeFolderThumbnailSeam>();
+  const auto exportedA = temp.path() / "covers" / "exported-a.png";
+  seam->setResult(folderA, exportedA);
+  seam->setResult(folderB, std::nullopt);
+
+  auto service = makeServiceWithSeam(temp, reader, seam->makeSeam());
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full,
+                                   [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 2U; });
+  {
+    const auto& snapshot = full.snapshot;
+    const auto* nodeA = directoryNodeByDisplayName(snapshot, "A");
+    const auto* nodeB = directoryNodeByDisplayName(snapshot, "B");
+    REQUIRE(nodeA != nullptr);
+    REQUIRE(nodeB != nullptr);
+    CHECK(nodeA->thumbnailPath == exportedA.generic_string());
+    CHECK(nodeB->thumbnailPath == (temp.path() / "art-b.png").generic_string());
+    const auto* root = rootNodeOf(snapshot);
+    REQUIRE(root != nullptr);
+    CHECK_FALSE(root->thumbnailPath.has_value());
+    const auto called = seam->called();
+    REQUIRE(called.size() == 2U);
+    CHECK(called[0] == folderA);
+    CHECK(called[1] == folderB);
+  }
+
+  const auto added = test::writeAudioFixture(folderB, "00-aa.flac");
+  auto addedMeta = rawMetadata("B Earlier");
+  addedMeta.thumbnailPath = temp.path() / "art-aa.png";
+  reader->put(added, addedMeta);
+
+  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                          [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+  {
+    const auto& snapshot = incremental.snapshot;
+    REQUIRE(songsIn(snapshot).size() == 3U);
+    const auto* nodeA = directoryNodeByDisplayName(snapshot, "A");
+    const auto* nodeB = directoryNodeByDisplayName(snapshot, "B");
+    REQUIRE(nodeA != nullptr);
+    REQUIRE(nodeB != nullptr);
+    CHECK(nodeA->thumbnailPath == exportedA.generic_string());
+    CHECK(nodeB->thumbnailPath == (temp.path() / "art-aa.png").generic_string());
+    const auto* root = rootNodeOf(snapshot);
+    REQUIRE(root != nullptr);
+    CHECK_FALSE(root->thumbnailPath.has_value());
+    const auto called = seam->called();
+    REQUIRE(called.size() == 4U);
+    CHECK(called[2] == folderA);
+    CHECK(called[3] == folderB);
+  }
 }
 
 }

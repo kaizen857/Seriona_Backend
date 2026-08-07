@@ -55,7 +55,7 @@ inc/seriona/         稳定公共契约（按模块分组；实现导向头不�
 src/audio/           播放核心（service/state_machine/device/buffer/clock/events）、
                      ffmpeg 解码与滤镜、waveform 波形生成（scalar/simd/avx2/strategy_a/b）
 src/scanner/         扫描服务/编排器/worker 池、cache/（SQLite v3）、哈希与身份、
-                     路径分类、播放列表树、TagReader 适配
+                     路径分类、播放列表树、文件夹缩略图解析、TagReader 适配
 src/metadata/        平台元数据分享（backend 抽象、MPRIS Linux 实现、Windows 占位）
 src/control/         媒体控制器、事件循环、状态归约器、播放上下文构建、封面解析、订阅存储
 src/app/             应用日志与运行时路径（亦编入 seriona_app）
@@ -83,13 +83,14 @@ docs/、*.md          项目演进记录文档，非事实来源
 ### 4.2 seriona_scanner（扫描与缓存）
 
 - `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, watcherDebounce}`。
-- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 聚合构建 `PlaylistTreeSnapshot` → 发布事件。
+- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
 - 事件顺序：ScanStarted →（每 root：ScanError/FileScanned）→ ProgressUpdated（仅结束一次，无周期进度）→ PlaylistSnapshotUpdated → ScanCompleted；取消路径先发一条 code=Cancelled 的 ScanError 再发 ScanStopped。
 - 缓存：`SQLiteCache`，固定 v3 schema（`user_version=0` 初始化、非 0 非 3 抛 unsupported，无迁移桥）；5 张表 content/locations/lyrics/scan_roots/scan_errors + 8 个索引；WAL + `synchronous=NORMAL` + 64MB 页缓存；写事务 `BEGIN IMMEDIATE`、读写各持独立互斥锁（并发依赖 SQLite busy timeout 500ms）。**实际读写的是 `<databasePath>.scan-roots.sqlite` 独立文件**；传入的主库文件仅被打开初始化，扫描流程不读写。
 - 身份哈希：`computeContentId`（duration/title/artist 链式 XXH64）与 `computeLocationId`（路径/大小/mtime，CUE 轨道追加 offset/index）——实现经 `hash_utils.cpp` 文本包含 `song_identity.cpp` 进入生产库。目录树哈希：XXH3_128bits 流式 Merkle（只含文件名/类型/子哈希，跳过 `.lrc`）。
 - 并发配置：worker 数默认 `hardware_concurrency`，TagReader 并发默认同 worker 数；环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY` 覆盖，`SERIONA_SCANNER_DISABLE_CONCURRENCY=1` 强制串行。
 - 自动重扫：wtr watcher（vendored 头文件库）→ 50ms 去抖 → 增量扫描。
 - TagReader 适配：`TagReader::Read`/`ReadCueSheet`（全局命名空间外部库）；适配头直接包含 `<TagReader.hpp>` 并暴露其类型，属实现导向头。
+- 文件夹缩略图解析（scanner-internal `folder_thumbnail_resolver.{h,cpp}`，不进 `inc/seriona/` 稳定边界）：扫描收尾阶段为非根 Directory 节点解析 node-level 缩略图，回填 `PlaylistNode::thumbnailPath` 随快照下发（Track 节点该字段留空，歌曲缩略图走 `SongMetadata::thumbnailPath`）。case 1 经导出 seam（生产侧由 `exportFolderCoverThumbnail` 装配 `TagReader::ExportFolderCover`，ThumbnailOnly+Ignore，只查目录自身）导出封面；case 2 回退取后代歌曲中已解析缩略图的第一首（(filename, relativeDirectory) 字节序升序）；根目录恒空；确定性全序比较，seam 异常被吞掉，单文件夹失败不阻断扫描。
 - 测试专用：`scan_scheduler.{h,cpp}`（通用任务调度器）不编译进任何库，仅测试目标直接编译。
 
 ### 4.3 seriona_metadata（平台媒体集成）
@@ -155,7 +156,7 @@ main(argc=2, 路径存在)                       main.cpp
 
 ### 7.2 扫描流程
 
-手动 `scanLibrary` 或 watcher 事件（50ms 去抖）→ 扫描队列 → 单扫描线程：每 root 计算目录树哈希，与 `scan-roots.sqlite` 中 `CachedScanRoot` 比对决定全量/增量；增量时逐文件用 `computeLocationId`（路径/大小/mtime）判定 added/changed/unchanged/deleted，unchanged 走缓存直灌（含 CUE 轨道与歌词），changed/added 构造 worker 任务并发读元数据；结束后歌词协调（外置 LRC 哈希比对/重解析/清除）→ 缓存写回（单事务，失败整体回滚）→ `PlaylistTreeBuilder` 聚合 → `PlaylistSnapshotUpdated`。
+手动 `scanLibrary` 或 watcher 事件（50ms 去抖）→ 扫描队列 → 单扫描线程：每 root 计算目录树哈希，与 `scan-roots.sqlite` 中 `CachedScanRoot` 比对决定全量/增量；增量时逐文件用 `computeLocationId`（路径/大小/mtime）判定 added/changed/unchanged/deleted，unchanged 走缓存直灌（含 CUE 轨道与歌词），changed/added 构造 worker 任务并发读元数据；结束后歌词协调（外置 LRC 哈希比对/重解析/清除）→ 缓存写回（单事务，失败整体回滚）→ `PlaylistTreeBuilder` 聚合 → `resolveFolderThumbnails` 为非根 Directory 节点解析 node-level 缩略图（`folder_thumbnail_resolver`：生产 seam 经 `exportFolderCoverThumbnail` 接 `TagReader::ExportFolderCover` 导出，回退取后代歌曲已解析缩略图，根目录恒空）→ `PlaylistSnapshotUpdated`。
 
 ### 7.3 元数据分享（Linux MPRIS）
 
