@@ -5,6 +5,7 @@
 
 #include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
+#include "seriona/scanner/playlist_tree_builder.h"
 
 #include <doctest.h>
 
@@ -165,6 +166,15 @@ public:
   CacheWriteObserverGuard& operator=(const CacheWriteObserverGuard&) = delete;
 };
 
+class TreeBuilderObserverGuard {
+public:
+  explicit TreeBuilderObserverGuard(TreeBuilderObserver observer) { setTreeBuilderObserver(std::move(observer)); }
+  ~TreeBuilderObserverGuard() { clearTreeBuilderObserver(); }
+
+  TreeBuilderObserverGuard(const TreeBuilderObserverGuard&) = delete;
+  TreeBuilderObserverGuard& operator=(const TreeBuilderObserverGuard&) = delete;
+};
+
 struct TimedSnapshot {
   PlaylistTreeSnapshot snapshot;
   std::chrono::milliseconds elapsed{0};
@@ -281,6 +291,150 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
     }
   }
   return nullptr;
+}
+
+[[nodiscard]] PlaylistNode normalizeForTreeDiff(const PlaylistNode& node) {
+  auto copy = node;
+  copy.thumbnailPath.reset();
+  return copy;
+}
+
+void sortNodesForTreeDiff(std::vector<PlaylistNode>& nodes) {
+  std::ranges::sort(nodes, [](const PlaylistNode& left, const PlaylistNode& right) {
+    if (left.kind != right.kind) {
+      return left.kind < right.kind;
+    }
+    return left.nodeId < right.nodeId;
+  });
+}
+
+[[nodiscard]] bool lyricsEquivalent(const std::vector<LyricLine>& left, const std::vector<LyricLine>& right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    if (left[index].timestamp != right[index].timestamp || left[index].text != right[index].text) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// song 元数据等价性：逐字段比较，排除 thumbnailPath（缩略图路径属 orchestrator 层职责）。
+[[nodiscard]] bool songMetadataEquivalent(const SongMetadata& left, const SongMetadata& right) {
+  return left.trackId == right.trackId && left.filePath == right.filePath && left.title == right.title &&
+         left.artist == right.artist && left.album == right.album && left.albumArtist == right.albumArtist &&
+         left.genre == right.genre && left.trackNumber == right.trackNumber && left.discNumber == right.discNumber &&
+         left.year == right.year && left.sampleRate == right.sampleRate && left.bitDepth == right.bitDepth &&
+         left.channels == right.channels && left.fileSizeBytes == right.fileSizeBytes &&
+         left.fileMtime == right.fileMtime && left.contentHash == right.contentHash &&
+         left.effectiveLyricsSource == right.effectiveLyricsSource &&
+         lyricsEquivalent(left.effectiveLyrics, right.effectiveLyrics) &&
+         left.externalLyricsPath == right.externalLyricsPath && left.externalLyricsHash == right.externalLyricsHash &&
+         left.externalLyricsMtime == right.externalLyricsMtime && left.sourceFilePath == right.sourceFilePath &&
+         left.offset == right.offset && left.duration == right.duration && left.logicalTrackId == right.logicalTrackId &&
+         left.artworkPath == right.artworkPath;
+}
+
+// 树 diff == 全量重建等价性：比较 nodeId/kind/displayName/parentNodeId/childNodeIds/song 元数据，
+// 排除 node 级 thumbnailPath（由 orchestrator 层 resolveFolderThumbnails 解析，非 builder 职责）。
+[[nodiscard]] bool treesEquivalent(const PlaylistTreeSnapshot& left, const PlaylistTreeSnapshot& right) {
+  if (left.nodes.size() != right.nodes.size() || left.rootNodeId != right.rootNodeId) {
+    return false;
+  }
+  auto leftNodes = left.nodes;
+  auto rightNodes = right.nodes;
+  for (auto& node : leftNodes) {
+    node = normalizeForTreeDiff(node);
+  }
+  for (auto& node : rightNodes) {
+    node = normalizeForTreeDiff(node);
+  }
+  sortNodesForTreeDiff(leftNodes);
+  sortNodesForTreeDiff(rightNodes);
+  for (std::size_t index = 0; index < leftNodes.size(); ++index) {
+    const auto& leftNode = leftNodes[index];
+    const auto& rightNode = rightNodes[index];
+    if (leftNode.nodeId != rightNode.nodeId || leftNode.kind != rightNode.kind ||
+        leftNode.displayName != rightNode.displayName || leftNode.parentNodeId != rightNode.parentNodeId ||
+        leftNode.childNodeIds != rightNode.childNodeIds) {
+      return false;
+    }
+    if (leftNode.song.has_value() != rightNode.song.has_value()) {
+      return false;
+    }
+    if (leftNode.song.has_value() && !songMetadataEquivalent(*leftNode.song, *rightNode.song)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// 树一致性断言（"nodeId 三处同步"的核心检验）：每个有父引用的节点，其父存在且父的 childNodeIds
+// 包含本节点；每个 childNodeIds 里的子节点，其 parentNodeId 精确指向本节点。双向校验杜绝悬空引用。
+void requireNoDanglingReferences(const PlaylistTreeSnapshot& snapshot) {
+  std::map<std::string, const PlaylistNode*> nodesById;
+  for (const auto& node : snapshot.nodes) {
+    nodesById[node.nodeId] = &node;
+  }
+  for (const auto& node : snapshot.nodes) {
+    if (node.parentNodeId.has_value()) {
+      const auto parent = nodesById.find(*node.parentNodeId);
+      REQUIRE(parent != nodesById.end());
+      REQUIRE(std::ranges::find(parent->second->childNodeIds, node.nodeId) != parent->second->childNodeIds.end());
+    }
+    for (const auto& childId : node.childNodeIds) {
+      const auto child = nodesById.find(childId);
+      REQUIRE(child != nodesById.end());
+      REQUIRE(child->second->parentNodeId.has_value());
+      CHECK(*child->second->parentNodeId == node.nodeId);
+    }
+  }
+}
+
+// 把歌曲的 relativePath 与 metadata 中的路径派生字段按前缀改写（== oldPrefix 或 oldPrefix+"/" 边界，
+// 保留 "/"），供 renameSubtree 的"独立全量重建"等价性测试构造路径改写后的歌曲集。
+[[nodiscard]] PlaylistTreeSong rewriteTreeSongPaths(const PlaylistTreeSong& song,
+                                                    const std::string& oldPrefix,
+                                                    const std::string& newPrefix) {
+  const auto rewriteText = [&oldPrefix, &newPrefix](const std::string& text) {
+    if (text == oldPrefix) {
+      return newPrefix;
+    }
+    if (text.rfind(oldPrefix + "/", 0) == 0) {
+      return newPrefix + text.substr(oldPrefix.size());
+    }
+    return text;
+  };
+  PlaylistTreeSong out = song;
+  out.relativePath = std::filesystem::path{rewriteText(song.relativePath.generic_string())};
+  if (!song.metadata.filePath.empty()) {
+    out.metadata.filePath = std::filesystem::path{rewriteText(song.metadata.filePath.generic_string())};
+  }
+  if (!song.metadata.sourceFilePath.empty()) {
+    out.metadata.sourceFilePath = std::filesystem::path{rewriteText(song.metadata.sourceFilePath.generic_string())};
+  }
+  out.metadata.logicalTrackId = rewriteText(song.metadata.logicalTrackId);
+  out.metadata.trackId = rewriteText(song.metadata.trackId);
+  return out;
+}
+
+// 用快照中 Track 节点的歌曲数据做一次独立的全量重建（物理路径 - root 还原 relativePath）。
+[[nodiscard]] PlaylistTreeSnapshot rebuildSnapshotFrom(const PlaylistTreeSnapshot& snapshot,
+                                                       const std::filesystem::path& root) {
+  PlaylistTreeBuilder builder{"Library"};
+  for (const auto& node : snapshot.nodes) {
+    if (!node.song.has_value()) {
+      continue;
+    }
+    std::error_code error;
+    auto relative = std::filesystem::relative(node.song->filePath, root, error);
+    if (error || relative.empty()) {
+      relative = node.song->filePath.filename();
+    }
+    builder.addSong({.relativePath = relative.lexically_normal(), .metadata = *node.song});
+  }
+  return builder.publish();
 }
 
 [[nodiscard]] const SongMetadata& songByPath(const std::vector<SongMetadata>& songs, const std::filesystem::path& path) {
@@ -1129,6 +1283,455 @@ TEST_CASE("scanner e2e resolves folder thumbnails consistently after incremental
     CHECK(called[2] == folderA);
     CHECK(called[3] == folderB);
   }
+}
+
+TEST_CASE("scanner seeds long-lived tree builder member and replaces it on fallback rescan") {
+  test::TempScannerRoot temp{"scanner-tree-builder-seed"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  std::vector<TreeBuilderSeededSnapshot> observations;
+  {
+    TreeBuilderObserverGuard guard([&observations](const TreeBuilderSeededSnapshot& snapshot) {
+      observations.push_back(snapshot);
+    });
+
+    const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+      return songsIn(snapshot).size() == 2U;
+    });
+    REQUIRE(songsIn(full.snapshot).size() == 2U);
+    REQUIRE(observations.size() == 1U);
+    CHECK(observations.back().seeded);
+    CHECK(observations.back().generation == 1U);
+    CHECK(observations.back().songCount == 2U);
+
+    const auto fallback = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+      return songsIn(snapshot).size() == 2U;
+    });
+    REQUIRE(songsIn(fallback.snapshot).size() == 2U);
+    REQUIRE(observations.size() == 2U);
+    CHECK(observations.back().seeded);
+    CHECK(observations.back().generation == 2U);
+    CHECK(observations.back().songCount == 2U);
+  }
+
+  const auto finalSnapshot = service->snapshot();
+  CHECK(songsIn(finalSnapshot).size() == 2U);
+  const auto independent = rebuildSnapshotFrom(finalSnapshot, canonicalRootPath(temp.path()));
+  CHECK(treesEquivalent(finalSnapshot, independent));
+}
+
+TEST_CASE("scanner fallback rescan produces no duplicate tree and equals full rebuild") {
+  test::TempScannerRoot temp{"scanner-tree-builder-no-duplicate"};
+  const auto first = test::writeAudioFixture(temp.path(), "01-first.flac");
+  const auto second = test::writeAudioFixture(temp.path(), "02-second.flac");
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  reader->put(second, rawMetadata("Second"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 2U;
+  });
+  const auto fallback = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) {
+    return songsIn(snapshot).size() == 2U;
+  });
+
+  REQUIRE(songsIn(full.snapshot).size() == 2U);
+  REQUIRE(songsIn(fallback.snapshot).size() == 2U);
+  CHECK(treesEquivalent(full.snapshot, fallback.snapshot));
+
+  const auto root = canonicalRootPath(temp.path());
+  const auto independent = rebuildSnapshotFrom(full.snapshot, root);
+  CHECK(treesEquivalent(fallback.snapshot, independent));
+
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(root);
+  CHECK(locations.size() == 2U);
+}
+
+[[nodiscard]] SongMetadata treeSong(std::string title, std::filesystem::path path, std::chrono::milliseconds duration) {
+  SongMetadata metadata{};
+  metadata.title = std::move(title);
+  metadata.filePath = path;
+  metadata.sourceFilePath = path;
+  metadata.duration = duration;
+  metadata.logicalTrackId = path.generic_string();
+  return metadata;
+}
+
+[[nodiscard]] SongMetadata treeCueContainer(std::filesystem::path cuePath) {
+  SongMetadata metadata{};
+  metadata.filePath = cuePath;
+  metadata.logicalTrackId = cuePath.generic_string();
+  metadata.duration = std::chrono::milliseconds{0};
+  return metadata;
+}
+
+[[nodiscard]] SongMetadata treeCueTrack(std::string title,
+                                         std::filesystem::path cuePath,
+                                         std::filesystem::path sourceAudioPath,
+                                         std::uint32_t trackNumber,
+                                         std::string logicalTrackId) {
+  SongMetadata metadata{};
+  metadata.title = std::move(title);
+  metadata.filePath = cuePath;
+  metadata.sourceFilePath = std::move(sourceAudioPath);
+  metadata.offset = std::chrono::seconds{static_cast<int>(trackNumber - 1U) * 60};
+  metadata.duration = std::chrono::seconds{60};
+  metadata.trackNumber = trackNumber;
+  metadata.logicalTrackId = std::move(logicalTrackId);
+  metadata.trackId = metadata.logicalTrackId;
+  return metadata;
+}
+
+TEST_CASE("playlist tree builder removeSubtree drops directory subtree including cue logical-track keys") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addDirectory({.relativePath = "music", .displayName = "music"});
+  builder.addSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+  builder.addSong({.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Outro", "music/live.cue", "music/live.flac", 2U, "custom_album_logical_id")});
+  builder.addSong({.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})});
+  builder.addSong({.relativePath = "other/keep.flac", .metadata = treeSong("Keep", "other/keep.flac", std::chrono::seconds{90})});
+
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 6U);
+  REQUIRE(std::ranges::find_if(before.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:custom_album_logical_id"; }) != before.nodes.end());
+
+  CHECK(builder.removeSubtree("music"));
+  const auto after = builder.publish();
+
+  const auto songs = songsIn(after);
+  REQUIRE(songs.size() == 2U);
+  CHECK(songByPath(songs, "loose.flac").title == "Loose");
+  CHECK(songByPath(songs, "other/keep.flac").title == "Keep");
+  CHECK(std::ranges::none_of(after.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == "dir:music" || node.nodeId.starts_with("dir:music/") ||
+           node.nodeId.starts_with("track:music/");
+  }));
+  CHECK(std::ranges::none_of(after.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == "track:custom_album_logical_id";
+  }));
+  const auto* root = rootNodeOf(after);
+  REQUIRE(root != nullptr);
+  REQUIRE(root->childNodeIds.size() == 2U);
+  CHECK(root->childNodeIds[0] == "dir:other");
+  CHECK(root->childNodeIds[1] == "track:loose.flac");
+  const auto stats = builder.stats();
+  CHECK(stats.songCount == 2U);
+  CHECK(stats.totalDuration == std::chrono::seconds{120});
+  CHECK_FALSE(builder.removeSubtree("music"));
+}
+
+TEST_CASE("playlist tree builder removeSubtree on a track prunes emptied parent directory") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "artist/alpha.flac", .metadata = treeSong("Alpha", "artist/alpha.flac", std::chrono::seconds{10})});
+  builder.addSong({.relativePath = "artist/beta.flac", .metadata = treeSong("Beta", "artist/beta.flac", std::chrono::seconds{20})});
+  builder.addSong({.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})});
+
+  CHECK(builder.removeSubtree("artist/alpha.flac"));
+  auto after = builder.publish();
+  CHECK(songsIn(after).size() == 2U);
+  CHECK(std::ranges::none_of(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:artist/alpha.flac"; }));
+  REQUIRE(directoryNodeByDisplayName(after, "artist") != nullptr);
+  const auto* root = rootNodeOf(after);
+  REQUIRE(root != nullptr);
+  REQUIRE(root->childNodeIds.size() == 2U);
+  CHECK(root->childNodeIds[0] == "dir:artist");
+  CHECK(root->childNodeIds[1] == "track:loose.flac");
+
+  CHECK(builder.removeSubtree("artist/beta.flac"));
+  after = builder.publish();
+  CHECK(songsIn(after).size() == 1U);
+  CHECK(directoryNodeByDisplayName(after, "artist") == nullptr);
+  const auto* rootAfter = rootNodeOf(after);
+  REQUIRE(rootAfter != nullptr);
+  REQUIRE(rootAfter->childNodeIds.size() == 1U);
+  CHECK(rootAfter->childNodeIds[0] == "track:loose.flac");
+  CHECK(builder.stats().songCount == 1U);
+
+  CHECK_FALSE(builder.removeSubtree("artist/ghost.flac"));
+  CHECK_FALSE(builder.removeSubtree("."));
+}
+
+TEST_CASE("playlist tree builder removeSubtree result equals independent full rebuild from reduced song set") {
+  const std::vector<PlaylistTreeSong> fullSet = {
+      {.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})},
+      {.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})},
+      {.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")},
+      {.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")},
+      {.relativePath = "music/live.cue", .metadata = treeCueTrack("Outro", "music/live.cue", "music/live.flac", 2U, "custom_album_logical_id")},
+      {.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})},
+      {.relativePath = "other/keep.flac", .metadata = treeSong("Keep", "other/keep.flac", std::chrono::seconds{90})},
+  };
+
+  PlaylistTreeBuilder builder{"Library"};
+  for (const auto& entry : fullSet) {
+    builder.addSong(entry);
+  }
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 6U);
+
+  CHECK(builder.removeSubtree("music"));
+  const auto after = builder.publish();
+
+  PlaylistTreeBuilder expected{"Library"};
+  for (const auto& entry : fullSet) {
+    if (entry.relativePath.generic_string().starts_with("music/")) {
+      continue;
+    }
+    expected.addSong(entry);
+  }
+  const auto expectedSnapshot = expected.publish();
+  REQUIRE(songsIn(expectedSnapshot).size() == 2U);
+  CHECK(treesEquivalent(after, expectedSnapshot));
+}
+
+TEST_CASE("playlist tree builder renameSubtree rewrites subtree keys node ids and parent references") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addDirectory({.relativePath = "music", .displayName = "music"});
+  builder.addSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+  builder.addSong({.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")});
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Outro", "music/live.cue", "music/live.flac", 2U, "custom_album_logical_id")});
+  builder.addSong({.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})});
+
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 5U);
+  REQUIRE(std::ranges::find_if(before.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:music/live.cue"; }) != before.nodes.end());
+
+  CHECK(builder.renameSubtree("music", "pop"));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  const auto songs = songsIn(after);
+  REQUIRE(songs.size() == 5U);
+  CHECK(songByPath(songs, "pop/01.flac").title == "One");
+  CHECK(songByPath(songs, "pop/02.flac").title == "Two");
+  CHECK(songByPath(songs, "loose.flac").title == "Loose");
+  CHECK(songByPath(songs, "pop/01.flac").filePath == "pop/01.flac");
+  CHECK(songByPath(songs, "pop/01.flac").logicalTrackId == "pop/01.flac");
+  auto cueNodes = songNodesByPath(after, "pop/live.cue");
+  REQUIRE(cueNodes.size() == 2U);
+  CHECK(cueNodes[0].song->title == "Intro");
+  CHECK(cueNodes[0].song->logicalTrackId == "pop/live.cue#track0");
+  CHECK(cueNodes[0].song->trackId == "pop/live.cue#track0");
+  CHECK(cueNodes[0].song->sourceFilePath == "pop/live.flac");
+  CHECK(cueNodes[1].song->title == "Outro");
+  CHECK(cueNodes[1].song->logicalTrackId == "custom_album_logical_id");
+  CHECK(cueNodes[1].song->sourceFilePath == "pop/live.flac");
+
+  CHECK(std::ranges::none_of(after.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == "dir:music" || node.nodeId.starts_with("dir:music/") || node.nodeId.starts_with("track:music/");
+  }));
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:pop"; }) != after.nodes.end());
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:pop/live.cue"; }) != after.nodes.end());
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:pop/01.flac"; }) != after.nodes.end());
+  const auto introIterator = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:pop/live.cue#track0"; });
+  REQUIRE(introIterator != after.nodes.end());
+  CHECK(introIterator->parentNodeId == "dir:pop/live.cue");
+  const auto outroIterator = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:custom_album_logical_id"; });
+  REQUIRE(outroIterator != after.nodes.end());
+  CHECK(outroIterator->parentNodeId == "dir:pop/live.cue");
+
+  CHECK(builder.stats().songCount == 5U);
+  CHECK(builder.stats().totalDuration == std::chrono::seconds{60 + 60 + 60 + 60 + 30});
+
+  CHECK_FALSE(builder.renameSubtree("pop", "pop"));
+  CHECK_FALSE(builder.renameSubtree("ghost", "phantom"));
+  CHECK_FALSE(builder.renameSubtree(".", "root"));
+}
+
+TEST_CASE("playlist tree builder renameSubtree result equals independent full rebuild from path-rewritten song set") {
+  const std::vector<PlaylistTreeSong> fullSet = {
+      {.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})},
+      {.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})},
+      {.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")},
+      {.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")},
+      {.relativePath = "music/live.cue", .metadata = treeCueTrack("Outro", "music/live.cue", "music/live.flac", 2U, "custom_album_logical_id")},
+      {.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})},
+      {.relativePath = "music/sub/keep.flac", .metadata = treeSong("Keep", "music/sub/keep.flac", std::chrono::seconds{90})},
+  };
+
+  PlaylistTreeBuilder builder{"Library"};
+  for (const auto& entry : fullSet) {
+    builder.addSong(entry);
+  }
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 6U);
+
+  CHECK(builder.renameSubtree("music", "pop"));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  PlaylistTreeBuilder expected{"Library"};
+  for (const auto& entry : fullSet) {
+    expected.addSong(rewriteTreeSongPaths(entry, "music", "pop"));
+  }
+  const auto expectedSnapshot = expected.publish();
+  REQUIRE(songsIn(expectedSnapshot).size() == 6U);
+  CHECK(treesEquivalent(after, expectedSnapshot));
+}
+
+TEST_CASE("playlist tree builder renameSubtree leaves sibling directory prefixes untouched") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "A/one.flac", .metadata = treeSong("A One", "A/one.flac", std::chrono::seconds{10})});
+  builder.addSong({.relativePath = "AB/two.flac", .metadata = treeSong("AB Two", "AB/two.flac", std::chrono::seconds{20})});
+  builder.addSong({.relativePath = "loose.flac", .metadata = treeSong("Loose", "loose.flac", std::chrono::seconds{30})});
+
+  CHECK(builder.renameSubtree("A", "D"));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  const auto songs = songsIn(after);
+  REQUIRE(songs.size() == 3U);
+  CHECK(songByPath(songs, "D/one.flac").title == "A One");
+  CHECK(songByPath(songs, "AB/two.flac").title == "AB Two");
+  CHECK(songByPath(songs, "loose.flac").title == "Loose");
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:AB"; }) != after.nodes.end());
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:AB/two.flac"; }) != after.nodes.end());
+  CHECK(std::ranges::none_of(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:A" || node.nodeId.starts_with("track:A/"); }));
+}
+
+TEST_CASE("playlist tree builder renameSubtree creates intermediate directories when moving deeper") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+
+  CHECK(builder.renameSubtree("music", "nested/pop"));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  REQUIRE(songsIn(after).size() == 1U);
+  CHECK(songByPath(songsIn(after), "nested/pop/01.flac").title == "One");
+  const auto nestedIterator = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:nested"; });
+  REQUIRE(nestedIterator != after.nodes.end());
+  const auto popIterator = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:nested/pop"; });
+  REQUIRE(popIterator != after.nodes.end());
+  CHECK(popIterator->parentNodeId == nestedIterator->nodeId);
+  const auto* root = rootNodeOf(after);
+  REQUIRE(root != nullptr);
+  REQUIRE(std::ranges::find(root->childNodeIds, "dir:nested") != root->childNodeIds.end());
+}
+
+TEST_CASE("playlist tree builder renameSubtree prunes a directory emptied by moving its only child out") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "artist/alpha.flac", .metadata = treeSong("Alpha", "artist/alpha.flac", std::chrono::seconds{10})});
+
+  CHECK(builder.renameSubtree("artist/alpha.flac", "renamed.flac"));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  REQUIRE(songsIn(after).size() == 1U);
+  CHECK(songByPath(songsIn(after), "renamed.flac").title == "Alpha");
+  CHECK(directoryNodeByDisplayName(after, "artist") == nullptr);
+}
+
+TEST_CASE("playlist tree builder upsertSong inserts a new song node and creates its parent directory") {
+  PlaylistTreeBuilder builder{"Library"};
+  const bool inserted = builder.upsertSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+  CHECK(inserted);
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  REQUIRE(songsIn(after).size() == 1U);
+  CHECK(songByPath(songsIn(after), "music/01.flac").title == "One");
+  const auto* musicDir = directoryNodeByDisplayName(after, "music");
+  REQUIRE(musicDir != nullptr);
+  const auto trackIt = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/01.flac"; });
+  REQUIRE(trackIt != after.nodes.end());
+  CHECK(trackIt->parentNodeId == musicDir->nodeId);
+  CHECK(builder.stats().songCount == 1U);
+  CHECK(builder.stats().totalDuration == std::chrono::seconds{60});
+
+  PlaylistTreeBuilder expected{"Library"};
+  expected.addSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+  CHECK(treesEquivalent(after, expected.publish()));
+}
+
+TEST_CASE("playlist tree builder upsertSong updates existing song without duplicating node") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "music/01.flac", .metadata = treeSong("One", "music/01.flac", std::chrono::seconds{60})});
+  builder.addSong({.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})});
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 2U);
+  const auto beforeIt = std::ranges::find_if(before.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/01.flac"; });
+  REQUIRE(beforeIt != before.nodes.end());
+  const auto nodeIdBefore = beforeIt->nodeId;
+
+  auto updated = treeSong("One Updated", "music/01.flac", std::chrono::seconds{75});
+  const bool inserted = builder.upsertSong({.relativePath = "music/01.flac", .metadata = updated});
+  CHECK_FALSE(inserted);
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  REQUIRE(songsIn(after).size() == 2U);
+  CHECK(builder.stats().songCount == 2U);
+  CHECK(builder.stats().totalDuration == std::chrono::seconds{75 + 60});
+  const auto afterIt = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/01.flac"; });
+  REQUIRE(afterIt != after.nodes.end());
+  CHECK(afterIt->nodeId == nodeIdBefore);
+  CHECK(afterIt->displayName == "One Updated");
+  REQUIRE(afterIt->song.has_value());
+  CHECK(afterIt->song->title == "One Updated");
+  CHECK(afterIt->song->duration == std::chrono::seconds{75});
+
+  PlaylistTreeBuilder expected{"Library"};
+  expected.addSong({.relativePath = "music/01.flac", .metadata = updated});
+  expected.addSong({.relativePath = "music/02.flac", .metadata = treeSong("Two", "music/02.flac", std::chrono::seconds{60})});
+  CHECK(treesEquivalent(after, expected.publish()));
+}
+
+TEST_CASE("playlist tree builder upsertSong routes cue tracks into cue virtual directory without key conflict") {
+  PlaylistTreeBuilder builder{"Library"};
+  builder.addSong({.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")});
+  CHECK(builder.upsertSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")}));
+  SongMetadata composite{};
+  composite.filePath = "music/live.cue";
+  composite.sourceFilePath = "music/live.flac";
+  composite.offset = std::chrono::milliseconds{60000};
+  composite.duration = std::chrono::seconds{60};
+  composite.title = "Composite";
+  CHECK(builder.upsertSong({.relativePath = "music/live.cue", .metadata = composite}));
+
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+  REQUIRE(songsIn(after).size() == 2U);
+  const auto introIt = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/live.cue#track0"; });
+  REQUIRE(introIt != after.nodes.end());
+  CHECK(introIt->parentNodeId == "dir:music/live.cue");
+  const auto compositeIt = std::ranges::find_if(after.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/live.cue#music/live.flac@60000"; });
+  REQUIRE(compositeIt != after.nodes.end());
+  CHECK(compositeIt->parentNodeId == "dir:music/live.cue");
+
+  auto compositeUpdated = composite;
+  compositeUpdated.title = "Composite Updated";
+  const bool inserted = builder.upsertSong({.relativePath = "music/live.cue", .metadata = compositeUpdated});
+  CHECK_FALSE(inserted);
+  const auto afterModify = builder.publish();
+  requireNoDanglingReferences(afterModify);
+  REQUIRE(songsIn(afterModify).size() == 2U);
+  const auto updatedIt = std::ranges::find_if(afterModify.nodes, [](const PlaylistNode& node) { return node.nodeId == "track:music/live.cue#music/live.flac@60000"; });
+  REQUIRE(updatedIt != afterModify.nodes.end());
+  CHECK(updatedIt->nodeId == compositeIt->nodeId);
+  REQUIRE(updatedIt->song.has_value());
+  CHECK(updatedIt->song->title == "Composite Updated");
+
+  PlaylistTreeBuilder expected{"Library"};
+  expected.addSong({.relativePath = "music/live.cue", .metadata = treeCueContainer("music/live.cue")});
+  expected.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")});
+  expected.addSong({.relativePath = "music/live.cue", .metadata = compositeUpdated});
+  CHECK(treesEquivalent(afterModify, expected.publish()));
 }
 
 }

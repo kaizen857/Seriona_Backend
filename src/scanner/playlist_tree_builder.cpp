@@ -71,6 +71,14 @@ struct MutableNode {
   bool virtualDirectory{false};
 };
 
+// MutableNode 变体的 cue 轨判定：cue 轨的父节点是 cue 虚拟目录（键 = relativePath 本身），
+// 而非 parent_path —— 与 songKeyFor/isCueTrack 使用同一组判别特征。
+[[nodiscard]] bool isCueTrackNode(const MutableNode& entry) {
+  return entry.node.kind == PlaylistNodeKind::Track && entry.node.song.has_value() &&
+         entry.relativePath.extension() == ".cue" && !entry.node.song->sourceFilePath.empty() &&
+         entry.node.song->offset.has_value();
+}
+
 }
 
 struct PlaylistTreeBuilder::Impl {
@@ -116,6 +124,35 @@ struct PlaylistTreeBuilder::Impl {
     if (entry.node.song->filePath.empty()) {
       entry.node.song->filePath = song.relativePath;
     }
+  }
+
+  // upsertSong 私有实现：key 定位（与 addSongNode/songKeyFor 同一规则）。节点已存在
+  // （modify）时原地更新 song 元数据 + displayName，保留 nodeId（同 key 同 nodeId），
+  // 不重复添加；不存在（create）时复用 addSongNode 插入新节点。返回是否新插入。
+  bool upsertSongNode(PlaylistTreeSong song) {
+    const auto songKey = songKeyFor(song);
+    const auto existing = nodes.find(songKey);
+    if (existing != nodes.end() && existing->second.node.kind == PlaylistNodeKind::Track) {
+      auto& entry = existing->second;
+      entry.relativePath = song.relativePath.lexically_normal();
+      entry.node.displayName = song.metadata.title.empty() ? displayNameFor(song.relativePath, songKey)
+                                                           : song.metadata.title;
+      entry.node.song = std::move(song.metadata);
+      if (entry.node.song->trackId.empty()) {
+        entry.node.song->trackId = songKey;
+      }
+      if (entry.node.song->filePath.empty()) {
+        entry.node.song->filePath = song.relativePath;
+      }
+      songKeys.insert(songKey);
+      rebuildChildren();
+      static_cast<void>(recomputeStats("."));
+      return false;
+    }
+    addSongNode(std::move(song));
+    rebuildChildren();
+    static_cast<void>(recomputeStats("."));
+    return true;
   }
 
   void addVirtualDirectoryNode(PlaylistTreeSong song) {
@@ -194,6 +231,185 @@ struct PlaylistTreeBuilder::Impl {
       }
     }
   }
+
+  bool removeSubtree(const std::filesystem::path& relativePath) {
+    const auto targetKey = pathKey(relativePath);
+    if (targetKey == ".") {
+      return false;
+    }
+    const auto target = nodes.find(targetKey);
+    if (target == nodes.end()) {
+      return false;
+    }
+    if (target->second.node.parentNodeId.has_value()) {
+      const auto parentKey = keyFromNodeId(*target->second.node.parentNodeId);
+      const auto parent = nodes.find(parentKey);
+      if (parent != nodes.end()) {
+        std::erase(parent->second.node.childNodeIds, target->second.node.nodeId);
+      }
+    }
+    std::vector<std::string> pending{target->second.node.nodeId};
+    std::vector<std::string> removedKeys;
+    while (!pending.empty()) {
+      const auto nodeId = pending.back();
+      pending.pop_back();
+      const auto key = keyFromNodeId(nodeId);
+      const auto entry = nodes.find(key);
+      if (entry == nodes.end()) {
+        continue;
+      }
+      removedKeys.push_back(key);
+      for (const auto& childId : entry->second.node.childNodeIds) {
+        pending.push_back(childId);
+      }
+    }
+    for (const auto& key : removedKeys) {
+      const auto entry = nodes.find(key);
+      if (entry == nodes.end()) {
+        continue;
+      }
+      if (entry->second.node.kind == PlaylistNodeKind::Track && entry->second.node.song.has_value()) {
+        songKeys.erase(key);
+      }
+      nodes.erase(entry);
+    }
+    rebuildChildren();
+    pruneEmptyDirectories();
+    static_cast<void>(recomputeStats("."));
+    return true;
+  }
+
+  bool renameSubtree(const std::filesystem::path& oldRelativePath, const std::filesystem::path& newRelativePath) {
+    const auto oldKey = pathKey(oldRelativePath);
+    const auto newKey = pathKey(newRelativePath);
+    if (oldKey == "." || newKey == "." || oldKey == newKey) {
+      return false;
+    }
+    if (nodes.find(oldKey) == nodes.end()) {
+      return false;
+    }
+    if (const auto existing = nodes.find(newKey); existing != nodes.end() && existing->first != oldKey) {
+      return false;
+    }
+
+    std::map<std::string, std::string> keyRewrites;
+    for (const auto& [key, _] : nodes) {
+      if (key == oldKey) {
+        keyRewrites[key] = newKey;
+      } else if (key.rfind(oldKey + "/", 0) == 0) {
+        keyRewrites[key] = newKey + key.substr(oldKey.size());
+      }
+    }
+    for (const auto& [key, updatedKey] : keyRewrites) {
+      if (updatedKey.empty() || updatedKey == ".") {
+        return false;
+      }
+      if (const auto collision = nodes.find(updatedKey); collision != nodes.end() && collision->first != key) {
+        return false;
+      }
+    }
+    if (keyRewrites.empty()) {
+      return false;
+    }
+
+    const auto rewrittenKeyOf = [&keyRewrites](const std::string& key) {
+      const auto iterator = keyRewrites.find(key);
+      return iterator == keyRewrites.end() ? key : iterator->second;
+    };
+    const auto rewriteText = [&oldKey, &newKey](const std::string& text) {
+      if (text == oldKey) {
+        return newKey;
+      }
+      if (text.rfind(oldKey + "/", 0) == 0) {
+        return newKey + text.substr(oldKey.size());
+      }
+      return text;
+    };
+
+    std::map<std::string, MutableNode> moved;
+    for (auto& [key, entry] : nodes) {
+      const auto updatedKey = rewrittenKeyOf(key);
+      auto movedEntry = std::move(entry);
+      const auto oldRelativeText = pathKey(movedEntry.relativePath);
+      const auto updatedRelativeText = rewriteText(oldRelativeText);
+      if (updatedRelativeText != oldRelativeText) {
+        movedEntry.relativePath = std::filesystem::path{updatedRelativeText};
+      }
+      const bool keyChanged = updatedKey != key;
+      if (keyChanged) {
+        const auto delimiter = movedEntry.node.nodeId.find(':');
+        const auto prefix = delimiter == std::string::npos ? "" : movedEntry.node.nodeId.substr(0, delimiter);
+        movedEntry.node.nodeId = nodeIdFor(prefix, updatedKey);
+        if (movedEntry.node.kind == PlaylistNodeKind::Directory) {
+          movedEntry.node.displayName = displayNameFor(movedEntry.relativePath, movedEntry.node.displayName);
+        }
+      }
+      if (movedEntry.node.kind == PlaylistNodeKind::Track && movedEntry.node.song.has_value()) {
+        auto& song = *movedEntry.node.song;
+        if (song.title.empty() && (keyChanged || updatedRelativeText != oldRelativeText)) {
+          movedEntry.node.displayName = displayNameFor(movedEntry.relativePath, movedEntry.node.displayName);
+        }
+        if (updatedRelativeText != oldRelativeText) {
+          if (!song.filePath.empty()) {
+            song.filePath = std::filesystem::path{rewriteText(pathKey(song.filePath))};
+          }
+          if (!song.sourceFilePath.empty()) {
+            song.sourceFilePath = std::filesystem::path{rewriteText(pathKey(song.sourceFilePath))};
+          }
+          song.logicalTrackId = rewriteText(song.logicalTrackId);
+          song.trackId = rewriteText(song.trackId);
+        }
+      }
+      moved.insert_or_assign(updatedKey, std::move(movedEntry));
+    }
+    nodes = std::move(moved);
+
+    std::set<std::string> updatedSongKeys;
+    for (const auto& songKey : songKeys) {
+      updatedSongKeys.insert(rewrittenKeyOf(songKey));
+    }
+    songKeys = std::move(updatedSongKeys);
+
+    const auto parentKeyOf = [](const MutableNode& entry) {
+      if (isCueTrackNode(entry)) {
+        return pathKey(entry.relativePath);
+      }
+      return pathKey(parentPathOf(entry.relativePath));
+    };
+    std::set<std::string> missingParents;
+    for (const auto& [key, entry] : nodes) {
+      if (key == ".") {
+        continue;
+      }
+      const auto parentKey = parentKeyOf(entry);
+      if (parentKey == key || nodes.find(parentKey) != nodes.end()) {
+        continue;
+      }
+      missingParents.insert(parentKey);
+    }
+    for (const auto& parentKey : missingParents) {
+      (void)ensureDirectory(std::filesystem::path{parentKey}, "Library");
+    }
+    for (auto& [key, entry] : nodes) {
+      if (key == "." || entry.node.kind == PlaylistNodeKind::Root) {
+        entry.node.parentNodeId.reset();
+        continue;
+      }
+      const auto parentKey = parentKeyOf(entry);
+      if (parentKey == key) {
+        continue;
+      }
+      const auto parent = nodes.find(parentKey);
+      if (parent != nodes.end()) {
+        entry.node.parentNodeId = parent->second.node.nodeId;
+      }
+    }
+
+    rebuildChildren();
+    pruneEmptyDirectories();
+    static_cast<void>(recomputeStats("."));
+    return true;
+  }
 };
 
 PlaylistTreeBuilder::PlaylistTreeBuilder(std::string rootDisplayName)
@@ -215,6 +431,25 @@ void PlaylistTreeBuilder::addSong(PlaylistTreeSong song) {
     return;
   }
   impl_->addSongNode(std::move(song));
+}
+
+bool PlaylistTreeBuilder::upsertSong(PlaylistTreeSong song) {
+  if (isCueContainer(song)) {
+    const auto containerKey = pathKey(song.relativePath);
+    const bool inserted = impl_->nodes.find(containerKey) == impl_->nodes.end();
+    impl_->addVirtualDirectoryNode(std::move(song));
+    return inserted;
+  }
+  return impl_->upsertSongNode(std::move(song));
+}
+
+bool PlaylistTreeBuilder::removeSubtree(const std::filesystem::path& relativePath) {
+  return impl_->removeSubtree(relativePath);
+}
+
+bool PlaylistTreeBuilder::renameSubtree(const std::filesystem::path& oldRelativePath,
+                                        const std::filesystem::path& newRelativePath) {
+  return impl_->renameSubtree(oldRelativePath, newRelativePath);
 }
 
 void PlaylistTreeBuilder::attachExternalLyrics(const std::filesystem::path& audioRelativePath,

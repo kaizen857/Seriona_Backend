@@ -61,6 +61,7 @@ static WorkerTaskObserver g_workerTaskObserver = nullptr;
 static PublishedSongObserver g_publishedSongObserver = nullptr;
 static CacheWriteObserver g_cacheWriteObserver = nullptr;
 static WatcherEventQueueObserver g_watcherEventQueueObserver = nullptr;
+static TreeBuilderObserver g_treeBuilderObserver = nullptr;
 
 [[nodiscard]] FileHashResult hashLyricsSidecarWithTestSeam(const std::filesystem::path& path,
                                                            const HashOptions& options) {
@@ -1137,21 +1138,32 @@ public:
     const auto phaseEnumTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnumEnd - phaseEnumStart).count();
 
     const auto phaseAggregationStart = std::chrono::steady_clock::now();
-    PlaylistTreeBuilder builder{"Library"};
+    auto builder = std::make_unique<PlaylistTreeBuilder>("Library");
     const auto cueSourcePaths = cueReferencedAudioPaths(allSongs);
     for (const auto& publishedSong : allSongs) {
       if (hiddenByCueSourceVisibility(publishedSong, cueSourcePaths)) {
         continue;
       }
-      builder.addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
+      builder->addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
     }
-    auto published = builder.publish();
+    auto published = builder->publish();
     // 文件夹缩略图解析：publish 之后、快照锁之外 —— seam（TagReader 导出写缓存）的 I/O 不持锁；
     // 单文件夹失败在 resolver 内隔离（回退树内兜底/空），不阻断扫描、不新增 error 事件。
     resolveFolderThumbnails(published, allSongs);
+    TreeBuilderSeededSnapshot treeBuilderReport;
     {
       std::scoped_lock lock{mutex_};
+      // 波 3a：长生命周期 builder 成员（生命周期=watch 会话）。首次 runScan 种子化接管，
+      // 回落全根重扫重建并原子替换成员（不累积、不产生重复树）；精准更新路径（波 3b/3c/3d、4.1）复用成员。
+      treeBuilder_ = std::move(builder);
+      ++treeBuilderGeneration_;
       snapshot_ = published;
+      treeBuilderReport.seeded = true;
+      treeBuilderReport.generation = treeBuilderGeneration_;
+      treeBuilderReport.songCount = treeBuilder_->stats().songCount;
+    }
+    if (g_treeBuilderObserver) {
+      g_treeBuilderObserver(treeBuilderReport);
     }
     const auto phaseAggregationEnd = std::chrono::steady_clock::now();
     const auto phaseAggregationTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(phaseAggregationEnd - phaseAggregationStart).count();
@@ -2228,6 +2240,8 @@ private:
   std::shared_ptr<WatchRuntimeState> watcherState_;
   std::vector<WatchEvent> pendingClassifierEvents_;
   bool pendingClassifierFallbackRescan_{false};
+  std::unique_ptr<PlaylistTreeBuilder> treeBuilder_;
+  std::size_t treeBuilderGeneration_{0};
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
   bool scanWorkerStopping_{false};
@@ -2312,6 +2326,14 @@ void setWatcherEventQueueObserver(WatcherEventQueueObserver observer) {
 
 void clearWatcherEventQueueObserver() {
   g_watcherEventQueueObserver = nullptr;
+}
+
+void setTreeBuilderObserver(TreeBuilderObserver observer) {
+  g_treeBuilderObserver = std::move(observer);
+}
+
+void clearTreeBuilderObserver() {
+  g_treeBuilderObserver = nullptr;
 }
 
 }

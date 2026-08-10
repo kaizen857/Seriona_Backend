@@ -39,6 +39,9 @@ public:
 
   void addDirectory(PlaylistTreeDirectory directory);
   void addSong(PlaylistTreeSong song);
+  bool upsertSong(PlaylistTreeSong song);
+  bool removeSubtree(const std::filesystem::path& relativePath);
+  bool renameSubtree(const std::filesystem::path& oldRelativePath, const std::filesystem::path& newRelativePath);
   void attachExternalLyrics(const std::filesystem::path& audioRelativePath,
                             const std::filesystem::path& lrcRelativePath,
                             std::string lrcHash,

@@ -127,4 +127,21 @@ using WatcherEventQueueObserver = std::function<void(const WatcherEventQueueSnap
 void setWatcherEventQueueObserver(WatcherEventQueueObserver observer);
 void clearWatcherEventQueueObserver();
 
+// Test-only observer for the long-lived tree builder member (波 3a：成员生命周期+种子化)。
+// runScan 完成全量建树并把结果接管为成员（treeBuilder_）后触发，报告：
+//  - seeded: treeBuilder_ 成员非空（首次扫描种子化成功）
+//  - generation: 成员被（重）建并替换的次数（回落重扫 +1；成员替换原子、不累积）
+//  - songCount: 成员当前树中的歌曲数（应与快照歌曲数一致）
+
+struct TreeBuilderSeededSnapshot {
+  bool seeded{false};
+  std::size_t generation{0};
+  std::uint64_t songCount{0};
+};
+
+using TreeBuilderObserver = std::function<void(const TreeBuilderSeededSnapshot&)>;
+
+void setTreeBuilderObserver(TreeBuilderObserver observer);
+void clearTreeBuilderObserver();
+
 } // namespace seriona::scanner
