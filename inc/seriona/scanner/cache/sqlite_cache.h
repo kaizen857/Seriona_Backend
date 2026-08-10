@@ -129,6 +129,11 @@ public:
   [[nodiscard]] std::optional<CachedLocation> loadLocation(const std::string& locationId) const;
   [[nodiscard]] std::vector<CachedLocation> loadLocationsByRoot(const std::filesystem::path& rootPath) const;
   void pruneDeletedLocations(const std::filesystem::path& rootPath, const std::vector<std::string>& retainedLocationIds);
+  std::int64_t deleteLocationsByPathPrefix(const std::string& rootPath, const std::string& filePathPrefix);
+  std::int64_t deleteLocationsByPathPrefixNoTransaction(const std::string& rootPath, const std::string& filePathPrefix);
+  // 单事务：把 root 下 file_path/source_file_path 以 oldPrefix（= 或 前缀/）开头的行改写为 newPrefix 前缀。
+  // 数据来自既有缓存行改写，绝不重读元数据/触发扫描。返回受影响行数。
+  std::int64_t replaceLocationsBySubtree(const std::string& rootPath, const std::string& oldPrefix, const std::string& newPrefix);
   void replaceLyrics(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics);
   [[nodiscard]] std::vector<LyricLine> loadLyrics(const std::string& locationId, const std::string& kind) const;
   void updateScanRoot(const CachedScanRoot& root);

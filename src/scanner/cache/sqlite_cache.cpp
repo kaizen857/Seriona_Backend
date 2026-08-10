@@ -1,4 +1,5 @@
 #include "seriona/scanner/cache/sqlite_cache.h"
+#include "seriona/scanner/song_identity.h"
 
 #include <sqlite3.h>
 
@@ -20,6 +21,19 @@ namespace {
 [[nodiscard]] std::chrono::system_clock::time_point msToSystemTime(const std::int64_t value) { return std::chrono::system_clock::time_point{std::chrono::milliseconds{value}}; }
 
 [[nodiscard]] std::string pathText(const std::filesystem::path& path) { return path.generic_string(); }
+
+[[nodiscard]] std::string rewritePathPrefix(const std::string& path,
+                                            const std::string& oldPrefix,
+                                            const std::string& newPrefix) {
+  if (path == oldPrefix) {
+    return newPrefix;
+  }
+  const auto oldDir = oldPrefix + "/";
+  if (path.rfind(oldDir, 0) == 0) {
+    return newPrefix + path.substr(oldPrefix.size());
+  }
+  return path;
+}
 
 [[nodiscard]] std::string lyricsSourceText(const LyricsSource source) {
   switch (source) {
@@ -474,6 +488,77 @@ void SQLiteCache::pruneDeletedLocationsNoTransaction(const std::filesystem::path
                   "AND location_id NOT IN (SELECT location_id FROM retained_locations);"};
   prune.bind(1, pathText(rootPath));
   prune.stepDone();
+}
+
+std::int64_t SQLiteCache::deleteLocationsByPathPrefix(const std::string& rootPath, const std::string& filePathPrefix) {
+  auto transaction = beginWriter();
+  const auto deleted = deleteLocationsByPathPrefixNoTransaction(rootPath, filePathPrefix);
+  transaction.commit();
+  return deleted;
+}
+
+std::int64_t SQLiteCache::deleteLocationsByPathPrefixNoTransaction(const std::string& rootPath, const std::string& filePathPrefix) {
+  Statement remove{
+      asDb(db_),
+      "DELETE FROM locations "
+      "WHERE root_path=?1 AND ("
+      "file_path=?2 OR substr(file_path, 1, length(?3) + 1) = ?3 || '/' "
+      "OR source_file_path=?4 OR substr(source_file_path, 1, length(?5) + 1) = ?5 || '/'"
+      ");"};
+  remove.bind(1, rootPath);
+  remove.bind(2, filePathPrefix);
+  remove.bind(3, filePathPrefix);
+  remove.bind(4, filePathPrefix);
+  remove.bind(5, filePathPrefix);
+  remove.stepDone();
+  return sqlite3_changes(asDb(db_));
+}
+
+std::int64_t SQLiteCache::replaceLocationsBySubtree(const std::string& rootPath, const std::string& oldPrefix, const std::string& newPrefix) {
+  if (oldPrefix == newPrefix) {
+    return 0;
+  }
+
+  struct RenamedRow {
+    CachedLocation location;
+    std::vector<LyricLine> embeddedLyrics;
+    std::vector<LyricLine> externalLyrics;
+  };
+
+  auto transaction = beginWriter();
+
+  std::vector<RenamedRow> renamed;
+  const auto oldRows = loadLocationsByRoot(rootPath);
+  renamed.reserve(oldRows.size());
+  for (const auto& row : oldRows) {
+    const auto rewrittenPath = rewritePathPrefix(pathText(row.filePath), oldPrefix, newPrefix);
+    const auto rewrittenSource = rewritePathPrefix(pathText(row.sourceFilePath), oldPrefix, newPrefix);
+    if (rewrittenPath == pathText(row.filePath) && rewrittenSource == pathText(row.sourceFilePath)) {
+      continue;
+    }
+    auto moved = row;
+    moved.filePath = rewrittenPath;
+    moved.sourceFilePath = rewrittenSource;
+    const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{row.fileMtimeNs}};
+    moved.locationId = computeLocationId(moved.filePath, moved.fileSizeBytes, mtime, moved.cueTrackOffset, moved.cueTrackIndex);
+    renamed.push_back(RenamedRow{
+        .location = std::move(moved),
+        .embeddedLyrics = loadLyrics(row.locationId, "embedded"),
+        .externalLyrics = loadLyrics(row.locationId, "external"),
+    });
+  }
+
+  deleteLocationsByPathPrefixNoTransaction(rootPath, oldPrefix);
+  for (const auto& entry : renamed) {
+    upsertLocationNoTransaction(entry.location);
+  }
+  for (const auto& entry : renamed) {
+    replaceLyricsNoTransaction(entry.location.locationId, "embedded", entry.embeddedLyrics);
+    replaceLyricsNoTransaction(entry.location.locationId, "external", entry.externalLyrics);
+  }
+
+  transaction.commit();
+  return static_cast<std::int64_t>(renamed.size());
 }
 
 }
