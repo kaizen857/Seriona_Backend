@@ -727,6 +727,87 @@ TEST_CASE("scanner watcher root-internal directory rename converges without resc
   }
 }
 
+TEST_CASE("scanner watcher root-internal rename keeps CUE source audio hidden (no ghost track)") {
+  test::TempScannerRoot temp{"scanner-watcher-rename-cue-hidden"};
+  const auto music = temp.path() / "music";
+  std::filesystem::create_directories(music);
+  const auto cueFile = music / "album.cue";
+  const auto referencedAudio = music / "album.flac";
+  const auto standaloneAudio = music / "bonus.flac";
+  // .cue 内容不解析出 FILE 引用：album.flac 作为独立曲目被扫描发布（进入 allSongs_），
+  // 同时测试 seam 的 CUE 轨又引用它 → 种子期通过 cueSourcePaths 在树中隐藏。
+  writeText(cueFile, "REM DUMMY COMMENT\n");
+  writeText(referencedAudio, "fake referenced audio");
+  writeText(standaloneAudio, "fake standalone audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(referencedAudio, rawMetadata("Bare album file"));
+  reader->put(standaloneAudio, rawMetadata("Bonus Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  setTestCueSheetProvider([&referencedAudio](const std::filesystem::path& cuePath)
+                              -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() == "album.cue") {
+      return {{.audioFilePath = referencedAudio,
+               .offset = 0,
+               .duration = 180000000,
+               .title = "Cue Track 1",
+               .artist = "Cue Artist",
+               .album = "Cue Album",
+               .trackNumber = 1}};
+    }
+    return {};
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 2U);
+  clearTestCueSheetProvider();
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto pop = temp.path() / "pop";
+  std::filesystem::rename(music, pop);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  WatchEvent rename = WatchEvent{.path = music, .pathKind = WatchPathKind::Directory,
+                                 .effectKind = WatchEffectKind::Renamed, .associated = {}};
+  rename.associated.push_back(WatchEvent{.path = pop, .pathKind = WatchPathKind::Directory,
+                                         .effectKind = WatchEffectKind::Renamed, .associated = {}});
+  watchers->states[0]->callback(rename);
+
+  const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
+    for (auto attempt = 0; attempt != 100; ++attempt) {
+      const auto songs = songsIn(service->snapshot());
+      if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    FAIL("timed out waiting for renamed snapshot path");
+  };
+  waitForSnapshotPath(pop / "album.cue");
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+
+  // 根内 rename 后 CUE 源音频（album.flac）必须仍隐藏：只有 CUE 轨 + standalone 轨可见，
+  // 不允许出现幽灵可见 B/album.flac 曲目（补丁结果 == 全量重建）。
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 2U);
+  CHECK(std::ranges::none_of(songs, [&](const SongMetadata& song) { return song.filePath == (pop / "album.flac"); }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (pop / "album.cue"); }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (pop / "bonus.flac"); }));
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 根内 rename 走精准分类器更新，不触发全根重扫。
+    CHECK(scanStartedCount(events) == 1U);
+  }
+}
+
 TEST_CASE("scanner watcher drops ghost create events for paths absent on disk") {
   test::TempScannerRoot temp{"scanner-watcher-ghost-create"};
   const auto track = test::writeAudioFixture(temp.path(), "real.flac");

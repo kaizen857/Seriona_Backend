@@ -2460,7 +2460,7 @@ private:
       return true;
     }
 
-    const auto cueSourcePaths = cueReferencedAudioPaths(allSongs_);
+    std::unordered_set<std::string> cueSourcePaths = cueReferencedAudioPaths(allSongs_);
     const auto hidden = [&](const RootResult::PublishedSong& entry) {
       return hiddenByCueSourceVisibility(entry, cueSourcePaths);
     };
@@ -2481,6 +2481,9 @@ private:
           return false;
         }
         rewriteAllSongsForRename(rename);
+        // rename 已改写 allSongs_ 路径，CUE 源音频（sourceFilePath 集合）须按新路径重算，
+        // 否则重 upsert 用改名前的旧路径判定隐藏，CUE 源音频被误插为幽灵可见曲目。
+        cueSourcePaths = cueReferencedAudioPaths(allSongs_);
         cache.replaceLocationsBySubtree(pathKey(rename.root), pathKey(rename.oldAbs), pathKey(rename.newAbs));
         const auto newRelText = rename.newRel.generic_string();
         for (const auto& entry : allSongs_) {

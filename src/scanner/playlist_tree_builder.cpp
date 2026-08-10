@@ -292,12 +292,43 @@ struct PlaylistTreeBuilder::Impl {
       return false;
     }
 
+    // CUE 轨节点以绝对路径作 key（logicalTrackId），其 filePath/sourceFilePath 也是绝对路径；
+    // 从被移动子树内的 Track 节点反推扫描根绝对前缀，使绝对 key 与路径也能随 rename 改写，
+    // 否则重命名含 CUE 的目录会残留旧路径的幽灵 CUE 轨节点（补丁结果 != 全量重建）。
+    std::filesystem::path absolutePrefix;
+    for (const auto& [_, entry] : nodes) {
+      if (entry.node.kind != PlaylistNodeKind::Track || !entry.node.song.has_value() ||
+          entry.node.song->filePath.empty() || entry.relativePath.empty()) {
+        continue;
+      }
+      const auto entryRelText = pathKey(entry.relativePath);
+      if (entryRelText != oldKey && entryRelText.rfind(oldKey + "/", 0) != 0) {
+        continue;
+      }
+      auto prefix = entry.node.song->filePath;
+      for (auto component = entry.relativePath.begin(); component != entry.relativePath.end(); ++component) {
+        prefix = prefix.parent_path();
+      }
+      std::filesystem::path restored = prefix;
+      for (const auto& component : entry.relativePath) {
+        restored /= component;
+      }
+      if (pathKey(restored) == pathKey(entry.node.song->filePath)) {
+        absolutePrefix = prefix;
+        break;
+      }
+    }
+    const auto oldAbsText = absolutePrefix.empty() ? std::string{} : pathKey(absolutePrefix / oldRelativePath);
+    const auto newAbsText = absolutePrefix.empty() ? std::string{} : pathKey(absolutePrefix / newRelativePath);
+
     std::map<std::string, std::string> keyRewrites;
     for (const auto& [key, _] : nodes) {
       if (key == oldKey) {
         keyRewrites[key] = newKey;
       } else if (key.rfind(oldKey + "/", 0) == 0) {
         keyRewrites[key] = newKey + key.substr(oldKey.size());
+      } else if (!oldAbsText.empty() && key.rfind(oldAbsText, 0) == 0) {
+        keyRewrites[key] = newAbsText + key.substr(oldAbsText.size());
       }
     }
     for (const auto& [key, updatedKey] : keyRewrites) {
@@ -316,12 +347,18 @@ struct PlaylistTreeBuilder::Impl {
       const auto iterator = keyRewrites.find(key);
       return iterator == keyRewrites.end() ? key : iterator->second;
     };
-    const auto rewriteText = [&oldKey, &newKey](const std::string& text) {
+    const auto rewriteText = [&oldKey, &newKey, &oldAbsText, &newAbsText](const std::string& text) {
       if (text == oldKey) {
         return newKey;
       }
       if (text.rfind(oldKey + "/", 0) == 0) {
         return newKey + text.substr(oldKey.size());
+      }
+      if (!oldAbsText.empty() && text == oldAbsText) {
+        return newAbsText;
+      }
+      if (!oldAbsText.empty() && text.rfind(oldAbsText + "/", 0) == 0) {
+        return newAbsText + text.substr(oldAbsText.size());
       }
       return text;
     };
