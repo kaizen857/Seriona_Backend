@@ -327,7 +327,9 @@ struct PlaylistTreeBuilder::Impl {
         keyRewrites[key] = newKey;
       } else if (key.rfind(oldKey + "/", 0) == 0) {
         keyRewrites[key] = newKey + key.substr(oldKey.size());
-      } else if (!oldAbsText.empty() && key.rfind(oldAbsText, 0) == 0) {
+      } else if (!oldAbsText.empty() && key == oldAbsText) {
+        keyRewrites[key] = newAbsText;
+      } else if (!oldAbsText.empty() && key.rfind(oldAbsText + "/", 0) == 0) {
         keyRewrites[key] = newAbsText + key.substr(oldAbsText.size());
       }
     }

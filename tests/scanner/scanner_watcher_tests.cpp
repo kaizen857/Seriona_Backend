@@ -808,6 +808,116 @@ TEST_CASE("scanner watcher root-internal rename keeps CUE source audio hidden (n
   }
 }
 
+TEST_CASE("scanner watcher root-internal rename with overlapping sibling prefix keeps sibling CUE tracks") {
+  test::TempScannerRoot temp{"scanner-watcher-rename-sibling-prefix"};
+  const auto music = temp.path() / "music";
+  const auto musicbox = temp.path() / "musicbox";
+  std::filesystem::create_directories(music);
+  std::filesystem::create_directories(musicbox);
+  const auto musicCue = music / "album.cue";
+  const auto musicReferenced = music / "album.flac";
+  const auto musicBonus = music / "bonus.flac";
+  const auto boxCue = musicbox / "box.cue";
+  const auto boxReferenced = musicbox / "album.flac";
+  const auto boxBonus = musicbox / "bonus.flac";
+  // .cue 内容不解析出 FILE 引用：源音频作为独立曲目被扫描发布（进入 allSongs_），
+  // 同时 seam 的 CUE 轨又引用它 → 种子期通过 cueSourcePaths 在树中隐藏。
+  // musicbox 前缀与 music 重叠（musicbox 以 music 开头），用于暴露绝对 key 改写的边界缺陷。
+  writeText(musicCue, "REM DUMMY COMMENT\n");
+  writeText(musicReferenced, "fake referenced audio");
+  writeText(musicBonus, "fake standalone audio");
+  writeText(boxCue, "REM DUMMY COMMENT\n");
+  writeText(boxReferenced, "fake referenced audio");
+  writeText(boxBonus, "fake standalone audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(musicReferenced, rawMetadata("Music album file"));
+  reader->put(musicBonus, rawMetadata("Music Bonus Track"));
+  reader->put(boxReferenced, rawMetadata("MusicBox album file"));
+  reader->put(boxBonus, rawMetadata("MusicBox Bonus Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  setTestCueSheetProvider([&musicCue, &boxCue, &musicReferenced, &boxReferenced](const std::filesystem::path& cuePath)
+                              -> std::vector<TestCueTrackData> {
+    if (cuePath == musicCue) {
+      return {{.audioFilePath = musicReferenced,
+               .offset = 0,
+               .duration = 180000000,
+               .title = "Music Cue Track 1",
+               .artist = "Cue Artist",
+               .album = "Music Cue Album",
+               .trackNumber = 1}};
+    }
+    if (cuePath == boxCue) {
+      return {{.audioFilePath = boxReferenced,
+               .offset = 0,
+               .duration = 180000000,
+               .title = "MusicBox Cue Track 1",
+               .artist = "Cue Artist",
+               .album = "MusicBox Cue Album",
+               .trackNumber = 1}};
+    }
+    return {};
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 4U);
+  clearTestCueSheetProvider();
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto pop = temp.path() / "pop";
+  std::filesystem::rename(music, pop);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  WatchEvent rename = WatchEvent{.path = music, .pathKind = WatchPathKind::Directory,
+                                 .effectKind = WatchEffectKind::Renamed, .associated = {}};
+  rename.associated.push_back(WatchEvent{.path = pop, .pathKind = WatchPathKind::Directory,
+                                         .effectKind = WatchEffectKind::Renamed, .associated = {}});
+  watchers->states[0]->callback(rename);
+
+  const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
+    for (auto attempt = 0; attempt != 100; ++attempt) {
+      const auto songs = songsIn(service->snapshot());
+      if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    FAIL("timed out waiting for renamed snapshot path");
+  };
+  waitForSnapshotPath(pop / "album.cue");
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+
+  // 根内 rename 只影响 music→pop：pop 内 CUE 轨/独立音频路径更新且无 music/ 残留。
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 4U);
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (pop / "album.cue"); }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (pop / "bonus.flac"); }));
+  CHECK(std::ranges::none_of(songs, [&](const SongMetadata& song) {
+    return song.filePath.generic_string().find("/music/") != std::string::npos;
+  }));
+  // musicbox 内 CUE 轨/独立音频路径完全不变。
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (musicbox / "box.cue"); }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == (musicbox / "bonus.flac"); }));
+  // MAJOR-1 红判据：兄弟目录前缀重叠时，绝对 key 改写不得幻影命中 musicbox（无 popbox 节点身份）。
+  const auto snapshot = service->snapshot();
+  CHECK(std::ranges::none_of(snapshot.nodes, [&](const PlaylistNode& node) {
+    return node.nodeId.find("popbox") != std::string::npos;
+  }));
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 根内 rename 走精准分类器更新，不触发全根重扫。
+    CHECK(scanStartedCount(events) == 1U);
+  }
+}
+
 TEST_CASE("scanner watcher drops ghost create events for paths absent on disk") {
   test::TempScannerRoot temp{"scanner-watcher-ghost-create"};
   const auto track = test::writeAudioFixture(temp.path(), "real.flac");
