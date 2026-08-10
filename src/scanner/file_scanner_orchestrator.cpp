@@ -867,8 +867,14 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
 
 [[nodiscard]] bool watcherMessageRequestsRootReconciliation(const std::filesystem::path& messagePath) {
   const auto message = messagePath.generic_string();
-  return message.starts_with("e/") || message.starts_with("w_") || message.contains("overflow") ||
-         message.contains("warning") || message.contains("error");
+  // s/self/live@、s/self/die@ 是 watch 生命周期消息（startWatching/stopWatching 内部），不应触发对账；
+  // e@ 是 wtr result::e 的独立完成标记（无路径后缀），必须精确 == "e@" 而不能 contains("e@")——
+  // 后者会误命中 s/self/live@（"live@" 含子串 "e@"）与 e/self/live@（同样含 "e@"）。
+  if (message.starts_with("s/")) {
+    return false;
+  }
+  return message.starts_with("w/") || message.starts_with("e/") || message == "e@" ||
+         message.contains("overflow") || message.contains("warning") || message.contains("error");
 }
 
 [[nodiscard]] bool pathChangeRequestsScan(const WatchEvent& event) {
@@ -1003,7 +1009,7 @@ public:
       : metadataReader_(std::move(dependencies.metadataReader)), databasePath_(std::move(dependencies.databasePath)),
         coverExportDir_(std::move(dependencies.coverExportDir)), watcherFactory_(std::move(dependencies.watcherFactory)),
         folderThumbnailSeam_(std::move(dependencies.folderThumbnailSeam)),
-        watcherDebounce_(dependencies.watcherDebounce) {
+        watcherDebounce_(dependencies.watcherDebounce), reconcileInterval_(dependencies.reconcileInterval) {
     if (!metadataReader_) {
       metadataReader_ = std::make_shared<ProductionTagMetadataReader>();
     }
@@ -1157,6 +1163,9 @@ public:
       // 回落全根重扫重建并原子替换成员（不累积、不产生重复树）；精准更新路径（波 3b/3c/3d、4.1）复用成员。
       treeBuilder_ = std::move(builder);
       ++treeBuilderGeneration_;
+      // 波 4.1：长期存活的 allSongs 成员（随精准 upsert/remove/rename 同步增删改；回落重扫随 builder 一并重建）。
+      // 快照无 relativePath 无法反推，补丁路径 publish 后 resolveFolderThumbnails 必须取自此成员。
+      allSongs_ = allSongs;
       snapshot_ = published;
       treeBuilderReport.seeded = true;
       treeBuilderReport.generation = treeBuilderGeneration_;
@@ -2126,6 +2135,438 @@ private:
 	    return ExternalLyricsCacheAction::UpdateExternal;
 	  }
 
+  struct ClassifierRename {
+    std::filesystem::path root;
+    std::filesystem::path oldAbs;
+    std::filesystem::path newAbs;
+    std::filesystem::path oldRel;
+    std::filesystem::path newRel;
+  };
+  struct ClassifierRemove {
+    std::filesystem::path root;
+    std::filesystem::path abs;
+    std::filesystem::path rel;
+  };
+  struct ClassifierUpsert {
+    std::filesystem::path root;
+    std::filesystem::path raw;
+    std::filesystem::path abs;
+    std::filesystem::path rel;
+    bool created{false};
+  };
+  struct ClassifierDestroy {
+    std::filesystem::path raw;
+    WatchPathKind pathKind{WatchPathKind::Other};
+  };
+
+  [[nodiscard]] cache::CachedSong readClassifierSong(const std::filesystem::path& path) {
+    auto raw = metadataReader_->read(thumbnailOnlyRequest(path, coverExportDir_));
+    raw.filePath = path;
+    auto mapped = mapRawTagMetadata(raw,
+                                    computeContentId(std::chrono::duration_cast<std::chrono::milliseconds>(raw.duration),
+                                                     raw.title,
+                                                     raw.artist),
+                                    std::nullopt,
+                                    false);
+    auto song = cachedSongFrom(std::move(mapped));
+    song.metadata.filePath = path;
+    song.metadata.sourceFilePath = path;
+    if (song.metadata.artworkPath.has_value() && !song.metadata.artworkPath->empty() &&
+        song.metadata.artworkPath->is_relative()) {
+      song.metadata.artworkPath = std::filesystem::absolute(*song.metadata.artworkPath);
+    }
+    if (song.metadata.thumbnailPath.has_value() && !song.metadata.thumbnailPath->empty() &&
+        song.metadata.thumbnailPath->is_relative()) {
+      song.metadata.thumbnailPath = std::filesystem::absolute(*song.metadata.thumbnailPath);
+    }
+    song.metadata.trackId = path.generic_string();
+    song.metadata.logicalTrackId = path.generic_string();
+    return song;
+  }
+
+  void refreshScanRootHash(const std::filesystem::path& rootPath) {
+    try {
+      const auto hash = computeDirectoryTreeHash(rootPath);
+      if (!hash.hash.has_value()) {
+        return;
+      }
+      cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+      auto scanRoot = cache.loadScanRoot(rootPath);
+      if (!scanRoot.has_value()) {
+        return;
+      }
+      scanRoot->directoryTreeHash = *hash.hash;
+      cache.updateScanRoot(*scanRoot);
+    } catch (const std::exception& error) {
+      spdlog::warn("failed to refresh scan-root directory-tree hash for {}: {}", rootPath.generic_string(), error.what());
+    }
+  }
+
+  void rewriteAllSongsForRename(const ClassifierRename& rename) {
+    const auto oldRelText = rename.oldRel.generic_string();
+    const auto newRelText = rename.newRel.generic_string();
+    const auto oldAbsText = pathKey(rename.oldAbs);
+    const auto newAbsText = pathKey(rename.newAbs);
+    const auto rewrite = [&](const std::string& text) -> std::string {
+      if (text == oldRelText) {
+        return newRelText;
+      }
+      if (text.rfind(oldRelText + "/", 0) == 0) {
+        return newRelText + text.substr(oldRelText.size());
+      }
+      if (text == oldAbsText) {
+        return newAbsText;
+      }
+      if (text.rfind(oldAbsText + "/", 0) == 0) {
+        return newAbsText + text.substr(oldAbsText.size());
+      }
+      return text;
+    };
+    for (auto& entry : allSongs_) {
+      const auto relative = entry.treeRelativePath.generic_string();
+      if (relative != oldRelText && relative.rfind(oldRelText + "/", 0) != 0) {
+        continue;
+      }
+      entry.treeRelativePath = std::filesystem::path{rewrite(relative)};
+      auto& metadata = entry.song.metadata;
+      if (!metadata.filePath.empty()) {
+        metadata.filePath = std::filesystem::path{rewrite(metadata.filePath.generic_string())};
+      }
+      if (!metadata.sourceFilePath.empty()) {
+        metadata.sourceFilePath = std::filesystem::path{rewrite(metadata.sourceFilePath.generic_string())};
+      }
+      metadata.logicalTrackId = rewrite(metadata.logicalTrackId);
+      metadata.trackId = rewrite(metadata.trackId);
+    }
+  }
+
+  void publishClassifierSnapshot() {
+    if (!treeBuilder_) {
+      return;
+    }
+    auto published = treeBuilder_->publish();
+    resolveFolderThumbnails(published, allSongs_);
+    ScannerEventSink sink;
+    {
+      std::scoped_lock lock{mutex_};
+      sink = sink_;
+      snapshot_ = published;
+    }
+    publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
+    publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
+  }
+
+  bool applyClassifierBatch(const std::vector<ScannerRoot>& roots, const std::vector<WatchEvent>& batch) {
+    if (batch.empty()) {
+      return true;
+    }
+    if (!treeBuilder_) {
+      return false;
+    }
+    ScannerConfig config;
+    {
+      std::scoped_lock lock{mutex_};
+      config = config_;
+    }
+    const auto effective = effectiveScannerConfig(config);
+
+    std::vector<ClassifierRename> renames;
+    std::vector<ClassifierRemove> removes;
+    std::vector<ClassifierUpsert> upserts;
+    std::unordered_map<std::string, std::filesystem::path> renameOldToNew;
+    std::unordered_map<std::string, ClassifierUpsert> upsertByKey;
+    std::unordered_map<std::string, ClassifierDestroy> destroyByKey;
+    std::unordered_map<std::string, std::filesystem::path> moveSelfByRaw;
+    bool unclassifiable = false;
+
+    const auto findRootFor = [&roots](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
+      std::optional<std::filesystem::path> best;
+      std::size_t bestLength = 0;
+      const auto normalized = path.lexically_normal().generic_string();
+      for (const auto& root : roots) {
+        const auto rootPath = rootPathFor(root);
+        const auto rootText = rootPath.generic_string();
+        if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
+          if (rootText.size() >= bestLength) {
+            bestLength = rootText.size();
+            best = rootPath;
+          }
+        }
+      }
+      return best;
+    };
+    const auto isRootSelf = [](const std::filesystem::path& path, const std::filesystem::path& root) {
+      return pathKey(path) == pathKey(root);
+    };
+
+    std::function<void(const WatchEvent&)> walk = [&](const WatchEvent& event) {
+      if (unclassifiable) {
+        return;
+      }
+      if (event.effectKind == WatchEffectKind::Renamed) {
+        for (const auto& associated : event.associated) {
+          if (associated.effectKind != WatchEffectKind::Renamed) {
+            continue;
+          }
+          const auto oldPath = event.path;
+          const auto newPath = associated.path;
+          const auto root = findRootFor(oldPath);
+          if (!root.has_value() || isRootSelf(oldPath, *root)) {
+            return;
+          }
+          const auto oldRel = relativePathFor(*root, oldPath);
+          const auto newRel = relativePathFor(*root, newPath);
+          const auto oldAbs = (*root / oldRel).lexically_normal();
+          const auto newAbs = (*root / newRel).lexically_normal();
+          renames.push_back(ClassifierRename{.root = *root,
+                                             .oldAbs = oldAbs,
+                                             .newAbs = newAbs,
+                                             .oldRel = oldRel,
+                                             .newRel = newRel});
+          renameOldToNew[pathKey(oldAbs)] = newAbs;
+          upsertByKey.erase(pathKey(oldAbs));
+          destroyByKey.erase(pathKey(oldAbs));
+          moveSelfByRaw.erase(pathKey(oldAbs));
+          return;
+        }
+        unclassifiable = true;
+        return;
+      }
+
+      switch (event.effectKind) {
+        case WatchEffectKind::Created:
+        case WatchEffectKind::Modified:
+          if (event.pathKind != WatchPathKind::File) {
+            unclassifiable = true;
+            return;
+          }
+          upsertByKey[pathKey(event.path)] = ClassifierUpsert{.root = {},
+                                                              .raw = event.path,
+                                                              .abs = {},
+                                                              .rel = {},
+                                                              .created = event.effectKind == WatchEffectKind::Created};
+          break;
+        case WatchEffectKind::Destroyed:
+          if (event.pathKind != WatchPathKind::File && event.pathKind != WatchPathKind::Directory) {
+            unclassifiable = true;
+            return;
+          }
+          destroyByKey[pathKey(event.path)] = ClassifierDestroy{.raw = event.path, .pathKind = event.pathKind};
+          break;
+        case WatchEffectKind::OwnerChanged:
+          unclassifiable = true;
+          return;
+        case WatchEffectKind::Other:
+          if (event.pathKind != WatchPathKind::Directory) {
+            unclassifiable = true;
+            return;
+          }
+          moveSelfByRaw[pathKey(event.path)] = event.path;
+          break;
+        case WatchEffectKind::Renamed:
+          return;
+      }
+      for (const auto& associated : event.associated) {
+        walk(associated);
+      }
+    };
+
+    for (const auto& event : batch) {
+      walk(event);
+    }
+    if (unclassifiable) {
+      return false;
+    }
+
+    for (auto iterator = upsertByKey.begin(); iterator != upsertByKey.end();) {
+      if (destroyByKey.contains(iterator->first)) {
+        destroyByKey.erase(iterator->first);
+        iterator = upsertByKey.erase(iterator);
+      } else {
+        ++iterator;
+      }
+    }
+
+    for (const auto& [key, raw] : moveSelfByRaw) {
+      if (renameOldToNew.contains(key)) {
+        continue;
+      }
+      const auto root = findRootFor(raw);
+      if (!root.has_value()) {
+        continue;
+      }
+      if (isRootSelf(raw, *root)) {
+        unclassifiable = true;
+        break;
+      }
+      const auto rel = relativePathFor(*root, raw);
+      const auto abs = (*root / rel).lexically_normal();
+      if (std::filesystem::exists(abs)) {
+        unclassifiable = true;
+        break;
+      }
+      removes.push_back(ClassifierRemove{.root = *root, .abs = abs, .rel = rel});
+    }
+    if (unclassifiable) {
+      return false;
+    }
+
+    for (const auto& [key, destroy] : destroyByKey) {
+      const auto root = findRootFor(destroy.raw);
+      if (!root.has_value()) {
+        continue;
+      }
+      if (isRootSelf(destroy.raw, *root)) {
+        unclassifiable = true;
+        break;
+      }
+      const auto rel = relativePathFor(*root, destroy.raw);
+      const auto abs = (*root / rel).lexically_normal();
+      if (destroy.pathKind == WatchPathKind::File && !isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
+        unclassifiable = true;
+        break;
+      }
+      removes.push_back(ClassifierRemove{.root = *root, .abs = abs, .rel = rel});
+    }
+    if (unclassifiable) {
+      return false;
+    }
+
+    for (auto& [key, op] : upsertByKey) {
+      const auto root = findRootFor(op.raw);
+      if (!root.has_value()) {
+        continue;
+      }
+      if (isRootSelf(op.raw, *root)) {
+        unclassifiable = true;
+        break;
+      }
+      const auto rel = relativePathFor(*root, op.raw);
+      const auto abs = (*root / rel).lexically_normal();
+      if (abs.extension() == ".cue" || !isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
+        unclassifiable = true;
+        break;
+      }
+      op.root = *root;
+      op.abs = abs;
+      op.rel = rel;
+      upserts.push_back(op);
+    }
+    if (unclassifiable) {
+      return false;
+    }
+
+    if (renames.empty() && removes.empty() && upserts.empty()) {
+      return true;
+    }
+
+    const auto cueSourcePaths = cueReferencedAudioPaths(allSongs_);
+    const auto hidden = [&](const RootResult::PublishedSong& entry) {
+      return hiddenByCueSourceVisibility(entry, cueSourcePaths);
+    };
+
+    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    std::unordered_set<std::filesystem::path> touchedRoots;
+
+    try {
+      for (const auto& rename : renames) {
+        // rename 改写并重插 locations 行（root_path 外键指向 scan_roots）：
+        // 若该 root 尚未扫描（scan_roots 无记录），回落全根重扫，扫描会写 scan_roots 记录。
+        if (!cache.loadScanRoot(rename.root).has_value()) {
+          return false;
+        }
+        if (!treeBuilder_->renameSubtree(rename.oldRel, rename.newRel)) {
+          spdlog::warn("classifier rename could not be applied to tree, falling back: {} -> {}",
+                       rename.oldRel.generic_string(), rename.newRel.generic_string());
+          return false;
+        }
+        rewriteAllSongsForRename(rename);
+        cache.replaceLocationsBySubtree(pathKey(rename.root), pathKey(rename.oldAbs), pathKey(rename.newAbs));
+        const auto newRelText = rename.newRel.generic_string();
+        for (const auto& entry : allSongs_) {
+          const auto relative = entry.treeRelativePath.generic_string();
+          if (relative != newRelText && relative.rfind(newRelText + "/", 0) != 0) {
+            continue;
+          }
+          if (hidden(entry)) {
+            continue;
+          }
+          treeBuilder_->upsertSong({.relativePath = entry.treeRelativePath, .metadata = entry.song.metadata});
+        }
+        touchedRoots.insert(rename.root);
+      }
+      for (const auto& remove : removes) {
+        treeBuilder_->removeSubtree(remove.rel);
+        cache.deleteLocationsByPathPrefix(pathKey(remove.root), pathKey(remove.abs));
+        const auto relText = remove.rel.generic_string();
+        std::erase_if(allSongs_, [&](const RootResult::PublishedSong& entry) {
+          const auto relative = entry.treeRelativePath.generic_string();
+          return relative == relText || relative.rfind(relText + "/", 0) == 0;
+        });
+        touchedRoots.insert(remove.root);
+      }
+      for (const auto& upsert : upserts) {
+        // 新 root 尚未扫描（scan_roots 无记录）时，首个 create 无法精准 upsert
+        // （locations.root_path 外键指向 scan_roots），回落全根重扫
+        // （扫描会写 scan_roots 记录，后续事件才能精准更新）。
+        if (!cache.loadScanRoot(upsert.root).has_value()) {
+          return false;
+        }
+        if (!std::filesystem::exists(upsert.abs)) {
+          continue;
+        }
+        auto song = readClassifierSong(upsert.abs);
+        const auto location = cachedLocationFromSong(song, upsert.root, upsert.abs);
+        RootResult::PublishedSong entry{.song = std::move(song),
+                                        .treeRelativePath = upsert.rel,
+                                        .origin = upsert.created ? ScanItemOrigin::ScannedNew : ScanItemOrigin::RescannedChanged,
+                                        .locationId = location.locationId,
+                                        .externalLyricsCacheAction = ExternalLyricsCacheAction::None};
+        const auto existing = std::ranges::find_if(allSongs_, [&](const RootResult::PublishedSong& candidate) {
+          return candidate.treeRelativePath == upsert.rel;
+        });
+        if (existing != allSongs_.end()) {
+          *existing = entry;
+        } else {
+          allSongs_.push_back(entry);
+        }
+        if (!hidden(entry)) {
+          treeBuilder_->upsertSong({.relativePath = upsert.rel, .metadata = entry.song.metadata});
+        }
+        cache.upsertContent(location.contentId, entry.song.metadata);
+        cache.upsertLocation(location);
+        cache.replaceLyrics(location.locationId, "embedded", entry.song.embeddedLyrics);
+        cache.replaceLyrics(location.locationId, "external", entry.song.externalLyrics);
+        touchedRoots.insert(upsert.root);
+      }
+    } catch (const std::exception& error) {
+      spdlog::warn("classifier precise update failed, falling back to full rescan: {}", error.what());
+      return false;
+    }
+
+    for (const auto& rootPath : touchedRoots) {
+      refreshScanRootHash(rootPath);
+    }
+    publishClassifierSnapshot();
+    return true;
+  }
+
+  void reconcileRootsPeriodically(const std::vector<ScannerRoot>& roots) {
+    if (roots.empty()) {
+      return;
+    }
+    std::vector<ScannerRoot> rootsToRescan;
+    for (const auto& root : roots) {
+      const auto decision = decideScanMode(root, ScanMode::Incremental, databasePath_);
+      if (decision.mode == ScanMode::Full) {
+        rootsToRescan.push_back(root);
+      }
+    }
+    if (!rootsToRescan.empty()) {
+      scan(rootsToRescan, ScanMode::Incremental);
+    }
+  }
+
   void debounceLoop(const std::shared_ptr<WatchRuntimeState>& state) {
     std::uint64_t processedGeneration = 0;
     while (true) {
@@ -2133,32 +2574,42 @@ private:
       std::vector<std::string> watcherMessages;
       std::vector<WatchEvent> watcherEvents;
       bool fallbackRescan = false;
+      bool periodicProbe = false;
       {
         std::unique_lock lock{state->mutex};
-        state->changed.wait(lock, [&state, processedGeneration] {
+        const auto wokeByEvent = state->changed.wait_for(lock, reconcileInterval_, [&state, processedGeneration] {
           return state->stopping || state->dirtyGeneration != processedGeneration;
         });
         if (state->stopping) {
           return;
         }
-        auto observedGeneration = state->dirtyGeneration;
-        state->changed.wait_for(lock, watcherDebounce_, [&state, observedGeneration] {
-          return state->stopping || state->dirtyGeneration != observedGeneration;
-        });
-        if (state->stopping) {
-          return;
+        if (!wokeByEvent) {
+          roots = state->watchedRoots;
+          periodicProbe = true;
+        } else {
+          auto observedGeneration = state->dirtyGeneration;
+          state->changed.wait_for(lock, watcherDebounce_, [&state, observedGeneration] {
+            return state->stopping || state->dirtyGeneration != observedGeneration;
+          });
+          if (state->stopping) {
+            return;
+          }
+          if (state->dirtyGeneration != observedGeneration) {
+            continue;
+          }
+          processedGeneration = observedGeneration;
+          roots = state->watchedRoots;
+          watcherMessages = std::move(state->pendingWatcherMessages);
+          state->pendingWatcherMessages.clear();
+          watcherEvents = std::move(state->pendingWatcherEvents);
+          state->pendingWatcherEvents.clear();
+          fallbackRescan = state->pendingFallbackRescan;
+          state->pendingFallbackRescan = false;
         }
-        if (state->dirtyGeneration != observedGeneration) {
-          continue;
-        }
-        processedGeneration = observedGeneration;
-        roots = state->watchedRoots;
-        watcherMessages = std::move(state->pendingWatcherMessages);
-        state->pendingWatcherMessages.clear();
-        watcherEvents = std::move(state->pendingWatcherEvents);
-        state->pendingWatcherEvents.clear();
-        fallbackRescan = state->pendingFallbackRescan;
-        state->pendingFallbackRescan = false;
+      }
+      if (periodicProbe) {
+        reconcileRootsPeriodically(roots);
+        continue;
       }
       {
         std::scoped_lock lock{mutex_};
@@ -2168,7 +2619,33 @@ private:
         pendingClassifierFallbackRescan_ = pendingClassifierFallbackRescan_ || fallbackRescan;
       }
       publishWatcherMessages(watcherMessages);
-      scan(roots, ScanMode::Incremental);
+
+      std::vector<WatchEvent> classifierEvents;
+      bool classifierFallback = false;
+      {
+        std::scoped_lock lock{mutex_};
+        classifierEvents = std::move(pendingClassifierEvents_);
+        pendingClassifierEvents_.clear();
+        classifierFallback = pendingClassifierFallbackRescan_;
+        pendingClassifierFallbackRescan_ = false;
+      }
+
+      // watcher 消息 / 队列溢出标记 = 事件可能丢失或不完整 → 回落全根重扫；
+      // 无事件批次 → 维持既有"对账增量重扫"路径。
+      const bool eventsUnreliable = classifierFallback || !watcherMessages.empty();
+      if (eventsUnreliable || classifierEvents.empty()) {
+        scan(roots, ScanMode::Incremental);
+        continue;
+      }
+
+      bool handled = false;
+      {
+        std::lock_guard scanLock{scanMutex_};
+        handled = applyClassifierBatch(roots, classifierEvents);
+      }
+      if (!handled) {
+        scan(roots, ScanMode::Incremental);
+      }
     }
   }
 
@@ -2229,6 +2706,7 @@ private:
   std::shared_ptr<FolderWatcherFactory> watcherFactory_;
   FolderThumbnailExportSeam folderThumbnailSeam_;
   std::chrono::milliseconds watcherDebounce_{50};
+  std::chrono::milliseconds reconcileInterval_{60000};
   PlaylistTreeSnapshot snapshot_{};
   mutable std::mutex mutex_;
   std::mutex scanMutex_;
@@ -2242,6 +2720,7 @@ private:
   bool pendingClassifierFallbackRescan_{false};
   std::unique_ptr<PlaylistTreeBuilder> treeBuilder_;
   std::size_t treeBuilderGeneration_{0};
+  std::vector<RootResult::PublishedSong> allSongs_;
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
   bool scanWorkerStopping_{false};

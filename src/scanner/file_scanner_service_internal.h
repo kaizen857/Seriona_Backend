@@ -61,6 +61,7 @@ struct FileScannerServiceDependencies {
   // ThumbnailOnly + Ignore）；测试注入 fake 断言接线。
   FolderThumbnailExportSeam folderThumbnailSeam;
   std::chrono::milliseconds watcherDebounce{50};
+  std::chrono::milliseconds reconcileInterval{60000};
 };
 
 [[nodiscard]] std::shared_ptr<FileScannerService> makeFileScannerService(FileScannerServiceDependencies dependencies);
