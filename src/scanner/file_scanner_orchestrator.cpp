@@ -30,10 +30,11 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
-#include <memory>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -59,6 +60,7 @@ static IncrementalPlanObserver g_incrementalPlanObserver = nullptr;
 static WorkerTaskObserver g_workerTaskObserver = nullptr;
 static PublishedSongObserver g_publishedSongObserver = nullptr;
 static CacheWriteObserver g_cacheWriteObserver = nullptr;
+static WatcherEventQueueObserver g_watcherEventQueueObserver = nullptr;
 
 [[nodiscard]] FileHashResult hashLyricsSidecarWithTestSeam(const std::filesystem::path& path,
                                                            const HashOptions& options) {
@@ -886,7 +888,8 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
   case WatchEffectKind::OwnerChanged:
     return true;
   case WatchEffectKind::Other:
-    return false;
+    // IN_MOVE_SELF 由 wtr 映射为 Other（波1.1 补丁后放行），由波 4.1 分类器细分；无法分类的 Other 将回落全根重扫
+    return true;
   }
   return false;
 }
@@ -904,6 +907,18 @@ void collectActionableWatcherEvent(const WatchEvent& event, std::vector<std::str
   for (const auto& associated : event.associated) {
     collectActionableWatcherEvent(associated, messages, actionable);
   }
+}
+
+[[nodiscard]] bool watcherEventRequestsQueue(const WatchEvent& event) {
+  if (pathChangeRequestsScan(event)) {
+    return true;
+  }
+  for (const auto& associated : event.associated) {
+    if (watcherEventRequestsQueue(associated)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 class WtrFolderWatcher final : public FolderWatcher {
@@ -939,9 +954,13 @@ struct WatchRuntimeState {
   std::condition_variable changed;
   std::vector<ScannerRoot> watchedRoots;
   std::vector<std::string> pendingWatcherMessages;
+  std::vector<WatchEvent> pendingWatcherEvents;
+  bool pendingFallbackRescan{false};
   bool stopping{true};
   std::uint64_t dirtyGeneration{0};
 };
+
+constexpr std::size_t kWatcherPendingEventLimit = 1024;
 
 void enqueueWatcherEvent(const std::shared_ptr<WatchRuntimeState>& state, const WatchEvent& event) {
   std::scoped_lock lock{state->mutex};
@@ -953,8 +972,28 @@ void enqueueWatcherEvent(const std::shared_ptr<WatchRuntimeState>& state, const 
   if (!actionable) {
     return;
   }
+  bool queued = false;
+  if (watcherEventRequestsQueue(event)) {
+    if (state->pendingWatcherEvents.size() < kWatcherPendingEventLimit) {
+      state->pendingWatcherEvents.push_back(event);
+      queued = true;
+    } else {
+      state->pendingFallbackRescan = true;
+    }
+  }
   ++state->dirtyGeneration;
   state->changed.notify_one();
+  if (g_watcherEventQueueObserver) {
+    WatcherEventQueueSnapshot snapshot;
+    if (queued) {
+      snapshot.event = event;
+    }
+    snapshot.dirtyGeneration = state->dirtyGeneration;
+    snapshot.eventQueueSize = state->pendingWatcherEvents.size();
+    snapshot.messageQueueSize = state->pendingWatcherMessages.size();
+    snapshot.fallbackRescan = state->pendingFallbackRescan;
+    g_watcherEventQueueObserver(snapshot);
+  }
 }
 
 class OrchestratedFileScannerService final : public FileScannerService {
@@ -1260,6 +1299,8 @@ public:
         std::scoped_lock lock{state->mutex};
         state->stopping = true;
         state->pendingWatcherMessages.clear();
+        state->pendingWatcherEvents.clear();
+        state->pendingFallbackRescan = false;
       }
       state->changed.notify_all();
     }
@@ -2078,6 +2119,8 @@ private:
     while (true) {
       std::vector<ScannerRoot> roots;
       std::vector<std::string> watcherMessages;
+      std::vector<WatchEvent> watcherEvents;
+      bool fallbackRescan = false;
       {
         std::unique_lock lock{state->mutex};
         state->changed.wait(lock, [&state, processedGeneration] {
@@ -2100,6 +2143,17 @@ private:
         roots = state->watchedRoots;
         watcherMessages = std::move(state->pendingWatcherMessages);
         state->pendingWatcherMessages.clear();
+        watcherEvents = std::move(state->pendingWatcherEvents);
+        state->pendingWatcherEvents.clear();
+        fallbackRescan = state->pendingFallbackRescan;
+        state->pendingFallbackRescan = false;
+      }
+      {
+        std::scoped_lock lock{mutex_};
+        pendingClassifierEvents_.insert(pendingClassifierEvents_.end(),
+                                        std::make_move_iterator(watcherEvents.begin()),
+                                        std::make_move_iterator(watcherEvents.end()));
+        pendingClassifierFallbackRescan_ = pendingClassifierFallbackRescan_ || fallbackRescan;
       }
       publishWatcherMessages(watcherMessages);
       scan(roots, ScanMode::Incremental);
@@ -2172,6 +2226,8 @@ private:
   std::deque<ScanRequest> scanQueue_;
   std::vector<std::unique_ptr<FolderWatcher>> watchers_;
   std::shared_ptr<WatchRuntimeState> watcherState_;
+  std::vector<WatchEvent> pendingClassifierEvents_;
+  bool pendingClassifierFallbackRescan_{false};
   std::atomic_bool cancellationRequested_{false};
   std::atomic_uint64_t eventVersion_{0};
   bool scanWorkerStopping_{false};
@@ -2248,6 +2304,14 @@ void setCacheWriteObserver(CacheWriteObserver observer) {
 
 void clearCacheWriteObserver() {
   g_cacheWriteObserver = nullptr;
+}
+
+void setWatcherEventQueueObserver(WatcherEventQueueObserver observer) {
+  g_watcherEventQueueObserver = std::move(observer);
+}
+
+void clearWatcherEventQueueObserver() {
+  g_watcherEventQueueObserver = nullptr;
 }
 
 }

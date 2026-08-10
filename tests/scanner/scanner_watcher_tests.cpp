@@ -1,6 +1,7 @@
 #include "scanner_test_harness.h"
 
 #include "file_scanner_service_internal.h"
+#include "file_scanner_orchestrator_test_access.h"
 
 #include <doctest.h>
 
@@ -391,6 +392,172 @@ TEST_CASE("scanner watcher startup failure leaves no live callback into service"
   CHECK_NOTHROW(callback(fileEvent(second, WatchEffectKind::Created)));
   std::this_thread::sleep_for(std::chrono::milliseconds{30});
   CHECK(reader->readCount() == 1U);
+}
+
+TEST_CASE("scanner watcher queues full watch events with generation bump") {
+  test::TempScannerRoot temp{"scanner-watcher-event-queue"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  std::vector<WatcherEventQueueSnapshot> snapshots;
+  std::mutex snapshotsMutex;
+  setWatcherEventQueueObserver([&snapshots, &snapshotsMutex](const WatcherEventQueueSnapshot& snapshot) {
+    std::scoped_lock lock{snapshotsMutex};
+    snapshots.push_back(snapshot);
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  WatchEvent event = fileEvent(temp.path() / "new.flac", WatchEffectKind::Created);
+  event.associated.push_back(fileEvent(temp.path() / "old.flac", WatchEffectKind::Renamed));
+  watchers->states[0]->callback(event);
+
+  {
+    std::scoped_lock lock{snapshotsMutex};
+    REQUIRE(snapshots.size() == 1U);
+    const auto& snapshot = snapshots[0];
+    REQUIRE(snapshot.event.has_value());
+    CHECK(snapshot.event->path == event.path);
+    CHECK(snapshot.event->pathKind == WatchPathKind::File);
+    CHECK(snapshot.event->effectKind == WatchEffectKind::Created);
+    REQUIRE(snapshot.event->associated.size() == 1U);
+    CHECK(snapshot.event->associated[0].path == event.associated[0].path);
+    CHECK(snapshot.event->associated[0].pathKind == WatchPathKind::File);
+    CHECK(snapshot.event->associated[0].effectKind == WatchEffectKind::Renamed);
+    CHECK(snapshot.eventQueueSize == 1U);
+    CHECK(snapshot.messageQueueSize == 0U);
+    CHECK(snapshot.dirtyGeneration == 1U);
+    CHECK_FALSE(snapshot.fallbackRescan);
+  }
+
+  clearWatcherEventQueueObserver();
+}
+
+TEST_CASE("scanner watcher keeps watcher messages out of the event queue") {
+  test::TempScannerRoot temp{"scanner-watcher-message-queue"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  std::vector<WatcherEventQueueSnapshot> snapshots;
+  std::mutex snapshotsMutex;
+  setWatcherEventQueueObserver([&snapshots, &snapshotsMutex](const WatcherEventQueueSnapshot& snapshot) {
+    std::scoped_lock lock{snapshotsMutex};
+    snapshots.push_back(snapshot);
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  watchers->states[0]->callback(watcherMessage("w_sys_q_overflow"));
+  {
+    std::scoped_lock lock{snapshotsMutex};
+    REQUIRE(snapshots.size() == 1U);
+    const auto& snapshot = snapshots[0];
+    CHECK_FALSE(snapshot.event.has_value());
+    CHECK(snapshot.eventQueueSize == 0U);
+    CHECK(snapshot.messageQueueSize == 1U);
+    CHECK(snapshot.dirtyGeneration == 1U);
+  }
+
+  watchers->states[0]->callback(fileEvent(temp.path() / "x.flac", WatchEffectKind::Created));
+  {
+    std::scoped_lock lock{snapshotsMutex};
+    REQUIRE(snapshots.size() == 2U);
+    const auto& snapshot = snapshots[1];
+    REQUIRE(snapshot.event.has_value());
+    CHECK(snapshot.event->path == temp.path() / "x.flac");
+    CHECK(snapshot.eventQueueSize == 1U);
+    CHECK(snapshot.dirtyGeneration == 2U);
+  }
+
+  clearWatcherEventQueueObserver();
+}
+
+TEST_CASE("scanner watcher ignores non-actionable events without queueing or waking") {
+  test::TempScannerRoot temp{"scanner-watcher-non-actionable"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  std::vector<WatcherEventQueueSnapshot> snapshots;
+  std::mutex snapshotsMutex;
+  setWatcherEventQueueObserver([&snapshots, &snapshotsMutex](const WatcherEventQueueSnapshot& snapshot) {
+    std::scoped_lock lock{snapshotsMutex};
+    snapshots.push_back(snapshot);
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  watchers->states[0]->callback(watcherMessage("s/self/live@" + temp.path().generic_string()));
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  {
+    std::scoped_lock lock{snapshotsMutex};
+    CHECK(snapshots.empty());
+  }
+
+  watchers->states[0]->callback(fileEvent(temp.path() / "x.flac", WatchEffectKind::Created));
+  {
+    std::scoped_lock lock{snapshotsMutex};
+    REQUIRE(snapshots.size() == 1U);
+    CHECK(snapshots[0].dirtyGeneration == 1U);
+  }
+
+  clearWatcherEventQueueObserver();
+}
+
+TEST_CASE("scanner watcher marks fallback rescan when event queue overflows") {
+  test::TempScannerRoot temp{"scanner-watcher-event-overflow"};
+  const auto first = test::writeAudioFixture(temp.path(), "first.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(first, rawMetadata("First"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeFileScannerService(FileScannerServiceDependencies{.metadataReader = reader,
+                                                                       .watcherFactory = watchers,
+                                                                       .databasePath = temp.dbPath(),
+                                                                       .coverExportDir = temp.path() / "covers",
+                                                                       .watcherDebounce = std::chrono::milliseconds{1000}});
+
+  bool sawFallback = false;
+  std::size_t maxEventQueueSize = 0;
+  std::mutex stateMutex;
+  setWatcherEventQueueObserver([&](const WatcherEventQueueSnapshot& snapshot) {
+    std::scoped_lock lock{stateMutex};
+    sawFallback = sawFallback || snapshot.fallbackRescan;
+    maxEventQueueSize = std::max(maxEventQueueSize, snapshot.eventQueueSize);
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  for (std::size_t i = 0; i != 1100; ++i) {
+    watchers->states[0]->callback(fileEvent(temp.path() / ("file" + std::to_string(i) + ".flac"), WatchEffectKind::Created));
+  }
+
+  {
+    std::scoped_lock lock{stateMutex};
+    CHECK(sawFallback);
+    CHECK(maxEventQueueSize >= 1024U);
+  }
+
+  clearWatcherEventQueueObserver();
 }
 
 TEST_CASE("scanner service serializes concurrent manual and watcher scans") {

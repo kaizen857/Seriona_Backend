@@ -1686,7 +1686,7 @@ inline auto do_ev_recv = [](auto const& cb, sysres& sr) -> result
   auto is_real_event = [](unsigned msk) -> bool
   {
     bool has_any = msk & ke_in_ev::recv_mask;
-    bool is_self_info = msk & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF);
+    bool is_self_info = msk & (IN_IGNORED | IN_DELETE_SELF);  // Seriona patch: forward IN_MOVE_SELF (upstream #122)
     return has_any && ! is_self_info;
   };
 

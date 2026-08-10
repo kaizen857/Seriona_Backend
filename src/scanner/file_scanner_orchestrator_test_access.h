@@ -1,10 +1,12 @@
 #pragma once
 
+#include "file_scanner_service_internal.h"
 #include "scanner_internal_types.h"
 
 #include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/hash_utils.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -104,5 +106,25 @@ using CacheWriteObserver = std::function<void(const cache::ScanRootCacheWrite& w
 
 void setCacheWriteObserver(CacheWriteObserver observer);
 void clearCacheWriteObserver();
+
+// Test-only observer for the watcher event queue (波 1.3：完整 WatchEvent 入队管道)。
+// 每次 enqueueWatcherEvent 处理完一个 actionable 事件后触发，报告：
+//  - event: 入队到 pendingWatcherEvents 的完整事件（含 associated），未入队则为 nullopt
+//  - dirtyGeneration: 本次入队后的代际号
+//  - eventQueueSize / messageQueueSize: 事件/消息两个队列的当前深度（分队列不混淆）
+//  - fallbackRescan: 事件队列超限置位的"需回落全根重扫"标记
+
+struct WatcherEventQueueSnapshot {
+  std::optional<WatchEvent> event;
+  std::uint64_t dirtyGeneration{0};
+  std::size_t eventQueueSize{0};
+  std::size_t messageQueueSize{0};
+  bool fallbackRescan{false};
+};
+
+using WatcherEventQueueObserver = std::function<void(const WatcherEventQueueSnapshot&)>;
+
+void setWatcherEventQueueObserver(WatcherEventQueueObserver observer);
+void clearWatcherEventQueueObserver();
 
 } // namespace seriona::scanner
