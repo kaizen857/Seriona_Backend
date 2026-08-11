@@ -853,6 +853,71 @@ int main() {
     }
   }
 
+  // ---------- 场景 11：单文件 mv 出根（fae flush 精准删除） ----------
+  // 波 1a（wtr-fae-flush）：wtr 只对目录加 watch，单文件移出根外时父目录收到
+  // 孤立 IN_MOVED_FROM（目标在根外 → 无 IN_MOVED_TO 配对），parse_ev 将其存入
+  // fae 16 槽环缓冲并以 err_pending 抑制转发 → 上层感知不到，只能靠 60s 对账兜底；
+  // fae ~100ms 超时 flush 以 destroy 事件发出 → orchestrator destroyByKey 精准删除
+  // （快照收敛 0 首、scan 不增长）。
+  // 与场景 7/8/9/10（目录 mv，可能回落重扫）区分：单文件 + 短窗口精准语义，
+  // scanStartedDelta 必须 == 0（flush-destroy 精准删除，非对账/回落）。
+  // 观察窗口 3s >> flush 100ms，但 << 60s 对账周期 → 收敛只能来自 flush-destroy。
+  {
+    printSceneHeader(11, "单文件 mv 出根（fae flush 精准删除）");
+    const fs::path faeDir = musicRoot / "fae";
+    const fs::path faeWav = faeDir / "01.wav";
+    const fs::path faeOut = tempRoot / "fae-out";
+    std::error_code ec;
+
+    // 若存在先清理；全部发生在基线与 mv 之前，不影响观察窗口测量
+    fs::remove_all(faeDir, ec);
+    fs::remove_all(faeOut, ec);
+    // 必须 .wav：destroy 门禁（orchestrator:2425 isSupportedAudioExtension）排除非音频
+    writeMinimalWav(faeWav);
+
+    // 等待歌曲"真实进入快照"（PlaylistSnapshotUpdated 后歌曲数 +1），
+    // 而非只等 ScanStarted：仅等 ScanStarted 会引入"扫描开始但快照未落地"
+    // 的竞态，污染后续观察窗口。
+    const auto tracksBeforeAdd = log.lastSnapshotTracks();
+    const bool songInSnapshot = waitUntil(
+        [&log, &tracksBeforeAdd] { return log.lastSnapshotTracks() > tracksBeforeAdd; },
+        kSceneTimeout);
+
+    if (!songInSnapshot) {
+      std::cout << "  操作    : 写 fae/01.wav；等待歌曲入快照（基线歌曲数="
+                << tracksBeforeAdd << "）\n";
+      std::cout << "  结果    : 歌曲未在超时内进入快照\n";
+      std::cout << "  判定    : UNKNOWN（无法执行实验）\n";
+    } else {
+      // 基线稳定沉降：把 setup（新建 fae 目录+写 01.wav）触发的回落重扫
+      // 计入 before，使 mv 窗口的 ScanStarted 增量纯净（flush-destroy 不扫描）。
+      std::this_thread::sleep_for(kBaselineSettle);
+      const auto before = log.baseline();
+      // 单文件 mv 出根（目标在根外 fae-out，fae 目录保留）：父目录 watch 收到
+      // 孤立 IN_MOVED_FROM，fae 槽滞留 → ~100ms 超时 flush 以 destroy 发出。
+      ec = {};
+      fs::rename(faeWav, faeOut, ec);
+      if (ec) {
+        std::cout << "  操作    : rename(musicRoot/fae/01.wav -> fae-out) 失败: "
+                  << ec.message() << "\n";
+        std::cout << "  判定    : UNKNOWN（无法执行实验）\n";
+      } else if (!fs::exists(faeOut)) {
+        std::cout << "  结果    : 移出目标 fae-out 不存在（mv 未生效）\n";
+        std::cout << "  判定    : UNKNOWN\n";
+      } else {
+        // 沉降 300ms + 观察窗口 3s（期间零文件系统操作）：
+        // 3s >> fae flush 100ms，但 << 60s 对账周期 → 收敛只能来自 flush-destroy。
+        std::this_thread::sleep_for(kSilentSettle);
+        std::this_thread::sleep_for(kSilentObserveWindow);
+        const auto after = log.baseline();
+        reportMoveOutScene(11, "单文件 mv 出根（fae flush 精准删除）", before, after,
+                           "写 fae/01.wav 并入快照；rename(musicRoot/fae/01.wav -> fae-out)；"
+                           "沉降 300ms；观察 3s（>> flush 100ms，<< 60s 对账）",
+                           service.get(), faeWav.generic_string());
+      }
+    }
+  }
+
   // ---------- 收尾：汇总表 ----------
   std::cout << "\n===== 汇总（判定依据：ScanStarted 增量 / 快照版本与歌曲数 / 残留路径）=====\n";
   std::cout << "场景 1 文件create   : 对照组，预期精准更新且快照歌曲数 +1\n";
@@ -865,6 +930,7 @@ int main() {
   std::cout << "场景 8 根外继续写   : 核心实验延续，预期幽灵事件丢弃、快照收敛、scan 不增长\n";
   std::cout << "场景 9 多根mv出根   : 核心实验延伸，预期精准删除 + 幽灵事件丢弃、scan 不增长\n";
   std::cout << "场景 10 纯静默mv出根: 用户复现场景，预期 IN_MOVE_SELF 精准删除（快照 0 首 + scan 不增长）\n";
+  std::cout << "场景 11 单文件mv出根 : fae flush 精准删除，预期快照 0 首 + scan 不增长（3s 窗口内，非对账回落）\n";
   std::cout << "注：以上预期为方案 B 语义；实际判定以上方各场景输出为准。\n";
 
   const auto finalErrors = log.errors();

@@ -21,6 +21,10 @@
 - **场景 1/3/4/5 判定不变**（对照组零回归）。
 - 审计程序 `tools/watch_root_move_audit.cpp` 判定分支与文案按上述语义更新（对应计划 todo 13）；`DESIGN.md` §7.2 已更新为"事件驱动精准增量 + 对账兜底"新运行流程。
 
+**单文件移出更新（2026-08-11 追加，wtr-fae-flush）**：
+
+> 上述 `watcher-move-out-fix` 覆盖的是"目录移出根"（IN_MOVE_SELF 转发）；**单文件 mv 出根不在其覆盖范围**（wtr 只对目录加 watch，原结论为"单文件移出零事件、只能靠 60s 对账回落"）。该过期结论已由后续 `wtr-fae-flush` 计划修正：孤立 IN_MOVED_FROM 经 **fae flush ~100ms** 超时（efsw 同款、上游 #122 同源方案）以 destroy 事件即时转发，orchestrator 精准删除，单文件移出监视根**即时感知**（实测约 100-200ms 收敛、scan 增量 0），不再依赖 60s 对账兜底。
+
 ---
 
 ## 一、架构总览
