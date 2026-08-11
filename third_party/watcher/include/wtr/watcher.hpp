@@ -892,8 +892,12 @@ struct ep {
       until we are woken up. We check if
       we are still alive through the fd
       from our semaphore-like eventfd.
+      Seriona patch (wtr-fae-flush): 100ms 周期唤醒，用于 flush
+      滞留的孤立 rename 事件（单文件移出监视根无 IN_MOVED_TO 配对时
+      fae 槽滞留，见 flush_pending_renames）。-1（永久阻塞）改为 100。
+      fanotify 亦共享本 ep，仅 root 启用时随 100ms 周期空醒，无害。
   */
-  static constexpr auto wake_ms = -1;
+  static constexpr auto wake_ms = 100;
 
   int fd = -1;
   epoll_event interests[q_ulim]{};
@@ -1322,6 +1326,9 @@ struct fae {
   struct {
     ::wtr::watcher::event ev{};
     uint32_t cookie = 0;
+    /*  Seriona patch (wtr-fae-flush): 该槽事件到达（存入 fae）的时间，
+        供 flush_pending_renames 判定超龄（>= 100ms）孤立 rename。 */
+    std::chrono::steady_clock::time_point arrived_at{};
   } evs[idx_ulim]{};
 
   int idx_rm = 0;
@@ -1569,6 +1576,9 @@ inline auto parse_ev = [](
            : parsed::err_pending;
   auto last_ev = ke.fae.evs[ke.fae.idx_rm].ev;
   ke.fae.evs[ke.fae.idx_rm] = {{path, et, pt}, in->cookie};
+  /* Seriona patch (wtr-fae-flush): 记录该孤立 rename 的到达时间，
+     flush_pending_renames 据此判定超龄（>= 100ms）。 */
+  ke.fae.evs[ke.fae.idx_rm].arrived_at = std::chrono::steady_clock::now();
   ke.fae.idx_rm = (ke.fae.idx_rm + 1) % fae::idx_ulim;
   return {last_ev, next, err};
 };
@@ -1728,6 +1738,34 @@ inline auto do_ev_recv = [](auto const& cb, sysres& sr) -> result
   }
 };
 
+/*  Seriona patch (wtr-fae-flush): 周期唤醒（ep::wake_ms=100ms）时扫描 fae 槽，
+    对超龄（>= 100ms）且仍滞留的孤立 rename（cookie != 0，单文件移出监视根时
+    无 IN_MOVED_TO 配对）事件，以 destroy 事件即时转发（efsw 100ms flush 成
+    DELETE 同款，上游 #122 提议的小超时方案）。只做两件事：清 cookie + 回调
+    destroy。绝不调 update_path_maps_on_rename、绝不动 wd_to_p/p_to_wd 路径
+    映射——残留 watch 映射由既有幽灵事件守卫处置。
+    已知边界（接受，不修）：文件 A 移出后 100ms 内同名 B 在同位置新建，flush
+    可能把 B 误判为 A 的 destroy 而删除；罕见且 60s 对账（hash 变化重新发现）自愈。
+    与 do_ev_recv 的 !err_pending 抑制（err_pending 不回调）共同构成孤立出口：
+    parse_ev 存槽时 err_pending → 抑制转发；flush 是本场景唯一的新出口。 */
+inline auto flush_pending_renames = [](ke_in_ev& ke, auto const& cb) -> void
+{
+  using ev_et = enum ::wtr::watcher::event::effect_type;
+  auto const now = std::chrono::steady_clock::now();
+  for (int i = 0; i < fae::idx_ulim; ++i) {
+    auto const& slot = ke.fae.evs[i];
+    if (slot.cookie == 0)
+      continue;
+    if (now - slot.arrived_at < std::chrono::milliseconds{100})
+      continue;
+    auto const ev = slot.ev;
+    ke.fae.evs[i].cookie = 0;
+    /* 槽内存的是 rename 事件，必须显式构造 destroy（path_type 沿用槽内已存值，
+       IN_MOVED_FROM 时 IN_ISDIR 已正确判定 dir/file）。 */
+    cb({ev.path_name, ev_et::destroy, ev.path_type});
+  }
+};
+
 } /*  namespace detail::wtr::watcher::adapter::inotify */
 
 #endif
@@ -1749,7 +1787,7 @@ namespace detail::wtr::watcher::adapter {
 inline auto watch =
   [](auto const& path, auto const& cb, auto const& living) -> bool
 {
-  auto platform_watch = [&](auto make_sysres, auto do_ev_recv) -> result
+  auto platform_watch = [&](auto make_sysres, auto do_ev_recv, auto on_timeout) -> result
   {
     auto sr = make_sysres(path.c_str(), cb, living);
     auto is_ev_of = [&](int nth, int fd) -> bool
@@ -1760,6 +1798,13 @@ inline auto watch =
         epoll_wait(sr.ep.fd, sr.ep.interests, sr.ep.q_ulim, sr.ep.wake_ms);
       if (ep_c < 0) {
         if (errno != EINTR) sr.ok = result::e_sys_api_epoll;
+      }
+      /* Seriona patch (wtr-fae-flush): epoll_wait 返回 0 = 周期唤醒超时。
+         调用 on_timeout 以 flush 滞留的孤立 rename。必须 if constexpr 短路：
+         ① fanotify sysres.ke 无 .fae（flush 回调体访问 sr.ke.fae 编译失败）；
+         ② nullptr 不可调用。 */
+      else if (ep_c == 0) {
+        if constexpr (! std::is_null_pointer_v<decltype(on_timeout)>) on_timeout(sr);
       }
       else
         for (int n = 0; n < ep_c; ++n)
@@ -1805,14 +1850,19 @@ inline auto watch =
   {
 #if (KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE) && ! __ANDROID_API__
     if (geteuid() == 0)
-      return platform_watch(fanotify::make_sysres, fanotify::do_ev_recv);
+      /*  Seriona patch (wtr-fae-flush): fanotify 不滞留孤立 rename，传 nullptr
+          禁用 flush（fanotify sysres.ke 无 .fae，on_timeout 亦不会实例化）。 */
+      return platform_watch(fanotify::make_sysres, fanotify::do_ev_recv, nullptr);
 #endif
     return result::e_sys_api_fanotify;
   };
 
   auto r = try_fanotify();
   if (r == result::e_sys_api_fanotify)
-    r = platform_watch(inotify::make_sysres, inotify::do_ev_recv);
+    /*  Seriona patch (wtr-fae-flush): inotify 周期唤醒时 flush 滞留的孤立
+        rename（inotify:: 限定：flush_pending_renames 在 adapter::inotify 内）。 */
+    r = platform_watch(inotify::make_sysres, inotify::do_ev_recv,
+                       [&](auto& sr) { inotify::flush_pending_renames(sr.ke, cb); });
   if (r >= result::e)
     return send_msg(r, path.c_str(), cb), false;
   else

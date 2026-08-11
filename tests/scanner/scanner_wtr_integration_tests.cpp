@@ -193,6 +193,64 @@ TEST_CASE("real wtr integration directory moved out of root converges snapshot s
   std::filesystem::remove_all(movedOut, ec);
 }
 
+// 波 1a（wtr-fae-flush）：单文件 mv 出根。wtr 只对目录加 watch，单文件移出根外时
+// 父目录收到孤立 IN_MOVED_FROM（目标在根外 → 无 IN_MOVED_TO 配对），parse_ev 将其存入
+// fae 16 槽环缓冲并以 err_pending 抑制转发 → 上层感知不到，只能靠 60s 对账兜底。
+// 本测试保持 reconcileInterval=60s（默认，排除对账），断言 10s 观察窗口内由
+// fae ~100ms 超时 flush（destroy 事件）收敛：快照空 + SQLite 空 + scan 增量 0（精准删除，非回落）。
+TEST_CASE("real wtr integration single file moved out converges via fae flush") {
+  test::TempScannerRoot temp{"scanner-wtr-single-move-out"};
+  const auto root = temp.path();
+  const auto music = root / "music";
+  const auto wav = music / "01.wav";
+  std::filesystem::create_directories(music);
+
+  const auto movedOut =
+      temp.path().parent_path() / ("seriona-wtr-single-moved-" + temp.path().filename().string());
+  std::error_code ec;
+  std::filesystem::remove_all(movedOut, ec);
+
+  RealWtrEventLog log;
+  auto service = makeRealWtrService(temp, log);
+
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  service->startWatching({ScannerRoot{.path = root}});
+
+  // 必须 .wav：destroy 门禁（orchestrator:2425 isSupportedAudioExtension）排除非音频。
+  writeMinimalWav(wav);
+  waitForSnapshotSongCount(*service, 1U);
+  // 沉降：create 可能触发的回落先完成，再取基线 scan 计数。
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  const auto baseline = log.scanStartedCount();
+
+  std::filesystem::rename(wav, movedOut, ec);
+  REQUIRE_FALSE(ec);
+
+  // 收敛（10s 窗口 << 60s 对账周期，排除对账兜底）：快照空 + SQLite 空 + 根外文件存在。
+  CHECK(waitUntil(
+      [&] {
+        return songsIn(service->snapshot()).empty() && locationsForRoot(temp).empty() &&
+               std::filesystem::exists(movedOut);
+      },
+      std::chrono::seconds{10}));
+
+  const auto songs = songsIn(service->snapshot());
+  CHECK(songs.empty());
+  CHECK(std::ranges::none_of(songs, [&wav](const SongMetadata& song) { return song.filePath == wav; }));
+
+  const auto locations = locationsForRoot(temp);
+  CHECK(locations.empty());
+
+  // 精准删除：flush-destroy 走 destroyByKey 精准移除，scan 计数不增长（非回落全根重扫）。
+  CHECK(log.scanStartedCount() == baseline);
+
+  service->stopWatching();
+  service->stop();
+  service.reset();
+  std::filesystem::remove_all(movedOut, ec);
+}
+
 TEST_CASE("real wtr integration root internal directory rename updates paths without residue") {
   test::TempScannerRoot temp{"scanner-wtr-rename-in-root"};
   const auto root = temp.path();
@@ -216,6 +274,14 @@ TEST_CASE("real wtr integration root internal directory rename updates paths wit
   std::filesystem::rename(music, pop, ec);
   REQUIRE_FALSE(ec);
 
+  // 负向守卫（波 1b，wtr-fae-flush）：证明 flush 不误伤根内 rename。rename 对
+  // （IN_MOVED_FROM + IN_MOVED_TO）在 watcherDebounce（夹具 10ms）内配对成功，fae 槽被清空，
+  // flush_pending_renames 不应把根内 rename 的 MOVED_FROM 误判为 destroy。
+  // 若 flush 误触发 destroy(music)，会破坏 renameSubtree 精准更新（旧路径被删后由回落重扫
+  // 重建 → scan 超既有容忍，或残留/计数异常）。故严格断言仅针对"无伪 destroy"，三项均
+  // 由下方既有断言覆盖：① song 数正确且新路径存在（:310-312）；② 旧路径 music/01.wav
+  // 无残留（快照 :298-299 与 SQLite :317-319 的 none_of）；③ scan 不增长（:322，沿用既有
+  // `<= baseline + 1U` 容忍——真实 wtr 根内 rename 可能回落一次，不新增字面 delta==0 断言）。
   // 三方收敛：快照路径更新、SQLite 路径更新、磁盘新路径存在，且旧路径无残留。
   const auto converged = [&] {
     const auto songs = songsIn(service->snapshot());
