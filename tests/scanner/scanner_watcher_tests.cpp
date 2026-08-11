@@ -684,6 +684,77 @@ TEST_CASE("scanner watcher precisely removes a directory moved out of the root")
   CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
 }
 
+TEST_CASE("scanner watcher dedups same-path move-self and flush destroy within one batch") {
+  // 波 2（wtr-fae-flush todo 3）：目录 mv 出根时 wtr 可能同时报 IN_MOVE_SELF
+  // （Other/Directory → moveSelfByRaw）与 flush destroy（Destroyed/Directory → destroyByKey），
+  // 两路都汇入 removes。applyClassifierBatch 的批内去重（按 pathKey(abs)，保留首个）保证
+  // 同路径 remove 只应用一次：精准删除、单次发布、不回落重扫、无重复 ScannerEvent。
+  test::TempScannerRoot temp{"scanner-watcher-remove-dedup"};
+  const auto music = temp.path() / "music";
+  std::filesystem::create_directories(music);
+  const auto track = test::writeAudioFixture(music, "01.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(track, rawMetadata("Dedup Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  CHECK(reader->readCount() == 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  const auto versionBefore = service->snapshot().version;
+  const auto completedBefore = [&events, &eventsMutex] {
+    std::scoped_lock lock{eventsMutex};
+    return static_cast<std::size_t>(
+      std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
+  }();
+  const auto snapshotEventsBefore = [&events, &eventsMutex] {
+    std::scoped_lock lock{eventsMutex};
+    return static_cast<std::size_t>(
+      std::ranges::count(events, ScannerEventType::PlaylistSnapshotUpdated, &ScannerEvent::type));
+  }();
+
+  const auto movedOut = temp.path().parent_path() / ("seriona-remove-dedup-" + temp.path().filename().string());
+  std::error_code moveError;
+  std::filesystem::remove_all(movedOut, moveError);
+  std::filesystem::rename(music, movedOut);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  // 同批注入两条同路径 remove 事件（背靠背、无 sleep 间隔，保证落入同一 debounce 批次）。
+  watchers->states[0]->callback(directorySelfEvent(music));
+  watchers->states[0]->callback(WatchEvent{.path = music,
+                                            .pathKind = WatchPathKind::Directory,
+                                            .effectKind = WatchEffectKind::Destroyed,
+                                            .associated = {}});
+
+  waitForSnapshotSongCount(*service, 0U);
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 双 remove 合并后仍走精准删除路径，不触发全根 ScanStarted（非回落重扫）。
+    CHECK(scanStartedCount(events) == 1U);
+    // 批内去重后同路径 remove 只发布一次完成/快照事件：恰好 +1，无重复 ScannerEvent。
+    CHECK(completedBefore + 1U == static_cast<std::size_t>(
+      std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type)));
+    CHECK(snapshotEventsBefore + 1U == static_cast<std::size_t>(
+      std::ranges::count(events, ScannerEventType::PlaylistSnapshotUpdated, &ScannerEvent::type)));
+  }
+  // 快照版本单调递增（单次发布，无重复 Snapshot）。
+  CHECK(service->snapshot().version > versionBefore);
+  // 精准删除只应用一次的效果：根下无残留位置。
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  CHECK(sidecar.loadLocationsByRoot(canonicalRootPath(temp.path())).empty());
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
 TEST_CASE("scanner watcher root-internal directory rename converges without rescan") {
   test::TempScannerRoot temp{"scanner-watcher-rename-in-root"};
   const auto music = temp.path() / "music";

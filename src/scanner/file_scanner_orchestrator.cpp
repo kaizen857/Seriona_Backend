@@ -2432,6 +2432,20 @@ private:
       return false;
     }
 
+    // Seriona patch (wtr-fae-flush): 批内防御性去重——目录 mv 出根可能同时产生
+    // IN_MOVE_SELF（上方 moveSelfByRaw 循环 push）+ flush destroy（destroyByKey 循环 push）
+    // 的同路径双 remove。watcherDebounce（50ms）聚合与 fae flush（100ms）跨批次，跨批去重
+    // 无效且双 remove 幂等无害（removeSubtree/deleteLocationsByPathPrefix 重复执行结果一致），
+    // 本段只消除同批内的冗余：按 pathKey(abs) 去重、保留首个（push 顺序即 moveSelfByRaw 在前），
+    // 不引入任何跨批去重状态。
+    {
+      std::unordered_set<std::string> seenRemoveKeys;
+      seenRemoveKeys.reserve(removes.size());
+      std::erase_if(removes, [&](const ClassifierRemove& remove) {
+        return !seenRemoveKeys.insert(pathKey(remove.abs)).second;
+      });
+    }
+
     for (auto& [key, op] : upsertByKey) {
       const auto root = findRootFor(op.raw);
       if (!root.has_value()) {
