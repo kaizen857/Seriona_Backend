@@ -33,7 +33,7 @@
 
 ## 不可破坏的约束
 - miniaudio 回调最终进入 `AudioOutputDevice::renderCallback()`；实时路径只能读 PCM 队列、补静音、应用音量/静音、更新原子计数，禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁和设备生命周期操作。
-- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。
+- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底。
 - 音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture；不要依赖真实硬件、版权媒体或仓库媒体样本。
 - `seriona_audio` 必须 PRIVATE 链接 `BS::thread_pool`，根 CMake 有 FATAL_ERROR 守卫；AVX2/FMA 参数仅允许施加于 `src/audio/waveform_simd_avx2.cpp`。
 
@@ -41,8 +41,8 @@
 - 发现：`ctest --test-dir build -N`；全量：`ctest --test-dir build --output-on-failure`；聚焦：`ctest --test-dir build -R '<regex>' --output-on-failure`。
 - 常用正则有 `seriona\.audio`、`seriona\.scanner`、`seriona\.metadata`、`seriona\.control`、`seriona\.logging`、`seriona\.runtime_paths`、`seriona\.application_logging`。
 - doctest 测试二进制必须恰有一个 `main`；多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，少数自带普通入口，禁止重复定义。
-- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 240s，`seriona.control_artwork_resolver` 超时 60s。
+- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 240s，`seriona.control_artwork_resolver` 超时 60s，`seriona.scanner.wtr_integration` 超时 180s。
 - `seriona_scanner_cache_tests`、`seriona_scanner_cache_content_tests`、v2→v3 migration、backup rollback、phase1 integration 目标在 `tests/CMakeLists.txt` 中禁用，不要假设可运行或已有迁移。
 - `seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test` 只构建不注册 CTest，直接运行 `build/tests/<target>`；`seriona.audio_fixture`、`seriona.scanner.cache.perf` 已注册。
-- `-DSERIONA_BUILD_TOOLS=ON` 才加入 `seriona_scanner_cold_perf` 和 `seriona_miniaudio_platform_probe`；后者是 `EXCLUDE_FROM_ALL`，用 `cmake --build build --target seriona_miniaudio_platform_probe` 显式构建。
+- `-DSERIONA_BUILD_TOOLS=ON` 才加入 `seriona_scanner_cold_perf`、`seriona_miniaudio_platform_probe` 和 `seriona_watch_root_move_audit`；只有 `seriona_miniaudio_platform_probe` 是 `EXCLUDE_FROM_ALL`（用 `cmake --build build --target seriona_miniaudio_platform_probe` 显式构建），`seriona_watch_root_move_audit` 随默认 `all` 目标构建、链接 `seriona_scanner` 且 include 路径伸入 `src/` 私有头 `file_scanner_service_internal.h`（审计“目录移出监视根”场景）。
 - `SERIONA_SCANNER_SIMULATE_MISSING_SQLITE`、`SERIONA_SCANNER_SIMULATE_MISSING_XXHASH`、`SERIONA_METADATA_SIMULATE_MISSING_SDBUS` 会故意令配置失败；第三项仅在 `UNIX AND NOT APPLE` 分支生效，正常构建不要开启。
