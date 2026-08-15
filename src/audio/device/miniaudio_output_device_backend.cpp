@@ -2,7 +2,9 @@
 #include <miniaudio.h>
 
 #include "seriona/audio/device/audio_output_device.h"
+#include "spdlog/spdlog.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -91,10 +93,24 @@ public:
     config.playback.channels = request.channelCount;
     config.sampleRate = request.sampleRate;
     config.periodSizeInFrames = request.bufferFrames;
+    // Explicit device buffering (plan §二 P1-③): target ~100ms total device buffer
+    // (96-150ms band) via `periods`; this miniaudio exposes only periodSizeInFrames +
+    // periods (total = periodSize * periods), so derive the period count from the
+    // 100ms target while keeping periodSizeInFrames as-is (service caps it at 512).
+    const auto explicitBufferFrames = request.sampleRate / 10U;
+    config.periods =
+        std::max(3U, (explicitBufferFrames + request.bufferFrames - 1U) / std::max(request.bufferFrames, 1U));
     config.dataCallback = miniaudioDataCallback;
     config.pUserData = request.callbackUserData;
 
-    const auto result = ma_device_init(nullptr, &config, &device_);
+    auto result = ma_device_init(nullptr, &config, &device_);
+    if (result != MA_SUCCESS) {
+      spdlog::warn("miniaudio backend rejected explicit buffer config (periodSizeInFrames={}, periods={}); "
+                   "retrying with backend defaults",
+                   config.periodSizeInFrames, config.periods);
+      config.periods = 0;
+      result = ma_device_init(nullptr, &config, &device_);
+    }
     if (result != MA_SUCCESS) {
       lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
                                           "failed to initialize audio output device",

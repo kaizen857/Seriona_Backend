@@ -1,10 +1,13 @@
 #include "seriona/audio/audio_contracts.h"
 #include "seriona/audio/audio_playback_service.h"
 
+#include "../../src/audio/thread_priority.h"
+
 #include <doctest.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -406,6 +409,44 @@ TEST_CASE("audio_error_matrix maps decode, underrun, and seek failures") {
   REQUIRE(underrunError.clock.has_value());
   CHECK(underrunError.clock->trackId == "underrun");
   CHECK(underrunError.detail.find("silence frames") != std::string::npos);
+}
+
+TEST_CASE("audio_error_matrix worker thread priority helper applies and reports the effective path") {
+  // Runs on the calling (test) thread; works privileged and unprivileged:
+  // the reported outcome must always match the thread's actual scheduling
+  // state, whichever fallback path the kernel allowed.
+  const auto result = applyAudioWorkerThreadPriority();
+  CHECK_FALSE(result.description.empty());
+
+#if defined(_WIN32)
+  if (result.outcome == ThreadPriorityOutcome::AboveNormal) {
+    CHECK(GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_ABOVE_NORMAL);
+  }
+#elif defined(__APPLE__)
+  // Apple has no per-thread priority control (no SCHED_RR, no per-thread
+  // nice); the helper is a deliberate no-op and must never touch the
+  // process-wide priority.
+  CHECK(result.outcome == ThreadPriorityOutcome::NoOp);
+#else
+  switch (result.outcome) {
+  case ThreadPriorityOutcome::Realtime:
+    CHECK(sched_getscheduler(0) == SCHED_RR);
+    break;
+  case ThreadPriorityOutcome::Nice:
+    errno = 0;
+    CHECK(getpriority(PRIO_PROCESS, 0) == -5);
+    break;
+  case ThreadPriorityOutcome::Denied: {
+    errno = 0;
+    const int priority = getpriority(PRIO_PROCESS, 0);
+    CHECK(sched_getscheduler(0) == SCHED_OTHER);
+    CHECK(priority >= 0);
+    break;
+  }
+  default:
+    FAIL("unexpected worker thread priority outcome: " << result.description);
+  }
+#endif
 }
 
 }

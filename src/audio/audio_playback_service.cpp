@@ -1,5 +1,7 @@
 #include "seriona/audio/audio_playback_service.h"
 
+#include "thread_priority.h"
+
 #include "spdlog/spdlog.h"
 
 #include "seriona/audio/buffer/pcm_buffer_queue.h"
@@ -565,6 +567,17 @@ private:
   }
 
   void runAudioWorker() {
+    // Raise this worker's own scheduling priority before the command/decode
+    // loop starts; the active path must be observable at startup. The helper
+    // only touches the calling thread, so the miniaudio device callback
+    // thread is unaffected.
+    const auto priority = applyAudioWorkerThreadPriority();
+    if (priority.outcome == ThreadPriorityOutcome::Denied) {
+      spdlog::warn("audio worker thread priority: {}", priority.description);
+    } else {
+      spdlog::info("audio worker thread priority: {}", priority.description);
+    }
+
     for (;;) {
       std::optional<AudioCommand> command;
       {

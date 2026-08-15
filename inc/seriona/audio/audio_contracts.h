@@ -80,7 +80,9 @@ struct AudioOutputConfig {
   std::optional<std::uint32_t> targetSampleRate;
   std::optional<AudioSampleFormat> targetSampleFormat;
   std::optional<std::uint16_t> targetChannelCount;
-  std::chrono::milliseconds bufferDuration{100};
+  // 300ms default ring: absorbs decoder-thread scheduling jitter that underran the 100ms ring under CPU load
+  // (docs/audio-playback-stutter-and-watcher-reconciliation-analysis.md §二 P0-①).
+  std::chrono::milliseconds bufferDuration{300};
   bool keepDeviceOpen{false};
   bool allowFallback{true};
   std::string preferredDeviceId;
