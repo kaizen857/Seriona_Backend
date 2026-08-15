@@ -625,21 +625,39 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
               trackPosition = std::min(trackPosition, *player_.timeline.duration);
             }
             player_.timeline.position = trackPosition;
-          }
-          addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
-          if (player_.repeatMode == RepeatMode::One) {
-            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
-              selectTrack(reduction, *track, true);
-            } else {
-              stopPlayback(reduction);
-            }
+	          }
+	          if (player_.repeatMode == RepeatMode::One) {
+	            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
+	              selectTrack(reduction, *track, true);
+	            } else {
+	              stopPlayback(reduction);
+	            }
+	          } else if (player_.shuffle && playbackContext_.has_value() && !playbackContext_->order.empty()) {
+	            if (const auto track = shuffledTrack(playbackContext_->order, /*reshuffleWhenExhausted=*/true); track.has_value()) {
+	              selectTrack(reduction, *track, true);
+	            } else if (const auto current = selectedPlaybackContextTrack(); current.has_value()) {
+	              selectTrack(reduction, *current, true);
+	            } else {
+	              stopPlayback(reduction);
+	            }
+          } else if (isLastTrackInContext()) {
+            addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
+	            if (player_.repeatMode == RepeatMode::All) {
+	              if (const auto track = firstTrackOfCurrentFolder(); track.has_value()) {
+	                selectTrack(reduction, *track, true);
+	              } else {
+	                stopPlayback(reduction);
+	              }
+	            } else {
+	              stopPlayback(reduction);
+	            }
           } else if (const auto track = nextTrack(true); track.has_value()) {
             selectTrack(reduction, *track, true);
           } else {
             stopPlayback(reduction);
           }
-          markPlayerChanged(reduction, payload.finalClock.sampledAt);
-        } else if constexpr (std::is_same_v<Payload, audio::OutputFormatChanged>) {
+	          markPlayerChanged(reduction, payload.finalClock.sampledAt);
+	        } else if constexpr (std::is_same_v<Payload, audio::OutputFormatChanged>) {
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::OutputModeFallback>) {
           addNotification(reduction, makeNotification(ControlDomainNotificationKind::OutputModeFallback, payload.reason));
@@ -766,7 +784,8 @@ std::vector<ControlStateReducer::PlayableTrack> ControlStateReducer::playableTra
                                      .display = displayFromSong(*node.song),
                                      .artwork = artworkFromSong(*node.song),
                                      .artworkSourcePath = !node.song->sourceFilePath.empty() ? node.song->sourceFilePath : node.song->filePath,
-                                     .fallbackThumbnailPath = node.song->thumbnailPath.value_or(std::filesystem::path{})});
+                                     .fallbackThumbnailPath = node.song->thumbnailPath.value_or(std::filesystem::path{}),
+                                     .parentNodeId = node.parentNodeId});
     }
   };
 
@@ -876,7 +895,8 @@ std::optional<ControlStateReducer::PlaybackContextState> ControlStateReducer::bu
                                         .display = displayFromSong(item.metadata),
                                         .artwork = artworkFromSong(item.metadata),
                                         .artworkSourcePath = !item.metadata.sourceFilePath.empty() ? item.metadata.sourceFilePath : item.metadata.filePath,
-                                        .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{})});
+                                        .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{}),
+                                        .parentNodeId = item.parentNodeId});
   }
   return state;
 }
@@ -974,7 +994,9 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack
   return std::nullopt;
 }
 
-std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(const std::vector<PlayableTrack>& tracks) {
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledTrack(
+    const std::vector<PlayableTrack>& tracks,
+    bool reshuffleWhenExhausted) {
   auto candidates = tracks;
   if (candidates.empty()) {
     return std::nullopt;
@@ -995,7 +1017,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
   candidates = std::move(filtered);
   
   if (candidates.empty()) {
-    if (player_.repeatMode == RepeatMode::All) {
+    if (player_.repeatMode == RepeatMode::All || reshuffleWhenExhausted) {
       shuffleHistory_.clear();
       candidates = tracks;
       candidates = filterOutHistory(candidates);
@@ -1026,6 +1048,48 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
     }
   }
   return selected;
+}
+
+bool ControlStateReducer::isLastTrackInContext() const {
+  if (!playbackContext_.has_value() || playbackContext_->order.empty()) {
+    return false;
+  }
+  const auto currentIndex = selectedContextIndex();
+  if (!currentIndex.has_value()) {
+    return false;
+  }
+  return *currentIndex + 1U >= playbackContext_->order.size();
+}
+
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::firstTrackOfCurrentFolder() {
+  if (!playbackContext_.has_value() || playbackContext_->order.empty()) {
+    return std::nullopt;
+  }
+
+  const auto containerNodeId = [&]() -> std::optional<std::string> {
+    if (playbackContext_->descriptor.scope == PlaybackContextScope::Folder) {
+      return playbackContext_->descriptor.folderNodeId;
+    }
+    if (library_.libraryTree.has_value() && library_.libraryTree->rootNodeId.has_value()) {
+      return library_.libraryTree->rootNodeId;
+    }
+    return std::nullopt;
+  }();
+
+  if (!containerNodeId.has_value()) {
+    return playbackContext_->order.front();
+  }
+
+  const auto firstIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(),
+                                    [&](const PlayableTrack& track) {
+                                      return track.parentNodeId.has_value() &&
+                                             *track.parentNodeId == *containerNodeId;
+                                    });
+  if (firstIt == playbackContext_->order.end()) {
+    return std::nullopt;
+  }
+  playbackContext_->index = static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), firstIt));
+  return *firstIt;
 }
 
 std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::previousTrack() {
@@ -1132,7 +1196,8 @@ void ControlStateReducer::reconcilePlaybackContextAfterSnapshot(ControlReduction
                                           .display = displayFromSong(item.metadata),
                                           .artwork = artworkFromSong(item.metadata),
                                           .artworkSourcePath = !item.metadata.sourceFilePath.empty() ? item.metadata.sourceFilePath : item.metadata.filePath,
-                                          .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{})});
+                                          .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{}),
+                                          .parentNodeId = item.parentNodeId});
   }
 
   std::optional<std::size_t> currentIndex{};

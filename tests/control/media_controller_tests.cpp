@@ -193,6 +193,21 @@ scanner::PlaylistTreeSnapshot contextLibraryTreeWithFolderA(std::vector<scanner:
   return snapshot;
 }
 
+scanner::PlaylistTreeSnapshot contextLibraryTreeWithSubfolder(std::uint64_t version = 60) {
+  scanner::PlaylistTreeSnapshot snapshot{};
+  snapshot.version = version;
+  snapshot.rootNodeId = "root";
+  snapshot.nodes = {rootNode({"dir:a", "dir:b"}),
+                    directoryNode("dir:a", "root", "Folder A", {"dir:a-sub", "track:a-01", "track:a-02"}),
+                    directoryNode("dir:a-sub", "dir:a", "Sub A", {"track:a-sub-01"}),
+                    directoryNode("dir:b", "root", "Folder B", {"track:b-01"}),
+                    trackNodeInParent("track:a-sub-01", "dir:a-sub", song("a-sub-01", "music/folder-a/sub/01.flac")),
+                    trackNodeInParent("track:a-01", "dir:a", song("a-01", "music/folder-a/01.flac")),
+                    trackNodeInParent("track:a-02", "dir:a", song("a-02", "music/folder-a/02.flac")),
+                    trackNodeInParent("track:b-01", "dir:b", song("b-01", "music/folder-b/01.flac"))};
+  return snapshot;
+}
+
 scanner::ScannerEvent scannerSnapshotEvent(scanner::PlaylistTreeSnapshot snapshot, std::uint64_t eventVersion) {
   return scanner::ScannerEvent{.type = scanner::ScannerEventType::PlaylistSnapshotUpdated,
                                .monotonicVersion = eventVersion,
@@ -1096,7 +1111,8 @@ TEST_CASE("media controller facade applies skip repeat and playback-ended polici
   fixture.fakeAudio->emit(audioPlaybackEndedEvent("a", "music/a.flac", 10));
   fixture.controller->drainForTests();
 
-  CHECK(waitUntil([&] { return playbackEndedNotifications.load() == 1U; }));
+  CHECK(waitUntil([&] { return fixture.fakeAudio->loadTrackCalls() > 0U; }));
+  CHECK(playbackEndedNotifications.load() == 0U);
   REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
   CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
@@ -1313,6 +1329,112 @@ TEST_CASE("media controller playback-ended advances only within the current play
   CHECK(fixture.fakeAudio->loadTrackCalls() == loadCallsBeforeEnd);
   CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+}
+
+TEST_CASE("media controller sequential playback notifies only when the list ends") {
+  ControllerFixture fixture{};
+  std::atomic_size_t playbackEndedNotifications{0};
+  auto subscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    if (notification.kind == ControlDomainNotificationKind::PlaybackEnded) {
+      playbackEndedNotifications.fetch_add(1U);
+    }
+  });
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 55));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-01", "music/folder-a/01.flac", 80));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  CHECK(playbackEndedNotifications.load() == 0U);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-02", "music/folder-a/02.flac", 81));
+  fixture.controller->drainForTests();
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-03");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  CHECK(playbackEndedNotifications.load() == 0U);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-03", "music/folder-a/03.flac", 82));
+  fixture.controller->drainForTests();
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Stopped);
+  REQUIRE(waitUntil([&] { return playbackEndedNotifications.load() == 1U; }));
+  CHECK(playbackEndedNotifications.load() == 1U);
+  subscription.unsubscribe();
+}
+
+TEST_CASE("media controller list-loop playback wraps to the folder's first direct track on end") {
+  ControllerFixture fixture{};
+  std::atomic_size_t playbackEndedNotifications{0};
+  auto subscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    if (notification.kind == ControlDomainNotificationKind::PlaybackEnded) {
+      playbackEndedNotifications.fetch_add(1U);
+    }
+  });
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTreeWithSubfolder(), 56));
+  fixture.controller->drainForTests();
+
+  auto repeatAll = command(MediaControlCommandKind::SetRepeatMode);
+  repeatAll.repeatMode = RepeatMode::All;
+  REQUIRE(fixture.controller->submitCommand(repeatAll).accepted);
+
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-01", "music/folder-a/01.flac", 80));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-02");
+  CHECK(playbackEndedNotifications.load() == 0U);
+
+  fixture.fakeAudio->emit(audioPlaybackEndedEvent("a-02", "music/folder-a/02.flac", 81));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+  CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a-01");
+  CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  REQUIRE(waitUntil([&] { return playbackEndedNotifications.load() == 1U; }));
+  CHECK(playbackEndedNotifications.load() == 1U);
+  subscription.unsubscribe();
+}
+
+TEST_CASE("media controller shuffle playback always picks a random next track on end") {
+  ControllerFixture fixture{};
+  std::atomic_size_t playbackEndedNotifications{0};
+  auto subscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    if (notification.kind == ControlDomainNotificationKind::PlaybackEnded) {
+      playbackEndedNotifications.fetch_add(1U);
+    }
+  });
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(contextLibraryTree(), 57));
+  fixture.controller->drainForTests();
+
+  auto enableShuffle = command(MediaControlCommandKind::SetShuffle);
+  enableShuffle.shuffle = true;
+  REQUIRE(fixture.controller->submitCommand(enableShuffle).accepted);
+  REQUIRE(fixture.controller->submitCommand(
+              startPlaybackFromContext(folderContext("dir:a", track("a-01", "music/folder-a/01.flac"))))
+              .accepted);
+
+  std::set<std::string> played{"a-01"};
+  for (int index = 0; index < 6; ++index) {
+    REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+    const auto current = fixture.fakeAudio->lastLoadedTrack()->trackId;
+    fixture.fakeAudio->emit(audioPlaybackEndedEvent(current, "music/folder-a/" + current.substr(2) + ".flac", 90 + index));
+    fixture.controller->drainForTests();
+    REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+    played.insert(fixture.fakeAudio->lastLoadedTrack()->trackId);
+    CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  }
+  CHECK(played == std::set<std::string>{"a-01", "a-02", "a-03"});
+  CHECK(playbackEndedNotifications.load() == 0U);
+  subscription.unsubscribe();
 }
 
 TEST_CASE("media controller ignores playback-ended events for a stale previous track") {

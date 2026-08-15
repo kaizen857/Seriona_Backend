@@ -82,6 +82,8 @@ private:
     std::optional<ArtworkRef> artwork{};
     std::filesystem::path artworkSourcePath;
     std::filesystem::path fallbackThumbnailPath;
+    // 曲目所属容器节点（目录/专辑等）；用于“当前文件夹第一首（不含子文件夹）”回绕。
+    std::optional<std::string> parentNodeId{};
   };
 
   struct PlaybackContextState {
@@ -100,8 +102,13 @@ private:
   [[nodiscard]] std::optional<PlayableTrack> selectedPlaybackContextTrack();
   [[nodiscard]] bool activateTrackWithDefaultContext(ControlReduction& reduction, const TrackIdentity& identity, bool startPlayback);
   [[nodiscard]] std::optional<PlayableTrack> nextTrack(bool forward);
-  [[nodiscard]] std::optional<PlayableTrack> shuffledTrack(const std::vector<PlayableTrack>& tracks);
+  [[nodiscard]] std::optional<PlayableTrack> shuffledTrack(const std::vector<PlayableTrack>& tracks,
+                                                          bool reshuffleWhenExhausted = false);
   [[nodiscard]] std::optional<PlayableTrack> previousTrack();
+  // 当前选中曲目是否为播放上下文的最后一首（不含子文件夹干扰的判断由 order 决定）。
+  [[nodiscard]] bool isLastTrackInContext() const;
+  // 当前播放上下文容器（文件夹 / 根）直属的第一首，不含子文件夹。
+  [[nodiscard]] std::optional<PlayableTrack> firstTrackOfCurrentFolder();
   [[nodiscard]] std::vector<PlayableTrack> filterOutHistory(const std::vector<PlayableTrack>& candidates) const;
   [[nodiscard]] std::chrono::milliseconds clampPosition(std::chrono::milliseconds position) const;
 
