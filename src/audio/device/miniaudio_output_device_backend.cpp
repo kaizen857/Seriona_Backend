@@ -5,6 +5,8 @@
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -103,15 +105,21 @@ public:
     config.dataCallback = miniaudioDataCallback;
     config.pUserData = request.callbackUserData;
 
-    auto result = ma_device_init(nullptr, &config, &device_);
+    // preferredDeviceId 非空时解析（枚举索引字符串，见 enumeratePlaybackDevices）并绑定对应
+    // 播放设备；解析失败（非数字/越界/枚举失败）回退默认设备——仅记日志，不视为失败。
+    const bool boundToPreferredDevice =
+        !request.config.preferredDeviceId.empty() && resolvePreferredDevice(request.config.preferredDeviceId, config);
+
+    auto result = ma_device_init(boundToPreferredDevice ? &context_ : nullptr, &config, &device_);
     if (result != MA_SUCCESS) {
       spdlog::warn("miniaudio backend rejected explicit buffer config (periodSizeInFrames={}, periods={}); "
                    "retrying with backend defaults",
                    config.periodSizeInFrames, config.periods);
       config.periods = 0;
-      result = ma_device_init(nullptr, &config, &device_);
+      result = ma_device_init(boundToPreferredDevice ? &context_ : nullptr, &config, &device_);
     }
     if (result != MA_SUCCESS) {
+      releaseContext();
       lastError_ = AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
                                           "failed to initialize audio output device",
                                           miniaudioDetail(result)};
@@ -172,10 +180,13 @@ public:
       return;
     }
 
+    // context 必须比 device 活得久（ma_device_init 将 pContext 存进 pDevice->pContext），
+    // 因此先 uninit device，再释放 context。
     ma_device_uninit(&device_);
     device_ = {};
     currentFormat_ = {};
     initialized_ = false;
+    releaseContext();
   }
 
   [[nodiscard]] AudioDeviceFormat currentFormat() const override { return currentFormat_; }
@@ -183,7 +194,67 @@ public:
   [[nodiscard]] std::optional<AudioOutputDeviceError> lastError() const override { return lastError_; }
 
 private:
+  // 将 preferredDeviceId（枚举索引字符串，见 enumeratePlaybackDevices：deviceId =
+  // std::to_string(index)）解析回 ma_device_id 并写入 config.playback.pDeviceID。
+  // miniaudio 在 ma_device_init 内部拷贝 pDeviceID（MA_COPY_MEMORY 进 pDevice->playback.id），
+  // 因此 playbackInfos[index].id 只需在 init 调用期间有效；但显式 context 会被 device
+  // 长期持有（pDevice->pContext），必须作为成员保存并在 ma_device_uninit 之后释放。
+  // 解析/枚举失败时释放本次 context 并返回 false——调用方回退默认设备（仅日志，不视为失败）。
+  bool resolvePreferredDevice(const std::string& preferredDeviceId, ma_device_config& config) {
+    std::size_t index = 0;
+    {
+      const char* const begin = preferredDeviceId.data();
+      const char* const end = begin + preferredDeviceId.size();
+      const auto parsed = std::from_chars(begin, end, index);
+      if (parsed.ec != std::errc{} || parsed.ptr != end) {
+        spdlog::warn("miniaudio backend: preferredDeviceId '{}' is not a numeric device index; "
+                     "falling back to the default output device",
+                     preferredDeviceId);
+        return false;
+      }
+    }
+
+    if (ma_context_init(nullptr, 0, nullptr, &context_) != MA_SUCCESS) {
+      spdlog::warn("miniaudio backend: failed to initialize context for preferred device index {}; "
+                   "falling back to the default output device",
+                   index);
+      return false;
+    }
+    contextInitialized_ = true;
+
+    ma_device_info* playbackInfos = nullptr;
+    ma_uint32 playbackCount = 0;
+    if (ma_context_get_devices(&context_, &playbackInfos, &playbackCount, nullptr, nullptr) != MA_SUCCESS) {
+      spdlog::warn("miniaudio backend: failed to enumerate playback devices for preferred device index {}; "
+                   "falling back to the default output device",
+                   index);
+      releaseContext();
+      return false;
+    }
+    if (index >= playbackCount) {
+      spdlog::warn("miniaudio backend: preferred device index {} is out of range ({} playback devices available); "
+                   "falling back to the default output device",
+                   index, playbackCount);
+      releaseContext();
+      return false;
+    }
+
+    config.playback.pDeviceID = &playbackInfos[index].id;
+    return true;
+  }
+
+  void releaseContext() noexcept {
+    if (!contextInitialized_) {
+      return;
+    }
+    ma_context_uninit(&context_);
+    context_ = {};
+    contextInitialized_ = false;
+  }
+
   ma_device device_{};
+  ma_context context_{};
+  bool contextInitialized_{false};
   AudioDeviceFormat currentFormat_{};
   std::optional<AudioOutputDeviceError> lastError_{};
   bool initialized_{false};
