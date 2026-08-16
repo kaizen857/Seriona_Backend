@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace seriona::audio {
 
@@ -187,6 +188,10 @@ public:
   virtual void setMuted(bool muted) = 0;
   virtual void selectOutputDevice(const std::string& deviceId) = 0;
   [[nodiscard]] virtual PlaybackClockSnapshot queryPlaybackClock() const = 0;
+  // 枚举当前可用的输出设备。非纯虚 + 默认返回空列表：实现者共 4 个
+  // （SingleTrack 业务实现、Noop、后端 Fake、前端 Fake），纯虚会同时打破
+  // 两仓库编译；默认空也是 Noop/Fake 的既有机制，无需逐个覆写。
+  [[nodiscard]] virtual std::vector<AudioDeviceFormat> enumeratePlaybackDevices() const { return {}; }
 };
 
 class AudioPlayer {

@@ -218,6 +218,24 @@ public:
     return lastClockSnapshot_;
   }
 
+  // 线程模型：本方法只允许命令线程（UI/控制线程）调用，绝不在 audio worker
+  // 线程内调用——enqueueCommand 把任务交给 worker 自身执行，在 worker 内等待
+  // future 会直接死锁。worker 线程内执行 device_.enumeratePlaybackDevices()，
+  // 枚举路径不触碰渲染回调/事件；超时（2s）兜底返回空列表。
+  [[nodiscard]] std::vector<AudioDeviceFormat> enumeratePlaybackDevices() const override {
+    auto promise = std::make_shared<std::promise<std::vector<AudioDeviceFormat>>>();
+    auto future = promise->get_future();
+    auto* self = const_cast<SingleTrackAudioPlaybackService*>(this);
+    self->enqueueCommand([self, promise] {
+      promise->set_value(self->device_.enumeratePlaybackDevices());
+    });
+    if (future.wait_for(std::chrono::seconds{2}) == std::future_status::ready) {
+      return future.get();
+    }
+
+    return {};
+  }
+
 private:
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     spdlog::info("loading track '{}'", request.filePath.string());
