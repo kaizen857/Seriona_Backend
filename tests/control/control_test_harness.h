@@ -73,6 +73,7 @@ public:
   void setMuted(bool muted) override;
   void selectOutputDevice(const std::string& deviceId) override;
   [[nodiscard]] audio::PlaybackClockSnapshot queryPlaybackClock() const override;
+  [[nodiscard]] std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const override;
 
   [[nodiscard]] std::size_t setEventSinkCalls() const noexcept;
   [[nodiscard]] std::size_t configureOutputCalls() const noexcept;
@@ -95,6 +96,12 @@ public:
   [[nodiscard]] const std::optional<float>& lastVolume() const noexcept;
   [[nodiscard]] const std::optional<bool>& lastMuted() const noexcept;
   [[nodiscard]] const std::optional<std::string>& lastSelectedOutputDevice() const noexcept;
+
+  // 按调用顺序记录的命令名日志，用于断言跨方法的调用顺序（如
+  // ConfigureOutput 必须先于 LoadTrack）。
+  [[nodiscard]] const std::vector<std::string>& callLog() const noexcept;
+  void setPlaybackDevices(std::vector<audio::AudioDeviceFormat> devices) noexcept;
+  [[nodiscard]] const std::vector<audio::AudioDeviceFormat>& playbackDevices() const noexcept;
 
   void emit(audio::BackendEvent event);
   void setPlaybackClock(audio::PlaybackClockSnapshot clock);
@@ -124,6 +131,8 @@ private:
   std::optional<float> lastVolume_{};
   std::optional<bool> lastMuted_{};
   std::optional<std::string> lastSelectedOutputDevice_{};
+  std::vector<std::string> callLog_{};
+  std::vector<audio::AudioDeviceFormat> playbackDevices_{};
   std::exception_ptr loadTrackException_{};
 };
 

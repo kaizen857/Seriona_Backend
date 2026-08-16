@@ -45,11 +45,13 @@ MediaControlCommand makePauseCommand() {
 
 void FakeAudioPlaybackService::setEventSink(audio::BackendEventSink sink) {
   ++setEventSinkCalls_;
+  callLog_.push_back("setEventSink");
   eventSink_ = std::move(sink);
 }
 
 void FakeAudioPlaybackService::configureOutput(const audio::AudioOutputConfig& config) {
   ++configureOutputCalls_;
+  callLog_.push_back("configureOutput");
   lastConfiguredOutput_ = config;
 }
 
@@ -58,52 +60,66 @@ void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& requ
     std::rethrow_exception(loadTrackException_);
   }
   ++loadTrackCalls_;
+  callLog_.push_back("loadTrack");
   lastLoadedTrack_ = request;
 }
 
 void FakeAudioPlaybackService::prepareNext(const audio::TrackPlaybackRequest& request) {
   ++prepareNextCalls_;
+  callLog_.push_back("prepareNext");
   lastPreparedTrack_ = request;
 }
 
 void FakeAudioPlaybackService::play() {
   ++playCalls_;
+  callLog_.push_back("play");
 }
 
 void FakeAudioPlaybackService::pause() {
   ++pauseCalls_;
+  callLog_.push_back("pause");
 }
 
 void FakeAudioPlaybackService::resume() {
   ++resumeCalls_;
+  callLog_.push_back("resume");
 }
 
 void FakeAudioPlaybackService::stop() {
   ++stopCalls_;
+  callLog_.push_back("stop");
 }
 
 void FakeAudioPlaybackService::seek(std::chrono::milliseconds position) {
   ++seekCalls_;
+  callLog_.push_back("seek");
   lastSeekPosition_ = position;
 }
 
 void FakeAudioPlaybackService::setVolume(float linearGain) {
   ++setVolumeCalls_;
+  callLog_.push_back("setVolume");
   lastVolume_ = linearGain;
 }
 
 void FakeAudioPlaybackService::setMuted(bool muted) {
   ++setMutedCalls_;
+  callLog_.push_back("setMuted");
   lastMuted_ = muted;
 }
 
 void FakeAudioPlaybackService::selectOutputDevice(const std::string& deviceId) {
   ++selectOutputDeviceCalls_;
+  callLog_.push_back("selectOutputDevice");
   lastSelectedOutputDevice_ = deviceId;
 }
 
 audio::PlaybackClockSnapshot FakeAudioPlaybackService::queryPlaybackClock() const {
   return clock_;
+}
+
+std::vector<audio::AudioDeviceFormat> FakeAudioPlaybackService::enumeratePlaybackDevices() const {
+  return playbackDevices_;
 }
 
 std::size_t FakeAudioPlaybackService::setEventSinkCalls() const noexcept {
@@ -184,6 +200,18 @@ const std::optional<bool>& FakeAudioPlaybackService::lastMuted() const noexcept 
 
 const std::optional<std::string>& FakeAudioPlaybackService::lastSelectedOutputDevice() const noexcept {
   return lastSelectedOutputDevice_;
+}
+
+const std::vector<std::string>& FakeAudioPlaybackService::callLog() const noexcept {
+  return callLog_;
+}
+
+void FakeAudioPlaybackService::setPlaybackDevices(std::vector<audio::AudioDeviceFormat> devices) noexcept {
+  playbackDevices_ = std::move(devices);
+}
+
+const std::vector<audio::AudioDeviceFormat>& FakeAudioPlaybackService::playbackDevices() const noexcept {
+  return playbackDevices_;
 }
 
 void FakeAudioPlaybackService::emit(audio::BackendEvent event) {

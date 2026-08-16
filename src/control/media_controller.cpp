@@ -248,6 +248,10 @@ public:
     return librarySnapshot_;
   }
 
+  std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const {
+    return dependencies_.audio->enumeratePlaybackDevices();
+  }
+
   audio::BackendEventSink audioEventSink() {
     return [this](audio::BackendEvent event) { postAudioEvent(std::move(event)); };
   }
@@ -553,6 +557,11 @@ private:
           dependencies_.artworkResolver->request(*intent.artworkRequest);
         }
         break;
+      case ControlIntentKind::ConfigureOutput:
+        if (intent.outputConfig.has_value()) {
+          dependencies_.audio->configureOutput(*intent.outputConfig);
+        }
+        break;
       }
     }
   }
@@ -606,6 +615,10 @@ SubscriptionHandle MediaController::subscribeDomainNotifications(ControlDomainNo
 PlayerStateSnapshot MediaController::playerStateSnapshot() const { return impl_->playerStateSnapshot(); }
 
 LibraryStateSnapshot MediaController::libraryStateSnapshot() const { return impl_->libraryStateSnapshot(); }
+
+std::vector<audio::AudioDeviceFormat> MediaController::enumeratePlaybackDevices() const {
+  return impl_->enumeratePlaybackDevices();
+}
 
 audio::BackendEventSink MediaController::audioEventSink() { return impl_->audioEventSink(); }
 
