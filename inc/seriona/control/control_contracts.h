@@ -288,6 +288,9 @@ enum class MediaControlCommandKind {
   SelectTrack,
   StartPlaybackFromContext,
   ApplyFolderSortRules,
+  // Appended at the end: existing enumerators keep their ordinal positions,
+  // preserving serialized-command compatibility.
+  ConfigureOutput,
 };
 
 struct MediaControlCommand {
@@ -301,6 +304,9 @@ struct MediaControlCommand {
   std::optional<TrackIdentity> track;
   std::optional<PlaybackContextDescriptor> playbackContext;
   std::optional<FolderSortSetting> folderSortSetting;
+  // Last member on purpose: appended fields never disturb designated or
+  // value-initialization of existing commands.
+  std::optional<audio::AudioOutputConfig> outputConfig;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;
