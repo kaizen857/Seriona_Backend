@@ -246,6 +246,12 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   return intent;
 }
 
+[[nodiscard]] ControlIntent makeConfigureOutputIntent(const audio::AudioOutputConfig& config) {
+  auto intent = makeIntent(ControlIntentKind::ConfigureOutput);
+  intent.outputConfig = config;
+  return intent;
+}
+
 [[nodiscard]] ControlDomainNotification makeNotification(ControlDomainNotificationKind kind, std::string message) {
   ControlDomainNotification notification{};
   notification.kind = kind;
@@ -529,11 +535,67 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     selectTrack(reduction, playbackContext_->order[playbackContext_->index], true);
     return reduction;
   }
+  case MediaControlCommandKind::ConfigureOutput:
+    return handleConfigureOutput(reduction, command);
   case MediaControlCommandKind::ApplyFolderSortRules:
     return reject(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules must be handled by MediaController");
   }
 
   return reject(MediaControllerErrorCode::InvalidCommand, "Unsupported media control command");
+}
+
+ControlReduction ControlStateReducer::handleConfigureOutput(ControlReduction& reduction, const MediaControlCommand& command) {
+  if (!command.outputConfig.has_value()) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput requires an output config");
+  }
+  const auto& config = *command.outputConfig;
+  const auto mode = static_cast<int>(config.outputMode);
+  if (mode != static_cast<int>(audio::AudioOutputMode::Direct) && mode != static_cast<int>(audio::AudioOutputMode::Mixed)) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput requires a valid output mode");
+  }
+  if (config.targetSampleRate.has_value() && (*config.targetSampleRate < 8000U || *config.targetSampleRate > 768000U)) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput sample rate is out of range (8000-768000)");
+  }
+  if (config.bufferDuration.count() < 50 || config.bufferDuration.count() > 1000) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput buffer duration is out of range (50-1000 ms)");
+  }
+
+  // 应用配置：转发给音频后端。
+  reduction.intents.push_back(makeConfigureOutputIntent(config));
+
+  // 立即重载：仅当存在选中曲目时重载，保持位置（含 CUE 偏移）与播放状态。
+  if (!selectedTrack_.has_value()) {
+    return reduction;
+  }
+  auto track = findPlayableTrack(*selectedTrack_);
+  if (!track.has_value()) {
+    track = selectedPlaybackContextTrack();
+  }
+  if (!track.has_value()) {
+    return reduction;
+  }
+  reduction.intents.push_back(makeTrackIntent(track->request));
+  const auto seekPosition = player_.timeline.position + currentTrackOffset_.value_or(std::chrono::milliseconds{0});
+  reduction.intents.push_back(makeSeekIntent(seekPosition));
+  switch (player_.playback.state) {
+  case PlaybackStatus::Playing:
+    reduction.intents.push_back(makeIntent(ControlIntentKind::Play));
+    break;
+  case PlaybackStatus::Paused:
+    reduction.intents.push_back(makeIntent(ControlIntentKind::Pause));
+    break;
+  case PlaybackStatus::Loading:
+  case PlaybackStatus::Buffering:
+  case PlaybackStatus::Seeking:
+    // 参照 reconcilePlaybackContextAfterSnapshot 的 shouldContinuePlayback 先例：
+    // 这些状态重载后应恢复播放，否则会静默停止。
+    reduction.intents.push_back(makeIntent(ControlIntentKind::Play));
+    break;
+  case PlaybackStatus::Stopped:
+  case PlaybackStatus::Error:
+    break;
+  }
+  return reduction;
 }
 
 ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent& event) {

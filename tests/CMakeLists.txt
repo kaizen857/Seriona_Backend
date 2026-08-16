@@ -204,6 +204,9 @@ add_executable(seriona_control_contract_tests
 add_executable(seriona_configure_output_command_tests
   control/configure_output_command_tests.cpp
 )
+add_executable(seriona_configure_output_reducer_tests
+  control/configure_output_reducer_tests.cpp
+)
 add_executable(seriona_media_controller_tests
   control/media_controller_tests.cpp
   control/control_test_harness.cpp
@@ -473,6 +476,7 @@ target_compile_definitions(seriona_metadata_service_recording_tests PRIVATE DOCT
 target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_configure_output_command_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_configure_output_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_folder_sort_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_persistence_guardrail_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -677,6 +681,11 @@ target_include_directories(seriona_control_contract_tests PRIVATE
 )
 target_include_directories(seriona_configure_output_command_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_configure_output_reducer_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_media_controller_tests PRIVATE
@@ -1004,6 +1013,10 @@ target_link_libraries(seriona_configure_output_command_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_configure_output_reducer_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
 target_link_libraries(seriona_media_controller_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1065,6 +1078,7 @@ seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_audio_enumerate_devices_tests)
 seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_configure_output_command_tests)
+seriona_enable_warnings(seriona_configure_output_reducer_tests)
 seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
 seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
@@ -1320,6 +1334,7 @@ add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
 add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
 add_test(NAME seriona.control_contract COMMAND seriona_control_contract_tests)
 add_test(NAME seriona.control.contract.configure_output_command COMMAND seriona_configure_output_command_tests)
+add_test(NAME seriona.control.reducer.configure_output COMMAND seriona_configure_output_reducer_tests)
 add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
 add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control_folder_sort_settings_store_tests)
 add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)

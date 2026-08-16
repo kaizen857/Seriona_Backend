@@ -42,6 +42,8 @@ enum class ControlIntentKind : std::uint8_t {
   SetVolume,
   SetMuted,
   ResolveArtwork,
+  // Appended at the end: existing enumerators keep their ordinal positions.
+  ConfigureOutput,
 };
 
 struct ControlIntent {
@@ -51,6 +53,9 @@ struct ControlIntent {
   std::optional<float> volume;
   std::optional<bool> muted;
   std::optional<ArtworkResolveRequest> artworkRequest;
+  // Last member on purpose: appended fields never disturb designated or
+  // value-initialization of existing intents.
+  std::optional<audio::AudioOutputConfig> outputConfig;
 };
 
 struct ControlReduction {
@@ -120,6 +125,7 @@ private:
   void selectFirstTrackWhenIdle(ControlReduction& reduction);
   void selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback);
   void stopPlayback(ControlReduction& reduction);
+  ControlReduction handleConfigureOutput(ControlReduction& reduction, const MediaControlCommand& command);
 
   PlayerStateSnapshot player_{};
   LibraryStateSnapshot library_{};
