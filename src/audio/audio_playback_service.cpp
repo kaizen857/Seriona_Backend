@@ -585,10 +585,10 @@ private:
   }
 
   void runAudioWorker() {
-    // Raise this worker's own scheduling priority before the command/decode
-    // loop starts; the active path must be observable at startup. The helper
-    // only touches the calling thread, so the miniaudio device callback
-    // thread is unaffected.
+    // Report the worker thread's scheduling state at startup (priority boosts
+    // are disabled by design; see thread_priority.h). The helper only touches
+    // the calling thread, so the miniaudio device callback thread is
+    // unaffected.
     const auto priority = applyAudioWorkerThreadPriority();
     if (priority.outcome == ThreadPriorityOutcome::Denied) {
       spdlog::warn("audio worker thread priority: {}", priority.description);
@@ -641,16 +641,30 @@ private:
     const auto requested = requestedTarget(streamInfo);
     const auto source = sourceTarget(streamInfo);
     std::vector<OutputNegotiationCandidate> candidates;
-    candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, config_.outputMode, requested), requested, {}});
-
-    if (!config_.allowFallback) {
-      return candidates;
-    }
 
     if (config_.outputMode == AudioOutputMode::Direct) {
+      // 直接输出：设备按曲目原生参数初始化（采样率/声道/格式），
+      // 用户配置的 target* 只作用于混合模式；Direct 不可用时降级 Mixed。
+      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Direct, source),
+                                                      source,
+                                                      {}});
+      if (!config_.allowFallback) {
+        return candidates;
+      }
       candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, requested),
                                                       requested,
                                                       "direct output mode was unavailable; using mixed output mode"});
+      if (!sameTarget(requested, source)) {
+        candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, source),
+                                                        source,
+                                                        "requested mixed output format was unavailable; using source format"});
+      }
+      return candidates;
+    }
+
+    candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, config_.outputMode, requested), requested, {}});
+    if (!config_.allowFallback) {
+      return candidates;
     }
 
     if (!sameTarget(requested, source)) {

@@ -19,6 +19,11 @@
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sched.h>
+#include <sys/resource.h>
+#endif
+
 using namespace std::chrono_literals;
 
 namespace seriona::audio {
@@ -428,24 +433,12 @@ TEST_CASE("audio_error_matrix worker thread priority helper applies and reports 
   // process-wide priority.
   CHECK(result.outcome == ThreadPriorityOutcome::NoOp);
 #else
-  switch (result.outcome) {
-  case ThreadPriorityOutcome::Realtime:
-    CHECK(sched_getscheduler(0) == SCHED_RR);
-    break;
-  case ThreadPriorityOutcome::Nice:
-    errno = 0;
-    CHECK(getpriority(PRIO_PROCESS, 0) == -5);
-    break;
-  case ThreadPriorityOutcome::Denied: {
-    errno = 0;
-    const int priority = getpriority(PRIO_PROCESS, 0);
-    CHECK(sched_getscheduler(0) == SCHED_OTHER);
-    CHECK(priority >= 0);
-    break;
-  }
-  default:
-    FAIL("unexpected worker thread priority outcome: " << result.description);
-  }
+  // Linux: priority boost is disabled by design; the calling thread must
+  // keep its default scheduling class and priority, untouched.
+  CHECK(result.outcome == ThreadPriorityOutcome::NoOp);
+  errno = 0;
+  CHECK(sched_getscheduler(0) == SCHED_OTHER);
+  CHECK(getpriority(PRIO_PROCESS, 0) >= 0);
 #endif
 }
 
