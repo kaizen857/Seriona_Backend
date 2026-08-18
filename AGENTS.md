@@ -6,6 +6,7 @@
 - 仓库无 CI、格式化配置和 `CMakePresets.json`；`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
 - 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。已跟踪的 `src/thumbnail/`、`inc/seriona/thumbnail/` 因使用 `QImage`/`QImageReader` 未被任何 CMake 目标包含，禁止接入生产。
+- 根目录两个跟踪文件非源码：`detailed-scanner-perf-report.txt`（生成的性能报告产物）与 `FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），均只作背景材料；根目录 `.ruff_cache/` 是未跟踪的 ruff 工作缓存，不是源码。
 
 ## DESIGN.md 维护规范
 - `DESIGN.md` 是描述项目长期稳定设计的架构文档，不是开发日志、变更记录或实现细节文档；应保持稳定，避免随开发逐渐演变为实现文档或变更日志。
@@ -28,6 +29,7 @@
 - `makeProductionMediaControllerDependencies(databasePath, coverExportDir)` 连接 miniaudio、scanner、生产 metadata；databasePath 非空时使用 SQLite 文件夹排序存储。
 - `makeDefaultMediaControllerDependencies()` 使用 no-op 音频和文件夹排序存储，但仍调用真实 scanner/metadata 工厂。
 - 对外契约以 `inc/seriona/` 为边界：audio 看 `audio_contracts.h`，scanner 稳定入口只看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，跨模块编排走 control；`inc/` 中的 TagReader adapter、SQLite cache 等实现导向头不属稳定边界，新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus 或 Windows 类型。
+- 公共契约错误风格：typed enum（`MediaControllerErrorCode`、`ScannerErrorCode` 等）+ result struct（`MediaControllerCommandResult`、`ScannerTaskResult` 等），异常（`std::runtime_error`/`std::invalid_argument`）只从实现抛出；公共头不声明 `throw`、不用 `std::expected`。
 - `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging`，入口公共 API 还包括 `runtime_paths.h`。
 - 部分 `inc/seriona/` 头（`scan_scheduler.h`、`song_identity.h`）与 `src/audio/audio_player.cpp` 的实现只被测试目标直接编译，未进任何静态库：生产代码调用这些符号会在最终链接报 undefined reference；`AudioPlayer` 类本质是测试专用封装，生产走 `makeAudioPlaybackService`。
 
