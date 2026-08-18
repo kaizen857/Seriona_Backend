@@ -220,7 +220,7 @@ const BackendEvent& firstEventOf(const std::vector<BackendEvent>& events, Backen
 TEST_CASE("output_format_negotiation covers direct, fallback, and mix downgrade") {
   const auto path = sineFixture("output_format_negotiation.wav");
 
-  const auto directResult = loadWith({{AudioOutputMode::Direct, 48000, AudioSampleFormat::Float32, 2}},
+  const auto directResult = loadWith({{AudioOutputMode::Direct, kSampleRate, AudioSampleFormat::Int16, kChannels}},
                                      config(AudioOutputMode::Direct, 48000, AudioSampleFormat::Float32, 2),
                                      path,
                                      "direct-success");
@@ -228,7 +228,9 @@ TEST_CASE("output_format_negotiation covers direct, fallback, and mix downgrade"
   CHECK(eventsOf(directResult.events, BackendEventType::OutputModeFallback).empty());
   const auto& directFormat = std::get<OutputFormatChanged>(firstEventOf(directResult.events, BackendEventType::OutputFormatChanged).payload).deviceFormat;
   CHECK(directFormat.actualMode == AudioOutputMode::Direct);
-  CHECK(directFormat.sampleRate == 48000U);
+  CHECK(directFormat.sampleRate == kSampleRate);
+  CHECK(directFormat.sampleFormat == AudioSampleFormat::Int16);
+  CHECK(directFormat.channelCount == kChannels);
   CHECK_FALSE(directFormat.fallbackApplied);
 
   const auto fallbackResult = loadWith({{AudioOutputMode::Mixed, 48000, AudioSampleFormat::Float32, 2}},
@@ -258,6 +260,24 @@ TEST_CASE("output_format_negotiation covers direct, fallback, and mix downgrade"
   CHECK(downgrade.effectiveFormat.sampleFormat == AudioSampleFormat::Int16);
   CHECK(downgrade.effectiveFormat.channelCount == 1U);
   CHECK(downgrade.reason.find("source format") != std::string::npos);
+}
+
+TEST_CASE("output_format_negotiation direct mode initializes device with track parameters") {
+  const auto path = sineFixture("output_format_negotiation_direct_track_params.wav");
+
+  const auto result = loadWith({{AudioOutputMode::Direct, kSampleRate, AudioSampleFormat::Int16, kChannels},
+                                {AudioOutputMode::Mixed, 96000, AudioSampleFormat::Float32, 2}},
+                               config(AudioOutputMode::Direct, 96000, AudioSampleFormat::Float32, 2),
+                               path,
+                               "direct-track-params");
+  CHECK(result.requests.size() == 1U);
+  CHECK(eventsOf(result.events, BackendEventType::OutputModeFallback).empty());
+  const auto& format = std::get<OutputFormatChanged>(firstEventOf(result.events, BackendEventType::OutputFormatChanged).payload).deviceFormat;
+  CHECK(format.actualMode == AudioOutputMode::Direct);
+  CHECK(format.sampleRate == kSampleRate);
+  CHECK(format.sampleFormat == AudioSampleFormat::Int16);
+  CHECK(format.channelCount == kChannels);
+  CHECK_FALSE(format.fallbackApplied);
 }
 
 TEST_CASE("output_format_negotiation_failure emits playback error only after all candidates fail") {

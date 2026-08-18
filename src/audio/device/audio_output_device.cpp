@@ -186,6 +186,10 @@ bool AudioOutputDevice::start() {
     return true;
   }
 
+  if (currentQueue_ != nullptr) {
+    publishCallbackQueue(*currentQueue_, currentFormat_);
+  }
+
   if (!backend_->start()) {
     spdlog::error("device start failed: backend start returned false");
     lastError_ = backend_->lastError().value_or(AudioOutputDeviceError{PlaybackErrorCode::DeviceUnavailable,
@@ -194,9 +198,6 @@ bool AudioOutputDevice::start() {
     return false;
   }
 
-  if (currentQueue_ != nullptr) {
-    publishCallbackQueue(*currentQueue_, currentFormat_);
-  }
   started_ = true;
   spdlog::info("device started");
   return true;
