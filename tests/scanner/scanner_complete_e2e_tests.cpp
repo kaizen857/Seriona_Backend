@@ -255,3 +255,4 @@ TEST_CASE("scanner complete e2e: empty cue remains interpretable without tracks"
   REQUIRE(songNodesWithFilePath(snapshot, standaloneAudio).size() == 1U);
   CHECK(standaloneTrack.parentNodeId == root.nodeId);
 }
+

@@ -32,7 +32,12 @@ class FakeMetadataReader final : public TagMetadataReader {
 public:
   void put(std::filesystem::path path, RawTagMetadata metadata) { metadataByPath_[std::move(path)] = std::move(metadata); }
 
+  void setReadDelay(std::chrono::milliseconds delay) { readDelay_ = delay; }
+
   [[nodiscard]] RawTagMetadata read(const TagReadRequest& request) override {
+    if (readDelay_.count() > 0) {
+      std::this_thread::sleep_for(readDelay_);
+    }
     {
       std::lock_guard lock{mutex_};
       requestedPaths.push_back(request.path);
@@ -62,6 +67,7 @@ public:
 private:
   std::map<std::filesystem::path, RawTagMetadata> metadataByPath_;
   mutable std::mutex mutex_;
+  std::chrono::milliseconds readDelay_{0};
 };
 
 class FakeFolderThumbnailSeam {
@@ -1732,6 +1738,35 @@ TEST_CASE("playlist tree builder upsertSong routes cue tracks into cue virtual d
   expected.addSong({.relativePath = "music/live.cue", .metadata = treeCueTrack("Intro", "music/live.cue", "music/live.flac", 1U, "music/live.cue#track0")});
   expected.addSong({.relativePath = "music/live.cue", .metadata = compositeUpdated});
   CHECK(treesEquivalent(afterModify, expected.publish()));
+}
+
+// Regression: throttled mid-scan ProgressUpdated events must never report
+// filesScanned + filesSkipped above filesDiscovered (the invariant the UI relies on).
+TEST_CASE("scanner progress events keep scanned plus skipped within discovered across scan rounds") {
+  test::TempScannerRoot temp{"scanner-progress-invariant-rounds"};
+  const auto a = test::writeAudioFixture(temp.path(), "a.flac");
+  const auto b = test::writeAudioFixture(temp.path(), "b.flac");
+  const auto c = test::writeAudioFixture(temp.path(), "c.flac");
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(a, rawMetadata("A"));
+  reader->put(b, rawMetadata("B"));
+  reader->put(c, rawMetadata("C"));
+  reader->setReadDelay(std::chrono::milliseconds{5});
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+  reader->put(b, rawMetadata("B Changed"));
+  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+
+  const auto progressEvents = eventLog.progressEvents();
+  REQUIRE(progressEvents.size() >= 3U);
+  for (const auto& progress : progressEvents) {
+    CHECK(progress.filesScanned + progress.filesSkipped <= progress.filesDiscovered);
+  }
+  CHECK(progressEvents.back().filesScanned + progressEvents.back().filesSkipped == progressEvents.back().filesDiscovered);
 }
 
 }

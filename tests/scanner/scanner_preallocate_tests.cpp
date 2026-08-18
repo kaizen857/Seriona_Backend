@@ -547,7 +547,7 @@ FILE "album.flac" WAVE
   REQUIRE(events.waitForScanCompletion(std::chrono::seconds{5}));
   
   CHECK(events.filesDiscovered == 3);
-  CHECK(events.filesScanned == 2);
+  CHECK(events.filesScanned == 3);
   
   const auto snapshot = service->snapshot();
   const auto allSongs = [&snapshot]() {
@@ -625,7 +625,7 @@ TITLE "Empty Album"
   REQUIRE(events.waitForScanCompletion(std::chrono::seconds{5}));
   
   CHECK(events.filesDiscovered == 1);
-  CHECK(events.filesScanned == 0);
+  CHECK(events.filesScanned == 1);
   
   const auto snapshot = service->snapshot();
   const auto allSongs = [&snapshot]() {

@@ -30,6 +30,7 @@ struct WorkerResult {
 
 struct WorkerPoolStatsSnapshot {
   std::uint64_t submittedTasks{0};
+  std::uint64_t completedTasks{0};
   std::uint64_t cacheHits{0};
   std::uint64_t scannedFiles{0};
   std::chrono::nanoseconds tagReaderTime{0};
@@ -57,7 +58,9 @@ public:
 
   [[nodiscard]] const Config& config() const noexcept;
   void submitBatch(std::vector<WorkerTask> batch);
-  [[nodiscard]] std::vector<WorkerResult> waitAll();
+  // Called from the waitAll thread with the finished task count (success or failure).
+  using ProgressCallback = std::function<void(std::uint64_t completed)>;
+  [[nodiscard]] std::vector<WorkerResult> waitAll(ProgressCallback progressCallback = {});
   void cancel();
   [[nodiscard]] bool isCancelled() const noexcept;
   [[nodiscard]] std::vector<ScannerError> errorsSnapshot() const;

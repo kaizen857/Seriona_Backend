@@ -84,7 +84,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 - `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, watcherDebounce}`。
 - 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
-- 事件顺序：ScanStarted →（每 root：ScanError/FileScanned）→ ProgressUpdated（仅结束一次，无周期进度）→ PlaylistSnapshotUpdated → ScanCompleted；取消路径先发一条 code=Cancelled 的 ScanError 再发 ScanStopped。
+- 事件顺序：ScanStarted →（每 root：ScanError/FileScanned）→ ProgressUpdated（worker 阶段按 `progressInterval`（默认 250ms）节流中途发布，结束后必发一次最终汇总；`filesScanned` 为"已完成节点数"（含内联 CUE 曲目/容器与失败任务），结束恒有 `filesScanned + filesSkipped == filesDiscovered`）→ PlaylistSnapshotUpdated → ScanCompleted；取消路径先发一条 code=Cancelled 的 ScanError 再发 ScanStopped。
 - 缓存：`SQLiteCache`，固定 v3 schema（`user_version=0` 初始化、非 0 非 3 抛 unsupported，无迁移桥）；5 张表 content/locations/lyrics/scan_roots/scan_errors + 8 个索引；WAL + `synchronous=NORMAL` + 64MB 页缓存；写事务 `BEGIN IMMEDIATE`、读写各持独立互斥锁（并发依赖 SQLite busy timeout 500ms）。**实际读写的是 `<databasePath>.scan-roots.sqlite` 独立文件**；传入的主库文件仅被打开初始化，扫描流程不读写。缓存另提供路径级精准写接口（按路径前缀删除、子树改名改写既有行），供事件驱动的精准增量更新使用，不读取元数据。
 - 身份哈希：`computeContentId`（duration/title/artist 链式 XXH64）与 `computeLocationId`（路径/大小/mtime，CUE 轨道追加 offset/index）——实现经 `hash_utils.cpp` 文本包含 `song_identity.cpp` 进入生产库。目录树哈希：XXH3_128bits 流式 Merkle（只含文件名/类型/子哈希，跳过 `.lrc`）。
 - 并发配置：worker 数默认 `hardware_concurrency`，TagReader 并发默认同 worker 数；环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY` 覆盖，`SERIONA_SCANNER_DISABLE_CONCURRENCY=1` 强制串行。
@@ -204,7 +204,7 @@ main(argc=2, 路径存在)                       main.cpp
 - 实时路径红线：`AudioOutputDevice::renderCallback()` 内禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁、设备生命周期操作。
 - schema 红线：`SQLiteCache` schema 固定 v3，`user_version=0` 直接初始化、非 0 非 3 报错；不存在迁移桥，改 schema 必须同步 `sqlite_cache_connection.cpp` 内嵌 SQL 与 `cache/schema.sql`（一致性仅靠测试校验）。
 - 编译归属陷阱：`audio_player.cpp`、`scan_scheduler.cpp` 只被测试目标编译；`song_identity.cpp` 经 `hash_utils.cpp` 文本包含进库——生产代码不要依赖这些文件的独立编译单元身份。AVX2/FMA 参数只允许施加于 `waveform_simd_avx2.cpp`（根 CMake 仅对该文件施加 `-mavx2;-mfma`，无专门守卫；FATAL_ERROR 守卫只针对 `BS::thread_pool` 链接）。
-- 未接线代码（勿假设生效）：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `progressInterval`/`ProgressThrottle`、`preferredDeviceId` 设备选择（当前仅为标签）、`platformExtension`（Windows）。
+- 未接线代码（勿假设生效）：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `ProgressThrottle` 类（orchestrator 自持轻量时间节流，未用此类）、`preferredDeviceId` 设备选择（当前仅为标签）、`platformExtension`（Windows）。
 - 新稳定契约不得暴露第三方类型（TagReader/SQLite/watcher/FFmpeg/MPRIS/sdbus/Windows）。
 - 文档优先级：本文件低于 CMake 配置、源码与测试注册；README 仅有标题，`docs/` 为演进记录。
 

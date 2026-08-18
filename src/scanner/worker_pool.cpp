@@ -113,6 +113,7 @@ std::string formatWorkerPoolStatsBreakdown(const WorkerPoolStatsSnapshot& stats)
   std::ostringstream output;
   output << "Worker Pool Phase Breakdown\n";
   output << "submittedTasks=" << stats.submittedTasks << '\n';
+  output << "completedTasks=" << stats.completedTasks << '\n';
   output << "cacheHits=" << stats.cacheHits << '\n';
   output << "scannedFiles=" << stats.scannedFiles << '\n';
   output << "tagReaderTimeMs=" << std::chrono::duration_cast<std::chrono::milliseconds>(stats.tagReaderTime).count()
@@ -154,6 +155,7 @@ public:
 
   [[nodiscard]] WorkerPoolStatsSnapshot statsSnapshot() const noexcept {
     return WorkerPoolStatsSnapshot{.submittedTasks = submittedTasks_.load(std::memory_order_relaxed),
+                                   .completedTasks = completedTasks_.load(std::memory_order_relaxed),
                                    .cacheHits = cacheHits_.load(std::memory_order_relaxed),
                                    .scannedFiles = scannedFiles_.load(std::memory_order_relaxed),
                                    .tagReaderTime = std::chrono::nanoseconds{
@@ -183,9 +185,9 @@ public:
     }
   }
 
-  [[nodiscard]] std::vector<WorkerResult> waitAll() {
+  [[nodiscard]] std::vector<WorkerResult> waitAll(ProgressCallback progressCallback) {
     auto pending = takePending();
-    waitForCompletion(pending);
+    waitForCompletion(pending, std::move(progressCallback));
 
     std::vector<WorkerResult> results;
     results.reserve(pending.size());
@@ -204,7 +206,7 @@ public:
   void cancel() {
     cancelled_.store(true, std::memory_order_release);
     auto pending = takePending();
-    waitForCompletion(pending);
+    waitForCompletion(pending, {});
     std::vector<ScannerError> errors;
     for (auto& future : pending) {
       auto result = future.get();
@@ -231,7 +233,7 @@ private:
     errors_ = std::move(errors);
   }
 
-  static void waitForCompletion(PendingResults& pending) {
+  static void waitForCompletion(PendingResults& pending, ProgressCallback progressCallback) {
     std::size_t completed = 0;
     std::vector<bool> observed(pending.size(), false);
     while (completed < pending.size()) {
@@ -240,6 +242,9 @@ private:
           observed[index] = true;
           ++completed;
         }
+      }
+      if (progressCallback && completed > 0) {
+        progressCallback(static_cast<std::uint64_t>(completed));
       }
       if (completed < pending.size()) {
         std::this_thread::yield();
@@ -262,10 +267,13 @@ private:
         scannedFiles_.fetch_add(1, std::memory_order_relaxed);
         assignContentIdentity(metadata);
       }
+      completedTasks_.fetch_add(1, std::memory_order_relaxed);
       return WorkerResult{.filePath = task.filePath, .metadata = std::move(metadata), .error = std::nullopt};
     } catch (const std::exception& error) {
+      completedTasks_.fetch_add(1, std::memory_order_relaxed);
       return WorkerResult{.filePath = task.filePath, .metadata = std::nullopt, .error = errorFromException(task, error)};
     } catch (...) {
+      completedTasks_.fetch_add(1, std::memory_order_relaxed);
       return WorkerResult{.filePath = task.filePath, .metadata = std::nullopt, .error = errorFromUnknownException(task)};
     }
   }
@@ -278,6 +286,7 @@ private:
   std::vector<ScannerError> errors_{};
   std::atomic<bool> cancelled_{false};
   std::atomic<std::uint64_t> submittedTasks_{0};
+  std::atomic<std::uint64_t> completedTasks_{0};
   std::atomic<std::uint64_t> cacheHits_{0};
   std::atomic<std::uint64_t> scannedFiles_{0};
   std::atomic<std::uint64_t> tagReaderTimeNs_{0};
@@ -295,7 +304,9 @@ const ScannerWorkerPool::Config& ScannerWorkerPool::config() const noexcept { re
 
 void ScannerWorkerPool::submitBatch(std::vector<WorkerTask> tasks) { impl_->submitBatch(std::move(tasks)); }
 
-std::vector<WorkerResult> ScannerWorkerPool::waitAll() { return impl_->waitAll(); }
+std::vector<WorkerResult> ScannerWorkerPool::waitAll(ProgressCallback progressCallback) {
+  return impl_->waitAll(std::move(progressCallback));
+}
 
 void ScannerWorkerPool::cancel() { impl_->cancel(); }
 

@@ -71,8 +71,36 @@ TEST_CASE("scanner worker pool stats count cache hits across one hundred tasks")
 
   CHECK(results.size() == 100U);
   CHECK(stats.submittedTasks == 100U);
+  CHECK(stats.completedTasks == 100U);
   CHECK(stats.cacheHits == 80U);
   CHECK(stats.scannedFiles == 20U);
+}
+
+TEST_CASE("scanner worker pool progress callback reports a monotonically increasing completion count") {
+  ScannerWorkerPool pool{ScannerWorkerPool::Config{.workerCount = 4,
+                                                   .tagReaderSlots = 4,
+                                                   .tagReader = [](const WorkerTask& task) {
+                                                     return metadataFixture(task.filePath);
+                                                   }}};
+
+  std::uint64_t lastReported = 0;
+  std::uint64_t reportCount = 0;
+  std::vector<std::uint64_t> reports;
+  pool.submitBatch(mixedBatch(0, 10));
+  const auto results = pool.waitAll([&](std::uint64_t completed) {
+    lastReported = completed;
+    ++reportCount;
+    reports.push_back(completed);
+  });
+
+  CHECK(results.size() == 10U);
+  REQUIRE(reportCount > 0U);
+  REQUIRE(reports.size() == reportCount);
+  for (std::size_t index = 1; index < reports.size(); ++index) {
+    CHECK(reports[index] >= reports[index - 1]);
+  }
+  CHECK(lastReported == 10U);
+  CHECK(pool.statsSnapshot().completedTasks == 10U);
 }
 
 TEST_CASE("scanner worker pool stats accumulate tag reader time across worker tasks") {

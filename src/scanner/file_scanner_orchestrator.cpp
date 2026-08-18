@@ -1107,6 +1107,7 @@ public:
     std::uint64_t discovered = 0;
     std::uint64_t skipped = 0;
     std::uint64_t scanned = 0;
+    std::uint64_t completedFiles = 0;
     std::uint64_t totalTagReaderTimeMs = 0;
 
     const auto phaseEnumStart = std::chrono::steady_clock::now();
@@ -1121,7 +1122,7 @@ public:
       spdlog::debug("scan mode decision for {}: {}", root.path.generic_string(),
                     decision.mode == ScanMode::Full ? "full" : "incremental");
       const auto rootScanStartTime = std::chrono::steady_clock::now();
-      auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, totalTagReaderTimeMs);
+      auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, completedFiles, totalTagReaderTimeMs, sink);
       const auto rootScanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - rootScanStartTime);
       if (rootResult.cancelled) {
         publishCancelled(sink, scanVersion);
@@ -1182,7 +1183,7 @@ public:
     
     ScanProgress progress{};
     progress.filesDiscovered = discovered;
-    progress.filesScanned = scanned;
+    progress.filesScanned = completedFiles;
     progress.filesSkipped = skipped;
     progress.errors = allErrors.size();
 
@@ -1550,9 +1551,10 @@ private:
   }
 
   [[nodiscard]] RootResult reconcileRoot(const ScannerRoot& root, const ScanModeDecision& decision, const EffectiveScannerConfig& config,
-                         [[maybe_unused]] cache::SQLiteCache& cache,
+                                         [[maybe_unused]] cache::SQLiteCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
-                                         std::uint64_t& totalTagReaderTimeMs) {
+                                         std::uint64_t& completedFiles, std::uint64_t& totalTagReaderTimeMs,
+                                         const ScannerEventSink& sink) {
     // Phase timing
     const auto phaseStart = std::chrono::steady_clock::now();
     auto phase1End = phaseStart;
@@ -1842,8 +1844,27 @@ private:
                                                              }
                                                              return metadata;
                                                            }}};
+    const auto workerTaskCount = workerTasks.size();
     workerPool.submitBatch(std::move(workerTasks));
-    auto workerResults = workerPool.waitAll();
+    const auto workerStarted = std::chrono::steady_clock::now();
+    auto lastProgressPublish = workerStarted;
+    const auto progressInterval = config.scanner.progressInterval;
+    // 发现阶段已处理完的节点（缓存命中、内联 CUE 曲目、虚拟容器）在 worker 启动前即计入"已完成"。
+    const auto inlineCompleted = discovered - skipped - workerTaskCount;
+    auto workerResults = workerPool.waitAll([&](std::uint64_t completed) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - lastProgressPublish < progressInterval) {
+        return;
+      }
+      lastProgressPublish = now;
+      ScanProgress progress{};
+      progress.filesDiscovered = discovered;
+      progress.filesScanned = inlineCompleted + completed;
+      progress.filesSkipped = skipped;
+      progress.errors = result.errors.size();
+      publishEvent(sink, ScannerEventType::ProgressUpdated, ++eventVersion_, progress);
+    });
+    completedFiles = discovered - skipped;
     phase3End = std::chrono::steady_clock::now();
     const auto workerStats = workerPool.statsSnapshot();
     totalTagReaderTimeMs += std::chrono::duration_cast<std::chrono::milliseconds>(workerStats.tagReaderTime).count();
