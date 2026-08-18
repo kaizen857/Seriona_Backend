@@ -236,11 +236,12 @@ scanner::ScannerEvent fileScannedEvent(scanner::SongMetadata metadata, std::uint
                                .payload = std::move(metadata)};
 }
 
-scanner::ScannerEvent scannerErrorEvent(std::string message, std::uint64_t version) {
+scanner::ScannerEvent scannerErrorEvent(std::string message, std::uint64_t version,
+                                        scanner::ScannerErrorCode code = scanner::ScannerErrorCode::MetadataReadFailed) {
   return scanner::ScannerEvent{.type = scanner::ScannerEventType::ScanError,
                                .monotonicVersion = version,
                                .timestamp = {},
-                               .payload = scanner::ScannerError{.code = scanner::ScannerErrorCode::MetadataReadFailed,
+                               .payload = scanner::ScannerError{.code = code,
                                                                 .message = std::move(message),
                                                                 .detail = {},
                                                                 .path = std::nullopt}};
@@ -2202,7 +2203,38 @@ TEST_CASE("media controller facade ignores stale audio and scanner events") {
   CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "fresh");
 }
 
-TEST_CASE("media controller facade publishes scanner errors as library state and domain notifications") {
+TEST_CASE("media controller facade publishes fatal scanner errors as library state and domain notifications") {
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  fixture.fakeScanner->emit(scannerErrorEvent("root unavailable", 5, scanner::ScannerErrorCode::RootUnavailable));
+  fixture.controller->drainForTests();
+
+  const auto librarySnapshot = fixture.controller->libraryStateSnapshot();
+  CHECK(librarySnapshot.version == 5U);
+  CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Error);
+  REQUIRE(librarySnapshot.lastError.has_value());
+  CHECK(librarySnapshot.lastError->message == "root unavailable");
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return !notifications.empty();
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK(notifications.back().kind == ControlDomainNotificationKind::LibraryScanError);
+    CHECK(notifications.back().errorCode == MediaControllerErrorCode::BackendRejected);
+    CHECK(notifications.back().scanStatus == LibraryScanStatus::Error);
+  }
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller facade keeps scanning state for non-fatal file errors") {
   ControllerFixture fixture{};
   std::mutex notificationMutex{};
   std::vector<ControlDomainNotification> notifications{};
@@ -2217,18 +2249,14 @@ TEST_CASE("media controller facade publishes scanner errors as library state and
 
   const auto librarySnapshot = fixture.controller->libraryStateSnapshot();
   CHECK(librarySnapshot.version == 5U);
-  CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Error);
+  CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Idle);
   REQUIRE(librarySnapshot.lastError.has_value());
   CHECK(librarySnapshot.lastError->message == "metadata read failed");
-  REQUIRE(waitUntil([&] {
-    std::lock_guard lock{notificationMutex};
-    return !notifications.empty();
-  }));
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
   {
     std::lock_guard lock{notificationMutex};
-    CHECK(notifications.back().kind == ControlDomainNotificationKind::LibraryScanError);
-    CHECK(notifications.back().errorCode == MediaControllerErrorCode::BackendRejected);
-    CHECK(notifications.back().scanStatus == LibraryScanStatus::Error);
+    CHECK_FALSE(hasNotification(notifications, ControlDomainNotificationKind::LibraryScanError,
+                                MediaControllerErrorCode::BackendRejected));
   }
   notificationSubscription.unsubscribe();
 }

@@ -727,7 +727,12 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
         } else if constexpr (std::is_same_v<Payload, audio::PlaybackError>) {
           spdlog::warn("playback error ({}): {}", playbackErrorCode(payload.code), payload.message);
           visibleStateDuringSeek_.reset();
-          player_.playback.state = PlaybackStatus::Error;
+          // BufferUnderrun 是瞬态欠载：音频层已补静音继续播放、状态机不变；
+          // 这里置 Error 会造成控制层与音频层状态错位，后续 Play/Pause 命令
+          // 会被音频层判为非法转换而反复报错（按钮失控）。仅记录诊断不置 Error。
+          if (payload.code != audio::PlaybackErrorCode::BufferUnderrun) {
+            player_.playback.state = PlaybackStatus::Error;
+          }
           player_.playback.errorCode = playbackErrorCode(payload.code);
           player_.playback.errorMessage = payload.message;
           if (payload.clock.has_value()) {
@@ -809,23 +814,27 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
                                                     "Library scan stopped",
                                                     library_.scanStatus));
     break;
-  case scanner::ScannerEventType::ScanError:
-    library_.scanStatus = LibraryScanStatus::Error;
+  case scanner::ScannerEventType::ScanError: {
     if (const auto* error = std::get_if<scanner::ScannerError>(&event.payload)) {
       library_.lastError = *error;
+      // 仅致命错误（根不可用 / 缓存不可用）视为整体扫描失败：
+      // 文件级错误（个别文件元数据读取失败等）不终止扫描，若置 Error 会造成
+      // UI 状态跳动（扫描失败 → 扫描中 → 扫描完成）并逐条弹出错误通知。
+      // 取消（Cancelled）随后由 ScanStopped 正常收尾，也不在此置 Error。
+      const bool fatal = error->code == scanner::ScannerErrorCode::RootUnavailable
+          || error->code == scanner::ScannerErrorCode::CacheUnavailable;
+      if (!fatal) {
+        break;
+      }
+      library_.scanStatus = LibraryScanStatus::Error;
       auto notification = makeErrorNotification(ControlDomainNotificationKind::LibraryScanError,
                                                 MediaControllerErrorCode::BackendRejected,
                                                 error->message);
       notification.scanStatus = library_.scanStatus;
       addNotification(reduction, std::move(notification));
-    } else {
-      auto notification = makeErrorNotification(ControlDomainNotificationKind::LibraryScanError,
-                                                MediaControllerErrorCode::BackendRejected,
-                                                "Library scan error");
-      notification.scanStatus = library_.scanStatus;
-      addNotification(reduction, std::move(notification));
     }
     break;
+  }
   }
 
   reduction.libraryStateChanged = true;
