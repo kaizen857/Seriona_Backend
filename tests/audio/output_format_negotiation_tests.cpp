@@ -253,7 +253,7 @@ TEST_CASE("output_format_negotiation covers direct, fallback, and mix downgrade"
                                         config(AudioOutputMode::Mixed, 96000, AudioSampleFormat::Float32, 2),
                                         path,
                                         "mix-downgrade");
-  CHECK(downgradeResult.requests.size() == 2U);
+  CHECK(downgradeResult.requests.size() == 3U);
   const auto& downgrade = std::get<OutputModeFallback>(firstEventOf(downgradeResult.events, BackendEventType::OutputModeFallback).payload);
   CHECK(downgrade.effectiveConfig.outputMode == AudioOutputMode::Mixed);
   CHECK(downgrade.effectiveFormat.sampleRate == 48000U);
@@ -287,7 +287,7 @@ TEST_CASE("output_format_negotiation_failure emits playback error only after all
                                path,
                                "total-failure");
 
-  CHECK(result.requests.size() == 3U);
+  CHECK(result.requests.size() == 4U);
   CHECK(eventsOf(result.events, BackendEventType::OutputModeFallback).empty());
   CHECK(eventsOf(result.events, BackendEventType::OutputFormatChanged).empty());
   const auto& error = std::get<PlaybackError>(firstEventOf(result.events, BackendEventType::PlaybackError).payload);
@@ -295,6 +295,73 @@ TEST_CASE("output_format_negotiation_failure emits playback error only after all
   CHECK(error.message == "failed to negotiate an output format");
   CHECK(error.detail.find("direct") != std::string::npos);
   CHECK(error.detail.find("mixed") != std::string::npos);
+}
+
+TEST_CASE("format_fallback downgrades bit depth when device rejects requested format") {
+  // 计划 happy 场景：指定 Int24，设备仅支持 Float32（同采样率/声道）→
+  // 候选链 Int24 → Int16 → Float32 自动降级并通知，不报错。
+  const auto path = sineFixture("format_fallback_int24_to_float32.wav");
+
+  const auto result = loadWith({{AudioOutputMode::Mixed, 96000, AudioSampleFormat::Float32, 2}},
+                               config(AudioOutputMode::Mixed, 96000, AudioSampleFormat::Int24, 2),
+                               path,
+                               "int24-to-float32");
+  CHECK(result.requests.size() == 3U);
+  CHECK(result.requests[0].sampleFormat == AudioSampleFormat::Int24);
+  CHECK(result.requests[1].sampleFormat == AudioSampleFormat::Int16);
+  CHECK(result.requests[2].sampleFormat == AudioSampleFormat::Float32);
+
+  CHECK(eventsOf(result.events, BackendEventType::PlaybackError).empty());
+  const auto& fallback = std::get<OutputModeFallback>(firstEventOf(result.events, BackendEventType::OutputModeFallback).payload);
+  CHECK(fallback.requestedConfig.outputMode == AudioOutputMode::Mixed);
+  CHECK(fallback.effectiveConfig.outputMode == AudioOutputMode::Mixed);
+  CHECK_FALSE(fallback.reason.empty());
+  CHECK(fallback.reason.find("24 位") != std::string::npos);
+  CHECK(fallback.reason.find("32 位浮点") != std::string::npos);
+  CHECK(fallback.effectiveFormat.sampleFormat == AudioSampleFormat::Float32);
+  CHECK(fallback.effectiveFormat.sampleRate == 96000U);
+  CHECK(fallback.effectiveFormat.fallbackApplied);
+
+  const auto& format = std::get<OutputFormatChanged>(firstEventOf(result.events, BackendEventType::OutputFormatChanged).payload).deviceFormat;
+  CHECK(format.sampleFormat == AudioSampleFormat::Float32);
+  CHECK(format.fallbackApplied);
+}
+
+TEST_CASE("format_fallback rejects unsupported sample format enum and moves to next candidate") {
+  // 人为构造不支持枚举值（Unknown）：候选被拒后降级到 Int16 成功播放 + 通知。
+  const auto path = sineFixture("format_fallback_unknown_enum.wav");
+
+  const auto result = loadWith({{AudioOutputMode::Mixed, 96000, AudioSampleFormat::Int16, 2}},
+                               config(AudioOutputMode::Mixed, 96000, AudioSampleFormat::Unknown, 2),
+                               path,
+                               "unknown-enum");
+  CHECK(result.requests.size() == 1U);
+  CHECK(result.requests[0].sampleFormat == AudioSampleFormat::Int16);
+
+  CHECK(eventsOf(result.events, BackendEventType::PlaybackError).empty());
+  const auto& fallback = std::get<OutputModeFallback>(firstEventOf(result.events, BackendEventType::OutputModeFallback).payload);
+  CHECK_FALSE(fallback.reason.empty());
+  CHECK(fallback.reason.find("16 位整数") != std::string::npos);
+  CHECK(fallback.effectiveFormat.sampleFormat == AudioSampleFormat::Int16);
+  CHECK(fallback.effectiveFormat.fallbackApplied);
+}
+
+TEST_CASE("format_fallback respects allowFallback disabled") {
+  // allowFallback=false：候选循环退化为单候选（用户指定格式），设备不支持即失败。
+  const auto path = sineFixture("format_fallback_allow_fallback_off.wav");
+
+  auto outputConfig = config(AudioOutputMode::Mixed, 96000, AudioSampleFormat::Int24, 2);
+  outputConfig.allowFallback = false;
+  const auto result = loadWith({{AudioOutputMode::Mixed, 96000, AudioSampleFormat::Float32, 2}},
+                               outputConfig,
+                               path,
+                               "allow-fallback-off");
+  CHECK(result.requests.size() == 1U);
+  CHECK(result.requests[0].sampleFormat == AudioSampleFormat::Int24);
+  CHECK(eventsOf(result.events, BackendEventType::OutputModeFallback).empty());
+  CHECK(eventsOf(result.events, BackendEventType::OutputFormatChanged).empty());
+  const auto& error = std::get<PlaybackError>(firstEventOf(result.events, BackendEventType::PlaybackError).payload);
+  CHECK(error.code == PlaybackErrorCode::FormatNegotiationFailed);
 }
 
 }

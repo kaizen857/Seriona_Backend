@@ -95,6 +95,29 @@ bool sameTarget(const FfmpegFilterTargetFormat& left, const FfmpegFilterTargetFo
          left.channelCount == right.channelCount;
 }
 
+std::string formatFallbackReason(AudioSampleFormat from, AudioSampleFormat to) {
+  const auto bitDepthName = [](AudioSampleFormat format) -> const char* {
+    switch (format) {
+    case AudioSampleFormat::Int16:
+      return "16 位整数";
+    case AudioSampleFormat::Int24:
+      return "24 位整数";
+    case AudioSampleFormat::Int32:
+      return "32 位整数";
+    case AudioSampleFormat::Float32:
+      return "32 位浮点";
+    case AudioSampleFormat::Unknown:
+      return "未知格式";
+    }
+    return "未知格式";
+  };
+
+  if (from == AudioSampleFormat::Unknown) {
+    return "请求的输出格式不受支持，已回退到 " + std::string(bitDepthName(to));
+  }
+  return "设备不支持 " + std::string(bitDepthName(from)) + " 输出，已回退到 " + bitDepthName(to);
+}
+
 std::optional<std::chrono::milliseconds> endPositionFor(const TrackPlaybackRequest& request) {
   if (!request.boundedSegment || !request.offset.has_value() || !request.duration.has_value()) {
     return std::nullopt;
@@ -302,14 +325,7 @@ private:
                   sampleFormatName(currentTarget_.sampleFormat),
                   outputModeName(negotiation->effectiveConfig.outputMode));
 
-    if (const auto error = pipeline_->configure(currentTarget_)) {
-      spdlog::error("track load failed (pipeline): {} - {}", error->message, error->detail);
-      device_.uninitialize();
-      queue_.reset();
-      fail(error->code, error->message, error->detail);
-      return;
-    }
-
+    // pipeline 已由 negotiateOutput 候选循环内的 configure（validateTarget）完成配置。
     clock_.reset(request.trackId, currentTarget_.sampleRate, request.offset.value_or(std::chrono::milliseconds{0}));
     observedQueueCounters_ = {};
 
@@ -642,6 +658,38 @@ private:
     const auto source = sourceTarget(streamInfo);
     std::vector<OutputNegotiationCandidate> candidates;
 
+    // 格式级降级链：在用户指定 target 基础上仅降位深（采样率/声道保持用户指定），
+    // 依序 Int16 → Float32；已加入过的格式不重复；source 兜底在链尾单独判断。
+    const auto pushFormatFallback = [&](AudioSampleFormat format) {
+      const bool alreadyPresent = std::any_of(candidates.begin(), candidates.end(),
+                                              [&](const OutputNegotiationCandidate& candidate) {
+                                                return candidate.config.outputMode == AudioOutputMode::Mixed &&
+                                                       candidate.target.sampleFormat == format;
+                                              });
+      if (alreadyPresent) {
+        return;
+      }
+      auto target = requested;
+      target.sampleFormat = format;
+      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, target),
+                                                      target,
+                                                      formatFallbackReason(requested.sampleFormat, format)});
+    };
+
+    const auto pushSourceFallback = [&]() {
+      const bool sourceCovered = std::any_of(candidates.begin(), candidates.end(),
+                                             [&](const OutputNegotiationCandidate& candidate) {
+                                               return candidate.config.outputMode == AudioOutputMode::Mixed &&
+                                                      sameTarget(candidate.target, source);
+                                             });
+      if (sourceCovered) {
+        return;
+      }
+      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, source),
+                                                      source,
+                                                      "requested mixed output format was unavailable; using source format"});
+    };
+
     if (config_.outputMode == AudioOutputMode::Direct) {
       // 直接输出：设备按曲目原生参数初始化（采样率/声道/格式），
       // 用户配置的 target* 只作用于混合模式；Direct 不可用时降级 Mixed。
@@ -654,11 +702,9 @@ private:
       candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, requested),
                                                       requested,
                                                       "direct output mode was unavailable; using mixed output mode"});
-      if (!sameTarget(requested, source)) {
-        candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, source),
-                                                        source,
-                                                        "requested mixed output format was unavailable; using source format"});
-      }
+      pushFormatFallback(AudioSampleFormat::Int16);
+      pushFormatFallback(AudioSampleFormat::Float32);
+      pushSourceFallback();
       return candidates;
     }
 
@@ -667,11 +713,9 @@ private:
       return candidates;
     }
 
-    if (!sameTarget(requested, source)) {
-      candidates.push_back(OutputNegotiationCandidate{explicitConfig(config_, AudioOutputMode::Mixed, source),
-                                                      source,
-                                                      "requested mixed output format was unavailable; using source format"});
-    }
+    pushFormatFallback(AudioSampleFormat::Int16);
+    pushFormatFallback(AudioSampleFormat::Float32);
+    pushSourceFallback();
 
     return candidates;
   }
@@ -686,6 +730,14 @@ private:
       if (candidate.target.sampleRate == 0U || candidate.target.channelCount == 0U || sampleBytes == 0U) {
         failures << describeTarget(candidate.config.outputMode, candidate.target)
                  << " rejected because sample rate, channel count, and sample bytes must be nonzero; ";
+        continue;
+      }
+
+      // T3：filter pipeline 枚举级验证（validateTarget）纳入协商循环——候选必须同时
+      // 通过 pipeline 验证与设备打开才能被选中；configure 幂等，可对每候选重复调用。
+      if (const auto error = pipeline_->configure(candidate.target)) {
+        failures << describeTarget(candidate.config.outputMode, candidate.target)
+                 << " rejected by filter pipeline validation: " << error->detail << "; ";
         continue;
       }
 

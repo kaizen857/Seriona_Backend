@@ -99,6 +99,12 @@ struct AudioDeviceFormat {
   std::uint32_t bufferFrames{0};
   AudioOutputMode actualMode{AudioOutputMode::Mixed};
   bool fallbackApplied{false};
+  // 设备能力枚举结果（ma_context_get_device_info 的 nativeDataFormats 提取）。
+  // 空列表表示"未枚举或全支持"：miniaudio 中 ma_format_unknown / sampleRate==0 即全支持，
+  // 不产生条目；查询失败时同样留空并置 fallbackApplied。前端设置窗口据此过滤
+  // 采样率/位深下拉（空=显示全部）。
+  std::vector<AudioSampleFormat> supportedSampleFormats;
+  std::vector<std::uint32_t> supportedSampleRates;
 };
 
 struct PlaybackClockSnapshot {

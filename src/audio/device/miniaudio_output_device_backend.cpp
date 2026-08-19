@@ -12,6 +12,62 @@
 #include <string>
 
 namespace seriona::audio {
+
+AudioDeviceFormat makeAudioDeviceFormat(const ma_device_info& info, std::string deviceId) {
+  return AudioDeviceFormat{.deviceId = std::move(deviceId),
+                          .deviceName = info.name,
+                          .backendName = "miniaudio",
+                          .sampleFormat = AudioSampleFormat::Unknown,
+                          .actualMode = AudioOutputMode::Mixed};
+}
+
+AudioSampleFormat fromMiniaudioFormat(ma_format format) noexcept {
+  switch (format) {
+  case ma_format_s16:
+    return AudioSampleFormat::Int16;
+  case ma_format_s24:
+    return AudioSampleFormat::Int24;
+  case ma_format_s32:
+    return AudioSampleFormat::Int32;
+  case ma_format_f32:
+    return AudioSampleFormat::Float32;
+  default:
+    return AudioSampleFormat::Unknown;
+  }
+}
+
+void fillDeviceCapabilitiesFromQuery(AudioDeviceFormat& device, const ma_device_info& info, ma_result queryResult) {
+  if (queryResult != MA_SUCCESS) {
+    // 能力查询失败（MA_SHARE_MODE_NOT_SUPPORTED 等）：列表保持空（=未枚举）并标记，
+    // 前端按"全支持"显示并允许协商回退。
+    device.fallbackApplied = true;
+    return;
+  }
+
+  device.supportedSampleFormats.clear();
+  device.supportedSampleRates.clear();
+  const ma_uint32 count =
+      std::min(info.nativeDataFormatCount, static_cast<ma_uint32>(ma_countof(info.nativeDataFormats)));
+  for (ma_uint32 i = 0; i < count; ++i) {
+    const auto& native = info.nativeDataFormats[i];
+    // ma_format_unknown 与 sampleRate==0 是 miniaudio 的"全支持"语义：不产生条目，
+    // 列表为空即全支持，与"未枚举"的默认空列表行为一致。
+    if (native.format != ma_format_unknown) {
+      const AudioSampleFormat format = fromMiniaudioFormat(native.format);
+      if (format != AudioSampleFormat::Unknown &&
+          std::find(device.supportedSampleFormats.begin(), device.supportedSampleFormats.end(), format) ==
+              device.supportedSampleFormats.end()) {
+        device.supportedSampleFormats.push_back(format);
+      }
+    }
+    if (native.sampleRate != 0 &&
+        std::find(device.supportedSampleRates.begin(), device.supportedSampleRates.end(), native.sampleRate) ==
+            device.supportedSampleRates.end()) {
+      device.supportedSampleRates.push_back(native.sampleRate);
+    }
+  }
+}
+
 namespace {
 
 ma_format toMiniaudioFormat(AudioSampleFormat format) noexcept {
@@ -29,21 +85,6 @@ ma_format toMiniaudioFormat(AudioSampleFormat format) noexcept {
   }
 
   return ma_format_unknown;
-}
-
-AudioSampleFormat fromMiniaudioFormat(ma_format format) noexcept {
-  switch (format) {
-  case ma_format_s16:
-    return AudioSampleFormat::Int16;
-  case ma_format_s24:
-    return AudioSampleFormat::Int24;
-  case ma_format_s32:
-    return AudioSampleFormat::Int32;
-  case ma_format_f32:
-    return AudioSampleFormat::Float32;
-  default:
-    return AudioSampleFormat::Unknown;
-  }
 }
 
 void miniaudioDataCallback(ma_device* device, void* output, const void*, ma_uint32 frameCount) noexcept {
@@ -72,11 +113,13 @@ public:
       devices.reserve(playbackCount);
       for (ma_uint32 index = 0; index < playbackCount; ++index) {
         const auto& info = playbackInfos[index];
-        devices.push_back(AudioDeviceFormat{.deviceId = std::to_string(index),
-                                            .deviceName = info.name,
-                                            .backendName = "miniaudio",
-                                            .sampleFormat = AudioSampleFormat::Unknown,
-                                            .actualMode = AudioOutputMode::Mixed});
+        AudioDeviceFormat device = makeAudioDeviceFormat(info, std::to_string(index));
+        // 逐设备查询详细能力（nativeDataFormats）；失败时能力留空并标记 fallbackApplied
+        // （空列表=未枚举=前端按全支持显示，见 fillDeviceCapabilitiesFromQuery）。
+        ma_device_info detailed{};
+        const ma_result result = ma_context_get_device_info(&context, ma_device_type_playback, &info.id, &detailed);
+        fillDeviceCapabilitiesFromQuery(device, detailed, result);
+        devices.push_back(std::move(device));
       }
     }
 

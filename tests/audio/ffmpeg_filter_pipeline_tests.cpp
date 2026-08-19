@@ -385,6 +385,79 @@ TEST_CASE("ffmpeg_filter_pipeline receives interleaved bytes from stereo planar 
   CHECK(filteredSamples[3] == 2001);
 }
 
+TEST_CASE("ffmpeg_filter_pipeline accepts Int24 target format") {
+  FfmpegFilterPipeline pipeline;
+
+  const auto error = pipeline.configure(FfmpegFilterTargetFormat{48'000, AudioSampleFormat::Int24, 2});
+
+  CHECK_FALSE(error.has_value());
+}
+
+TEST_CASE("ffmpeg_filter_pipeline packs Int24 target output as 3-byte little-endian s24") {
+  FfmpegFilterPipeline pipeline;
+  const auto target = FfmpegFilterTargetFormat{kSourceSampleRate, AudioSampleFormat::Int24, kSourceChannels};
+  REQUIRE_FALSE(pipeline.configure(target).has_value());
+
+  FfmpegAudioFrame input{};
+  input.sampleRate = kSourceSampleRate;
+  input.channelCount = kSourceChannels;
+  input.sampleFormat = AudioSampleFormat::Int32;
+  input.frameCount = 4U;
+  // S32 左对齐样本（24bit 内容占用高 24 位）：0x123456<<8 = 0x12345600
+  input.sampleBytes = {
+      0x00, 0x56, 0x34, 0x12,  // 0x12345600 -> s24 小端: 56 34 12
+      0x00, 0xFF, 0xFF, 0x7F,  // 0x7FFFFF00 -> 7F FF FF
+      0x00, 0x01, 0x00, 0x80,  // 0x80000100 -> 01 00 80（24bit 负数）
+      0x00, 0x00, 0x00, 0x00,  // 0x00000000 -> 00 00 00
+  };
+  REQUIRE_FALSE(pipeline.pushFrame(input).has_value());
+
+  std::vector<std::uint8_t> packed;
+  for (int guard = 0; guard < 16 && packed.size() < 12U; ++guard) {
+    auto result = pipeline.readFrame();
+    REQUIRE_FALSE(result.error.has_value());
+    REQUIRE_FALSE(result.endOfStream);
+    if (result.frame.has_value()) {
+      CHECK(result.frame->sampleFormat == AudioSampleFormat::Int24);
+      packed.insert(packed.end(), result.frame->sampleBytes.begin(), result.frame->sampleBytes.end());
+    }
+  }
+
+  REQUIRE(packed.size() == 12U);
+  // 字节序断言：0x123456<<8 = 0x12345600，高 24 位 0x123456，小端三字节 56 34 12
+  CHECK(packed[0] == 0x56U);
+  CHECK(packed[1] == 0x34U);
+  CHECK(packed[2] == 0x12U);
+  CHECK(packed[3] == 0xFFU);
+  CHECK(packed[4] == 0xFFU);
+  CHECK(packed[5] == 0x7FU);
+  CHECK(packed[6] == 0x01U);
+  CHECK(packed[7] == 0x00U);
+  CHECK(packed[8] == 0x80U);
+  CHECK(packed[9] == 0x00U);
+  CHECK(packed[10] == 0x00U);
+  CHECK(packed[11] == 0x00U);
+}
+
+TEST_CASE("ffmpeg_filter_pipeline rejects 3-byte Int24 decoded input frames") {
+  FfmpegFilterPipeline pipeline;
+  const auto target = FfmpegFilterTargetFormat{kSourceSampleRate, AudioSampleFormat::Int16, kSourceChannels};
+  REQUIRE_FALSE(pipeline.configure(target).has_value());
+
+  const auto error = pipeline.pushFrame(decodedFrame(kSourceSampleRate, kSourceChannels, AudioSampleFormat::Int24, 4U));
+
+  REQUIRE(error.has_value());
+  CHECK(error->code == PlaybackErrorCode::UnsupportedFormat);
+
+  // 非 3 字节 payload 的 Int24 帧同样被拒（解码帧必须是 4 字节 S32 承载）
+  auto badPayload = decodedFrame(kSourceSampleRate, kSourceChannels, AudioSampleFormat::Int24, 4U);
+  badPayload.sampleBytes.resize(1U);
+  const auto badError = pipeline.pushFrame(badPayload);
+
+  REQUIRE(badError.has_value());
+  CHECK(badError->code == PlaybackErrorCode::UnsupportedFormat);
+}
+
 TEST_CASE("ffmpeg_filter_pipeline maps invalid target to typed error") {
   FfmpegFilterPipeline pipeline;
 

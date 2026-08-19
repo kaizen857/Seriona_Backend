@@ -70,3 +70,6 @@ Testing/
 tmp/
 # OpenCode working directory
 .omo/
+
+# Test-generated audio fixtures (created at runtime in current_path())
+generated_audio_fixtures/

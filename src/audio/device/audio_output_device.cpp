@@ -56,25 +56,6 @@ void applyFloat32Gain(void* output, std::uint32_t frameCount, std::uint16_t chan
   }
 }
 
-void applyInt24Gain(void* output, std::uint32_t frameCount, std::uint16_t channelCount, float volume) noexcept {
-  auto* bytes = static_cast<std::uint8_t*>(output);
-  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
-  for (std::size_t index = 0; index < sampleCount; ++index) {
-    auto* sample = bytes + index * 3U;
-    std::int32_t value = static_cast<std::int32_t>(sample[0]) | (static_cast<std::int32_t>(sample[1]) << 8U) |
-                         (static_cast<std::int32_t>(sample[2]) << 16U);
-    if ((value & 0x00800000) != 0) {
-      value |= ~0x00FFFFFF;
-    }
-    const auto scaled = std::lround(static_cast<float>(value) * volume);
-    const auto clamped = std::clamp<long>(scaled, -8'388'608L, 8'388'607L);
-    const auto encoded = static_cast<std::uint32_t>(static_cast<std::int32_t>(clamped)) & 0x00FFFFFFU;
-    sample[0] = static_cast<std::uint8_t>(encoded & 0xFFU);
-    sample[1] = static_cast<std::uint8_t>((encoded >> 8U) & 0xFFU);
-    sample[2] = static_cast<std::uint8_t>((encoded >> 16U) & 0xFFU);
-  }
-}
-
 void applyGain(void* output,
                std::uint32_t frameCount,
                std::uint16_t channelCount,
@@ -96,7 +77,8 @@ void applyGain(void* output,
     applyInt16Gain(output, frameCount, channelCount, volume);
     return;
   case AudioSampleFormat::Int24:
-    applyInt24Gain(output, frameCount, channelCount, volume);
+    // 音量由 miniaudio 设备侧控制：s24 为 3 字节打包格式，实时路径不实现增益分支
+    // （避免在 renderCallback 中解包/重打包 3 字节样本），静音与音量 0 已在上方 memset 分支覆盖。
     return;
   case AudioSampleFormat::Int32:
     applyInt32Gain(output, frameCount, channelCount, volume);

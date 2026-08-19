@@ -78,11 +78,14 @@ AVSampleFormat toPackedAvSampleFormat(AudioSampleFormat format) {
   switch (format) {
   case AudioSampleFormat::Int16:
     return AV_SAMPLE_FMT_S16;
+  case AudioSampleFormat::Int24:
+    // FFmpeg 24bit 标准承载 = S32（解码器左对齐惯例，24bit 内容占用高 24 位）；
+    // 打包为 3 字节 s24 在 readFrame 输出侧完成。
+    return AV_SAMPLE_FMT_S32;
   case AudioSampleFormat::Int32:
     return AV_SAMPLE_FMT_S32;
   case AudioSampleFormat::Float32:
     return AV_SAMPLE_FMT_FLT;
-  case AudioSampleFormat::Int24:
   case AudioSampleFormat::Unknown:
     return AV_SAMPLE_FMT_NONE;
   }
@@ -134,7 +137,7 @@ std::optional<FfmpegFilterPipelineError> validateTarget(const FfmpegFilterTarget
     return makeError(PlaybackErrorCode::FormatNegotiationFailed, "target channel count is invalid", "channel count must be greater than zero");
   }
   if (toPackedAvSampleFormat(target.sampleFormat) == AV_SAMPLE_FMT_NONE) {
-    return makeError(PlaybackErrorCode::UnsupportedFormat, "target sample format is unsupported", "only Int16, Int32, and Float32 PCM targets are supported");
+    return makeError(PlaybackErrorCode::UnsupportedFormat, "target sample format is unsupported", "supported targets are Int16, Int24, Int32, and Float32 PCM");
   }
 
   return std::nullopt;
@@ -143,6 +146,9 @@ std::optional<FfmpegFilterPipelineError> validateTarget(const FfmpegFilterTarget
 std::optional<FfmpegFilterPipelineError> validateInputFrame(const FfmpegAudioFrame& frame) {
   if (frame.sampleRate == 0 || frame.channelCount == 0 || frame.frameCount == 0) {
     return makeError(PlaybackErrorCode::UnsupportedFormat, "decoded frame has invalid audio shape", "sample rate, channel count, and frame count must be nonzero");
+  }
+  if (frame.sampleFormat == AudioSampleFormat::Int24) {
+    return makeError(PlaybackErrorCode::UnsupportedFormat, "decoded frame sample format is unsupported", "decoded frames must use 4-byte S32 packing; 3-byte Int24 input frames are not accepted");
   }
   if (toPackedAvSampleFormat(frame.sampleFormat) == AV_SAMPLE_FMT_NONE) {
     return makeError(PlaybackErrorCode::UnsupportedFormat, "decoded frame sample format is unsupported", "only Int16, Int32, and Float32 decoded frames are supported");
@@ -177,6 +183,26 @@ std::vector<std::uint8_t> copyFrameBytes(const AVFrame& frame) {
   }
 
   return bytes;
+}
+
+std::vector<std::uint8_t> packS32ToS24(const std::vector<std::uint8_t>& source) {
+  // FFmpeg aformat 输出左对齐 S32（24bit 内容占用高 24 位），每样本取高 24 位打包为
+  // 3 字节小端，与 ma_format_s24 字节序约定一致；不实现右对齐兼容。
+  const auto sampleCount = source.size() / 4U;
+  std::vector<std::uint8_t> packed;
+  packed.reserve(sampleCount * 3U);
+  for (std::size_t index = 0; index < sampleCount; ++index) {
+    const auto offset = index * 4U;
+    const auto value = static_cast<std::uint32_t>(source[offset]) |
+                       (static_cast<std::uint32_t>(source[offset + 1U]) << 8U) |
+                       (static_cast<std::uint32_t>(source[offset + 2U]) << 16U) |
+                       (static_cast<std::uint32_t>(source[offset + 3U]) << 24U);
+    const auto high24 = value >> 8U;
+    packed.push_back(static_cast<std::uint8_t>(high24 & 0xFFU));
+    packed.push_back(static_cast<std::uint8_t>((high24 >> 8U) & 0xFFU));
+    packed.push_back(static_cast<std::uint8_t>((high24 >> 16U) & 0xFFU));
+  }
+  return packed;
 }
 
 }
@@ -300,6 +326,15 @@ public:
     filtered.position = output->pts == AV_NOPTS_VALUE ? std::chrono::microseconds{0} : std::chrono::microseconds{av_rescale_q(output->pts, AVRational{1, static_cast<int>(filtered.sampleRate)}, AVRational{1, 1'000'000})};
     filtered.frameCount = static_cast<std::uint32_t>(std::max(0, output->nb_samples));
     filtered.sampleBytes = copyFrameBytes(*output);
+    if (target_.sampleFormat == AudioSampleFormat::Int24) {
+      if (filtered.sampleBytes.size() % 4U != 0U) {
+        spdlog::error("filter pipeline read failed: S32 payload byte count {} is not a multiple of 4",
+                      filtered.sampleBytes.size());
+        return FfmpegFilterReadResult{std::nullopt, false, makeError(PlaybackErrorCode::DecodeFailed, "filtered frame has invalid S32 payload", "S32 frame byte count is not a multiple of 4")};
+      }
+      filtered.sampleFormat = AudioSampleFormat::Int24;
+      filtered.sampleBytes = packS32ToS24(filtered.sampleBytes);
+    }
     return FfmpegFilterReadResult{std::move(filtered), false, std::nullopt};
   }
 
