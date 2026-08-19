@@ -73,7 +73,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 - `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：12 个异步控制方法 + 1 个同步 `queryPlaybackClock`（合计 13，勿与测试专用 `AudioPlayer` 的 13 个方法混淆）；所有操作入命令队列由单音频工作线程执行。
 - 播放状态机 `PlaybackStateMachine`：Idle → Loading → Ready → Playing ⇄ Paused，另有瞬时 Draining、Stopped、Error；每次迁移发 `PlaybackStateChanged`。seek 为 begin/cancel/complete 三阶段，带 generation 防过期完成。
-- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。
+- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取），`AudioOutputConfig.preferredDeviceId`（枚举索引字符串）经 `resolvePreferredDevice` 解析并绑定对应设备，选错格式自动回退并通知。
 - `PcmBufferQueue`：无锁 SPSC 字节环 + generation 失效机制（seek 防竞态）；`PlaybackClock`：帧计数驱动（非墙钟）。
 - `AudioEventDispatcher`：锁内取 sink 副本、锁外回调；`BackendEvent` 信封带 monotonicVersion/timestamp。
 - FFmpeg：`FfmpegAudioSource`（解复用+解码，含 MP3 尾部 ID3v1 净化与损坏尾部截断）、`FfmpegFilterPipeline`（libavfilter 图：abuffer→aformat→abuffersink，输入签名变化时惰性重建）；两者均 pimpl，公共头不暴露任何 AV 类型。
@@ -104,7 +104,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.4 seriona_control（编排核心）
 
-- `MediaController`（pimpl 门面）：`submitCommand`（15 种命令，同步阻塞直到执行完成）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。
+- `MediaController`（pimpl 门面）：`submitCommand`（21 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。
 - 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
 - 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 多规则排序（缺失值 First/Last）+ 锚点定位；Root/Folder 两种作用域。
 - 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）。
@@ -177,7 +177,7 @@ main(argc=2, 路径存在)                       main.cpp
 - 构建期（CMake 选项）：`SERIONA_BUILD_APP`（默认 ON）、`SERIONA_BUILD_TESTS`（默认 ON）、`SERIONA_BUILD_TOOLS`（默认 OFF）、`SERIONA_TAGREADER_SOURCE_DIR`（TagReader 源码路径）；三个 `SERIONA_*_SIMULATE_MISSING_*` 选项会故意令配置失败（依赖门禁演示）。
 - 运行时：**无配置文件**。路径全部由可执行文件位置推导（§6）；scanner 并发由环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY`、`SERIONA_SCANNER_DISABLE_CONCURRENCY` 调节（非法值警告并忽略）。
 - 命令行：单参数（音乐根目录或文件），必须存在。
-- 日志级别：Release 构建 logger 级别 info、Debug 构建 trace；控制台 sink 在终端 UI 下恒关闭。
+- 日志级别：Release 构建 logger 级别 info、Debug 构建 trace；控制台 sink 在终端 UI 下恒关闭。运行时可经 `setLogLevel`（`inc/seriona/app/application_logging.h`）调整（前端设置窗口接线）。
 
 ## 9. 测试
 
@@ -204,7 +204,7 @@ main(argc=2, 路径存在)                       main.cpp
 - 实时路径红线：`AudioOutputDevice::renderCallback()` 内禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁、设备生命周期操作。
 - schema 红线：`SQLiteCache` schema 固定 v3，`user_version=0` 直接初始化、非 0 非 3 报错；不存在迁移桥，改 schema 必须同步 `sqlite_cache_connection.cpp` 内嵌 SQL 与 `cache/schema.sql`（一致性仅靠测试校验）。
 - 编译归属陷阱：`audio_player.cpp`、`scan_scheduler.cpp` 只被测试目标编译；`song_identity.cpp` 经 `hash_utils.cpp` 文本包含进库——生产代码不要依赖这些文件的独立编译单元身份。AVX2/FMA 参数只允许施加于 `waveform_simd_avx2.cpp`（根 CMake 仅对该文件施加 `-mavx2;-mfma`，无专门守卫；FATAL_ERROR 守卫只针对 `BS::thread_pool` 链接）。
-- 未接线代码（勿假设生效）：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `ProgressThrottle` 类（orchestrator 自持轻量时间节流，未用此类）、`preferredDeviceId` 设备选择（当前仅为标签）、`platformExtension`（Windows）。
+- 未接线代码（勿假设生效）：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `ProgressThrottle` 类（orchestrator 自持轻量时间节流，未用此类）、`platformExtension`（Windows）。设备选择已接线（§4.1：`preferredDeviceId` 解析绑定，非纯标签）。
 - 新稳定契约不得暴露第三方类型（TagReader/SQLite/watcher/FFmpeg/MPRIS/sdbus/Windows）。
 - 文档优先级：本文件低于 CMake 配置、源码与测试注册；README 仅有标题，`docs/` 为演进记录。
 
