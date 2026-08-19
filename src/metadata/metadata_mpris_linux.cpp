@@ -103,6 +103,12 @@ namespace {
       return capabilities.canSkipPrevious;
     case control::MediaControlCommandKind::SelectTrack:
       return false;
+    case control::MediaControlCommandKind::StartPlaybackFromContext:
+    case control::MediaControlCommandKind::ApplyFolderSortRules:
+    case control::MediaControlCommandKind::ConfigureOutput:
+    case control::MediaControlCommandKind::DeleteTrack:
+    case control::MediaControlCommandKind::DeleteFolder:
+      return false;
   }
   return false;
 }

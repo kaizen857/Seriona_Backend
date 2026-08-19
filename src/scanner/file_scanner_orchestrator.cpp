@@ -1343,6 +1343,101 @@ public:
     return snapshot_;
   }
 
+  bool removeLocation(const std::filesystem::path& absolutePath) override {
+    const auto target = absolutePath.lexically_normal();
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(target, ec);
+    if (ec) {
+      spdlog::error("removeLocation failed probing '{}': {}", target.generic_string(), ec.message());
+      return false;
+    }
+    if (!exists) {
+      // 文件不存在：幂等成功（无需磁盘删除与缓存清理）。
+      spdlog::info("removeLocation: target already absent, idempotent success: {}", target.generic_string());
+      return true;
+    }
+
+    std::shared_ptr<WatchRuntimeState> state;
+    {
+      std::scoped_lock lock{watcherMutex_};
+      state = watcherState_;
+    }
+    std::vector<ScannerRoot> watchedRoots;
+    if (state) {
+      std::scoped_lock stateLock{state->mutex};
+      watchedRoots = state->watchedRoots;
+    }
+    for (const auto& watched : watchedRoots) {
+      if (pathKey(rootPathFor(watched)) == target.generic_string()) {
+        spdlog::warn("removeLocation refused: target is a scan root: {}", target.generic_string());
+        return false;
+      }
+    }
+
+    const bool isDirectory = std::filesystem::is_directory(target, ec);
+    if (ec) {
+      spdlog::error("removeLocation failed classifying '{}': {}", target.generic_string(), ec.message());
+      return false;
+    }
+    if (isDirectory) {
+      std::filesystem::remove_all(target, ec);
+    } else {
+      std::filesystem::remove(target, ec);
+    }
+    if (ec) {
+      spdlog::error("removeLocation failed removing '{}': {}", target.generic_string(), ec.message());
+      return false;
+    }
+    spdlog::info("removeLocation removed {} '{}'", isDirectory ? "folder" : "file", target.generic_string());
+
+    // 缓存与树更新串行于 scanMutex_（与 runScan/applyClassifierBatch 同一临界区）；
+    // 未扫描过（无树）时磁盘已删，缓存由 watcher/周期对账兜底。
+    std::lock_guard scanLock{scanMutex_};
+    if (!treeBuilder_) {
+      spdlog::debug("removeLocation: no tree seeded yet; cache update skipped");
+      return true;
+    }
+
+    std::optional<std::filesystem::path> root;
+    if (state) {
+      std::scoped_lock stateLock{state->mutex};
+      const auto normalized = target.generic_string();
+      std::size_t bestLength = 0;
+      for (const auto& watched : watchedRoots) {
+        const auto rootPath = rootPathFor(watched);
+        const auto rootText = rootPath.generic_string();
+        if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
+          if (rootText.size() >= bestLength) {
+            bestLength = rootText.size();
+            root = rootPath;
+          }
+        }
+      }
+    }
+    if (!root) {
+      spdlog::warn("removeLocation: '{}' is outside all watched roots; disk removed, cache untouched",
+                   target.generic_string());
+      return true;
+    }
+
+    const auto rel = relativePathFor(*root, target);
+    treeBuilder_->removeSubtree(rel);
+    const auto relText = rel.generic_string();
+    std::erase_if(allSongs_, [&](const RootResult::PublishedSong& entry) {
+      const auto relative = entry.treeRelativePath.generic_string();
+      return relative == relText || relative.rfind(relText + "/", 0) == 0;
+    });
+    try {
+      cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+      cache.deleteLocationsByPathPrefix(pathKey(*root), target.generic_string());
+    } catch (const std::exception& error) {
+      spdlog::warn("removeLocation failed updating locations cache: {}", error.what());
+    }
+    refreshScanRootHash(*root);
+    publishClassifierSnapshot();
+    return true;
+  }
+
 private:
   struct RootResult {
 	    struct PublishedSong {

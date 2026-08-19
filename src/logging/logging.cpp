@@ -1,6 +1,7 @@
 #include "logging/logging.h"
 
 #include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <algorithm>
@@ -47,6 +48,28 @@ void initialize(spdlog::level::level_enum console_level,
     logger->set_level(logger_level);
     logger->flush_on(spdlog::level::err);
     spdlog::set_default_logger(std::move(logger));
+}
+
+void setLogLevel(spdlog::level::level_enum level) {
+    // 防御无效枚举：level_enum 是 int 底层枚举，越界值会破坏 should_log 比较；
+    // 只接受 [trace, off] 有效区间，其余直接忽略（等级保持现状）。
+    if (level < spdlog::level::trace || level > spdlog::level::off) {
+        return;
+    }
+
+    // 默认 logger（initialize 注册的 "seriona"）与全部已注册 named logger
+    // （createDedicatedLogger 等）同步：spdlog 1.17 的 registry::set_level
+    // 遍历所有已注册 logger，线程安全。
+    spdlog::set_level(level);
+
+    // sink 级过滤同步：控制台/文件 sink 各持有独立级别（控制台初始为 console_level、
+    // 文件初始为 trace），logger 级别放开后 sink 级别仍可能挡掉新级别消息，
+    // 因此将默认 logger 的全部 sink 一并同步到新等级。
+    if (const auto logger = spdlog::default_logger(); logger) {
+        for (const auto& sink : logger->sinks()) {
+            sink->set_level(level);
+        }
+    }
 }
 
 std::filesystem::path prepareLogFile(

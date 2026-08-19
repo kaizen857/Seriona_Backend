@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -143,6 +144,13 @@ struct PlaybackCapabilities {
   bool canSelectTrack{false};
 };
 
+// 临时播放队列条目（T7）。跨端契约字段名定死：trackId/nodeId —— 前端（T14/T15）
+// 按 queueEntries: [{trackId, nodeId}] 同名断言。
+struct QueueEntry {
+  std::string trackId;
+  std::string nodeId;
+};
+
 struct PlayerStateSnapshot {
   SnapshotFreshness freshness{};
   std::optional<TrackIdentity> currentTrack;
@@ -155,6 +163,9 @@ struct PlayerStateSnapshot {
   PlaybackTimeline timeline{};
   float volume{1.0F};
   bool muted{false};
+  // 临时播放队列（不持久化，重启清空）。字段名/结构为跨端定死契约：
+  // queueEntries: [{trackId, nodeId}]（T14/T15 按同名断言）。
+  std::vector<QueueEntry> queueEntries;
 };
 
 enum class LibraryScanStatus {
@@ -291,6 +302,15 @@ enum class MediaControlCommandKind {
   // Appended at the end: existing enumerators keep their ordinal positions,
   // preserving serialized-command compatibility.
   ConfigureOutput,
+  // 删除命令（T8）：DeleteTrack=单曲、DeleteFolder=递归删除文件夹，均直接删原文件
+  // （无回收站），目标经 MediaControlCommand::targetPath 传入。追加末尾保持兼容。
+  DeleteTrack,
+  DeleteFolder,
+  // 临时播放队列命令（T7）：PlayNextTrack=目标曲目入队首；ClearPlayQueue=清空队列；
+  // RemoveFromQueue=按索引移除。追加末尾保持序列化兼容。
+  PlayNextTrack,
+  ClearPlayQueue,
+  RemoveFromQueue,
 };
 
 struct MediaControlCommand {
@@ -307,6 +327,11 @@ struct MediaControlCommand {
   // Last member on purpose: appended fields never disturb designated or
   // value-initialization of existing commands.
   std::optional<audio::AudioOutputConfig> outputConfig;
+  // DeleteTrack/DeleteFolder 目标：绝对路径（DeleteTrack=音频文件，
+  // DeleteFolder=文件夹）。追加末尾保持序列化兼容；字段名对前端（T16）为定死契约。
+  std::optional<std::filesystem::path> targetPath;
+  // RemoveFromQueue 目标索引（queueEntries 下标）。追加末尾保持序列化兼容。
+  std::optional<std::size_t> queueIndex;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;

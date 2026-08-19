@@ -36,12 +36,19 @@ public:
 
   [[nodiscard]] seriona::scanner::PlaylistTreeSnapshot snapshot() const override { return snapshot_; }
 
+  bool removeLocation(const std::filesystem::path& path) override {
+    removedPaths_.push_back(path);
+    return removeLocationResult_;
+  }
+
   seriona::scanner::ScannerEventSink sink_{};
   seriona::scanner::ScannerConfig config_{};
   std::vector<seriona::scanner::ScannerRoot> roots_{};
   std::vector<seriona::scanner::ScannerRoot> watchedRoots_{};
   seriona::scanner::ScanMode mode_{seriona::scanner::ScanMode::Incremental};
   seriona::scanner::PlaylistTreeSnapshot snapshot_{};
+  std::vector<std::filesystem::path> removedPaths_{};
+  bool removeLocationResult_{true};
   bool watchingStopped_{false};
   bool stopped_{false};
 };

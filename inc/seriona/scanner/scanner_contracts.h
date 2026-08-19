@@ -169,6 +169,10 @@ public:
   virtual void stopWatching() = 0;
   virtual void stop() = 0;
   [[nodiscard]] virtual PlaylistTreeSnapshot snapshot() const = 0;
+  // 从磁盘删除目标（文件 remove / 文件夹 remove_all 递归，无回收站），随后同步
+  // scanner 缓存（locations 行 + 播放树）并重新发布快照。目标不存在返回 true
+  // （幂等成功）；目标为扫描根本身时拒绝并返回 false。
+  virtual bool removeLocation(const std::filesystem::path& absolutePath) = 0;
 };
 
 }

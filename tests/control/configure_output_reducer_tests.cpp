@@ -332,7 +332,15 @@ TEST_CASE("reducer preserves playback state across reload") {
     CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Paused);
   }
   SUBCASE("loading resumes with play tail intent") {
-    // 注意：本子用例不做 SeekTo，避免 visibleStateDuringSeek_ 抑制 Loading 事件。
+    // T6 切轨抑制：selectTrack 后的 Loading 会被压回乐观 Playing。先确认真实
+    // Playing（清除切轨抑制），再发布 Loading —— 此时无抑制，Loading 可见，
+    // 验证 ConfigureOutput 重载走 Loading 分支（Play 尾意图）。
+    audio::BackendEvent confirmedPlaying{};
+    confirmedPlaying.type = audio::BackendEventType::PlaybackStateChanged;
+    confirmedPlaying.sourceModule = audio::BackendSourceModule::AudioPlaybackService;
+    confirmedPlaying.monotonicVersion = 5;
+    confirmedPlaying.payload = audio::PlaybackStateChanged{.state = audio::PlaybackState::Playing};
+    fixture.reducer.reduceAudioEvent(confirmedPlaying);
     fixture.driveToLoading();
     CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Loading);
 

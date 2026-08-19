@@ -378,6 +378,9 @@ private:
     if (command.kind == MediaControlCommandKind::StartPlaybackFromContext) {
       return startPlaybackFromContext(command);
     }
+    if (command.kind == MediaControlCommandKind::DeleteTrack || command.kind == MediaControlCommandKind::DeleteFolder) {
+      return deleteTarget(command);
+    }
 
     auto reduction = reducer_.reduceCommand(command);
     commitReduction(reduction);
@@ -444,6 +447,58 @@ private:
   MediaControllerCommandResult rejectCommand(MediaControllerErrorCode code, std::string message) {
     notificationSubscriptions_.publish(makeCommandRejectedNotification(code, message));
     return rejectedResult(code, std::move(message));
+  }
+
+  // 删除命令执行（worker 线程 = 控制事件循环）：若目标即在播/加载中曲目，先经
+  // reducer 停止当前播放（audio worker FIFO 保证 stop 排在未完成的 loadTrackOnWorker
+  // 之后，加载失败/成功均收敛为 Stopped），再经 scanner 服务删磁盘 + 同步缓存 +
+  // 发布新快照（PlaylistSnapshotUpdated → 库快照通知）。
+  MediaControllerCommandResult deleteTarget(const MediaControlCommand& command) {
+    if (!command.targetPath.has_value() || command.targetPath->empty()) {
+      return rejectCommand(MediaControllerErrorCode::InvalidCommand, "DeleteTrack/DeleteFolder requires a target path");
+    }
+    const auto target = command.targetPath->lexically_normal();
+
+    if (isPlaybackTarget(target)) {
+      MediaControlCommand stopCommand{};
+      stopCommand.kind = MediaControlCommandKind::Stop;
+      auto reduction = reducer_.reduceCommand(stopCommand);
+      commitReduction(reduction);
+      executeIntents(reduction.intents);
+    }
+
+    bool removed = false;
+    std::string failure;
+    try {
+      removed = dependencies_.scanner->removeLocation(target);
+    } catch (const std::exception& error) {
+      failure = error.what();
+    } catch (...) {
+      failure = "unknown scanner failure";
+    }
+    if (!removed) {
+      const auto message = failure.empty() ? std::string{"Failed to remove target from disk or library"} : failure;
+      return rejectCommand(MediaControllerErrorCode::BackendRejected, message);
+    }
+    return acceptedResult();
+  }
+
+  [[nodiscard]] bool isPlaybackTarget(const std::filesystem::path& target) const {
+    switch (playerSnapshot_.playback.state) {
+    case PlaybackStatus::Stopped:
+    case PlaybackStatus::Error:
+      return false;
+    case PlaybackStatus::Playing:
+    case PlaybackStatus::Paused:
+    case PlaybackStatus::Loading:
+    case PlaybackStatus::Seeking:
+    case PlaybackStatus::Buffering:
+      break;
+    }
+    if (!playerSnapshot_.currentTrack.has_value()) {
+      return false;
+    }
+    return playerSnapshot_.currentTrack->filePath.lexically_normal().generic_string() == target.generic_string();
   }
 
   void publishSavedFolderSortRulesForRoots(const std::vector<scanner::ScannerRoot>& roots) {

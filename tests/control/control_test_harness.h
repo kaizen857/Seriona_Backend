@@ -145,6 +145,7 @@ public:
   void stopWatching() override;
   void stop() override;
   [[nodiscard]] scanner::PlaylistTreeSnapshot snapshot() const override;
+  bool removeLocation(const std::filesystem::path& path) override;
 
   [[nodiscard]] std::size_t setEventSinkCalls() const noexcept;
   [[nodiscard]] std::size_t configureCalls() const noexcept;
@@ -153,6 +154,8 @@ public:
   [[nodiscard]] std::size_t stopWatchingCalls() const noexcept;
   [[nodiscard]] std::size_t stopCalls() const noexcept;
   [[nodiscard]] std::size_t emitEventCalls() const noexcept;
+  [[nodiscard]] std::size_t removeLocationCalls() const noexcept;
+  [[nodiscard]] const std::vector<std::filesystem::path>& removeLocationPaths() const noexcept;
 
   [[nodiscard]] const std::optional<scanner::ScannerConfig>& lastConfigured() const noexcept;
   [[nodiscard]] const std::optional<std::vector<scanner::ScannerRoot>>& lastScannedRoots() const noexcept;
@@ -166,6 +169,9 @@ public:
   void blockScansUntilReleased() noexcept;
   void releaseBlockedScans();
   [[nodiscard]] bool waitForBlockedScan(std::chrono::milliseconds timeout);
+  void setRemoveLocationResult(bool result) noexcept;
+  void setRemoveLocationThrows(std::exception_ptr exception) noexcept;
+  void setRemoveLocationThrows(std::runtime_error exception);
 
 private:
   void waitIfScanBlocked();
@@ -181,6 +187,8 @@ private:
   std::size_t stopWatchingCalls_{0};
   std::size_t stopCalls_{0};
   std::size_t emitEventCalls_{0};
+  std::size_t removeLocationCalls_{0};
+  std::vector<std::filesystem::path> removeLocationPaths_{};
   std::optional<scanner::ScannerConfig> lastConfigured_{};
   std::optional<std::vector<scanner::ScannerRoot>> lastScannedRoots_{};
   std::optional<scanner::ScanMode> lastScanMode_{};
@@ -189,6 +197,8 @@ private:
   bool blockScans_{false};
   bool scanBlocked_{false};
   bool releaseScans_{false};
+  bool removeLocationResult_{true};
+  std::exception_ptr removeLocationException_{};
 };
 
 class FakeMetadataSharingService final : public metadata::MetadataSharingService {

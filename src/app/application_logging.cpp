@@ -27,4 +27,8 @@ void initializeApplicationLogging(const RuntimePaths& runtimePaths) {
   spdlog::default_logger()->flush();
 }
 
+void setLogLevel(spdlog::level::level_enum level) {
+  seriona::logging::setLogLevel(level);
+}
+
 }

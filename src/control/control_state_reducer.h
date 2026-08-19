@@ -110,6 +110,11 @@ private:
   [[nodiscard]] std::optional<PlayableTrack> shuffledTrack(const std::vector<PlayableTrack>& tracks,
                                                           bool reshuffleWhenExhausted = false);
   [[nodiscard]] std::optional<PlayableTrack> previousTrack();
+  [[nodiscard]] std::optional<PlayableTrack> findPlayableTrackByTrackId(const std::string& trackId) const;
+  // 消费临时队列队首（跳过不可解析条目）；队列为空返回 nullopt。不改播放上下文 index。
+  [[nodiscard]] std::optional<PlayableTrack> consumeQueueFront();
+  // 将临时队列同步进 PlayerStateSnapshot::queueEntries（跨端契约）。
+  void syncQueueSnapshot();
   // 当前选中曲目是否为播放上下文的最后一首（不含子文件夹干扰的判断由 order 决定）。
   [[nodiscard]] bool isLastTrackInContext() const;
   // 当前播放上下文容器（文件夹 / 根）直属的第一首，不含子文件夹。
@@ -131,6 +136,12 @@ private:
   LibraryStateSnapshot library_{};
   std::optional<TrackIdentity> selectedTrack_{};
   std::optional<PlaybackContextState> playbackContext_{};
+  // 临时播放队列（T7）：不持久化（新实例即空）；消费期间播放上下文 index 冻结，
+  // 队列空后才从冻结位置推进文件夹序列。
+  std::deque<QueueEntry> playbackQueue_{};
+  // 当前曲目是否来自临时队列（T7）：仅此时 nextTrack 允许从冻结 index 继续；
+  // 普通"上下文漂移"（选中曲目不在 order）保持旧语义（返回空，停止播放）。
+  bool playingQueuedTrack_{false};
   std::optional<PlaybackStatus> visibleStateDuringSeek_{};
   std::optional<std::chrono::milliseconds> currentTrackOffset_{};
   std::uint64_t lastAudioPlayerVersion_{0};

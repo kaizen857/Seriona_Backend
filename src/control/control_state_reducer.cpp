@@ -452,6 +452,12 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     markPlayerChanged(reduction);
     return reduction;
   case MediaControlCommandKind::SkipNext:
+    // 临时队列优先（T7）：next 命令先消费队列头部，播放上下文 index 冻结不动。
+    if (const auto queued = consumeQueueFront(); queued.has_value()) {
+      selectTrack(reduction, *queued, true);
+      playingQueuedTrack_ = true;
+      return reduction;
+    }
     if (player_.repeatMode == RepeatMode::One && selectedTrack_.has_value()) {
       const auto track = this->selectedPlaybackContextTrack();
       if (track.has_value()) {
@@ -520,6 +526,41 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       return reduction;
     }
     return reject(MediaControllerErrorCode::TrackNotInLibrary, "Selected track is not present in the current library");
+  case MediaControlCommandKind::PlayNextTrack:
+    if (!command.track.has_value() || command.track->trackId.empty()) {
+      return reject(MediaControllerErrorCode::InvalidCommand, "PlayNextTrack requires a track identity");
+    }
+    {
+      const auto track = findPlayableTrack(*command.track);
+      if (!track.has_value()) {
+        return reject(MediaControllerErrorCode::TrackNotInLibrary, "PlayNextTrack target is not present in the current library");
+      }
+      playbackQueue_.push_front(QueueEntry{.trackId = track->identity.trackId,
+                                           .nodeId = track->parentNodeId.value_or(std::string{})});
+      syncQueueSnapshot();
+      markPlayerChanged(reduction);
+      spdlog::debug("play queue entry added at front: '{}' (queue size {})", track->identity.trackId, playbackQueue_.size());
+      return reduction;
+    }
+  case MediaControlCommandKind::ClearPlayQueue:
+    if (!playbackQueue_.empty()) {
+      playbackQueue_.clear();
+      syncQueueSnapshot();
+      markPlayerChanged(reduction);
+      spdlog::debug("play queue cleared");
+    }
+    return reduction;
+  case MediaControlCommandKind::RemoveFromQueue:
+    if (!command.queueIndex.has_value()) {
+      return reject(MediaControllerErrorCode::InvalidCommand, "RemoveFromQueue requires a queue index");
+    }
+    if (*command.queueIndex < playbackQueue_.size()) {
+      playbackQueue_.erase(playbackQueue_.begin() + static_cast<std::ptrdiff_t>(*command.queueIndex));
+      syncQueueSnapshot();
+      markPlayerChanged(reduction);
+      spdlog::debug("play queue entry removed at index {}", *command.queueIndex);
+    }
+    return reduction;
   case MediaControlCommandKind::StartPlaybackFromContext: {
     if (!command.playbackContext.has_value()) {
       return reject(MediaControllerErrorCode::InvalidCommand, "StartPlaybackFromContext requires a playback context");
@@ -537,6 +578,11 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   }
   case MediaControlCommandKind::ConfigureOutput:
     return handleConfigureOutput(reduction, command);
+  case MediaControlCommandKind::DeleteTrack:
+  case MediaControlCommandKind::DeleteFolder:
+    // 删除涉及文件系统与 scanner 缓存，必须经 MediaController（service 层）执行；
+    // reducer 不直接做文件系统操作。
+    return reject(MediaControllerErrorCode::InvalidCommand, "Delete commands must be handled by MediaController");
   case MediaControlCommandKind::ApplyFolderSortRules:
     return reject(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules must be handled by MediaController");
   }
@@ -688,13 +734,18 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
             }
             player_.timeline.position = trackPosition;
 	          }
-	          if (player_.repeatMode == RepeatMode::One) {
-	            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
-	              selectTrack(reduction, *track, true);
-	            } else {
-	              stopPlayback(reduction);
-	            }
-	          } else if (player_.shuffle && playbackContext_.has_value() && !playbackContext_->order.empty()) {
+          if (const auto queued = consumeQueueFront(); queued.has_value()) {
+            // 临时队列优先（T7）：消费队列头部，播放上下文 index 冻结不动；
+            // 队列空后由文件夹序列从冻结 index 的下一曲继续。
+            selectTrack(reduction, *queued, true);
+            playingQueuedTrack_ = true;
+          } else if (player_.repeatMode == RepeatMode::One) {
+            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
+              selectTrack(reduction, *track, true);
+            } else {
+              stopPlayback(reduction);
+            }
+          } else if (player_.shuffle && playbackContext_.has_value() && !playbackContext_->order.empty()) {
 	            if (const auto track = shuffledTrack(playbackContext_->order, /*reshuffleWhenExhausted=*/true); track.has_value()) {
 	              selectTrack(reduction, *track, true);
 	            } else if (const auto current = selectedPlaybackContextTrack(); current.has_value()) {
@@ -905,6 +956,37 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::findPlaya
   return *trackIt;
 }
 
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::findPlayableTrackByTrackId(const std::string& trackId) const {
+  if (trackId.empty()) {
+    return std::nullopt;
+  }
+  const auto tracks = playableTracks();
+  const auto trackIt = std::find_if(tracks.begin(), tracks.end(), [&](const PlayableTrack& track) {
+    return track.identity.trackId == trackId;
+  });
+  if (trackIt == tracks.end()) {
+    return std::nullopt;
+  }
+  return *trackIt;
+}
+
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::consumeQueueFront() {
+  while (!playbackQueue_.empty()) {
+    const auto entry = playbackQueue_.front();
+    playbackQueue_.pop_front();
+    syncQueueSnapshot();
+    if (const auto track = findPlayableTrackByTrackId(entry.trackId); track.has_value()) {
+      return track;
+    }
+    spdlog::debug("play queue entry '{}' is no longer playable; skipped", entry.trackId);
+  }
+  return std::nullopt;
+}
+
+void ControlStateReducer::syncQueueSnapshot() {
+  player_.queueEntries.assign(playbackQueue_.begin(), playbackQueue_.end());
+}
+
 std::optional<PlaybackContextDescriptor> ControlStateReducer::defaultContextDescriptorForTrack(const TrackIdentity& identity) const {
   if (identity.trackId.empty() || !library_.libraryTree.has_value()) {
     return std::nullopt;
@@ -1016,9 +1098,13 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::nextTrack
   }
   const auto currentIndex = selectedContextIndex();
   if (selectedTrack_.has_value() && !currentIndex.has_value()) {
-    return std::nullopt;
-  }
-  if (currentIndex.has_value()) {
+    // 当前选中曲目不在播放上下文 order 中。仅当它来自临时队列（playingQueuedTrack_）
+    // 时才保留冻结的 playbackContext_->index 继续（A 歌曲1 → 插播 B → B 播完 →
+    // A 歌曲2）；普通上下文漂移保持旧语义（返回空，由调用方停止播放）。
+    if (!playingQueuedTrack_ || !playbackContext_.has_value()) {
+      return std::nullopt;
+    }
+  } else if (currentIndex.has_value()) {
     playbackContext_->index = *currentIndex;
   }
   const auto& tracks = playbackContext_->order;
@@ -1342,7 +1428,16 @@ ControlReduction ControlStateReducer::reduceArtworkResolved(const ArtworkResolve
 }
 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
-  visibleStateDuringSeek_.reset();
+  // 切轨抑制（需求 4 按钮锁定）：startPlayback=true 时立即发布乐观 Playing 快照，
+  // 并设置可见状态抑制 —— 音频层随后发布的 Loading 会被 reduceAudioEvent 压回
+  // Playing（:621-629），直到真实 Playing/Stopped/Error 到达时解除；Error 必放行，
+  // 真实错误不会被掩盖。注意不要无条件 reset：那会把刚设置的抑制立即清掉
+  // （历史陷阱：seek 抑制变量被 selectTrack 清空）。startPlayback=false 时切轨
+  // 不自动播放，无需抑制。
+  visibleStateDuringSeek_ = startPlayback ? std::optional<PlaybackStatus>{PlaybackStatus::Playing} : std::nullopt;
+  // 除临时队列消费路径外，切轨都回到文件夹序列来源（队列消费路径在 selectTrack
+  // 之后重新置位 playingQueuedTrack_）。
+  playingQueuedTrack_ = false;
   selectedTrack_ = track.identity;
   currentTrackOffset_ = track.request.offset;
   player_.currentTrack = track.identity;

@@ -272,6 +272,15 @@ scanner::PlaylistTreeSnapshot FakeFileScannerService::snapshot() const {
   return snapshot_;
 }
 
+bool FakeFileScannerService::removeLocation(const std::filesystem::path& path) {
+  ++removeLocationCalls_;
+  removeLocationPaths_.push_back(path);
+  if (removeLocationException_) {
+    std::rethrow_exception(removeLocationException_);
+  }
+  return removeLocationResult_;
+}
+
 std::size_t FakeFileScannerService::setEventSinkCalls() const noexcept {
   return setEventSinkCalls_;
 }
@@ -298,6 +307,26 @@ std::size_t FakeFileScannerService::stopCalls() const noexcept {
 
 std::size_t FakeFileScannerService::emitEventCalls() const noexcept {
   return emitEventCalls_;
+}
+
+std::size_t FakeFileScannerService::removeLocationCalls() const noexcept {
+  return removeLocationCalls_;
+}
+
+const std::vector<std::filesystem::path>& FakeFileScannerService::removeLocationPaths() const noexcept {
+  return removeLocationPaths_;
+}
+
+void FakeFileScannerService::setRemoveLocationResult(bool result) noexcept {
+  removeLocationResult_ = result;
+}
+
+void FakeFileScannerService::setRemoveLocationThrows(std::exception_ptr exception) noexcept {
+  removeLocationException_ = std::move(exception);
+}
+
+void FakeFileScannerService::setRemoveLocationThrows(std::runtime_error exception) {
+  setRemoveLocationThrows(std::make_exception_ptr(std::move(exception)));
 }
 
 const std::optional<scanner::ScannerConfig>& FakeFileScannerService::lastConfigured() const noexcept {
