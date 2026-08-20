@@ -6,7 +6,7 @@
 - 仓库无 CI、格式化配置和 `CMakePresets.json`；`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
 - 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。已跟踪的 `src/thumbnail/`、`inc/seriona/thumbnail/` 因使用 `QImage`/`QImageReader` 未被任何 CMake 目标包含，禁止接入生产。
-- 根目录两个跟踪文件非源码：`detailed-scanner-perf-report.txt`（生成的性能报告产物）与 `FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），均只作背景材料；根目录 `.ruff_cache/` 是未跟踪的 ruff 工作缓存，不是源码。
+- 根目录两个跟踪文件非源码：`detailed-scanner-perf-report.txt`（生成的性能报告产物）与 `FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），均只作背景材料；根目录 `docs/` 是已跟踪的历史分析/方案文档（watcher 修复方案、性能研究等），同样只作背景材料，不是事实来源。
 
 ## DESIGN.md 维护规范
 - `DESIGN.md` 是描述项目长期稳定设计的架构文档，不是开发日志、变更记录或实现细节文档；应保持稳定，避免随开发逐渐演变为实现文档或变更日志。
@@ -24,7 +24,7 @@
 - `SERIONA_BUILD_APP`、`SERIONA_BUILD_TESTS`、`SERIONA_BUILD_TOOLS` 默认分别为 ON、ON、OFF；线程池 FetchContent 固定 `bshoshany/thread-pool` v4.1.0。
 
 ## 入口与模块边界
-- 五个静态库是 `seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`、`seriona_app`。可执行文件 `seriona` 直接编译 terminal、runtime_paths、logging 源，链接 `seriona_control` 而不链接 `seriona_app`，仅 Release 直接追加 `PkgConfig::SERIONA_FFMPEG`。
+- 五个静态库是 `seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`、`seriona_app`，并导出别名 `SerionaBackend::{audio,scanner,metadata,control,app}`（前端 `Seriona/CMakeLists.txt` 通过别名链接）。可执行文件 `seriona` 直接编译 terminal、runtime_paths、logging 源，链接 `seriona_control` 而不链接 `seriona_app`，仅 Release 直接追加 `PkgConfig::SERIONA_FFMPEG`。
 - `app/main.cpp` 做单参数/路径校验和顶层异常边界；`app/terminal_controller.cpp` 与 `terminal_io.{h,cpp}` 管终端生命周期、运行时路径、日志及生产控制器创建。
 - `makeProductionMediaControllerDependencies(databasePath, coverExportDir)` 连接 miniaudio、scanner、生产 metadata；databasePath 非空时使用 SQLite 文件夹排序存储。
 - `makeDefaultMediaControllerDependencies()` 使用 no-op 音频和文件夹排序存储，但仍调用真实 scanner/metadata 工厂。
