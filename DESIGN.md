@@ -104,12 +104,13 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.4 seriona_control（编排核心）
 
-- `MediaController`（pimpl 门面）：`submitCommand`（21 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。
+- `MediaController`（pimpl 门面）：`submitCommand`（21 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
 - 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
 - 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 多规则排序（缺失值 First/Last）+ 锚点定位；Root/Folder 两种作用域。
-- 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）。
+- 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/appSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）、SQLite 应用设置存储（与排序存储共享 databasePath）。
 - 封面解析：`ArtworkResolver`（有界 latest-wins 队列 + 结果 epoch 失效）+ 归约器 generation 校验，结果回填 `player_.artwork.localPath`。
 - 文件夹排序：`FolderSortSettingsStore` 抽象（Noop/SQLite 实现，手写 JSON 解析）；`ApplyFolderSortRules` 命令持久化、扫描启动时重放、播放上下文构建时回填。
+- 应用设置：`AppSettingsStore` 抽象（Noop/SQLite 实现），`app_settings` 表 `(group_name, key, value, updated_at_ms)` 主键 `(group_name, key)`；`getAppSetting` 失败返回 nullopt（未启动/未存储），值以不透明字符串存储（前端负责 JSON 编码）。
 - 订阅分发：每订阅类型一个独立投递线程，快照拷贝后异步回调，避免阻塞归约线程。
 
 ### 4.5 seriona_app 与入口层
