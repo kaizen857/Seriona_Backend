@@ -271,6 +271,8 @@ struct MediaControllerCommandResult {
 
 struct MediaControllerOptions {
   bool runInlineForTests{false};
+  // 0 = 由生产工厂注入每次进程启动的随机种子（每次启动/每台机器序列不同）；
+  // 显式非 0 = 确定性种子（测试可复现，reducer 直接以其播种）。
   std::uint64_t shuffleSeed{0};
   std::size_t shuffleHistorySize{50};
 };

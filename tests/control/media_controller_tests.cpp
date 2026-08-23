@@ -1909,6 +1909,43 @@ TEST_CASE("media controller facade shuffle produces deterministic selected track
   CHECK(first.fakeAudio->lastLoadedTrack()->trackId == second.fakeAudio->lastLoadedTrack()->trackId);
 }
 
+TEST_CASE("media controller different explicit shuffle seeds produce different playback sequences") {
+  ControllerFixture first{MediaControllerOptions{.runInlineForTests = true, .shuffleSeed = 1}};
+  ControllerFixture second{MediaControllerOptions{.runInlineForTests = true, .shuffleSeed = 2}};
+  first.controller->start();
+  second.controller->start();
+
+  std::vector<scanner::SongMetadata> songs;
+  songs.reserve(10);
+  for (int i = 0; i < 10; ++i) {
+    songs.push_back(song("s" + std::to_string(i), "music/s" + std::to_string(i) + ".flac"));
+  }
+  first.fakeScanner->emit(scannerSnapshotEvent(libraryTree(songs, 20), 1));
+  second.fakeScanner->emit(scannerSnapshotEvent(libraryTree(songs, 20), 1));
+  first.controller->drainForTests();
+  second.controller->drainForTests();
+
+  first.controller->submitCommand(command(MediaControlCommandKind::Play));
+  second.controller->submitCommand(command(MediaControlCommandKind::Play));
+
+  auto enableShuffle = command(MediaControlCommandKind::SetShuffle);
+  enableShuffle.shuffle = true;
+  CHECK(first.controller->submitCommand(enableShuffle).accepted);
+  CHECK(second.controller->submitCommand(enableShuffle).accepted);
+
+  std::vector<std::string> firstSequence;
+  std::vector<std::string> secondSequence;
+  for (int i = 0; i < 8; ++i) {
+    CHECK(first.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+    CHECK(second.controller->submitCommand(command(MediaControlCommandKind::SkipNext)).accepted);
+    REQUIRE(first.fakeAudio->lastLoadedTrack().has_value());
+    REQUIRE(second.fakeAudio->lastLoadedTrack().has_value());
+    firstSequence.push_back(first.fakeAudio->lastLoadedTrack()->trackId);
+    secondSequence.push_back(second.fakeAudio->lastLoadedTrack()->trackId);
+  }
+  CHECK(firstSequence != secondSequence);
+}
+
 TEST_CASE("media controller facade scans library, starts watching, and publishes committed library snapshots") {
   ControllerFixture fixture{};
   std::mutex librarySnapshotMutex{};

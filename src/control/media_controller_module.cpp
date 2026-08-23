@@ -12,7 +12,9 @@
 #include "spdlog/spdlog.h"
 
 #include <chrono>
+#include <exception>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 
@@ -107,6 +109,21 @@ public:
   return options;
 }
 
+// 生产路径默认 seed 为 0：注入每次进程启动的随机种子，避免每次启动/每台机器
+// 播放顺序完全相同。显式非 0 seed 保持原语义（确定性，测试可复现）。
+[[nodiscard]] MediaControllerOptions withProductionShuffleSeed(MediaControllerOptions options) {
+  if (options.shuffleSeed != 0) {
+    return options;
+  }
+  try {
+    options.shuffleSeed = std::random_device{}();
+  } catch (const std::exception&) {
+    options.shuffleSeed =
+        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  }
+  return options;
+}
+
 }
 
 MediaControllerDependencies makeDefaultMediaControllerDependencies() {
@@ -141,14 +158,16 @@ MediaControllerDependencies makeProductionMediaControllerDependencies(
 }
 
 std::unique_ptr<MediaController> makeProductionMediaController(MediaControllerOptions options) {
-  return makeMediaController(makeProductionMediaControllerDependencies(), options);
+  return makeMediaController(makeProductionMediaControllerDependencies(),
+                             withProductionShuffleSeed(std::move(options)));
 }
 
 std::unique_ptr<MediaController> makeProductionMediaController(
     MediaControllerOptions options,
     std::filesystem::path databasePath,
     std::filesystem::path coverExportDir) {
-  return makeMediaController(makeProductionMediaControllerDependencies(std::move(databasePath), std::move(coverExportDir)), options);
+  return makeMediaController(makeProductionMediaControllerDependencies(std::move(databasePath), std::move(coverExportDir)),
+                             withProductionShuffleSeed(std::move(options)));
 }
 
 void normalizeMediaControllerDependencies(MediaControllerDependencies& dependencies) {
