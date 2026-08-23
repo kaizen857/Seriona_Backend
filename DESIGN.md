@@ -52,18 +52,20 @@ seriona_app（静态库，仅 application_logging/runtime_paths/logging，当前
 ```
 app/                 可执行文件 seriona：main、terminal_controller、terminal_io
 inc/seriona/         稳定公共契约（按模块分组；实现导向头不属稳定边界）
-src/audio/           播放核心（service/state_machine/device/buffer/clock/events）、
+src/audio/           播放核心（service 与状态机、device/buffer/clock/events 子目录）、
                      ffmpeg 解码与滤镜、waveform 波形生成（scalar/simd/avx2/strategy_a/b）
 src/scanner/         扫描服务/编排器/worker 池、cache/（SQLite v3）、哈希与身份、
                      路径分类、播放列表树、文件夹缩略图解析、TagReader 适配
 src/metadata/        平台元数据分享（backend 抽象、MPRIS Linux 实现、Windows 占位）
-src/control/         媒体控制器、事件循环、状态归约器、播放上下文构建、封面解析、订阅存储
+src/control/         媒体控制器、事件循环、状态归约器、播放上下文构建、封面解析、订阅存储、
+                     设置存储（SQLite 文件夹排序/应用设置）
 src/app/             应用日志与运行时路径（亦编入 seriona_app）
 src/logging/         内部日志模块（无公共头，编入式复用）
 src/thumbnail/       缩略图服务（Qt/QImage，未接入任何构建目标，生产禁用）
 third_party/         vendored：doctest、miniaudio、watcher（wtr/watcher 头文件库）
 tests/               doctest 测试（70+ 目标，见 §9）
-tools/               SERIONA_BUILD_TOOLS=ON 才构建：scanner_cold_perf、miniaudio_platform_probe
+tools/               SERIONA_BUILD_TOOLS=ON 才构建：scanner_cold_perf、miniaudio_platform_probe、
+                     watch_root_move_audit
 docs/、*.md          项目演进记录文档，非事实来源
 ```
 
@@ -110,7 +112,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 - 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/appSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）、SQLite 应用设置存储（与排序存储共享 databasePath）。
 - 封面解析：`ArtworkResolver`（有界 latest-wins 队列 + 结果 epoch 失效）+ 归约器 generation 校验，结果回填 `player_.artwork.localPath`。
 - 文件夹排序：`FolderSortSettingsStore` 抽象（Noop/SQLite 实现，手写 JSON 解析）；`ApplyFolderSortRules` 命令持久化、扫描启动时重放、播放上下文构建时回填。
-- 应用设置：`AppSettingsStore` 抽象（Noop/SQLite 实现），`app_settings` 表 `(group_name, key, value, updated_at_ms)` 主键 `(group_name, key)`；`getAppSetting` 失败返回 nullopt（未启动/未存储），值以不透明字符串存储（前端负责 JSON 编码）。
+- 应用设置：`AppSettingsStore` 抽象（Noop/SQLite 实现，接口含 `set`/`get`/`remove`/`listByGroup`（按 key 排序）），`app_settings` 表 `(group_name, key, value, updated_at_ms)` 主键 `(group_name, key)`；`getAppSetting` 失败返回 nullopt（未启动/未存储），值以不透明字符串存储（后端不解释，前端负责编解码）。
 - 订阅分发：每订阅类型一个独立投递线程，快照拷贝后异步回调，避免阻塞归约线程。
 
 ### 4.5 seriona_app 与入口层
@@ -196,6 +198,7 @@ main(argc=2, 路径存在)                       main.cpp
 - 元数据后端：实现 `MetadataServiceBackend` 或复用 MPRIS 抽象（`IMprisBus`/`IMprisObject`）；通过 `MetadataSharingOptions.backendKind` + `platformExtension` 选择。
 - 扫描依赖：`FileScannerServiceDependencies` 注入自定义元数据读取器（`TagMetadataReader`）与 watcher 工厂。
 - 排序存储：实现 `FolderSortSettingsStore` 抽象。
+- 应用设置：实现 `AppSettingsStore` 抽象（Noop 或 SQLite 落库）。
 - 控制器依赖：`MediaControllerDependencies` 全量注入，缺失项自动回退 noop——可用于无 UI/无真实硬件的场景。
 - 对外消费：订阅 `PlayerStateSnapshot`/`LibraryStateSnapshot`/领域通知即可构建新前端；`AudioPlaybackService` 与 `FileScannerService` 也可独立使用。
 - 前端集成：终端控制器是 `TerminalActionReader` 抽象之上的唯一实现，新 UI 可替换入口层而保持 control 不变。
