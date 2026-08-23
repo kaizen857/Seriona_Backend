@@ -5,6 +5,7 @@
 #include "media_controller_module.h"
 #include "subscription_store.h"
 
+#include "seriona/control/app_settings_store.h"
 #include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/metadata/metadata_contracts.h"
 
@@ -204,6 +205,82 @@ public:
 
   MediaControllerCommandResult submitCommand(const MediaControlCommand& command) {
     return dispatch<MediaControllerCommandResult>([this, command] { return reduceCommand(command); });
+  }
+
+  [[nodiscard]] std::optional<std::string> getAppSetting(const std::string& group, const std::string& key) {
+    {
+      std::lock_guard lock{mutex_};
+      if (!started_ || stopping_) {
+        return std::nullopt;
+      }
+    }
+
+    auto promise = std::make_shared<std::promise<std::optional<std::string>>>();
+    auto future = promise->get_future();
+    const auto work = [promise, this, group, key] {
+      if (!dependencies_.appSettingsStore) {
+        promise->set_value(std::nullopt);
+        return;
+      }
+      try {
+        promise->set_value(dependencies_.appSettingsStore->get(group, key));
+      } catch (const std::exception&) {
+        promise->set_value(std::nullopt);
+      } catch (...) {
+        promise->set_value(std::nullopt);
+      }
+    };
+    if (!eventLoop_.post(work)) {
+      spdlog::error("media controller dispatch failed: event loop post rejected");
+      return std::nullopt;
+    }
+    if (options_.runInlineForTests) {
+      eventLoop_.drainForTests();
+    }
+    return future.get();
+  }
+
+  MediaControllerCommandResult setAppSetting(std::string group, std::string key, std::string value) {
+    return dispatch<MediaControllerCommandResult>([this,
+                                                   group = std::move(group),
+                                                   key = std::move(key),
+                                                   value = std::move(value)] {
+      if (group.empty() || key.empty()) {
+        return rejectCommand(MediaControllerErrorCode::InvalidCommand,
+                             "SetAppSetting requires non-empty group and key");
+      }
+      if (!dependencies_.appSettingsStore) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, "app settings store is unavailable");
+      }
+      try {
+        dependencies_.appSettingsStore->set(group, key, value);
+      } catch (const AppSettingsError& error) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
+      } catch (const std::exception& error) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
+      }
+      return acceptedResult();
+    });
+  }
+
+  MediaControllerCommandResult removeAppSetting(std::string group, std::string key) {
+    return dispatch<MediaControllerCommandResult>([this, group = std::move(group), key = std::move(key)] {
+      if (group.empty() || key.empty()) {
+        return rejectCommand(MediaControllerErrorCode::InvalidCommand,
+                             "RemoveAppSetting requires non-empty group and key");
+      }
+      if (!dependencies_.appSettingsStore) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, "app settings store is unavailable");
+      }
+      try {
+        dependencies_.appSettingsStore->remove(group, key);
+      } catch (const AppSettingsError& error) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
+      } catch (const std::exception& error) {
+        return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
+      }
+      return acceptedResult();
+    });
   }
 
   MediaControllerCommandResult scanLibrary(std::vector<scanner::ScannerRoot> roots, scanner::ScanMode mode) {
@@ -650,6 +727,18 @@ void MediaController::start() { impl_->start(); }
 void MediaController::shutdown() { impl_->shutdown(); }
 
 MediaControllerCommandResult MediaController::submitCommand(const MediaControlCommand& command) { return impl_->submitCommand(command); }
+
+std::optional<std::string> MediaController::getAppSetting(const std::string& group, const std::string& key) {
+  return impl_->getAppSetting(group, key);
+}
+
+MediaControllerCommandResult MediaController::setAppSetting(std::string group, std::string key, std::string value) {
+  return impl_->setAppSetting(std::move(group), std::move(key), std::move(value));
+}
+
+MediaControllerCommandResult MediaController::removeAppSetting(std::string group, std::string key) {
+  return impl_->removeAppSetting(std::move(group), std::move(key));
+}
 
 MediaControllerCommandResult MediaController::scanLibrary(std::vector<scanner::ScannerRoot> roots, scanner::ScanMode mode) {
   return impl_->scanLibrary(std::move(roots), mode);

@@ -20,6 +20,7 @@ class MetadataSharingService;
 namespace seriona::control {
 
 class FolderSortSettingsStore;
+class AppSettingsStore;
 
 enum class PlaybackStatus {
   Stopped,
@@ -279,6 +280,8 @@ struct MediaControllerDependencies {
   std::shared_ptr<scanner::FileScannerService> scanner;
   std::unique_ptr<::seriona::metadata::MetadataSharingService> metadata;
   std::shared_ptr<FolderSortSettingsStore> folderSortSettingsStore;
+  // 前端应用设置存储（输出设置/导航状态/曲目统计）；null 时读写安全降级。
+  std::shared_ptr<AppSettingsStore> appSettingsStore;
   // Optional artwork resolver; when null, artwork resolve intents are dropped.
   std::shared_ptr<ArtworkResolveService> artworkResolver;
 };

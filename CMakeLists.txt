@@ -220,6 +220,7 @@ add_library(seriona_control STATIC
   src/control/media_controller.cpp
   src/control/media_controller_module.cpp
   src/control/playback_context_builder.cpp
+  src/control/sqlite_app_settings_store.cpp
   src/control/sqlite_folder_sort_settings_store.cpp
   src/control/subscription_store.cpp
 )

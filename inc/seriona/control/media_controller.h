@@ -4,6 +4,8 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace seriona::control {
@@ -21,6 +23,11 @@ public:
   void start();
   void shutdown();
   MediaControllerCommandResult submitCommand(const MediaControlCommand& command);
+  // 前端应用设置读写：与命令同模式（控制事件循环串行化），未启动时 get 返回
+  // nullopt、set/remove 返回拒绝结果；存储不可用时同样安全降级。
+  [[nodiscard]] std::optional<std::string> getAppSetting(const std::string& group, const std::string& key);
+  MediaControllerCommandResult setAppSetting(std::string group, std::string key, std::string value);
+  MediaControllerCommandResult removeAppSetting(std::string group, std::string key);
   MediaControllerCommandResult scanLibrary(std::vector<scanner::ScannerRoot> roots, scanner::ScanMode mode);
   SubscriptionHandle subscribePlayerState(PlayerStateSnapshotCallback callback);
   SubscriptionHandle subscribeLibraryState(LibraryStateSnapshotCallback callback);

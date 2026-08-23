@@ -224,6 +224,9 @@ add_executable(seriona_media_controller_tests
 add_executable(seriona_control_folder_sort_settings_store_tests
   control/folder_sort_settings_store_tests.cpp
 )
+add_executable(seriona_control_app_settings_store_tests
+  control/app_settings_store_tests.cpp
+)
 add_executable(seriona_control_persistence_guardrail_tests
   control/persistence_guardrail_tests.cpp
   control/control_test_harness.cpp
@@ -512,6 +515,7 @@ target_compile_definitions(seriona_configure_output_reducer_tests PRIVATE DOCTES
 target_compile_definitions(seriona_configure_output_executes_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_folder_sort_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_control_app_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_persistence_guardrail_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_terminal_controller_tests PRIVATE
   DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -740,6 +744,10 @@ target_include_directories(seriona_media_controller_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_control_folder_sort_settings_store_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_control_app_settings_store_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -1107,6 +1115,12 @@ target_link_libraries(seriona_control_folder_sort_settings_store_tests PRIVATE
   seriona_scanner
   SQLite3::SQLite3
 )
+target_link_libraries(seriona_control_app_settings_store_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+  seriona_scanner
+  SQLite3::SQLite3
+)
 target_link_libraries(seriona_control_persistence_guardrail_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1183,6 +1197,7 @@ seriona_enable_warnings(seriona_configure_output_reducer_tests)
 seriona_enable_warnings(seriona_configure_output_executes_tests)
 seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
+seriona_enable_warnings(seriona_control_app_settings_store_tests)
 seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
 seriona_enable_warnings(seriona_control_playback_context_builder_tests)
 seriona_enable_warnings(seriona_artwork_resolver_tests)
@@ -1453,6 +1468,7 @@ add_test(NAME seriona.control.configure_output_executes COMMAND seriona_configur
 add_test(NAME seriona.control.enumerate_devices COMMAND seriona_configure_output_executes_tests --test-case=*enumerate_devices*)
 add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
 add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control_folder_sort_settings_store_tests)
+add_test(NAME seriona.control_app_settings_store COMMAND seriona_control_app_settings_store_tests)
 add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)
 add_test(NAME seriona.control_playback_context_builder COMMAND seriona_control_playback_context_builder_tests)
 add_test(NAME seriona.control_artwork_resolver COMMAND seriona_artwork_resolver_tests)
