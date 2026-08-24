@@ -2,7 +2,7 @@
 
 ## 边界与事实来源
 - 当前目录即仓库根；不要向上扫描 Seriona。`build/`、`build-*/`、`.omo/` 是生成或工作目录，不是源码。
-- 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于仅有标题的 `README.md` 与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
+- 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于完整项目文档 `README.md`（2026-08 public 准备时重写）与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
 - 仓库无 CI、格式化配置和 `CMakePresets.json`；`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
 - 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。已跟踪的 `src/thumbnail/`、`inc/seriona/thumbnail/` 未被任何 CMake 目标包含，禁止接入生产；Qt 类型（`QImage`/`QImageReader`）只出现在 `src/thumbnail/*.cpp` 实现里，`inc/seriona/thumbnail/` 头文件本身是纯 C++。
@@ -28,6 +28,7 @@
 - `app/main.cpp` 做单参数/路径校验和顶层异常边界；`app/terminal_controller.cpp` 与 `terminal_io.{h,cpp}` 管终端生命周期、运行时路径、日志及生产控制器创建。
 - `makeProductionMediaControllerDependencies(databasePath, coverExportDir)` 连接 miniaudio、scanner、生产 metadata；databasePath 非空时使用 SQLite 文件夹排序存储。
 - `makeDefaultMediaControllerDependencies()` 使用 no-op 音频和文件夹排序存储，但仍调用真实 scanner/metadata 工厂。
+- 前端应用设置的公共契约在 `inc/seriona/control/app_settings_store.h`：`AppSettingsStore`（`set`/`get`/`remove`/`listByGroup`，value 为不透明字符串，前端负责 QVariant ↔ 字符串编解码）+ `makeSQLiteAppSettingsStore` 工厂，编入 `seriona_control`，与 FolderSortSettingsStore 同库不同表、实现须线程安全。
 - 对外契约以 `inc/seriona/` 为边界：audio 看 `audio_contracts.h`，scanner 稳定入口只看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，跨模块编排走 control；`inc/` 中的 TagReader adapter、SQLite cache 等实现导向头不属稳定边界，新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus 或 Windows 类型。
 - 公共契约错误风格：typed enum（`MediaControllerErrorCode`、`ScannerErrorCode` 等）+ result struct（`MediaControllerCommandResult`、`ScannerTaskResult` 等），异常（`std::runtime_error`/`std::invalid_argument`）只从实现抛出；公共头不声明 `throw`、不用 `std::expected`。
 - `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging` 与 `setLogLevel`（运行时日志等级），入口公共 API 还包括 `runtime_paths.h`。
