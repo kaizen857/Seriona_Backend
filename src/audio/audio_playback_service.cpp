@@ -6,6 +6,7 @@
 
 #include "seriona/audio/buffer/pcm_buffer_queue.h"
 #include "seriona/audio/clock/playback_clock.h"
+#include "seriona/audio/device/audio_device_format_enumerator.h"
 #include "seriona/audio/events/audio_event_dispatcher.h"
 #include "seriona/audio/ffmpeg_audio_source.h"
 #include "seriona/audio/ffmpeg_filter_pipeline.h"
@@ -179,8 +180,11 @@ AudioOutputConfig explicitConfig(AudioOutputConfig config, AudioOutputMode mode,
 
 class SingleTrackAudioPlaybackService final : public AudioPlaybackService {
 public:
-  explicit SingleTrackAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend)
-      : device_(std::move(backend)), dispatcher_(BackendSourceModule::AudioPlaybackService) {
+  explicit SingleTrackAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend,
+                                           std::unique_ptr<DeviceFormatEnumerator> formatEnumerator)
+      : device_(std::move(backend)),
+        formatEnumerator_(std::move(formatEnumerator)),
+        dispatcher_(BackendSourceModule::AudioPlaybackService) {
     stateMachine_.setEventSink([this](BackendEvent event) { dispatcher_.dispatch(std::move(event)); });
     audioWorker_ = std::thread{[this] { runAudioWorker(); }};
   }
@@ -250,7 +254,7 @@ public:
     auto future = promise->get_future();
     auto* self = const_cast<SingleTrackAudioPlaybackService*>(this);
     self->enqueueCommand([self, promise] {
-      promise->set_value(self->device_.enumeratePlaybackDevices());
+      promise->set_value(self->enumeratePlaybackDevicesOnWorker());
     });
     if (future.wait_for(std::chrono::seconds{2}) == std::future_status::ready) {
       return future.get();
@@ -260,6 +264,52 @@ public:
   }
 
 private:
+  // worker 线程内的枚举：先取播放后端（miniaudio）设备列表，再用平台
+  // 原生枚举器（PipeWire/WASAPI）的能力数据覆盖格式/采样率列表。
+  std::vector<AudioDeviceFormat> enumeratePlaybackDevicesOnWorker() {
+    auto devices = device_.enumeratePlaybackDevices();
+    mergeDeviceFormatCapabilities(devices);
+    return devices;
+  }
+
+  // 用 DeviceFormatCapabilities 覆盖 AudioDeviceFormat 的能力字段：
+  // 按 deviceId 精确匹配 → deviceName 精确匹配 的顺序定位设备；仅当 caps
+  // 至少一个列表非空时覆盖（空列表=未枚举或全支持，覆盖会丢失该语义）；
+  // backendName 等播放字段不覆盖（保持 miniaudio 播放后端标识）。
+  void mergeDeviceFormatCapabilities(std::vector<AudioDeviceFormat>& devices) {
+    if (!formatEnumerator_) {
+      return;
+    }
+    const auto capabilities = formatEnumerator_->enumerate();
+    if (capabilities.empty()) {
+      return;
+    }
+    for (auto& device : devices) {
+      for (const auto& caps : capabilities) {
+        const bool idMatched = !caps.deviceId.empty() && caps.deviceId == device.deviceId;
+        const bool nameMatched = !idMatched && !caps.deviceName.empty() && caps.deviceName == device.deviceName;
+        if (!idMatched && !nameMatched) {
+          continue;
+        }
+        if (caps.supportedSampleFormats.empty() && caps.supportedSampleRates.empty()) {
+          continue;
+        }
+        if (!caps.supportedSampleFormats.empty()) {
+          device.supportedSampleFormats = caps.supportedSampleFormats;
+        }
+        if (!caps.supportedSampleRates.empty()) {
+          device.supportedSampleRates = caps.supportedSampleRates;
+        }
+        spdlog::debug("device format capabilities merged for '{}' (match: {}): {} formats, {} rates",
+                      device.deviceName,
+                      idMatched ? "deviceId" : "deviceName",
+                      device.supportedSampleFormats.size(),
+                      device.supportedSampleRates.size());
+        break;
+      }
+    }
+  }
+
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     spdlog::info("loading track '{}'", request.filePath.string());
     stopProgressWorker();
@@ -1226,6 +1276,7 @@ private:
 
   AudioOutputConfig config_{};
   AudioOutputDevice device_;
+  std::unique_ptr<DeviceFormatEnumerator> formatEnumerator_{};
   AudioEventDispatcher dispatcher_;
   PlaybackStateMachine stateMachine_;
   PlaybackClock clock_;
@@ -1252,8 +1303,9 @@ private:
   std::atomic<bool> progressWorkerRunning_{false};
 };
 
-std::shared_ptr<AudioPlaybackService> makeAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend) {
-  return std::make_shared<SingleTrackAudioPlaybackService>(std::move(backend));
+std::shared_ptr<AudioPlaybackService> makeAudioPlaybackService(std::unique_ptr<AudioOutputDeviceBackend> backend,
+                                                               std::unique_ptr<DeviceFormatEnumerator> formatEnumerator) {
+  return std::make_shared<SingleTrackAudioPlaybackService>(std::move(backend), std::move(formatEnumerator));
 }
 
 }

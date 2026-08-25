@@ -134,6 +134,30 @@ add_executable(seriona_audio_enumerate_devices_tests
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
 )
+add_executable(seriona_audio_device_format_enumerator_tests
+  audio/device_format_enumerator_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_device_format_caching.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
+)
+# PipeWire 真实枚举测试：仅平台条件注册（参照 metadata_mpris_tests 守卫），
+# 无 PipeWire 守护进程时测试体 SUCCEED 跳过。
+if(UNIX AND NOT APPLE)
+  add_executable(seriona_audio_pipewire_device_enumerator_tests
+    audio/pipewire_device_enumerator_tests.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/device/audio_device_format_enumerator.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/device/audio_device_format_caching.cpp
+    ${PROJECT_SOURCE_DIR}/src/audio/device/pipewire_device_format_enumerator.cpp
+  )
+endif()
 add_executable(seriona_miniaudio_device_capabilities_tests
   audio/miniaudio_device_capabilities_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
@@ -492,6 +516,8 @@ target_compile_definitions(seriona_audio_player_seamless_tests PRIVATE DOCTEST_C
 target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_shutdown_lifecycle_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_enumerate_devices_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_device_format_enumerator_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_pipewire_device_enumerator_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_miniaudio_device_capabilities_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -643,6 +669,15 @@ target_include_directories(seriona_audio_enumerate_devices_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_device_format_enumerator_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_pipewire_device_enumerator_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_miniaudio_device_capabilities_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
@@ -1035,6 +1070,15 @@ target_link_libraries(seriona_audio_enumerate_devices_tests PRIVATE
   PkgConfig::SERIONA_FFMPEG
   spdlog::spdlog
 )
+target_link_libraries(seriona_audio_device_format_enumerator_tests PRIVATE
+  seriona_third_party_headers
+  PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
+)
+target_link_libraries(seriona_audio_pipewire_device_enumerator_tests PRIVATE
+  PkgConfig::SERIONA_PIPEWIRE
+  spdlog::spdlog
+)
 target_link_libraries(seriona_miniaudio_device_capabilities_tests PRIVATE
   seriona_third_party_headers
   spdlog::spdlog
@@ -1190,6 +1234,8 @@ seriona_enable_warnings(seriona_audio_player_seamless_tests)
 seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_audio_enumerate_devices_tests)
+seriona_enable_warnings(seriona_audio_device_format_enumerator_tests)
+seriona_enable_warnings(seriona_audio_pipewire_device_enumerator_tests)
 seriona_enable_warnings(seriona_miniaudio_device_capabilities_tests)
 seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_configure_output_command_tests)
@@ -1451,6 +1497,10 @@ add_test(NAME seriona.audio_player_preload_failure COMMAND seriona_audio_player_
 add_test(NAME seriona.audio_error_matrix COMMAND seriona_audio_error_matrix_tests)
 add_test(NAME seriona.audio_shutdown_lifecycle COMMAND seriona_audio_shutdown_lifecycle_tests)
 add_test(NAME seriona.audio.enumerate_playback_devices COMMAND seriona_audio_enumerate_devices_tests)
+add_test(NAME seriona.audio.device_format_enumerator COMMAND seriona_audio_device_format_enumerator_tests)
+if(UNIX AND NOT APPLE)
+  add_test(NAME seriona.audio.pipewire_device_enumerator COMMAND seriona_audio_pipewire_device_enumerator_tests)
+endif()
 add_test(NAME seriona.audio.miniaudio_device_capabilities COMMAND seriona_miniaudio_device_capabilities_tests)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)

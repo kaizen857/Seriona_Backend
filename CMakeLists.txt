@@ -60,7 +60,10 @@ add_library(seriona_audio STATIC
   src/audio/audio_playback_service.cpp
   src/audio/buffer/pcm_buffer_queue.cpp
   src/audio/clock/playback_clock.cpp
+  src/audio/device/audio_device_format_enumerator.cpp
   src/audio/device/audio_output_device.cpp
+  src/audio/device/audio_device_format_enumerator.cpp
+  src/audio/device/audio_device_format_caching.cpp
   src/audio/device/miniaudio_output_device_backend.cpp
   src/audio/events/audio_event_dispatcher.cpp
   src/audio/ffmpeg/ffmpeg_audio_source.cpp
@@ -96,6 +99,22 @@ target_link_libraries(seriona_audio PRIVATE
   BS::thread_pool
   spdlog::spdlog
 )
+
+# 设备采样率/位深格式枚举的平台分支（结构同 metadata 模块）：
+# Linux 用 PipeWire 原生 SPA EnumFormat（libpipewire-0.3），Windows 用
+# WASAPI 格式矩阵探测（ole32）；其余平台由工厂返回空枚举器，无需源文件。
+if(UNIX AND NOT APPLE)
+  pkg_check_modules(SERIONA_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+  target_sources(seriona_audio PRIVATE
+    src/audio/device/pipewire_device_format_enumerator.cpp
+  )
+  target_link_libraries(seriona_audio PRIVATE PkgConfig::SERIONA_PIPEWIRE)
+elseif(WIN32)
+  target_sources(seriona_audio PRIVATE
+    src/audio/device/windows_device_format_enumerator.cpp
+  )
+  target_link_libraries(seriona_audio PRIVATE ole32)
+endif()
 
 get_target_property(SERIONA_AUDIO_LINK_LIBRARIES seriona_audio LINK_LIBRARIES)
 if(NOT "BS::thread_pool" IN_LIST SERIONA_AUDIO_LINK_LIBRARIES)

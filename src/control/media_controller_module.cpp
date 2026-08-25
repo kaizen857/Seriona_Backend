@@ -2,6 +2,7 @@
 
 #include "artwork_resolver.h"
 #include "seriona/audio/audio_playback_service.h"
+#include "seriona/audio/device/audio_device_format_enumerator.h"
 #include "seriona/control/app_settings_store.h"
 #include "seriona/control/folder_sort_settings_store.h"
 #include "seriona/control/media_controller.h"
@@ -142,7 +143,13 @@ MediaControllerDependencies makeProductionMediaControllerDependencies(
     std::filesystem::path coverExportDir) {
   spdlog::info("selected production audio backend (miniaudio)");
   MediaControllerDependencies dependencies{};
-  dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend());
+  // 平台原生设备格式枚举器（Linux PipeWire / Windows WASAPI）随播放服务
+  // 注入：enumeratePlaybackDevices 会用真实设备能力覆盖 miniaudio 报告
+  // 的 supportedSampleFormats/supportedSampleRates（miniaudio 各后端均
+  // 无法完整枚举设备格式）。
+  dependencies.audio = audio::makeAudioPlaybackService(audio::makeMiniaudioOutputDeviceBackend(),
+                                                       audio::makeDeviceFormatEnumerator());
+  spdlog::info("device format enumerator active: native platform formats merged into device enumeration");
   scanner::FileScannerServiceDependencies scannerDeps{};
   auto settingsDatabasePath = databasePath;
   scannerDeps.databasePath = std::move(databasePath);
