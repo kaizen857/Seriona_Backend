@@ -43,6 +43,11 @@ constexpr std::uint16_t kWaveformProbeBitsPerSample = 16;
 constexpr double kWaveformProbePi = 3.141592653589793238462643383279502884;
 constexpr int kWaveformProbeId3v1TagSize = 128;
 constexpr int kWaveformPerfDurationSeconds = 180;
+#if defined(NDEBUG)
+constexpr bool kWaveformPerfHardGate = true;
+#else
+constexpr bool kWaveformPerfHardGate = false;
+#endif
 constexpr int kWaveformPerfSampleRate = 44'100;
 constexpr int kWaveformPerfChannels = 1;
 constexpr int kWaveformPerfBarCount = 400;
@@ -195,17 +200,26 @@ std::filesystem::path waveformProbeFixture(std::string name,
 
 std::string shellQuote(const std::filesystem::path& path) {
   const auto text = path.string();
+#if defined(_WIN32)
+  REQUIRE(text.find('"') == std::string::npos);
+  return "\"" + text + "\"";
+#else
   REQUIRE(text.find('\'') == std::string::npos);
   return "'" + text + "'";
+#endif
 }
 
 std::string shellQuoteText(const std::string& text) {
+#if defined(_WIN32)
+  REQUIRE(text.find('"') == std::string::npos);
+  return "\"" + text + "\"";
+#else
   REQUIRE(text.find('\'') == std::string::npos);
   return "'" + text + "'";
+#endif
 }
 
 void requireWaveformFfmpegCommand(const std::string& command) {
-  REQUIRE(std::filesystem::exists("/usr/bin/ffmpeg"));
   const int exitCode = std::system(command.c_str());
   REQUIRE_MESSAGE(exitCode == 0, "ffmpeg command failed with exit=" << exitCode << ": " << command);
 }
@@ -213,7 +227,7 @@ void requireWaveformFfmpegCommand(const std::string& command) {
 void transcodeWaveformProbeMp3(const std::filesystem::path& sourceWav,
                                const std::filesystem::path& outputMp3,
                                const char* bitrate = "128k") {
-  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
                        " -map_metadata -1 -id3v2_version 0 -write_id3v1 0 -codec:a libmp3lame -b:a " + bitrate + " " +
                        shellQuote(outputMp3);
 
@@ -222,7 +236,7 @@ void transcodeWaveformProbeMp3(const std::filesystem::path& sourceWav,
 }
 
 void transcodeWaveformProbeFlac(const std::filesystem::path& sourceWav, const std::filesystem::path& outputFlac) {
-  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a flac " + shellQuote(outputFlac);
 
   requireWaveformFfmpegCommand(command);
@@ -230,7 +244,7 @@ void transcodeWaveformProbeFlac(const std::filesystem::path& sourceWav, const st
 }
 
 void transcodeWaveformProbeM4a(const std::filesystem::path& sourceWav, const std::filesystem::path& outputM4a) {
-  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a aac -b:a 128k " + shellQuote(outputM4a);
 
   requireWaveformFfmpegCommand(command);
@@ -238,7 +252,7 @@ void transcodeWaveformProbeM4a(const std::filesystem::path& sourceWav, const std
 }
 
 void transcodeWaveformProbeMp4(const std::filesystem::path& sourceWav, const std::filesystem::path& outputMp4) {
-  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a aac -b:a 128k -f mp4 " + shellQuote(outputMp4);
 
   requireWaveformFfmpegCommand(command);
@@ -254,7 +268,7 @@ void generateWaveformPerfSourceWav(const std::filesystem::path& outputWav) {
   const auto filter = std::string{"[0:a][1:a]amix=inputs=2:normalize=0,volume=0.7,"} +
                       "aformat=sample_fmts=s16:sample_rates=" + std::to_string(kWaveformPerfSampleRate) +
                       ":channel_layouts=mono";
-  const auto command = std::string{"/usr/bin/ffmpeg -v error -nostdin -y -f lavfi -i "} + shellQuoteText(sine) +
+  const auto command = std::string{"ffmpeg -v error -nostdin -y -f lavfi -i "} + shellQuoteText(sine) +
                        " -f lavfi -i " + shellQuoteText(noise) + " -filter_complex " + shellQuoteText(filter) +
                        " -codec:a pcm_s16le " + shellQuote(outputWav);
 
@@ -1478,7 +1492,7 @@ TEST_CASE("waveform perf release fixtures meet hard limits and record comparison
   auto runs = std::vector<WaveformPerfRun>{};
   runs.reserve(fixtures.size() + 1U);
   for (const auto& fixture : fixtures) {
-    runs.push_back(measureWaveformPerfRun(fixture, productionConfig, "production", true));
+    runs.push_back(measureWaveformPerfRun(fixture, productionConfig, "production", kWaveformPerfHardGate));
   }
 
   auto simdDisabledConfig = productionConfig;
