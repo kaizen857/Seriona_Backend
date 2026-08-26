@@ -222,11 +222,13 @@ add_executable(seriona_metadata_service_recording_tests
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_testing.cpp
   ${PROJECT_SOURCE_DIR}/src/metadata/metadata_service_recording.cpp
 )
-add_executable(seriona_metadata_mpris_tests
-  metadata/metadata_mpris_tests.cpp
-  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris.cpp
-  ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris_linux.cpp
-)
+if(UNIX AND NOT APPLE)
+  add_executable(seriona_metadata_mpris_tests
+    metadata/metadata_mpris_tests.cpp
+    ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris.cpp
+    ${PROJECT_SOURCE_DIR}/src/metadata/metadata_mpris_linux.cpp
+  )
+endif()
 add_executable(seriona_control_contract_tests
   control/control_contract_tests.cpp
   control/control_test_harness.cpp
@@ -442,7 +444,7 @@ add_executable(seriona_scanner_cache_perf_tests
 add_executable(seriona_scanner_cache_schema_tests
   scanner/scanner_cache_schema_tests.cpp
 )
-target_link_libraries(seriona_scanner_cache_schema_tests PRIVATE sqlite3)
+target_link_libraries(seriona_scanner_cache_schema_tests PRIVATE SQLite3::SQLite3)
 add_executable(seriona_scanner_tagreader_tests
   scanner/scanner_tagreader_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/tag_reader_metadata_adapter.cpp
@@ -517,7 +519,9 @@ target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONF
 target_compile_definitions(seriona_audio_shutdown_lifecycle_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_enumerate_devices_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_device_format_enumerator_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 target_compile_definitions(seriona_audio_pipewire_device_enumerator_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+endif()
 target_compile_definitions(seriona_miniaudio_device_capabilities_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -534,7 +538,9 @@ target_compile_definitions(seriona_metadata_contract_tests PRIVATE DOCTEST_CONFI
 target_compile_definitions(seriona_metadata_mapper_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_metadata_service_recording_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
-target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+if(TARGET seriona_metadata_mpris_tests)
+  target_compile_definitions(seriona_metadata_mpris_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+endif()
 target_compile_definitions(seriona_control_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_configure_output_command_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_configure_output_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -675,10 +681,12 @@ target_include_directories(seriona_audio_device_format_enumerator_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
 )
+if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 target_include_directories(seriona_audio_pipewire_device_enumerator_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+endif()
 target_include_directories(seriona_miniaudio_device_capabilities_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -752,11 +760,13 @@ target_include_directories(seriona_metadata_service_recording_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/src/metadata
 )
-target_include_directories(seriona_metadata_mpris_tests PRIVATE
-  ${PROJECT_SOURCE_DIR}/inc
-  ${PROJECT_SOURCE_DIR}/third_party/doctest
-  ${PROJECT_SOURCE_DIR}/src/metadata
-)
+if(TARGET seriona_metadata_mpris_tests)
+  target_include_directories(seriona_metadata_mpris_tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/inc
+    ${PROJECT_SOURCE_DIR}/third_party/doctest
+    ${PROJECT_SOURCE_DIR}/src/metadata
+  )
+endif()
 target_include_directories(seriona_control_contract_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -931,7 +941,6 @@ target_include_directories(seriona_scanner_cache_perf_tests PRIVATE
 target_include_directories(seriona_scanner_cache_schema_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
-target_link_libraries(seriona_scanner_cache_schema_tests PRIVATE sqlite3)
 target_include_directories(seriona_scanner_tagreader_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1075,10 +1084,12 @@ target_link_libraries(seriona_audio_device_format_enumerator_tests PRIVATE
   PkgConfig::SERIONA_FFMPEG
   spdlog::spdlog
 )
+if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 target_link_libraries(seriona_audio_pipewire_device_enumerator_tests PRIVATE
   PkgConfig::SERIONA_PIPEWIRE
   spdlog::spdlog
 )
+endif()
 target_link_libraries(seriona_miniaudio_device_capabilities_tests PRIVATE
   seriona_third_party_headers
   spdlog::spdlog
@@ -1130,9 +1141,11 @@ target_link_libraries(seriona_metadata_service_tests PRIVATE
 target_link_libraries(seriona_metadata_service_recording_tests PRIVATE
   seriona_metadata
 )
-target_link_libraries(seriona_metadata_mpris_tests PRIVATE
-  seriona_metadata
-)
+if(TARGET seriona_metadata_mpris_tests)
+  target_link_libraries(seriona_metadata_mpris_tests PRIVATE
+    seriona_metadata
+  )
+endif()
 target_link_libraries(seriona_control_contract_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1211,7 +1224,7 @@ target_link_libraries(seriona_terminal_controller_tests PRIVATE
   spdlog::spdlog
 )
 
-if(UNIX AND NOT APPLE)
+if(TARGET seriona_metadata_mpris_tests)
   target_link_libraries(seriona_metadata_mpris_tests PRIVATE PkgConfig::SERIONA_SDBUS_CPP)
 endif()
 
@@ -1235,7 +1248,9 @@ seriona_enable_warnings(seriona_audio_error_matrix_tests)
 seriona_enable_warnings(seriona_audio_shutdown_lifecycle_tests)
 seriona_enable_warnings(seriona_audio_enumerate_devices_tests)
 seriona_enable_warnings(seriona_audio_device_format_enumerator_tests)
+if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 seriona_enable_warnings(seriona_audio_pipewire_device_enumerator_tests)
+endif()
 seriona_enable_warnings(seriona_miniaudio_device_capabilities_tests)
 seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_configure_output_command_tests)
@@ -1267,7 +1282,9 @@ seriona_enable_warnings(seriona_scanner_complete_e2e_tests)
 seriona_enable_warnings(seriona_metadata_contract_tests)
 seriona_enable_warnings(seriona_metadata_mapper_tests)
 seriona_enable_warnings(seriona_metadata_service_tests)
-seriona_enable_warnings(seriona_metadata_mpris_tests)
+if(TARGET seriona_metadata_mpris_tests)
+  seriona_enable_warnings(seriona_metadata_mpris_tests)
+endif()
 seriona_enable_warnings(seriona_scanner_paths_tests)
 seriona_enable_warnings(seriona_scanner_hash_tests)
 seriona_enable_warnings(seriona_scanner_tree_tests)
@@ -1509,8 +1526,10 @@ add_test(NAME seriona.metadata_contract COMMAND seriona_metadata_contract_tests)
 add_test(NAME seriona.metadata_mapper COMMAND seriona_metadata_mapper_tests)
 add_test(NAME seriona.metadata_service COMMAND seriona_metadata_service_tests)
 add_test(NAME seriona.metadata_service_recording COMMAND seriona_metadata_service_recording_tests)
-add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
-add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
+if(TARGET seriona_metadata_mpris_tests)
+  add_test(NAME seriona.metadata_mpris COMMAND seriona_metadata_mpris_tests)
+  add_test(NAME seriona.metadata_mpris_smoke COMMAND seriona_metadata_mpris_tests --test-case=*smoke*)
+endif()
 add_test(NAME seriona.control_contract COMMAND seriona_control_contract_tests)
 add_test(NAME seriona.control.contract.configure_output_command COMMAND seriona_configure_output_command_tests)
 add_test(NAME seriona.control.reducer.configure_output COMMAND seriona_configure_output_reducer_tests)
@@ -1531,8 +1550,8 @@ set_tests_properties(seriona.control_artwork_resolver PROPERTIES TIMEOUT 60)
 add_test(NAME seriona.terminal_controller COMMAND seriona_terminal_controller_tests)
 add_test(NAME seriona.scanner_paths COMMAND seriona_scanner_paths_tests)
 add_test(NAME seriona.scanner_hash COMMAND seriona_scanner_hash_tests)
-add_test(NAME seriona.scanner.directory_tree_hash COMMAND seriona_scanner_hash_tests --test-case="scanner directory tree hash*")
-add_test(NAME seriona.scanner.song_identity COMMAND seriona_scanner_hash_tests --test-case="scanner song identity*")
+add_test(NAME seriona.scanner.directory_tree_hash COMMAND seriona_scanner_hash_tests "--test-case=scanner directory tree hash*")
+add_test(NAME seriona.scanner.song_identity COMMAND seriona_scanner_hash_tests "--test-case=scanner song identity*")
 add_test(NAME seriona.scanner_tree COMMAND seriona_scanner_tree_tests)
 add_test(NAME seriona.scanner_scheduler COMMAND seriona_scanner_scheduler_tests)
 add_test(NAME seriona.scanner.thread_pool_basic COMMAND seriona_scanner_thread_pool_tests)
@@ -1558,9 +1577,9 @@ add_test(NAME seriona.scanner.cache.schema COMMAND seriona_scanner_cache_schema_
 add_test(NAME seriona.scanner_tagreader COMMAND seriona_scanner_tagreader_tests)
 add_test(NAME seriona.scanner.tagreader_concurrency_stress COMMAND seriona_scanner_tagreader_concurrency_stress_tests)
 add_test(NAME seriona.scanner_service COMMAND seriona_scanner_service_tests)
-add_test(NAME seriona.scanner.event_ordering COMMAND seriona_scanner_service_tests --test-case="scanner service publishes worker results in discovered file order")
-add_test(NAME seriona.scanner.cache_lookup COMMAND seriona_scanner_service_tests --test-case="scanner service cache lookup reuses a high-count cached root")
-add_test(NAME seriona.scanner.incremental_integration COMMAND seriona_scanner_service_tests --test-case="scanner service incremental integration reuses unchanged scans only added and changed and prunes deleted")
+add_test(NAME seriona.scanner.event_ordering COMMAND seriona_scanner_service_tests "--test-case=scanner service publishes worker results in discovered file order")
+add_test(NAME seriona.scanner.cache_lookup COMMAND seriona_scanner_service_tests "--test-case=scanner service cache lookup reuses a high-count cached root")
+add_test(NAME seriona.scanner.incremental_integration COMMAND seriona_scanner_service_tests "--test-case=scanner service incremental integration reuses unchanged scans only added and changed and prunes deleted")
 add_test(NAME seriona.scanner.config_concurrency COMMAND seriona_scanner_service_tests --test-case=*configured*)
 add_test(NAME seriona.scanner.config_serial COMMAND seriona_scanner_service_tests --test-case=*serial*fallback*)
 add_test(NAME seriona.scanner.env_serial COMMAND seriona_scanner_service_tests --test-case=*disable*concurrency*)

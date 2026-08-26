@@ -19,6 +19,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_definitions($<$<CONFIG:Release>:SERIONA_RELEASE_BUILD>)
 
+if(WIN32)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
   libavformat
@@ -134,6 +138,10 @@ if(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE)
 endif()
 
 find_package(SQLite3 REQUIRED)
+
+if(TARGET SQLite::SQLite3 AND NOT TARGET SQLite3::SQLite3)
+  add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
 
 if(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH)
   message(FATAL_ERROR "seriona_scanner dependency gate: libxxhash is required for scanner hashing. Install externally, for example: sudo pacman -S xxhash")
