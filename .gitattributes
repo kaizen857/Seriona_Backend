@@ -1,0 +1,31 @@
+# 统一换行符为 LF（Linux 风格）：提交与检出均为 LF，杜绝 CRLF 警告
+* text=auto eol=lf
+
+# 二进制文件不参与换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.webp binary
+*.avif binary
+*.pdf binary
+*.zip binary
+*.7z binary
+*.gz binary
+*.xz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.obj binary
+*.pdb binary
+*.a binary
+*.so binary
+*.dylib binary
+*.qm binary
