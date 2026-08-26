@@ -82,6 +82,20 @@ TEST_CASE("scanner path classification handles single file roots and custom exte
         PathEntryKind::AudioCandidate);
 }
 
+TEST_CASE("scanner path classification preserves native relative paths and utf8 serialization") {
+  test::TempScannerRoot root("scanner-native-relative-path");
+  const auto relativePath = std::filesystem::path{u8"音乐.flac"};
+  const auto audio = root.path() / relativePath;
+  writeTextFile(audio, "audio");
+
+  ClassifiedPath classified;
+  CHECK_NOTHROW(classified = classifyScannerPath(root.path(), audio));
+
+  const auto expectedUtf8 = relativePath.generic_u8string();
+  CHECK(classified.relativePath == relativePath);
+  CHECK(classified.relativeUtf8 == std::string{expectedUtf8.begin(), expectedUtf8.end()});
+}
+
 TEST_CASE("scanner path classification does not follow symlinks by default") {
   test::TempScannerRoot root("scanner-symlink");
   const auto target = test::writeAudioFixture(root.path(), "target.flac");
@@ -199,7 +213,7 @@ TEST_CASE("cue sheet classification does not depend on file content or parsing")
 TEST_CASE("cue sheet classification works in subdirectories and with non-ascii names") {
   test::TempScannerRoot root("scanner-cue-paths");
   writeTextFile(root.path() / "nested" / "deep" / "album.cue", "FILE \"track.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
-  writeTextFile(root.path() / "古典音乐.cue", "FILE \"track.ape\" APE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+  writeTextFile(root.path() / std::filesystem::path{u8"古典音乐.cue"}, "FILE \"track.ape\" APE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
   writeTextFile(root.path() / "names with spaces.CUE", "FILE \"audio.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
 
   const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});

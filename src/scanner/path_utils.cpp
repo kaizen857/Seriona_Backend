@@ -116,11 +116,12 @@ struct ParsedCueToken {
 }
 
 [[nodiscard]] std::string displayNameFor(const std::filesystem::path& path) {
-  const auto filename = path.filename().generic_string();
+  const auto filename = path.filename().generic_u8string();
   if (!filename.empty()) {
-    return filename;
+    return {reinterpret_cast<const char*>(filename.data()), filename.size()};
   }
-  return path.generic_string();
+  const auto genericPath = path.generic_u8string();
+  return {reinterpret_cast<const char*>(genericPath.data()), genericPath.size()};
 }
 
 [[nodiscard]] ClassifiedPath makeTraversalError(const std::filesystem::path& rootPath, const std::error_code& error) {
@@ -254,9 +255,15 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
                                    const PathClassificationConfig& config) {
   const auto canonicalRoot = weaklyCanonicalParentJoinedPath(root);
   const auto canonicalPath = weaklyCanonicalParentJoinedPath(path);
+  std::error_code relativeError;
+  auto relativePath = std::filesystem::relative(canonicalPath, canonicalRoot, relativeError);
+  if (relativeError || relativePath.empty()) {
+    relativePath = canonicalPath.filename();
+  }
+  const auto relativeUtf8 = relativePath.generic_u8string();
   ClassifiedPath result{.path = canonicalPath,
-                        .relativePath = std::filesystem::path{serializeRelativeUtf8(canonicalRoot, canonicalPath)},
-                        .relativeUtf8 = serializeRelativeUtf8(canonicalRoot, canonicalPath),
+                        .relativePath = relativePath,
+                        .relativeUtf8 = {relativeUtf8.begin(), relativeUtf8.end()},
                         .displayName = displayNameFor(canonicalPath),
                         .kind = PathEntryKind::Unsupported,
                         .sidecarLyricsPath = std::nullopt,

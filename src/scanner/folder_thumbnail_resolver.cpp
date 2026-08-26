@@ -11,15 +11,15 @@ namespace {
 // ASCII 大小写敏感（'B' < 'a'）；filePath 最终 tiebreak 保证同键候选排序完全确定
 // （无 unordered 容器序依赖，同输入两次调用结果一致）。
 [[nodiscard]] bool candidateLess(const FolderThumbnailCandidate& lhs, const FolderThumbnailCandidate& rhs) {
-  const auto lhsName = lhs.filePath.filename().generic_string();
-  const auto rhsName = rhs.filePath.filename().generic_string();
+  const auto lhsName = lhs.filePath.filename().generic_u8string();
+  const auto rhsName = rhs.filePath.filename().generic_u8string();
   if (lhsName != rhsName) {
     return lhsName < rhsName;
   }
   if (lhs.relativeDirectory != rhs.relativeDirectory) {
     return lhs.relativeDirectory < rhs.relativeDirectory;
   }
-  return lhs.filePath.generic_string() < rhs.filePath.generic_string();
+  return lhs.filePath.generic_u8string() < rhs.filePath.generic_u8string();
 }
 
 }  // namespace

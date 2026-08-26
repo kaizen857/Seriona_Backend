@@ -142,13 +142,14 @@ TEST_CASE("folder thumbnail resolver keeps the winner stable under shuffled inpu
 
 TEST_CASE("folder thumbnail resolver is deterministic across consecutive runs with CJK filenames (C8)") {
   const std::vector<FolderThumbnailCandidate> descendants{
-      track("音乐/一.mp3", "音乐", std::filesystem::path{"/thumb/one.png"}),
-      track("音乐/三.mp3", "音乐", std::filesystem::path{"/thumb/three.png"}),
-      track("曲/界.mp3", "曲", std::filesystem::path{"/thumb/boundary.png"}),
+      track(std::filesystem::path{u8"音乐/一.mp3"}, "音乐", std::filesystem::path{"/thumb/one.png"}),
+      track(std::filesystem::path{u8"音乐/三.mp3"}, "音乐", std::filesystem::path{"/thumb/three.png"}),
+      track(std::filesystem::path{u8"曲/界.mp3"}, "曲", std::filesystem::path{"/thumb/boundary.png"}),
   };
 
-  const auto first = resolveFolderThumbnail("/音乐库", descendants, emptySeam());
-  const auto second = resolveFolderThumbnail("/音乐库", descendants, emptySeam());
+  const auto directory = std::filesystem::path{u8"/音乐库"};
+  const auto first = resolveFolderThumbnail(directory, descendants, emptySeam());
+  const auto second = resolveFolderThumbnail(directory, descendants, emptySeam());
 
   CHECK(first.has_value());
   CHECK(second.has_value());
