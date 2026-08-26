@@ -49,6 +49,9 @@ TempScannerRoot::TempScannerRoot(std::string name) : path_(uniqueRootPath(name))
   std::filesystem::remove_all(dbRoot, error);
   std::filesystem::create_directories(path_);
   std::filesystem::create_directories(dbRoot);
+  std::error_code canonicalError;
+  const auto canonicalPath = std::filesystem::weakly_canonical(path_, canonicalError);
+  path_ = canonicalError ? path_.lexically_normal() : canonicalPath;
 }
 
 TempScannerRoot::~TempScannerRoot() {

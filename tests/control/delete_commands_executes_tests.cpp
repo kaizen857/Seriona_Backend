@@ -45,6 +45,8 @@ public:
     if (ec) {
       throw std::runtime_error("failed to create temp root: " + ec.message());
     }
+    const auto canonicalPath = std::filesystem::weakly_canonical(path_, ec);
+    path_ = ec ? path_.lexically_normal() : canonicalPath;
   }
 
   ~TempRoot() {

@@ -736,7 +736,8 @@ TEST_CASE("media controller applies folder sort rules through the injected store
   CHECK(fixture.fakeFolderSortSettingsStore->upsertCalls() == 1U);
   REQUIRE(fixture.fakeFolderSortSettingsStore->lastUpsert().has_value());
   const auto stored = *fixture.fakeFolderSortSettingsStore->lastUpsert();
-  CHECK(stored.rootPath == std::filesystem::path{"/library"});
+  const auto expectedRoot = std::filesystem::absolute(std::filesystem::path{"/library"}).lexically_normal();
+  CHECK(stored.rootPath == expectedRoot);
   CHECK(stored.folderNodeId == "dir:a");
   REQUIRE(stored.rules.size() == 1U);
   CHECK(stored.rules.front().field == FolderSortField::Artist);
@@ -754,7 +755,7 @@ TEST_CASE("media controller applies folder sort rules through the injected store
     REQUIRE(applied != notifications.end());
     CHECK(applied->errorCode == MediaControllerErrorCode::None);
     REQUIRE(applied->folderSortSetting.has_value());
-    CHECK(applied->folderSortSetting->rootPath == std::filesystem::path{"/library"});
+    CHECK(applied->folderSortSetting->rootPath == expectedRoot);
     CHECK(applied->folderSortSetting->folderNodeId == "dir:a");
     REQUIRE(applied->folderSortSetting->rules.size() == 1U);
     CHECK(applied->folderSortSetting->rules.front().field == FolderSortField::Artist);

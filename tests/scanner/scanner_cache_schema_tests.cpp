@@ -88,7 +88,8 @@ TEST_CASE("sqlite scanner cache schema artifact validates against a temp databas
   std::filesystem::remove(tempDatabasePath, removeError);
 
   sqlite3* db = nullptr;
-  REQUIRE(sqlite3_open_v2(tempDatabasePath.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+  const auto tempDatabasePathUtf8 = tempDatabasePath.string();
+  REQUIRE(sqlite3_open_v2(tempDatabasePathUtf8.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
 
   std::error_code readError;
   const auto artifactPath = schemaPath();
