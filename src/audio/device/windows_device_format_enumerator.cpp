@@ -16,7 +16,8 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <comdef.h>
-#include <functiondiscoverykeys_devp.h>
+#include <propkeydef.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <propkey.h>
@@ -245,9 +246,16 @@ std::vector<DeviceFormatCapabilities> enumerateWindowsDevices() {
       }
       std::string deviceName = readDeviceProperty(store.get(), PKEY_Device_FriendlyName);
       if (deviceName.empty()) {
-        deviceName = readDeviceProperty(store.get(), PKEY_Device_InterfaceFriendlyName);
+        deviceName = readDeviceProperty(store.get(), PKEY_DeviceInterface_FriendlyName);
       }
-      std::string instanceId = readDeviceProperty(store.get(), PKEY_Device_InstanceId);
+      std::string instanceId;
+      LPWSTR endpointId = nullptr;
+      if (SUCCEEDED(device->GetId(&endpointId)) && endpointId != nullptr) {
+        instanceId = wideToUtf8(endpointId);
+      }
+      if (endpointId != nullptr) {
+        CoTaskMemFree(endpointId);
+      }
       if (instanceId.empty()) {
         instanceId = deviceName;  // 属性读取失败时退化为友好名称匹配
       }
