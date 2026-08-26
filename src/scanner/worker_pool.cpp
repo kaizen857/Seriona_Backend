@@ -65,7 +65,8 @@ private:
 };
 
 [[nodiscard]] std::optional<std::filesystem::file_time_type> fileTimeFromNanoseconds(std::int64_t value) {
-  return std::filesystem::file_time_type{std::chrono::nanoseconds{value}};
+  return std::filesystem::file_time_type{
+      std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{value})};
 }
 
 [[nodiscard]] SongMetadata metadataFromCacheLocation(const cache::CachedLocation& cached) {

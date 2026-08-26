@@ -3,6 +3,7 @@
 #include <doctest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,11 @@
 
 namespace seriona::scanner {
 namespace {
+
+[[nodiscard]] std::filesystem::file_time_type fileTimeFromNanoseconds(std::int64_t value) {
+  return std::filesystem::file_time_type{
+      std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{value})};
+}
 
 class FakeTagMetadataReader final : public TagMetadataReader {
 public:
@@ -60,7 +66,7 @@ private:
   raw.thumbnailPath = "covers/thumbnails/song.png";
   raw.duration = std::chrono::microseconds{1234567};
   raw.offset = std::chrono::microseconds{9876};
-  raw.lastModified = std::filesystem::file_time_type{std::chrono::nanoseconds{42}};
+  raw.lastModified = fileTimeFromNanoseconds(42);
   raw.sampleRate = 48000;
   raw.bitDepth = 24;
   raw.bitRate = 320000;
@@ -91,7 +97,7 @@ TEST_CASE("tagreader adapter maps raw metadata lyrics technical fields and initi
   CHECK(metadata.thumbnailPath == std::filesystem::path{"covers/thumbnails/song.png"});
   CHECK(metadata.duration == std::chrono::milliseconds{1234});
   CHECK(metadata.offset == std::chrono::milliseconds{9});
-  CHECK(metadata.fileMtime == std::filesystem::file_time_type{std::chrono::nanoseconds{42}});
+  CHECK(metadata.fileMtime == fileTimeFromNanoseconds(42));
   CHECK(metadata.sampleRate == 48000U);
   CHECK(metadata.bitDepth == 24U);
   CHECK(mapped.bitRate == 320000U);

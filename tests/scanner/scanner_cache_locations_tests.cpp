@@ -6,11 +6,17 @@
 #include <doctest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 
 namespace seriona::scanner::cache {
 namespace {
+
+[[nodiscard]] std::filesystem::file_time_type fileTimeFromNanoseconds(std::int64_t value) {
+  return std::filesystem::file_time_type{
+      std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{value})};
+}
 
 TEST_CASE("SQLiteCache: stores and retrieves location without CUE offset") {
   test::TempScannerRoot temp{"cache-location-basic"};
@@ -590,7 +596,7 @@ TEST_CASE("SQLiteCache: replaceLocationsBySubtree never deletes sibling rows (un
   const auto newDir = musicDir / "Moved";
 
   constexpr std::int64_t kMtimeNs = 555;
-  const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{kMtimeNs}};
+  const auto mtime = fileTimeFromNanoseconds(kMtimeNs);
 
   auto insert = [&](const std::string& id, const std::string& contentId, const std::filesystem::path& file) {
     cache.upsertLocation(CachedLocation{
@@ -641,7 +647,7 @@ TEST_CASE("SQLiteCache: replaceLocationsBySubtree rewrites paths, recomputes ids
   const auto otherFile = temp.path() / "Other" / "song.mp3";
 
   constexpr std::int64_t kMtimeNs = 123456789;
-  const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{kMtimeNs}};
+  const auto mtime = fileTimeFromNanoseconds(kMtimeNs);
   const auto offset = std::chrono::milliseconds{30000};
 
   const auto song1Old = aDir / "song1.flac";
@@ -806,7 +812,7 @@ TEST_CASE("SQLiteCache: replaceLocationsBySubtree respects prefix boundary and n
   const auto newDir = musicDir / "D";
 
   constexpr std::int64_t kMtimeNs = 555;
-  const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{kMtimeNs}};
+  const auto mtime = fileTimeFromNanoseconds(kMtimeNs);
 
   const auto aFile = aDir / "song.flac";
   const auto abFile = abDir / "song.flac";
@@ -855,7 +861,7 @@ TEST_CASE("SQLiteCache: replaceLocationsBySubtree row set equals re-insert at ne
   const auto aDir = temp.path() / "Music" / "A";
   const auto dDir = temp.path() / "Music" / "D";
   constexpr std::int64_t kMtimeNs = 987654321;
-  const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{kMtimeNs}};
+  const auto mtime = fileTimeFromNanoseconds(kMtimeNs);
   const auto offset = std::chrono::milliseconds{30000};
 
   const auto songOld = aDir / "song.flac";

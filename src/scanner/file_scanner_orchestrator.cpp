@@ -23,6 +23,7 @@
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -99,6 +100,11 @@ static TreeBuilderObserver g_treeBuilderObserver = nullptr;
 }
 
 [[nodiscard]] std::string pathKey(const std::filesystem::path& path) { return path.lexically_normal().generic_string(); }
+
+[[nodiscard]] std::filesystem::file_time_type fileTimeFromNanoseconds(std::int64_t value) {
+  return std::filesystem::file_time_type{
+      std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{value})};
+}
 
 [[nodiscard]] std::filesystem::path rootPathFor(const ScannerRoot& root) {
   std::error_code error;
@@ -708,7 +714,7 @@ void applyCachedLocation(cache::CachedSong& song,
   song.metadata.filePath = filePath;
   song.metadata.sourceFilePath = location.sourceFilePath.empty() ? filePath : location.sourceFilePath;
   song.metadata.fileSizeBytes = location.fileSizeBytes;
-  song.metadata.fileMtime = std::filesystem::file_time_type{std::chrono::nanoseconds{location.fileMtimeNs}};
+  song.metadata.fileMtime = fileTimeFromNanoseconds(location.fileMtimeNs);
   song.metadata.contentHash = location.contentId;
   song.metadata.effectiveLyricsSource = location.lyricsSource;
   song.metadata.offset = location.cueTrackOffset;
@@ -717,8 +723,7 @@ void applyCachedLocation(cache::CachedSong& song,
   song.metadata.externalLyricsPath = location.externalLrcPath;
   song.metadata.externalLyricsMtime = location.externalLrcMtimeNs.has_value()
                                           ? std::optional<std::filesystem::file_time_type>{
-                                                std::filesystem::file_time_type{std::chrono::nanoseconds{
-                                                    *location.externalLrcMtimeNs}}}
+                                                fileTimeFromNanoseconds(*location.externalLrcMtimeNs)}
                                           : std::nullopt;
   song.metadata.externalLyricsHash = location.externalLrcHash;
   song.metadata.trackId = filePath.generic_string();
@@ -733,7 +738,7 @@ void hydrateCachedCueTrack(cache::CachedSong& song,
   song.metadata.filePath = cuePath;
   song.metadata.sourceFilePath = location.sourceFilePath;
   song.metadata.fileSizeBytes = location.fileSizeBytes;
-  song.metadata.fileMtime = std::filesystem::file_time_type{std::chrono::nanoseconds{location.fileMtimeNs}};
+  song.metadata.fileMtime = fileTimeFromNanoseconds(location.fileMtimeNs);
   song.metadata.contentHash = location.contentId;
   song.metadata.offset = location.cueTrackOffset;
   if (location.cueTrackDuration.has_value()) {
@@ -744,8 +749,7 @@ void hydrateCachedCueTrack(cache::CachedSong& song,
   song.metadata.externalLyricsPath = location.externalLrcPath;
   song.metadata.externalLyricsMtime = location.externalLrcMtimeNs.has_value()
                                           ? std::optional<std::filesystem::file_time_type>{
-                                                std::filesystem::file_time_type{std::chrono::nanoseconds{
-                                                    *location.externalLrcMtimeNs}}}
+                                                fileTimeFromNanoseconds(*location.externalLrcMtimeNs)}
                                           : std::nullopt;
   song.metadata.externalLyricsHash = location.externalLrcHash;
   const auto trackIdentity = cuePath.generic_string() + "#track" + std::to_string(trackIndex);
@@ -2802,6 +2806,33 @@ private:
     ScanMode mode{ScanMode::Incremental};
   };
 
+  void reportScanFailure(std::string_view detail) noexcept {
+    try {
+      spdlog::error("scanner scan failed with an unhandled exception: {}", detail);
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "failed to log scanner scan failure: %s\n", error.what());
+    } catch (...) {
+      std::fputs("failed to log scanner scan failure: unknown exception\n", stderr);
+    }
+
+    try {
+      ScannerEventSink sink;
+      {
+        std::scoped_lock lock{mutex_};
+        sink = sink_;
+      }
+      publishEvent(sink, ScannerEventType::ScanError, ++eventVersion_,
+                   ScannerError{.code = ScannerErrorCode::CacheUnavailable,
+                                .message = "scanner scan failed with an unhandled exception",
+                                .detail = std::string{detail},
+                                .path = std::nullopt});
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "failed to publish scanner scan failure: %s\n", error.what());
+    } catch (...) {
+      std::fputs("failed to publish scanner scan failure: unknown exception\n", stderr);
+    }
+  }
+
   void scanWorkerLoop() {
     while (true) {
       ScanRequest request;
@@ -2814,7 +2845,13 @@ private:
         request = std::move(scanQueue_.front());
         scanQueue_.pop_front();
       }
-      runScan(request.roots, request.mode);
+      try {
+        runScan(request.roots, request.mode);
+      } catch (const std::exception& error) {
+        reportScanFailure(error.what());
+      } catch (...) {
+        reportScanFailure("unknown exception escaped runScan");
+      }
     }
   }
 

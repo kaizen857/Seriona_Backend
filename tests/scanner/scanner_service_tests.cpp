@@ -10,6 +10,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -25,6 +26,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace seriona::scanner {
 namespace {
@@ -276,6 +281,11 @@ public:
     return false;
   }
 
+  [[nodiscard]] std::size_t eventCount(ScannerEventType type) const {
+    std::lock_guard lock{mutex_};
+    return static_cast<std::size_t>(std::ranges::count(events_, type, &ScannerEvent::type));
+  }
+
   [[nodiscard]] std::vector<SongMetadata> fileScannedSongs() const {
     std::lock_guard lock{mutex_};
     std::vector<SongMetadata> songs;
@@ -398,15 +408,27 @@ public:
     if (const auto* existing = std::getenv(name_.c_str())) {
       previous_ = existing;
     }
+#if defined(_WIN32)
+    _putenv_s(name_.c_str(), value.c_str());
+#else
     setenv(name_.c_str(), value.c_str(), 1);
+#endif
   }
 
   ~ScopedEnvVar() {
     if (previous_.has_value()) {
+#if defined(_WIN32)
+      _putenv_s(name_.c_str(), previous_->c_str());
+#else
       setenv(name_.c_str(), previous_->c_str(), 1);
+#endif
       return;
     }
+#if defined(_WIN32)
+    SetEnvironmentVariableA(name_.c_str(), nullptr);
+#else
     unsetenv(name_.c_str());
+#endif
   }
 
   ScopedEnvVar(const ScopedEnvVar&) = delete;
@@ -454,6 +476,30 @@ public:
 
   CacheWriteObserverGuard(const CacheWriteObserverGuard&) = delete;
   CacheWriteObserverGuard& operator=(const CacheWriteObserverGuard&) = delete;
+};
+
+class PreallocationObserverGuard {
+public:
+  explicit PreallocationObserverGuard(PreallocationObserver observer) {
+    setPreallocationObserver(std::move(observer));
+  }
+
+  ~PreallocationObserverGuard() {
+    if (active_) {
+      clearPreallocationObserver();
+    }
+  }
+
+  void reset() {
+    clearPreallocationObserver();
+    active_ = false;
+  }
+
+  PreallocationObserverGuard(const PreallocationObserverGuard&) = delete;
+  PreallocationObserverGuard& operator=(const PreallocationObserverGuard&) = delete;
+
+private:
+  bool active_{true};
 };
 
 [[nodiscard]] cache::CachedLocation cachedLocationForPath(cache::SQLiteCache& cache,
@@ -1014,6 +1060,44 @@ TEST_CASE("scanner service processes audio candidates through the worker pool") 
   REQUIRE(songs.size() == 2U);
   CHECK(songByPath(songs, blocked).title == "Blocked");
   CHECK(songByPath(songs, parallel).title == "Parallel");
+}
+
+TEST_CASE("scanner service contains queued scan exceptions and keeps the worker alive") {
+  test::TempScannerRoot temp{"scanner-service-run-scan-exception"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(audio, rawMetadata("Recovered"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  std::atomic<std::size_t> injectionCount{0U};
+  PreallocationObserverGuard preallocationObserver{[&injectionCount](const std::vector<IndexedPublishedSong>&) {
+    if (injectionCount.fetch_add(1U) == 0U) {
+      throw std::filesystem::filesystem_error{"forced preallocation failure",
+                                              std::make_error_code(std::errc::io_error)};
+    }
+  }};
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanError, std::chrono::seconds{1}));
+
+  const auto errors = eventLog.errors();
+  REQUIRE(errors.size() == 1U);
+  CHECK(errors.front().code == ScannerErrorCode::CacheUnavailable);
+  CHECK(errors.front().detail.find("forced preallocation failure") != std::string::npos);
+  CHECK(injectionCount.load() == 1U);
+  CHECK(eventLog.eventCount(ScannerEventType::ScanCompleted) == 0U);
+  CHECK(eventLog.eventCount(ScannerEventType::ScanStopped) == 0U);
+
+  preallocationObserver.reset();
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs.front().filePath == audio);
+  CHECK(songs.front().title == "Recovered");
 }
 
 TEST_CASE("scanner service honors configured worker and tagreader concurrency") {

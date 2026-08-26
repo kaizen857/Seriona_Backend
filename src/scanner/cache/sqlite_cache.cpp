@@ -539,7 +539,9 @@ std::int64_t SQLiteCache::replaceLocationsBySubtree(const std::string& rootPath,
     auto moved = row;
     moved.filePath = rewrittenPath;
     moved.sourceFilePath = rewrittenSource;
-    const auto mtime = std::filesystem::file_time_type{std::chrono::nanoseconds{row.fileMtimeNs}};
+    const auto mtime = std::filesystem::file_time_type{
+        std::chrono::duration_cast<std::filesystem::file_time_type::duration>(
+            std::chrono::nanoseconds{row.fileMtimeNs})};
     moved.locationId = computeLocationId(moved.filePath, moved.fileSizeBytes, mtime, moved.cueTrackOffset, moved.cueTrackIndex);
     renamed.push_back(RenamedRow{
         .location = std::move(moved),
