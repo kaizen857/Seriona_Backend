@@ -16,6 +16,10 @@
 
 #include <string>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace seriona::audio {
 
 enum class ThreadPriorityOutcome {
@@ -38,8 +42,6 @@ struct ThreadPriorityResult {
 };
 
 #if defined(_WIN32)
-
-#include <windows.h>
 
 inline ThreadPriorityResult applyAudioWorkerThreadPriority() {
   if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL)) {
