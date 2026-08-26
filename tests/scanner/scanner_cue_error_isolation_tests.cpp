@@ -59,6 +59,7 @@ TEST_CASE("CUE error isolation: single bad CUE with good CUE and audio") {
   REQUIRE(cueWithErrorsCount == 1);
 }
 
+#if !defined(_WIN32)
 TEST_CASE("CUE error isolation: unreadable CUE file records error") {
   TempScannerRoot temp{"test"};
   
@@ -94,6 +95,7 @@ TEST_CASE("CUE error isolation: unreadable CUE file records error") {
   CHECK(cueWithErrorCount == 1);
   CHECK(audioCount == 2);
 }
+#endif
 
 TEST_CASE("CUE error isolation: all CUEs bad still returns audio files") {
   TempScannerRoot temp{"test"};

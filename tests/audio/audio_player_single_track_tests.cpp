@@ -416,6 +416,7 @@ TEST_CASE("audio_player_public_commands_enqueue_without_waiting_for_device_start
   player.setEventSink(BackendEventSink{});
 }
 
+#if !defined(_WIN32)
 TEST_CASE("audio_player_single_track seek reuses the open source after the file is removed") {
   const auto path = sineFixture("audio_player_seek_reuses_open_source.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
@@ -465,6 +466,7 @@ TEST_CASE("audio_player_single_track seek reuses the open source after the file 
 
   player.setEventSink(BackendEventSink{});
 }
+#endif  // Windows requires FILE_SHARE_DELETE for unlinking an open media file.
 
 TEST_CASE("audio_player_single_track ignores duration metadata as a hard stop when offset is absent") {
   const auto path = sineFixture("audio_player_duration_without_offset.wav", kSampleRate * 2U);
