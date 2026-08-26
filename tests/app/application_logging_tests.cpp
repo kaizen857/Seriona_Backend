@@ -13,7 +13,15 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
+#define dup _dup
+#define dup2 _dup2
+#define close _close
+#define open _open
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -38,7 +46,12 @@ class StdoutCapture {
 public:
   explicit StdoutCapture(const std::filesystem::path& outputPath)
       : savedStdout_(::dup(STDOUT_FILENO)),
-        captureFd_(::open(outputPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR)) {
+        captureFd_(::open(outputPath.string().c_str(), O_CREAT | O_TRUNC | O_WRONLY,
+#if defined(_WIN32)
+                          _S_IREAD | _S_IWRITE)) {
+#else
+                          S_IRUSR | S_IWUSR)) {
+#endif
     std::fflush(stdout);
     if (savedStdout_ >= 0 && captureFd_ >= 0) {
       active_ = ::dup2(captureFd_, STDOUT_FILENO) >= 0;

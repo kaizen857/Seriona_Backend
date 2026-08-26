@@ -15,7 +15,16 @@
 #include <string>
 
 #include <fcntl.h>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <io.h>
+#define dup _dup
+#define dup2 _dup2
+#define close _close
+#define open _open
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -45,7 +54,12 @@ class StdoutCapture {
 public:
   explicit StdoutCapture(const std::filesystem::path& outputPath)
       : savedStdout_(::dup(STDOUT_FILENO)),
-        captureFd_(::open(outputPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR)) {
+        captureFd_(::open(outputPath.string().c_str(), O_CREAT | O_TRUNC | O_WRONLY,
+#if defined(_WIN32)
+                          _S_IREAD | _S_IWRITE)) {
+#else
+                          S_IRUSR | S_IWUSR)) {
+#endif
     std::fflush(stdout);
     if (savedStdout_ >= 0 && captureFd_ >= 0) {
       active_ = ::dup2(captureFd_, STDOUT_FILENO) >= 0;
@@ -98,9 +112,10 @@ TEST_CASE("setLogLevel toggles should_log from debug through error") {
   CHECK(spdlog::should_log(spdlog::level::critical));
 
   // named logger（initialize 注册的 "seriona"，同时是默认 logger）同步生效
-  const auto named = spdlog::get("seriona");
-  REQUIRE(named != nullptr);
-  CHECK(named->should_log(spdlog::level::debug));
+  {
+    const auto named = spdlog::get("seriona");
+    REQUIRE(named != nullptr);
+    CHECK(named->should_log(spdlog::level::debug));
 
   // info：debug 被过滤
   seriona::app::setLogLevel(spdlog::level::info);
@@ -123,7 +138,8 @@ TEST_CASE("setLogLevel toggles should_log from debug through error") {
   // off：全部关闭
   seriona::app::setLogLevel(spdlog::level::off);
   CHECK_FALSE(spdlog::should_log(spdlog::level::critical));
-  CHECK_FALSE(named->should_log(spdlog::level::critical));
+    CHECK_FALSE(named->should_log(spdlog::level::critical));
+  }
 
   spdlog::shutdown();
   std::filesystem::remove_all(root);
@@ -158,6 +174,8 @@ TEST_CASE("setLogLevel syncs sinks and makes debug visible on console") {
   const auto stdoutPath = root / "stdout.log";
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
+  StdoutCapture capture(stdoutPath);
+  REQUIRE(capture.active());
   seriona::app::initializeApplicationLogging(makeRuntimePaths(root));
 
   constexpr const char* filteredMarker = "setLogLevel filtered debug marker";
@@ -165,32 +183,26 @@ TEST_CASE("setLogLevel syncs sinks and makes debug visible on console") {
 
   // 先收紧到 err：debug 在 logger 级与 sink 级都被过滤
   seriona::app::setLogLevel(spdlog::level::err);
-  {
-    StdoutCapture capture(stdoutPath);
-    REQUIRE(capture.active());
-    spdlog::debug(filteredMarker);
-    spdlog::default_logger()->flush();
-    capture.restore();
-  }
-  CHECK(readFile(stdoutPath).find(filteredMarker) == std::string::npos);
+  spdlog::debug(filteredMarker);
+  spdlog::default_logger()->flush();
 
   // 再放开到 debug：控制台 sink 同步后 debug 实际可见
   seriona::app::setLogLevel(spdlog::level::debug);
-  {
-    StdoutCapture capture(stdoutPath);
-    REQUIRE(capture.active());
-    spdlog::debug(visibleMarker);
-    spdlog::default_logger()->flush();
-    capture.restore();
-  }
+  spdlog::debug(visibleMarker);
+  spdlog::default_logger()->flush();
+  capture.restore();
+
+  CHECK(readFile(stdoutPath).find(filteredMarker) == std::string::npos);
   CHECK(readFile(stdoutPath).find(visibleMarker) != std::string::npos);
 
   // 默认 logger 的全部 sink（控制台 + 文件）级别跟随新等级
-  const auto logger = spdlog::default_logger();
-  REQUIRE(logger != nullptr);
-  REQUIRE_FALSE(logger->sinks().empty());
-  for (const auto& sink : logger->sinks()) {
-    CHECK(sink->level() == spdlog::level::debug);
+  {
+    const auto logger = spdlog::default_logger();
+    REQUIRE(logger != nullptr);
+    REQUIRE_FALSE(logger->sinks().empty());
+    for (const auto& sink : logger->sinks()) {
+      CHECK(sink->level() == spdlog::level::debug);
+    }
   }
 
   spdlog::shutdown();
