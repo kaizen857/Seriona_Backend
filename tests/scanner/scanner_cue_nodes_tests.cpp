@@ -566,7 +566,7 @@ TEST_CASE("CUE nodes: referenced source audio is hidden from final playlist tree
   ScanEvents events;
   service->setEventSink([&](const ScannerEvent& event) {
     events.onEvent(event);
-    if (event.type == ScannerEventType::ScanCompleted) {
+    if (event.type == ScannerEventType::PlaylistSnapshotUpdated) {
       if (const auto* snapshot = std::get_if<PlaylistTreeSnapshot>(&event.payload)) {
         completedSnapshot = *snapshot;
       }

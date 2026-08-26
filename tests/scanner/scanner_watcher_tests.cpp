@@ -19,6 +19,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -183,6 +184,18 @@ void waitForSnapshotSongCount(const FileScannerService& service, std::size_t exp
   FAIL("timed out waiting for watcher reconciliation snapshot");
 }
 
+void waitForLyrics(const FileScannerService& service, LyricsSource source, std::string_view text) {
+  for (auto attempt = 0; attempt != 100; ++attempt) {
+    const auto songs = songsIn(service.snapshot());
+    if (songs.size() == 1U && songs[0].effectiveLyricsSource == source && songs[0].effectiveLyrics.size() == 1U &&
+        songs[0].effectiveLyrics[0].text == text) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for watcher lyrics reconciliation");
+}
+
 [[nodiscard]] std::size_t scanStartedCount(const std::vector<ScannerEvent>& events) {
   return static_cast<std::size_t>(std::ranges::count_if(events, [](const ScannerEvent& event) {
     return event.type == ScannerEventType::ScanStarted;
@@ -286,8 +299,7 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   writeText(lrc, "[00:02.00]external\n");
   std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Modified));
-  waitForSnapshotSongCount(*service, 1U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  waitForLyrics(*service, LyricsSource::ExternalLrc, "external");
   auto songs = songsIn(service->snapshot());
 
   CHECK(reader->readCount() == 1U);
@@ -298,7 +310,7 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
 
   std::filesystem::remove(lrc);
   watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Destroyed));
-  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  waitForLyrics(*service, LyricsSource::EmbeddedTag, "embedded");
   songs = songsIn(service->snapshot());
 
   CHECK(reader->readCount() == 1U);
