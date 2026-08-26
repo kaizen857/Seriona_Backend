@@ -2,25 +2,34 @@
 
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <string>
 
 namespace seriona::app {
 namespace {
 
-TEST_CASE("RuntimePaths resolves absolute executable path") {
-  const auto paths = resolveRuntimePaths("/tmp/example/bin/seriona");
+std::filesystem::path uniqueTestRoot() {
+  const auto uniqueSuffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  return std::filesystem::temp_directory_path() / ("seriona_runtime_paths_test_" + std::to_string(uniqueSuffix));
+}
 
-  CHECK(paths.dataRoot == "/tmp/example/bin/SerionaData");
-  CHECK(paths.logFile == "/tmp/example/bin/SerionaData/logs/seriona.log");
-  CHECK(paths.databasePath == "/tmp/example/bin/SerionaData/library.sqlite");
-  CHECK(paths.artworkDir == "/tmp/example/bin/SerionaData/artwork");
+TEST_CASE("RuntimePaths resolves absolute executable path") {
+  const auto executablePath = uniqueTestRoot() / "bin" / "seriona";
+  const auto expectedDataRoot = executablePath.parent_path() / "SerionaData";
+  const auto paths = resolveRuntimePaths(executablePath);
+
+  CHECK(paths.dataRoot == expectedDataRoot);
+  CHECK(paths.logFile == expectedDataRoot / "logs" / "seriona.log");
+  CHECK(paths.databasePath == expectedDataRoot / "library.sqlite");
+  CHECK(paths.artworkDir == expectedDataRoot / "artwork");
 }
 
 TEST_CASE("RuntimePaths derives all fields from dataRoot") {
-  const auto paths = resolveRuntimePaths("/opt/music/seriona");
+  const auto executablePath = uniqueTestRoot() / "bin" / "seriona";
+  const auto paths = resolveRuntimePaths(executablePath);
 
-  CHECK(paths.dataRoot == "/opt/music/SerionaData");
+  CHECK(paths.dataRoot == executablePath.parent_path() / "SerionaData");
 
   CHECK(paths.logFile.parent_path() == paths.dataRoot / "logs");
   CHECK(paths.logFile.filename() == "seriona.log");
@@ -70,11 +79,16 @@ TEST_CASE("RuntimePaths fallback for empty/relative path uses current_path") {
 }
 
 TEST_CASE("RuntimePaths ensureDirectoriesExist does not crash") {
-  const auto paths = resolveRuntimePaths("/tmp/example/bin/seriona");
-  // This is a smoke test — directories won't actually be created
-  // because /tmp/example/bin/SerionaData probably doesn't have write
-  // permission, but the call should not throw or crash.
+  const auto root = uniqueTestRoot();
+  const auto paths = resolveRuntimePaths(root / "bin" / "seriona");
+  std::filesystem::remove_all(root);
+
   CHECK_NOTHROW(paths.ensureDirectoriesExist());
+  CHECK(std::filesystem::exists(paths.dataRoot));
+  CHECK(std::filesystem::exists(paths.logFile.parent_path()));
+  CHECK(std::filesystem::exists(paths.artworkDir));
+
+  std::filesystem::remove_all(root);
 }
 
 }  // namespace
