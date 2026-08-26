@@ -169,7 +169,11 @@ std::filesystem::path prepareLogFile(
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
     localtime_r(&t, &tm_buf);
+#endif
     char buf[64];
     std::strftime(buf, sizeof(buf), "seriona-%Y%m%d%H%M%S.log", &tm_buf);
 
