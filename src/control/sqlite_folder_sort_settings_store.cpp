@@ -21,6 +21,18 @@ FolderSortSettingsError::FolderSortSettingsError(FolderSortSettingsErrorCode cod
 
 namespace {
 
+// 路径文本恒为 UTF-8：generic_string() 在 Windows 按 CP_ACP 转换，字符不可表示时抛
+// std::system_error（ERROR_NO_UNICODE_TRANSLATION）；generic_u8string() 永不抛，
+// POSIX 上字节级不变。SQLite 键/值与读回路径构造必须经这两个函数往返。
+[[nodiscard]] std::string pathText(const std::filesystem::path& path) {
+  const auto utf8 = path.generic_u8string();
+  return {utf8.begin(), utf8.end()};
+}
+
+[[nodiscard]] std::filesystem::path pathFromUtf8(std::string_view utf8) {
+  return std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()}};
+}
+
 [[nodiscard]] std::int64_t systemTimeToMs(const std::chrono::system_clock::time_point time) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch()).count();
 }
@@ -404,7 +416,7 @@ public:
                      "VALUES(?1, ?2, ?3, ?4) "
                      "ON CONFLICT(root_path, folder_node_id) DO UPDATE SET "
                      "rules_json=excluded.rules_json, updated_at_ms=excluded.updated_at_ms;"};
-    upsert.bind(1, rootPath.generic_string());
+    upsert.bind(1, pathText(rootPath));
     upsert.bind(2, setting.folderNodeId);
     upsert.bind(3, rulesJson);
     upsert.bind(4, systemTimeToMs(updatedAt));
@@ -420,7 +432,7 @@ public:
     Statement select{db_,
                      "SELECT root_path, folder_node_id, rules_json "
                      "FROM folder_sort_rules WHERE root_path=?1 AND folder_node_id=?2;"};
-    select.bind(1, normalizedRoot.generic_string());
+    select.bind(1, pathText(normalizedRoot));
     select.bind(2, folderNodeId);
     if (!select.stepRow()) {
       return std::nullopt;
@@ -434,7 +446,7 @@ public:
 
     std::lock_guard<std::mutex> lock(mutex_);
     Statement remove{db_, "DELETE FROM folder_sort_rules WHERE root_path=?1 AND folder_node_id=?2;"};
-    remove.bind(1, normalizedRoot.generic_string());
+    remove.bind(1, pathText(normalizedRoot));
     remove.bind(2, folderNodeId);
     remove.stepDone();
   }
@@ -446,7 +458,7 @@ public:
     Statement select{db_,
                      "SELECT root_path, folder_node_id, rules_json "
                      "FROM folder_sort_rules WHERE root_path=?1 ORDER BY folder_node_id;"};
-    select.bind(1, normalizedRoot.generic_string());
+    select.bind(1, pathText(normalizedRoot));
     std::vector<FolderSortSetting> settings;
     while (select.stepRow()) {
       settings.push_back(readSetting(select));
@@ -464,7 +476,7 @@ private:
     }
 
     sqlite3* db = nullptr;
-    if (sqlite3_open_v2(databasePath_.generic_string().c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) !=
+    if (sqlite3_open_v2(pathText(databasePath_).c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) !=
         SQLITE_OK) {
       const std::string message = db == nullptr ? "failed to open folder sort settings database" : sqlite3_errmsg(db);
       sqlite3_close(db);
@@ -495,7 +507,7 @@ private:
   }
 
   [[nodiscard]] static FolderSortSetting readSetting(Statement& row) {
-    return FolderSortSetting{.rootPath = row.textColumn(0),
+    return FolderSortSetting{.rootPath = pathFromUtf8(row.textColumn(0)),
                              .folderNodeId = row.textColumn(1),
                              .rules = parseRules(row.textColumn(2))};
   }

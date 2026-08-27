@@ -1,5 +1,7 @@
 #include "seriona/scanner/path_utils.h"
 
+#include "path_utf8.h"
+
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
@@ -20,7 +22,7 @@ namespace {
 }
 
 [[nodiscard]] std::string normalizedExtension(const std::filesystem::path& path) {
-  return lowerAscii(path.extension().generic_string());
+  return lowerAscii(pathToUtf8(path.extension()));
 }
 
 [[nodiscard]] std::unordered_set<std::string> extensionSet(const std::vector<std::string>& extensions) {
@@ -103,7 +105,7 @@ struct ParsedCueToken {
   if (!parseCueToken(filename->tail, false).has_value()) {
     return std::nullopt;
   }
-  return std::filesystem::path{std::string{filename->value}};
+  return pathFromUtf8(filename->value);
 }
 
 [[nodiscard]] std::filesystem::path weaklyCanonicalParentJoinedPath(const std::filesystem::path& path) {
@@ -276,20 +278,20 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
       result.kind = PathEntryKind::Missing;
       result.errors.push_back(makeError(ScannerErrorCode::RootUnavailable, canonicalPath, "scanner path does not exist",
                                         error.message()));
-      spdlog::warn("scanner root unavailable: {} ({})", canonicalPath.generic_string(), error.message());
+      spdlog::warn("scanner root unavailable: {} ({})", pathToUtf8(canonicalPath), error.message());
       return result;
     }
     result.kind = error == std::errc::permission_denied ? PathEntryKind::PermissionDenied : PathEntryKind::Error;
     result.errors.push_back(makeError(result.kind == PathEntryKind::PermissionDenied ? ScannerErrorCode::PermissionDenied
                                                                                       : ScannerErrorCode::RootUnavailable,
                                       canonicalPath, "failed to stat scanner path", error.message()));
-    spdlog::warn("scanner path access failed: {} ({})", canonicalPath.generic_string(), error.message());
+    spdlog::warn("scanner path access failed: {} ({})", pathToUtf8(canonicalPath), error.message());
     return result;
   }
   if (!std::filesystem::exists(status)) {
     result.kind = PathEntryKind::Missing;
     result.errors.push_back(makeError(ScannerErrorCode::RootUnavailable, canonicalPath, "scanner path does not exist"));
-    spdlog::warn("scanner root unavailable: {}", canonicalPath.generic_string());
+    spdlog::warn("scanner root unavailable: {}", pathToUtf8(canonicalPath));
     return result;
   }
   if (std::filesystem::is_symlink(status) && !config.followSymlinks) {
@@ -304,7 +306,7 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
     result.errors.push_back(makeError(result.kind == PathEntryKind::PermissionDenied ? ScannerErrorCode::PermissionDenied
                                                                                       : ScannerErrorCode::RootUnavailable,
                                       canonicalPath, "failed to resolve scanner path", error.message()));
-    spdlog::warn("scanner path resolve failed: {} ({})", canonicalPath.generic_string(), error.message());
+    spdlog::warn("scanner path resolve failed: {} ({})", pathToUtf8(canonicalPath), error.message());
     return result;
   }
 
@@ -393,7 +395,7 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
     if (parseResult.error.has_value()) {
       const auto canonicalCuePath = weaklyCanonicalParentJoinedPath(cuePath);
       cueParseErrors[canonicalCuePath] = *parseResult.error;
-      spdlog::warn("CUE sheet parse failed for {}: {}", cuePath.generic_string(), parseResult.error->message);
+      spdlog::warn("CUE sheet parse failed for {}: {}", pathToUtf8(cuePath), parseResult.error->message);
     }
     for (const auto& audioPath : parseResult.references) {
       const auto canonicalRefPath = weaklyCanonicalParentJoinedPath(audioPath);

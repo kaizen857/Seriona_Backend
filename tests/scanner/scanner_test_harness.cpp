@@ -232,19 +232,21 @@ void FakeWatcher::push(FakeWatcherEvent event) {
 }
 
 std::filesystem::path writeAudioFixture(const std::filesystem::path& root, std::string filename) {
-  auto path = root / std::move(filename);
+  // filename 按 UTF-8 处理（路径文本不变量）；`/` 窄追加在 Windows 按 CP_ACP 解释会抛
+  // ERROR_NO_UNICODE_TRANSLATION。ASCII 输入字节不变。
+  auto path = root / std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(filename.data()), filename.size()}};
   writeTextFile(path, "SERIONA_TEST_AUDIO\nframes=1024\nsample_rate=48000\n");
   return path;
 }
 
 std::filesystem::path writeValidLrcFixture(const std::filesystem::path& root, std::string filename) {
-  auto path = root / std::move(filename);
+  auto path = root / std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(filename.data()), filename.size()}};
   writeTextFile(path, "[00:00.00]Seriona fixture lyric\n[00:01.25]second deterministic line\n");
   return path;
 }
 
 std::filesystem::path writeInvalidLrcFixture(const std::filesystem::path& root, std::string filename) {
-  auto path = root / std::move(filename);
+  auto path = root / std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(filename.data()), filename.size()}};
   writeTextFile(path, "not a timed lyric line\n[invalid]still deterministic\n");
   return path;
 }

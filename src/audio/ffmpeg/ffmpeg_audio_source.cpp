@@ -1,5 +1,7 @@
 #include "seriona/audio/ffmpeg_audio_source.h"
 
+#include "../path_text.h"
+
 #include "spdlog/spdlog.h"
 
 extern "C" {
@@ -374,15 +376,15 @@ class FfmpegAudioSource::Impl {
 public:
   std::optional<FfmpegAudioSourceError> open(const std::filesystem::path& path) {
     reset();
-    spdlog::debug("ffmpeg source opening '{}'", path.string());
+    spdlog::debug("ffmpeg source opening '{}'", pathToUtf8(path));
 
     if (!std::filesystem::exists(path)) {
-      spdlog::error("ffmpeg source open failed: file not found '{}'", path.string());
-      return makeError(PlaybackErrorCode::OpenFailed, "audio file does not exist", path.string());
+      spdlog::error("ffmpeg source open failed: file not found '{}'", pathToUtf8(path));
+      return makeError(PlaybackErrorCode::OpenFailed, "audio file does not exist", pathToUtf8(path));
     }
 
     AVFormatContext* rawFormat = nullptr;
-    const auto pathString = path.string();
+    const auto pathString = pathToUtf8(path);
     int result = avformat_open_input(&rawFormat, pathString.c_str(), nullptr, nullptr);
     if (result < 0) {
       spdlog::error("ffmpeg source open failed: avformat_open_input returned {} ({})",
@@ -448,7 +450,7 @@ public:
     info_.channelCount = channelCount(*codec_);
     info_.sampleFormat = mapSampleFormat(codec_->sample_fmt);
     info_.duration = streamDuration(*format_, *stream);
-    spdlog::info("ffmpeg source opened '{}': {}Hz {}ch fmt={} dur={}ms", path.string(),
+    spdlog::info("ffmpeg source opened '{}': {}Hz {}ch fmt={} dur={}ms", pathToUtf8(path),
                  info_.sampleRate, info_.channelCount,
                  static_cast<int>(info_.sampleFormat),
                  std::chrono::duration_cast<std::chrono::milliseconds>(info_.duration).count());

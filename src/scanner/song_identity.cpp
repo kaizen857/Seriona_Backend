@@ -1,5 +1,7 @@
 #include "seriona/scanner/song_identity.h"
 
+#include "path_utf8.h"
+
 #include <cctype>
 #include <cstdint>
 #include <optional>
@@ -23,7 +25,7 @@ constexpr std::uint64_t kSongIdentitySeed = 0U;
 }
 
 [[nodiscard]] std::string canonicalPathText(const std::filesystem::path& path) {
-  return path.lexically_normal().generic_string();
+  return pathToUtf8(path.lexically_normal());
 }
 
 [[nodiscard]] std::string normalizedWhitespace(std::string_view text) {

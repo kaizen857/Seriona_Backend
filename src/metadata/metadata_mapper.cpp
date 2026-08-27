@@ -30,7 +30,10 @@ namespace {
 }
 
 [[nodiscard]] std::string fileUriFromPath(const std::filesystem::path& path) {
-  return std::string{"file://"} + path.generic_string();
+  // generic_string() 在 Windows 按 CP_ACP 转换（不可表示字符抛异常）；generic_u8string()
+  // 恒为 UTF-8，Qt 的 file:// 解析按 UTF-8 解码，POSIX 上字节级不变。
+  const auto utf8 = path.generic_u8string();
+  return std::string{"file://"} + std::string{utf8.begin(), utf8.end()};
 }
 
 [[nodiscard]] MetadataFieldSet mapFields(const std::optional<control::DisplayMetadata>& display) {

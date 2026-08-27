@@ -21,6 +21,14 @@
 namespace seriona::control {
 namespace {
 
+// 路径文本恒为 UTF-8：generic_string() 在 Windows 按 CP_ACP 转换，字符不可表示时抛
+// std::system_error（ERROR_NO_UNICODE_TRANSLATION）；generic_u8string() 永不抛，
+// POSIX 上字节级不变。
+[[nodiscard]] std::string pathText(const std::filesystem::path& path) {
+  const auto utf8 = path.generic_u8string();
+  return {utf8.begin(), utf8.end()};
+}
+
 [[nodiscard]] MediaControllerCommandResult stoppedResult() {
   return MediaControllerCommandResult{.accepted = false,
                                       .code = MediaControllerErrorCode::ControllerStopped,
@@ -488,12 +496,12 @@ private:
       }
     } catch (const FolderSortSettingsError& error) {
       spdlog::warn("failed to load saved folder sort rules for root '{}' folder '{}': {}",
-                   descriptor.rootPath.generic_string(),
+                   pathText(descriptor.rootPath),
                    descriptor.folderNodeId,
                    error.what());
     } catch (const std::exception& error) {
       spdlog::warn("failed to load saved folder sort rules for root '{}' folder '{}': {}",
-                   descriptor.rootPath.generic_string(),
+                   pathText(descriptor.rootPath),
                    descriptor.folderNodeId,
                    error.what());
     }
@@ -575,7 +583,7 @@ private:
     if (!playerSnapshot_.currentTrack.has_value()) {
       return false;
     }
-    return playerSnapshot_.currentTrack->filePath.lexically_normal().generic_string() == target.generic_string();
+    return playerSnapshot_.currentTrack->filePath.lexically_normal() == target;
   }
 
   void publishSavedFolderSortRulesForRoots(const std::vector<scanner::ScannerRoot>& roots) {
@@ -585,9 +593,9 @@ private:
           notificationSubscriptions_.publish(makeFolderSortAppliedNotification(std::move(setting)));
         }
       } catch (const FolderSortSettingsError& error) {
-        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", root.path.generic_string(), error.what());
+        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", pathText(root.path), error.what());
       } catch (const std::exception& error) {
-        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", root.path.generic_string(), error.what());
+        spdlog::warn("failed to list saved folder sort rules for root '{}': {}", pathText(root.path), error.what());
       }
     }
   }

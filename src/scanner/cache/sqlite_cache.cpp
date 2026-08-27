@@ -1,6 +1,8 @@
 #include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/song_identity.h"
 
+#include "../path_utf8.h"
+
 #include <sqlite3.h>
 
 #include <chrono>
@@ -20,7 +22,7 @@ namespace {
 
 [[nodiscard]] std::chrono::system_clock::time_point msToSystemTime(const std::int64_t value) { return std::chrono::system_clock::time_point{std::chrono::milliseconds{value}}; }
 
-[[nodiscard]] std::string pathText(const std::filesystem::path& path) { return path.generic_string(); }
+[[nodiscard]] std::string pathText(const std::filesystem::path& path) { return pathToUtf8(path); }
 
 [[nodiscard]] std::string rewritePathPrefix(const std::string& path,
                                             const std::string& oldPrefix,
@@ -139,11 +141,11 @@ private:
   CachedLocation location{};
   location.locationId = row.textColumn(0);
   location.contentId = row.textColumn(1);
-  location.rootPath = row.textColumn(2);
-  location.filePath = row.textColumn(3);
+  location.rootPath = pathFromUtf8(row.textColumn(2));
+  location.filePath = pathFromUtf8(row.textColumn(3));
   location.fileSizeBytes = static_cast<std::uint64_t>(row.int64Column(4));
   location.fileMtimeNs = row.int64Column(5);
-  location.sourceFilePath = row.textColumn(6);
+  location.sourceFilePath = pathFromUtf8(row.textColumn(6));
   if (row.columnType(7) == SQLITE_INTEGER) { location.cueTrackOffset = std::chrono::milliseconds{row.int64Column(7)}; }
   if (row.columnType(8) == SQLITE_INTEGER) { location.cueTrackIndex = static_cast<std::uint32_t>(row.int64Column(8)); }
   if (row.columnType(9) == SQLITE_INTEGER) { location.cueTrackDuration = std::chrono::milliseconds{row.int64Column(9)}; }
@@ -151,10 +153,10 @@ private:
   if (row.columnType(11) == SQLITE_INTEGER) { location.cueFileMtimeNs = row.int64Column(11); }
   if (row.columnType(12) == SQLITE_INTEGER) { location.sourceFileSizeBytes = static_cast<std::uint64_t>(row.int64Column(12)); }
   if (row.columnType(13) == SQLITE_INTEGER) { location.sourceFileMtimeNs = row.int64Column(13); }
-  if (row.columnType(14) == SQLITE_TEXT) { location.artworkPath = row.textColumn(14); }
-  if (row.columnType(15) == SQLITE_TEXT) { location.thumbnailPath = row.textColumn(15); }
+  if (row.columnType(14) == SQLITE_TEXT) { location.artworkPath = pathFromUtf8(row.textColumn(14)); }
+  if (row.columnType(15) == SQLITE_TEXT) { location.thumbnailPath = pathFromUtf8(row.textColumn(15)); }
   location.lyricsSource = parseLyricsSource(row.textColumn(16));
-  if (row.columnType(17) == SQLITE_TEXT) { location.externalLrcPath = row.textColumn(17); }
+  if (row.columnType(17) == SQLITE_TEXT) { location.externalLrcPath = pathFromUtf8(row.textColumn(17)); }
   if (row.columnType(18) == SQLITE_INTEGER) { location.externalLrcMtimeNs = row.int64Column(18); }
   if (row.columnType(19) == SQLITE_TEXT) { location.externalLrcHash = row.textColumn(19); }
   location.discoveredAt = msToSystemTime(row.int64Column(20));

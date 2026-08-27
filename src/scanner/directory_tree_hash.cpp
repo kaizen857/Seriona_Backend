@@ -1,5 +1,7 @@
 #include "seriona/scanner/directory_tree_hash.h"
 
+#include "path_utf8.h"
+
 #include <xxhash.h>
 
 #include <algorithm>
@@ -31,7 +33,7 @@ constexpr char kHashSeparator = '\0';
 
 // Local copy: some test binaries compile this file without path_utils.cpp.
 [[nodiscard]] bool isLyricsSidecarPath(const std::filesystem::path& path) {
-  auto extension = path.extension().generic_string();
+  auto extension = pathToUtf8(path.extension());
   std::ranges::transform(extension, extension.begin(),
                          [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
   return extension == ".lrc";

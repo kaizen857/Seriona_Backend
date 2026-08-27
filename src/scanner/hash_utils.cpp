@@ -2,6 +2,8 @@
 
 #include "seriona/scanner/directory_tree_hash.h"
 
+#include "path_utf8.h"
+
 #include "spdlog/spdlog.h"
 
 #include <array>
@@ -82,13 +84,13 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (error || !std::filesystem::exists(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "file hash path disappeared", error.message()));
-    spdlog::warn("file hash: path disappeared: {} ({})", path.generic_string(), error.message());
+    spdlog::warn("file hash: path disappeared: {} ({})", pathToUtf8(path), error.message());
     return result;
   }
   if (!std::filesystem::is_regular_file(status)) {
     result.errors.push_back(makeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
                                           "file hash requires a regular file"));
-    spdlog::debug("file hash: not a regular file: {}", path.generic_string());
+    spdlog::debug("file hash: not a regular file: {}", pathToUtf8(path));
     return result;
   }
 
@@ -96,7 +98,7 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (!input) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "failed to open file for hashing"));
-    spdlog::error("file hash: failed to open {} for hashing", path.generic_string());
+    spdlog::error("file hash: failed to open {} for hashing", pathToUtf8(path));
     return result;
   }
 
@@ -126,24 +128,24 @@ FileHashResult hashFileContent(const std::filesystem::path& path, const HashOpti
   if (!input.eof()) {
     result.errors.push_back(makeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
                                           "failed while reading file for hashing"));
-    spdlog::error("file hash: read error for {}", path.generic_string());
+    spdlog::error("file hash: read error for {}", pathToUtf8(path));
     return result;
   }
 
   result.hash = canonicalHex(XXH3_128bits_digest(state.get()));
-  spdlog::debug("file hash complete: {} -> {}", path.generic_string(), *result.hash);
+  spdlog::debug("file hash complete: {} -> {}", pathToUtf8(path), *result.hash);
   return result;
 }
 
 FileHashResult hashLyricsSidecar(const std::filesystem::path& path, const HashOptions& options) {
   auto result = hashFileContent(path, options);
-  spdlog::debug("lrc hash complete: {} -> {}", path.generic_string(), result.hash.value_or("none"));
+  spdlog::debug("lrc hash complete: {} -> {}", pathToUtf8(path), result.hash.value_or("none"));
   return result;
 }
 
 DirectoryHashResult hashDirectoryMerkle(const std::filesystem::path& root, const HashOptions& options) {
   auto result = computeDirectoryTreeHash(root, options);
-  spdlog::debug("dir hash complete: {} errors={} hash={}", root.generic_string(), result.errors.size(),
+  spdlog::debug("dir hash complete: {} errors={} hash={}", pathToUtf8(root), result.errors.size(),
                 result.hash.value_or("none"));
   return result;
 }

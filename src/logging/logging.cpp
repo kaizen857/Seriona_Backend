@@ -33,7 +33,7 @@ void initialize(spdlog::level::level_enum console_level,
         file_sink->set_pattern(pattern);
     } catch (const spdlog::spdlog_ex& e) {
         std::cerr << "spdlog: unable to create rotating file sink at "
-                  << log_file_path << ": " << e.what() << "\n"
+                  << pathText(log_file_path) << ": " << e.what() << "\n"
                   << "spdlog: falling back to console-only logging"
                   << std::endl;
     }
@@ -109,7 +109,7 @@ std::filesystem::path prepareLogFile(
             continue;
         }
 
-        const auto& filename = entry.path().filename().string();
+        const auto& filename = pathText(entry.path().filename());
         if (filename.find(".log") == std::string::npos) {
             continue;
         }
@@ -190,7 +190,7 @@ std::shared_ptr<spdlog::logger> createDedicatedLogger(
     
     try {
         auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            log_file_path.string(), 1024 * 1024 * 5, 3);
+            pathText(log_file_path), 1024 * 1024 * 5, 3);
         file_sink->set_level(spdlog::level::trace);
         file_sink->set_pattern(pattern);
         
@@ -203,7 +203,7 @@ std::shared_ptr<spdlog::logger> createDedicatedLogger(
         return logger;
     } catch (const spdlog::spdlog_ex& e) {
         std::cerr << "Failed to create dedicated logger '" << logger_name 
-                  << "' at " << log_file_path << ": " << e.what() << std::endl;
+                  << "' at " << pathText(log_file_path) << ": " << e.what() << std::endl;
         return nullptr;
     }
 }

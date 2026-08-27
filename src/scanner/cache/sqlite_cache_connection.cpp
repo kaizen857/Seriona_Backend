@@ -1,5 +1,7 @@
 #include "seriona/scanner/cache/sqlite_cache.h"
 
+#include "../path_utf8.h"
+
 #include <sqlite3.h>
 
 #include <chrono>
@@ -17,7 +19,7 @@ constexpr int kSchemaVersion = 3;
 
 [[nodiscard]] sqlite3* asDb(void* db) noexcept { return static_cast<sqlite3*>(db); }
 
-[[nodiscard]] std::string pathText(const std::filesystem::path& path) { return path.generic_string(); }
+[[nodiscard]] std::string pathText(const std::filesystem::path& path) { return pathToUtf8(path); }
 
 [[nodiscard]] std::runtime_error sqliteError(sqlite3* db, const std::string& action) {
   return std::runtime_error(action + ": " + sqlite3_errmsg(db));
@@ -312,7 +314,7 @@ std::optional<CachedScanRoot> SQLiteCache::loadScanRoot(const std::filesystem::p
   std::lock_guard<std::mutex> lock(readerMutex_);
   
   Statement select{asDb(db_), "SELECT root_path, directory_tree_hash, total_files, last_scan_mode, last_scan_duration_ms, last_scan_at_ms FROM scan_roots WHERE root_path=?1;"}; select.bind(1, pathText(rootPath)); if (!select.stepRow()) { return std::nullopt; }
-  return CachedScanRoot{.rootPath = select.textColumn(0), .directoryTreeHash = select.textColumn(1), .totalFiles = static_cast<std::uint64_t>(select.int64Column(2)), .lastScanMode = parseScanMode(select.textColumn(3)), .lastScanDuration = std::chrono::milliseconds{select.int64Column(4)}, .lastScanAt = msToSystemTime(select.int64Column(5))};
+  return CachedScanRoot{.rootPath = pathFromUtf8(select.textColumn(0)), .directoryTreeHash = select.textColumn(1), .totalFiles = static_cast<std::uint64_t>(select.int64Column(2)), .lastScanMode = parseScanMode(select.textColumn(3)), .lastScanDuration = std::chrono::milliseconds{select.int64Column(4)}, .lastScanAt = msToSystemTime(select.int64Column(5))};
 }
 
 void SQLiteCache::saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors) {
@@ -328,7 +330,7 @@ std::vector<CachedScanError> SQLiteCache::loadErrors(const std::filesystem::path
   std::lock_guard<std::mutex> lock(readerMutex_);
   
   Statement select{asDb(db_), "SELECT root_path, file_path, error_code, error_message, occurred_at_ms FROM scan_errors WHERE root_path=?1 ORDER BY id;"}; select.bind(1, pathText(rootPath)); std::vector<CachedScanError> errors;
-  while (select.stepRow()) { errors.push_back({.rootPath = select.textColumn(0), .filePath = select.columnType(1) == SQLITE_TEXT ? std::optional<std::filesystem::path>{select.textColumn(1)} : std::nullopt, .errorCode = parseErrorCode(select.textColumn(2)), .errorMessage = select.textColumn(3), .occurredAt = msToSystemTime(select.int64Column(4))}); }
+  while (select.stepRow()) { errors.push_back({.rootPath = pathFromUtf8(select.textColumn(0)), .filePath = select.columnType(1) == SQLITE_TEXT ? std::optional<std::filesystem::path>{pathFromUtf8(select.textColumn(1))} : std::nullopt, .errorCode = parseErrorCode(select.textColumn(2)), .errorMessage = select.textColumn(3), .occurredAt = msToSystemTime(select.int64Column(4))}); }
   return errors;
 }
 

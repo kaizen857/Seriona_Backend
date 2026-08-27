@@ -17,13 +17,13 @@ void initializeApplicationLogging(const RuntimePaths& runtimePaths) {
 
   const auto logFile = seriona::logging::prepareLogFile(runtimePaths.logFile.parent_path());
   seriona::logging::initialize(loggerLevel,
-                               logFile.string(),
+                               seriona::logging::pathText(logFile),
                                loggerLevel);
   spdlog::info("seriona application logging initialized");
-  spdlog::info("  data root:   {}", runtimePaths.dataRoot.string());
-  spdlog::info("  log file:    {}", logFile.string());
-  spdlog::info("  database:    {}", runtimePaths.databasePath.string());
-  spdlog::info("  artwork dir: {}", runtimePaths.artworkDir.string());
+  spdlog::info("  data root:   {}", seriona::logging::pathText(runtimePaths.dataRoot));
+  spdlog::info("  log file:    {}", seriona::logging::pathText(logFile));
+  spdlog::info("  database:    {}", seriona::logging::pathText(runtimePaths.databasePath));
+  spdlog::info("  artwork dir: {}", seriona::logging::pathText(runtimePaths.artworkDir));
   spdlog::default_logger()->flush();
 }
 

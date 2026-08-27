@@ -21,6 +21,14 @@ AppSettingsError::AppSettingsError(AppSettingsErrorCode code, std::string messag
 
 namespace {
 
+// 路径文本恒为 UTF-8：generic_string() 在 Windows 按 CP_ACP 转换，字符不可表示时抛
+// std::system_error（ERROR_NO_UNICODE_TRANSLATION）；generic_u8string() 永不抛，
+// POSIX 上字节级不变。
+[[nodiscard]] std::string pathText(const std::filesystem::path& path) {
+  const auto utf8 = path.generic_u8string();
+  return {utf8.begin(), utf8.end()};
+}
+
 [[nodiscard]] std::int64_t systemTimeToMs(const std::chrono::system_clock::time_point time) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch()).count();
 }
@@ -188,7 +196,7 @@ private:
     }
 
     sqlite3* db = nullptr;
-    if (sqlite3_open_v2(databasePath_.generic_string().c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) !=
+    if (sqlite3_open_v2(pathText(databasePath_).c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) !=
         SQLITE_OK) {
       const std::string message = db == nullptr ? "failed to open app settings database" : sqlite3_errmsg(db);
       sqlite3_close(db);

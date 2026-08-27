@@ -1,5 +1,7 @@
 #include "seriona/scanner/lrc_parser.h"
 
+#include "path_utf8.h"
+
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
@@ -102,7 +104,7 @@ LrcParseResult parseLrcText(std::string text, const LrcParseOptions& options,
   LrcParseResult result;
   if (text.size() > options.maxBytes) {
     result.errors.push_back(makeError(LrcParseErrorCode::FileTooLarge, path, 0U, 0U, "lrc file exceeds scanner limit"));
-    spdlog::warn("lrc parse: file exceeds size limit ({})", path.has_value() ? path->generic_string() : "<text>");
+    spdlog::warn("lrc parse: file exceeds size limit ({})", path.has_value() ? pathToUtf8(*path) : "<text>");
     return result;
   }
 
@@ -178,17 +180,17 @@ LrcParseResult parseLrcFile(const std::filesystem::path& path, const LrcParseOpt
   std::error_code error;
   const auto size = std::filesystem::file_size(path, error);
   if (error) {
-    spdlog::warn("lrc parse: failed to stat {} ({})", path.generic_string(), error.message());
+    spdlog::warn("lrc parse: failed to stat {} ({})", pathToUtf8(path), error.message());
     return {.errors = {makeError(LrcParseErrorCode::IoFailure, path, 0U, 0U, "failed to stat lrc file", error.message())}};
   }
   if (size > options.maxBytes) {
-    spdlog::warn("lrc parse: file exceeds size limit ({})", path.generic_string());
+    spdlog::warn("lrc parse: file exceeds size limit ({})", pathToUtf8(path));
     return {.errors = {makeError(LrcParseErrorCode::FileTooLarge, path, 0U, 0U, "lrc file exceeds scanner limit")}};
   }
 
   std::ifstream input(path, std::ios::binary);
   if (!input) {
-    spdlog::warn("lrc parse: failed to open {}", path.generic_string());
+    spdlog::warn("lrc parse: failed to open {}", pathToUtf8(path));
     return {.errors = {makeError(LrcParseErrorCode::IoFailure, path, 0U, 0U, "failed to open lrc file")}};
   }
 

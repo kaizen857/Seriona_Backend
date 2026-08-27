@@ -6,11 +6,19 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace seriona::scanner {
 namespace {
+
+// 从 UTF-8 文本构造路径：C++20 起 path{u8string} 按 UTF-8 → 原生编码转换；
+// MSVC 上避免窄字符串构造的 ACP 解释（CP_ACP 遇到不可表示字符会抛
+// ERROR_NO_UNICODE_TRANSLATION）。POSIX 上字节级不变。
+[[nodiscard]] std::filesystem::path pathFromUtf8(std::string_view utf8) {
+  return std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(utf8.data()), utf8.size()}};
+}
 
 [[nodiscard]] std::string pathKey(const std::filesystem::path& path) {
   const auto normalized = path.lexically_normal();
@@ -372,7 +380,7 @@ struct PlaylistTreeBuilder::Impl {
       const auto oldRelativeText = pathKey(movedEntry.relativePath);
       const auto updatedRelativeText = rewriteText(oldRelativeText);
       if (updatedRelativeText != oldRelativeText) {
-        movedEntry.relativePath = std::filesystem::path{updatedRelativeText};
+        movedEntry.relativePath = pathFromUtf8(updatedRelativeText);
       }
       const bool keyChanged = updatedKey != key;
       if (keyChanged) {
@@ -390,10 +398,10 @@ struct PlaylistTreeBuilder::Impl {
         }
         if (updatedRelativeText != oldRelativeText) {
           if (!song.filePath.empty()) {
-            song.filePath = std::filesystem::path{rewriteText(pathKey(song.filePath))};
+            song.filePath = pathFromUtf8(rewriteText(pathKey(song.filePath)));
           }
           if (!song.sourceFilePath.empty()) {
-            song.sourceFilePath = std::filesystem::path{rewriteText(pathKey(song.sourceFilePath))};
+            song.sourceFilePath = pathFromUtf8(rewriteText(pathKey(song.sourceFilePath)));
           }
           song.logicalTrackId = rewriteText(song.logicalTrackId);
           song.trackId = rewriteText(song.trackId);
@@ -427,7 +435,7 @@ struct PlaylistTreeBuilder::Impl {
       missingParents.insert(parentKey);
     }
     for (const auto& parentKey : missingParents) {
-      (void)ensureDirectory(std::filesystem::path{parentKey}, "Library");
+      (void)ensureDirectory(pathFromUtf8(parentKey), "Library");
     }
     for (auto& [key, entry] : nodes) {
       if (key == "." || entry.node.kind == PlaylistNodeKind::Root) {

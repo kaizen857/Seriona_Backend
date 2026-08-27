@@ -1,5 +1,7 @@
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
 
+#include "path_utf8.h"
+
 #include "spdlog/spdlog.h"
 
 #include <Tag.hpp>
@@ -118,7 +120,7 @@ std::vector<RawTagMetadata> ProductionTagMetadataReader::readCueSheet(const TagR
       results.push_back(rawFromMusicTag(tag));
     }
   } catch (const std::exception& error) {
-    spdlog::warn("CUE sheet parse failed for {}: {}", request.path.generic_string(), error.what());
+    spdlog::warn("CUE sheet parse failed for {}: {}", pathToUtf8(request.path), error.what());
   }
   return results;
 }
@@ -129,7 +131,7 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
                                     bool externalLyricsOverrideActive) {
   MappedTagMetadata result{};
   auto& metadata = result.metadata;
-  metadata.trackId = raw.filePath.generic_string();
+  metadata.trackId = pathToUtf8(raw.filePath);
   metadata.filePath = raw.filePath;
   metadata.title = raw.title;
   metadata.artist = raw.artist;
@@ -150,7 +152,7 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
   metadata.thumbnailPath = raw.thumbnailPath.empty() ? std::optional<std::filesystem::path>{std::filesystem::path{}} : std::optional<std::filesystem::path>{raw.thumbnailPath};
   metadata.offset = toMilliseconds(raw.offset);
   metadata.duration = toMilliseconds(raw.duration);
-  metadata.logicalTrackId = raw.filePath.generic_string();
+  metadata.logicalTrackId = pathToUtf8(raw.filePath);
   result.embeddedLyrics = mapLyrics(raw.embeddedLyrics);
   if (!externalLyricsOverrideActive && !result.embeddedLyrics.empty()) {
     metadata.effectiveLyricsSource = LyricsSource::EmbeddedTag;
@@ -179,10 +181,10 @@ std::vector<TagReaderSuccess> readTagMetadataBatch(TagMetadataReader& reader,
   for (const auto& path : paths) {
     try {
       auto raw = reader.read(thumbnailOnlyRequest(path, coverExportDir));
-      successes.push_back({.metadata = mapRawTagMetadata(raw, std::string{contentHashSeed} + ":" + path.generic_string(),
+      successes.push_back({.metadata = mapRawTagMetadata(raw, std::string{contentHashSeed} + ":" + pathToUtf8(path),
                                                          std::nullopt, false)});
     } catch (const std::exception& error) {
-      spdlog::warn("TagReader read failed for {}", path.generic_string());
+      spdlog::warn("TagReader read failed for {}", pathToUtf8(path));
       failures.push_back({.error = metadataReadError(path, error)});
     }
   }
@@ -199,12 +201,12 @@ std::optional<std::filesystem::path> exportFolderCoverThumbnail(const std::files
   CoverProcessingOptions options;
   options.mode = CoverProcessingOptions::CoverProcessingMode::ThumbnailOnly;
   options.failurePolicy = CoverProcessingOptions::CoverFailurePolicy::Ignore;
-  const auto tag = TagReader::ExportFolderCover(folderPath.generic_string(), coverExportDir.generic_string(), options);
+  const auto tag = TagReader::ExportFolderCover(folderPath, coverExportDir, options);
   const auto thumbnail = tag.thumbnailPath();
   if (thumbnail.empty()) {
     return std::nullopt;
   }
-  return std::filesystem::path{thumbnail};
+  return thumbnail;
 }
 
 }

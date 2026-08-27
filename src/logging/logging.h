@@ -9,6 +9,13 @@
 namespace seriona {
 namespace logging {
 
+// 路径文本统一为 UTF-8：Windows 上 path::string() 按 ANSI 代码页转换，
+// 不可表示字符会抛异常或乱码，路径文本通道禁止使用。
+[[nodiscard]] inline std::string pathText(const std::filesystem::path& path) {
+  const auto utf8 = path.u8string();
+  return std::string{reinterpret_cast<const char*>(utf8.data()), utf8.size()};
+}
+
 void initialize(spdlog::level::level_enum console_level,
                 const std::string& log_file_path,
                 spdlog::level::level_enum logger_level = spdlog::level::trace);

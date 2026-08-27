@@ -1,5 +1,6 @@
 #include "seriona/audio/waveform_generator.h"
 
+#include "path_text.h"
 #include "waveform_ffmpeg.h"
 #include "waveform_internal.h"
 
@@ -90,7 +91,7 @@ constexpr double kSilentRmsThreshold = 1.0e-9;
 
 [[nodiscard]] std::runtime_error publicWaveformBuildError(const std::filesystem::path& filepath,
                                                           const std::exception& error) {
-  return std::runtime_error{"failed to build waveform for '" + filepath.string() + "': " + error.what()};
+  return std::runtime_error{"failed to build waveform for '" + seriona::audio::pathToUtf8(filepath) + "': " + error.what()};
 }
 
 void mergeBarData(const std::vector<seriona::audio::detail::BarData>& source,
@@ -131,7 +132,7 @@ std::vector<int> buildAudioWaveform(const std::string& filepath,
     return zeroBars;
   }
 
-  const auto path = std::filesystem::path{filepath};
+  const auto path = pathFromUtf8(filepath);
   try {
     auto input = detail::openWaveformInput(path);
     auto& stream = detail::findBestAudioStream(*input);

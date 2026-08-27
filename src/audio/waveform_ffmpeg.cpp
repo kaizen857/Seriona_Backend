@@ -1,5 +1,7 @@
 #include "waveform_ffmpeg.h"
 
+#include "path_text.h"
+
 extern "C" {
 #include <libavutil/error.h>
 }
@@ -120,11 +122,11 @@ std::string ffmpegErrorDetail(int value) {
 
 WaveformFormatContextPtr openWaveformInput(const std::filesystem::path& filepath) {
   if (!std::filesystem::exists(filepath)) {
-    throwWaveformFfmpegError(WaveformFfmpegErrorCode::OpenFailed, "audio file does not exist", filepath.string());
+    throwWaveformFfmpegError(WaveformFfmpegErrorCode::OpenFailed, "audio file does not exist", pathToUtf8(filepath));
   }
 
   AVFormatContext* rawFormat = nullptr;
-  const auto pathString = filepath.string();
+  const auto pathString = pathToUtf8(filepath);
   int result = avformat_open_input(&rawFormat, pathString.c_str(), nullptr, nullptr);
   if (result < 0) {
     throwWaveformFfmpegError(WaveformFfmpegErrorCode::UnsupportedFormat, "failed to open audio container", result);

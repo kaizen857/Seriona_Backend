@@ -1219,6 +1219,58 @@ TEST_CASE("scanner e2e resolves folder thumbnails after full scan") {
   CHECK(called[3] == folderC);
 }
 
+TEST_CASE("scanner e2e resolves folder thumbnails for non-ANSI UTF-8 directory names") {
+  // 回归保护：目录/文件名含 GBK 无法表示的字符（"𠮷" U+20BB7 扩展 B、"髙" U+9AD9），
+  // 在 Windows 上任何 CP_ACP 窄转换（path::string()、窄字符串构造、`path /= std::string`）
+  // 都会抛 ERROR_NO_UNICODE_TRANSLATION。目录树构建 + 文件夹缩略图解析（displayName
+  // 父链重建）必须全程以 UTF-8 路径文本工作。
+  test::TempScannerRoot temp{"scanner-folder-thumbnail-cjk"};
+  const auto folderJp = temp.path() / std::filesystem::path{std::u8string{u8"音楽𠮷"}};
+  const auto folderSub = folderJp / std::filesystem::path{std::u8string{u8"アルバム-髙"}};
+  std::filesystem::create_directories(folderSub);
+
+  const auto topTrack = test::writeAudioFixture(folderJp, "01-初音ミク.flac");
+  const auto subTrack = test::writeAudioFixture(folderSub, "02-鏡音リン.flac");
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  auto topMeta = rawMetadata("Top");
+  topMeta.thumbnailPath = temp.path() / "art-top.png";
+  reader->put(topTrack, topMeta);
+  auto subMeta = rawMetadata("Sub");
+  subMeta.thumbnailPath = temp.path() / "art-sub.png";
+  reader->put(subTrack, subMeta);
+
+  auto seam = std::make_shared<FakeFolderThumbnailSeam>();
+  const auto exportedJp = temp.path() / "covers" / "exported-jp.png";
+  seam->setResult(folderJp, exportedJp);
+  seam->setResult(folderSub, std::nullopt);
+
+  auto service = makeServiceWithSeam(temp, reader, seam->makeSeam());
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto result = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full,
+                                     [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 2U; });
+  const auto& snapshot = result.snapshot;
+  REQUIRE(songsIn(snapshot).size() == 2U);
+
+  const auto* nodeJp = directoryNodeByDisplayName(snapshot, std::string{reinterpret_cast<const char*>(u8"音楽𠮷")});
+  const auto* nodeSub = directoryNodeByDisplayName(snapshot, std::string{reinterpret_cast<const char*>(u8"アルバム-髙")});
+  REQUIRE(nodeJp != nullptr);
+  REQUIRE(nodeSub != nullptr);
+
+  CHECK(nodeJp->thumbnailPath == exportedJp.generic_string());
+  CHECK(nodeSub->thumbnailPath == (temp.path() / "art-sub.png").generic_string());
+  const auto* root = rootNodeOf(snapshot);
+  REQUIRE(root != nullptr);
+  CHECK_FALSE(root->thumbnailPath.has_value());
+
+  const auto called = seam->called();
+  REQUIRE(called.size() == 2U);
+  CHECK(called[0] == folderJp);
+  CHECK(called[1] == folderSub);
+}
+
 TEST_CASE("scanner e2e resolves folder thumbnails consistently after incremental scan") {
   test::TempScannerRoot temp{"scanner-folder-thumbnail-incremental"};
   const auto folderA = temp.path() / "A";
@@ -1370,14 +1422,17 @@ TEST_CASE("scanner fallback rescan produces no duplicate tree and equals full re
   metadata.filePath = path;
   metadata.sourceFilePath = path;
   metadata.duration = duration;
-  metadata.logicalTrackId = path.generic_string();
+  // 路径文本恒为 UTF-8（generic_string() 在 Windows CP_ACP 下对不可表示字符抛异常）。
+  const auto utf8 = path.generic_u8string();
+  metadata.logicalTrackId = {utf8.begin(), utf8.end()};
   return metadata;
 }
 
 [[nodiscard]] SongMetadata treeCueContainer(std::filesystem::path cuePath) {
   SongMetadata metadata{};
   metadata.filePath = cuePath;
-  metadata.logicalTrackId = cuePath.generic_string();
+  const auto utf8 = cuePath.generic_u8string();
+  metadata.logicalTrackId = {utf8.begin(), utf8.end()};
   metadata.duration = std::chrono::milliseconds{0};
   return metadata;
 }
@@ -1557,6 +1612,37 @@ TEST_CASE("playlist tree builder renameSubtree rewrites subtree keys node ids an
   CHECK_FALSE(builder.renameSubtree("pop", "pop"));
   CHECK_FALSE(builder.renameSubtree("ghost", "phantom"));
   CHECK_FALSE(builder.renameSubtree(".", "root"));
+}
+
+TEST_CASE("playlist tree builder renameSubtree round-trips non-ANSI UTF-8 relative paths") {
+  // 回归保护：renameSubtree 以 UTF-8 文本重写 key 后须用 u8string 恢复 path；
+  // 窄字符串构造/`/=` 在 Windows CP_ACP 下对 GBK 不可表示字符（"𠮷" U+20BB7、
+  // "髙" U+9AD9）抛 ERROR_NO_UNICODE_TRANSLATION。
+  PlaylistTreeBuilder builder{"Library"};
+  const auto oldDir = std::filesystem::path{std::u8string{u8"音楽𠮷"}};
+  const auto newDir = std::filesystem::path{std::u8string{u8"アルバム-髙"}};
+  const auto songPath = oldDir / std::filesystem::path{std::u8string{u8"初音ミク.flac"}};
+  builder.addSong({.relativePath = songPath, .metadata = treeSong("Miku", songPath, std::chrono::seconds{60})});
+
+  const auto before = builder.publish();
+  REQUIRE(songsIn(before).size() == 1U);
+  REQUIRE(std::ranges::find_if(before.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == std::string{"dir:"} + std::string{reinterpret_cast<const char*>(u8"音楽𠮷")};
+  }) != before.nodes.end());
+
+  CHECK(builder.renameSubtree(oldDir, newDir));
+  const auto after = builder.publish();
+  requireNoDanglingReferences(after);
+
+  const auto songs = songsIn(after);
+  REQUIRE(songs.size() == 1U);
+  const auto expectedPath = newDir / std::filesystem::path{std::u8string{u8"初音ミク.flac"}};
+  CHECK(songs[0].filePath == expectedPath);
+  CHECK(songs[0].logicalTrackId == std::string{reinterpret_cast<const char*>(u8"アルバム-髙/初音ミク.flac")});
+  CHECK(std::ranges::find_if(after.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == std::string{"dir:"} + std::string{reinterpret_cast<const char*>(u8"アルバム-髙")};
+  }) != after.nodes.end());
+  CHECK(builder.stats().songCount == 1U);
 }
 
 TEST_CASE("playlist tree builder renameSubtree result equals independent full rebuild from path-rewritten song set") {

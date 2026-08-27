@@ -1,6 +1,7 @@
 #include "file_scanner_service_internal.h"
 #include "scanner_internal_types.h"
 #include "file_scanner_orchestrator_test_access.h"
+#include "path_utf8.h"
 
 #include "spdlog/spdlog.h"
 #include "logging/logging.h"
@@ -99,7 +100,7 @@ static TreeBuilderObserver g_treeBuilderObserver = nullptr;
   return resolvePortableDataRoot() / "artwork";
 }
 
-[[nodiscard]] std::string pathKey(const std::filesystem::path& path) { return path.lexically_normal().generic_string(); }
+[[nodiscard]] std::string pathKey(const std::filesystem::path& path) { return pathToUtf8(path.lexically_normal()); }
 
 [[nodiscard]] std::filesystem::file_time_type fileTimeFromNanoseconds(std::int64_t value) {
   return std::filesystem::file_time_type{
@@ -247,7 +248,9 @@ enum class ExternalLyricsCacheAction {
 }
 
 [[nodiscard]] std::filesystem::path scanRootDatabasePath(const std::filesystem::path& databasePath) {
-  return std::filesystem::path{databasePath.generic_string() + ".scan-roots.sqlite"};
+  auto path = databasePath;
+  path += ".scan-roots.sqlite";
+  return path;
 }
 
 [[nodiscard]] cache::CachedScanRoot scanRootRecord(const std::filesystem::path& rootPath,
@@ -434,7 +437,7 @@ struct CachedLocationPathIndex {
 
 [[nodiscard]] std::optional<std::uint32_t> cueTrackIndexFromLogicalTrackId(const std::filesystem::path& cuePath,
                                                                             std::string_view logicalTrackId) {
-  const auto prefix = cuePath.generic_string() + "#track";
+  const auto prefix = pathToUtf8(cuePath) + "#track";
   if (!logicalTrackId.starts_with(prefix)) {
     return std::nullopt;
   }
@@ -726,8 +729,8 @@ void applyCachedLocation(cache::CachedSong& song,
                                                 fileTimeFromNanoseconds(*location.externalLrcMtimeNs)}
                                           : std::nullopt;
   song.metadata.externalLyricsHash = location.externalLrcHash;
-  song.metadata.trackId = filePath.generic_string();
-  song.metadata.logicalTrackId = filePath.generic_string();
+  song.metadata.trackId = pathToUtf8(filePath);
+  song.metadata.logicalTrackId = pathToUtf8(filePath);
   selectEffectiveLyrics(song);
 }
 
@@ -752,7 +755,7 @@ void hydrateCachedCueTrack(cache::CachedSong& song,
                                                 fileTimeFromNanoseconds(*location.externalLrcMtimeNs)}
                                           : std::nullopt;
   song.metadata.externalLyricsHash = location.externalLrcHash;
-  const auto trackIdentity = cuePath.generic_string() + "#track" + std::to_string(trackIndex);
+  const auto trackIdentity = pathToUtf8(cuePath) + "#track" + std::to_string(trackIndex);
   song.metadata.logicalTrackId = trackIdentity;
   song.metadata.trackId = trackIdentity;
   selectEffectiveLyrics(song);
@@ -870,7 +873,7 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
 }
 
 [[nodiscard]] bool watcherMessageRequestsRootReconciliation(const std::filesystem::path& messagePath) {
-  const auto message = messagePath.generic_string();
+  const auto message = pathToUtf8(messagePath);
   // s/self/live@、s/self/die@ 是 watch 生命周期消息（startWatching/stopWatching 内部），不应触发对账；
   // e@ 是 wtr result::e 的独立完成标记（无路径后缀），必须精确 == "e@" 而不能 contains("e@")——
   // 后者会误命中 s/self/live@（"live@" 含子串 "e@"）与 e/self/live@（同样含 "e@"）。
@@ -908,7 +911,7 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
 void collectActionableWatcherEvent(const WatchEvent& event, std::vector<std::string>& messages, bool& actionable) {
   if (event.pathKind == WatchPathKind::Watcher) {
     if (watcherMessageRequestsRootReconciliation(event.path)) {
-      messages.push_back(event.path.generic_string());
+      messages.push_back(pathToUtf8(event.path));
       actionable = true;
     }
   } else if (pathChangeRequestsScan(event)) {
@@ -1031,8 +1034,8 @@ public:
         return exportFolderCoverThumbnail(folderPath, coverExportDir_);
       };
     }
-    spdlog::info("scanner configured: database={} artwork={}", databasePath_.generic_string(),
-                 coverExportDir_.generic_string());
+    spdlog::info("scanner configured: database={} artwork={}", pathToUtf8(databasePath_),
+                 pathToUtf8(coverExportDir_));
     
     const auto logDir = databasePath_.parent_path() / "logs";
     std::error_code ec;
@@ -1042,7 +1045,7 @@ public:
       tagReaderErrorLogger_ = logging::createDedicatedLogger(
           "tagreader_errors", tagReaderLogPath, spdlog::level::warn);
       if (tagReaderErrorLogger_) {
-        spdlog::info("TagReader error logging enabled: {}", tagReaderLogPath.generic_string());
+        spdlog::info("TagReader error logging enabled: {}", pathToUtf8(tagReaderLogPath));
       }
     }
   }
@@ -1120,10 +1123,10 @@ public:
         publishCancelled(sink, scanVersion);
         return;
       }
-      spdlog::debug("scanning root: {}", root.path.generic_string());
+      spdlog::debug("scanning root: {}", pathToUtf8(root.path));
       const auto requestedMode = (!effectiveConfig.scanner.enableIncrementalScan || effectiveConfig.scanner.forceFull) ? ScanMode::Full : mode;
       const auto decision = decideScanMode(root, requestedMode, databasePath_);
-      spdlog::debug("scan mode decision for {}: {}", root.path.generic_string(),
+      spdlog::debug("scan mode decision for {}: {}", pathToUtf8(root.path),
                     decision.mode == ScanMode::Full ? "full" : "incremental");
       const auto rootScanStartTime = std::chrono::steady_clock::now();
       auto rootResult = reconcileRoot(root, decision, effectiveConfig, cache, discovered, skipped, scanned, completedFiles, totalTagReaderTimeMs, sink);
@@ -1204,7 +1207,7 @@ public:
         if (error.message.find("TagReader") != std::string::npos) {
           ++tagReaderErrorCount;
           if (tagReaderErrorLogger_) {
-            const auto pathStr = error.path ? error.path->generic_string() : "(no path)";
+            const auto pathStr = error.path ? pathToUtf8(*error.path) : "(no path)";
             if (error.detail.empty()) {
               tagReaderErrorLogger_->warn("{}: {}", error.message, pathStr);
             } else {
@@ -1237,7 +1240,7 @@ public:
       spdlog::warn("\nFirst {} error(s) with details:", detailedErrorCount);
       for (std::size_t i = 0; i < detailedErrorCount; ++i) {
         const auto& error = allErrors[i];
-        const auto pathStr = error.path ? error.path->generic_string() : "(no path)";
+        const auto pathStr = error.path ? pathToUtf8(*error.path) : "(no path)";
         if (error.detail.empty()) {
           spdlog::warn("  [{}] {}: {}", i + 1, error.message, pathStr);
         } else {
@@ -1352,12 +1355,12 @@ public:
     std::error_code ec;
     const bool exists = std::filesystem::exists(target, ec);
     if (ec) {
-      spdlog::error("removeLocation failed probing '{}': {}", target.generic_string(), ec.message());
+      spdlog::error("removeLocation failed probing '{}': {}", pathToUtf8(target), ec.message());
       return false;
     }
     if (!exists) {
       // 文件不存在：幂等成功（无需磁盘删除与缓存清理）。
-      spdlog::info("removeLocation: target already absent, idempotent success: {}", target.generic_string());
+      spdlog::info("removeLocation: target already absent, idempotent success: {}", pathToUtf8(target));
       return true;
     }
 
@@ -1372,15 +1375,15 @@ public:
       watchedRoots = state->watchedRoots;
     }
     for (const auto& watched : watchedRoots) {
-      if (pathKey(rootPathFor(watched)) == target.generic_string()) {
-        spdlog::warn("removeLocation refused: target is a scan root: {}", target.generic_string());
+      if (pathKey(rootPathFor(watched)) == pathToUtf8(target)) {
+        spdlog::warn("removeLocation refused: target is a scan root: {}", pathToUtf8(target));
         return false;
       }
     }
 
     const bool isDirectory = std::filesystem::is_directory(target, ec);
     if (ec) {
-      spdlog::error("removeLocation failed classifying '{}': {}", target.generic_string(), ec.message());
+      spdlog::error("removeLocation failed classifying '{}': {}", pathToUtf8(target), ec.message());
       return false;
     }
     if (isDirectory) {
@@ -1389,10 +1392,10 @@ public:
       std::filesystem::remove(target, ec);
     }
     if (ec) {
-      spdlog::error("removeLocation failed removing '{}': {}", target.generic_string(), ec.message());
+      spdlog::error("removeLocation failed removing '{}': {}", pathToUtf8(target), ec.message());
       return false;
     }
-    spdlog::info("removeLocation removed {} '{}'", isDirectory ? "folder" : "file", target.generic_string());
+    spdlog::info("removeLocation removed {} '{}'", isDirectory ? "folder" : "file", pathToUtf8(target));
 
     // 缓存与树更新串行于 scanMutex_（与 runScan/applyClassifierBatch 同一临界区）；
     // 未扫描过（无树）时磁盘已删，缓存由 watcher/周期对账兜底。
@@ -1405,11 +1408,11 @@ public:
     std::optional<std::filesystem::path> root;
     if (state) {
       std::scoped_lock stateLock{state->mutex};
-      const auto normalized = target.generic_string();
+      const auto normalized = pathToUtf8(target);
       std::size_t bestLength = 0;
       for (const auto& watched : watchedRoots) {
         const auto rootPath = rootPathFor(watched);
-        const auto rootText = rootPath.generic_string();
+        const auto rootText = pathToUtf8(rootPath);
         if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
           if (rootText.size() >= bestLength) {
             bestLength = rootText.size();
@@ -1420,20 +1423,20 @@ public:
     }
     if (!root) {
       spdlog::warn("removeLocation: '{}' is outside all watched roots; disk removed, cache untouched",
-                   target.generic_string());
+                   pathToUtf8(target));
       return true;
     }
 
     const auto rel = relativePathFor(*root, target);
     treeBuilder_->removeSubtree(rel);
-    const auto relText = rel.generic_string();
+    const auto relText = pathToUtf8(rel);
     std::erase_if(allSongs_, [&](const RootResult::PublishedSong& entry) {
-      const auto relative = entry.treeRelativePath.generic_string();
+      const auto relative = pathToUtf8(entry.treeRelativePath);
       return relative == relText || relative.rfind(relText + "/", 0) == 0;
     });
     try {
       cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
-      cache.deleteLocationsByPathPrefix(pathKey(*root), target.generic_string());
+      cache.deleteLocationsByPathPrefix(pathKey(*root), pathToUtf8(target));
     } catch (const std::exception& error) {
       spdlog::warn("removeLocation failed updating locations cache: {}", error.what());
     }
@@ -1475,7 +1478,7 @@ private:
       }
       std::vector<std::string> components;
       for (const auto& component : relative) {
-        components.push_back(component.generic_string());
+        components.push_back(pathToUtf8(component));
       }
       if (components.empty()) {
         continue;
@@ -1486,8 +1489,8 @@ private:
       }
       std::filesystem::path prefix;
       for (const auto& component : components) {
-        prefix /= component;
-        physicalRootByRelPrefix.emplace(prefix.lexically_normal().generic_string(), root);
+        prefix /= pathFromUtf8(component);
+        physicalRootByRelPrefix.emplace(pathToUtf8(prefix.lexically_normal()), root);
       }
     }
 
@@ -1517,10 +1520,10 @@ private:
           cursor = parentIterator->second;
         }
         for (auto iterator = names.rbegin(); iterator != names.rend(); ++iterator) {
-          relativePath /= *iterator;
+          relativePath /= pathFromUtf8(*iterator);
         }
       }
-      const auto relKey = relativePath.lexically_normal().generic_string();
+      const auto relKey = pathToUtf8(relativePath.lexically_normal());
       const auto rootIterator = physicalRootByRelPrefix.find(relKey);
       if (rootIterator == physicalRootByRelPrefix.end()) {
         continue;
@@ -1545,7 +1548,7 @@ private:
             const auto relativeDirectory = trackDirectory.lexically_relative(physicalDirectory);
             candidate.relativeDirectory = (relativeDirectory.empty() || relativeDirectory == std::filesystem::path{"."})
                                               ? std::string{}
-                                              : relativeDirectory.generic_string();
+                                              : pathToUtf8(relativeDirectory);
             candidate.thumbnailPath = child.song->thumbnailPath;
             candidates.push_back(std::move(candidate));
           } else if (child.kind == PlaylistNodeKind::Directory) {
@@ -1557,7 +1560,7 @@ private:
 
       const auto resolved = resolveFolderThumbnail(physicalDirectory, candidates, folderThumbnailSeam_);
       if (resolved.has_value()) {
-        node.thumbnailPath = resolved->generic_string();
+        node.thumbnailPath = pathToUtf8(*resolved);
       }
     }
   }
@@ -1724,7 +1727,7 @@ private:
             .detail = error.what(),
             .path = entry.path
           });
-          spdlog::warn("CUE sheet metadata read failed for {}: {}", entry.path.generic_string(), error.what());
+          spdlog::warn("CUE sheet metadata read failed for {}: {}", pathToUtf8(entry.path), error.what());
           failedCuePaths.insert(pathKey(entry.path));
           ++nodeCount;
         }
@@ -1817,7 +1820,7 @@ private:
             };
             
             const auto& trackRaw = tracks[trackIdx];
-            const auto contentHash = std::string{"cue:"} + entry.path.generic_string() + "#" + std::to_string(trackIdx);
+            const auto contentHash = std::string{"cue:"} + pathToUtf8(entry.path) + "#" + std::to_string(trackIdx);
             auto mapped = mapRawTagMetadata(trackRaw, contentHash, std::nullopt, false);
             
             mapped.metadata.sourceFilePath = trackRaw.filePath;
@@ -1826,7 +1829,7 @@ private:
                 std::chrono::microseconds(trackRaw.offset));
             mapped.metadata.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::microseconds(trackRaw.duration));
-            mapped.metadata.logicalTrackId = entry.path.generic_string() + "#track" + std::to_string(trackIdx);
+            mapped.metadata.logicalTrackId = pathToUtf8(entry.path) + "#track" + std::to_string(trackIdx);
             mapped.metadata.trackId = mapped.metadata.logicalTrackId;
             
 	            auto cachedSong = cachedSongFrom(std::move(mapped));
@@ -1861,7 +1864,7 @@ private:
             const auto cachedSong = scanRootCache.loadContent(cachedLocation->contentId);
             if (cachedSong.has_value()) {
               ++skipped;
-              spdlog::debug("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+              spdlog::debug("Cache hit for nodeIndex={}, filePath={}", currentDiscoveryIndex, pathToUtf8(entry.path));
               auto hydratedSong = *cachedSong;
               hydratedSong.embeddedLyrics = scanRootCache.loadLyrics(cachedLocation->locationId, "embedded");
               hydratedSong.externalLyrics = scanRootCache.loadLyrics(cachedLocation->locationId, "external");
@@ -1875,7 +1878,7 @@ private:
             }
           }
         } catch (const std::exception& error) {
-          spdlog::warn("failed to hydrate scanner cache hit for {}: {}", entry.path.generic_string(), error.what());
+          spdlog::warn("failed to hydrate scanner cache hit for {}: {}", pathToUtf8(entry.path), error.what());
         }
       }
       if (!shouldProcessViaWorker) {
@@ -1884,10 +1887,10 @@ private:
 	      const auto fileSize = fileSizeBytes(entry.path);
 	      const auto fileMtimeValue = fileMtime(entry.path);
 	      const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
-	      spdlog::trace("Preparing audio task: nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+	      spdlog::trace("Preparing audio task: nodeIndex={}, filePath={}", currentDiscoveryIndex, pathToUtf8(entry.path));
 	      auto audioTask = prepareAudioTask(entry.path, rootPath, result.errors, skipped, scanned);
       if (!audioTask.has_value()) {
-        spdlog::warn("prepareAudioTask returned nullopt for nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+        spdlog::warn("prepareAudioTask returned nullopt for nodeIndex={}, filePath={}", currentDiscoveryIndex, pathToUtf8(entry.path));
         continue;
       }
       audioTask->discoveryIndex = currentDiscoveryIndex;
@@ -1898,7 +1901,7 @@ private:
 	                                       .locationId = locationId,
 	                                       .cachedLocation = std::nullopt,
 	                                       .nodeIndex = currentDiscoveryIndex});
-      spdlog::trace("Queued worker task: nodeIndex={}, filePath={}", currentDiscoveryIndex, entry.path.generic_string());
+      spdlog::trace("Queued worker task: nodeIndex={}, filePath={}", currentDiscoveryIndex, pathToUtf8(entry.path));
     }
     phase2End = std::chrono::steady_clock::now();
 
@@ -1935,7 +1938,7 @@ private:
                                                                  indexedSongs[task.nodeIndex].filled.store(true);
                                                                } else {
                                                                  spdlog::debug("Worker callback: take() returned nullopt for task.filePath={}, nodeIndex={}",
-                                                                               task.filePath.generic_string(), task.nodeIndex);
+                                                                               pathToUtf8(task.filePath), task.nodeIndex);
                                                                }
                                                              } else {
                                                                spdlog::error("Worker callback: task.nodeIndex={} >= indexedSongs.size()={}", 
@@ -1981,7 +1984,7 @@ private:
           indexedSongs[nodeIdx].filled.store(true);
         } else {
           spdlog::debug("workerSongs->take() returned nullopt for cache-hit nodeIndex={}, filePath={}", 
-                        nodeIdx, workResult.filePath.generic_string());
+                        nodeIdx, pathToUtf8(workResult.filePath));
         }
       }
     }
@@ -1998,7 +2001,7 @@ private:
     for (auto& indexedSong : indexedSongs) {
       if (indexedSong.nodeType == NodeType::CueContainer) {
         indexedSong.song.metadata.filePath = indexedSong.treeRelativePath;
-        indexedSong.song.metadata.logicalTrackId = indexedSong.treeRelativePath.generic_string();
+        indexedSong.song.metadata.logicalTrackId = pathToUtf8(indexedSong.treeRelativePath);
         result.songs.push_back({.song = std::move(indexedSong.song),
                                 .treeRelativePath = std::move(indexedSong.treeRelativePath),
                                 .origin = indexedSong.origin,
@@ -2016,7 +2019,7 @@ private:
                      &indexedSong - &indexedSongs[0],
                      static_cast<int>(indexedSong.nodeType),
                      indexedSong.discoveryIndex,
-                     indexedSong.treeRelativePath.generic_string());
+                     pathToUtf8(indexedSong.treeRelativePath));
       }
     }
 	    if (unfilledCount > 0) {
@@ -2067,7 +2070,7 @@ private:
     const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(phase5End - phaseStart).count();
 
     spdlog::info("reconcileRoot phase timing for {}: total={}ms | discovery={}ms | task-prep={}ms | worker-wait={}ms | finalize={}ms | cache-save={}ms",
-                 rootPath.generic_string(), totalMs, phase1Ms, phase2Ms, phase3Ms, phase4Ms, phase5Ms);
+                 pathToUtf8(rootPath), totalMs, phase1Ms, phase2Ms, phase3Ms, phase4Ms, phase5Ms);
 
     return result;
   }
@@ -2137,7 +2140,7 @@ private:
 	                                            ScanItemOrigin workerOrigin,
 	                                            const std::shared_ptr<WorkerSongStore>& workerSongs) {
 	    spdlog::trace("readWorkerSong called: nodeIndex={}, filePath={}, hasCachedLocation={}", 
-	                 task.nodeIndex, task.filePath.generic_string(), task.cachedLocation.has_value());
+	                 task.nodeIndex, pathToUtf8(task.filePath), task.cachedLocation.has_value());
     const auto audioTask = audioTaskByPath(audioTasks, audioTaskIndexByPath, task.filePath);
     if (audioTask == nullptr) {
 	      throw std::runtime_error{"missing scanner worker task context"};
@@ -2162,8 +2165,8 @@ private:
         song.metadata.thumbnailPath->is_relative()) {
       song.metadata.thumbnailPath = std::filesystem::absolute(*song.metadata.thumbnailPath);
     }
-    song.metadata.trackId = task.filePath.generic_string();
-    song.metadata.logicalTrackId = task.filePath.generic_string();
+    song.metadata.trackId = pathToUtf8(task.filePath);
+    song.metadata.logicalTrackId = pathToUtf8(task.filePath);
 	    auto metadata = song.metadata;
 	    workerSongs->put(task.filePath,
 	                     WorkerSongPublication{.song = std::move(song),
@@ -2299,8 +2302,8 @@ private:
         song.metadata.thumbnailPath->is_relative()) {
       song.metadata.thumbnailPath = std::filesystem::absolute(*song.metadata.thumbnailPath);
     }
-    song.metadata.trackId = path.generic_string();
-    song.metadata.logicalTrackId = path.generic_string();
+    song.metadata.trackId = pathToUtf8(path);
+    song.metadata.logicalTrackId = pathToUtf8(path);
     return song;
   }
 
@@ -2318,13 +2321,13 @@ private:
       scanRoot->directoryTreeHash = *hash.hash;
       cache.updateScanRoot(*scanRoot);
     } catch (const std::exception& error) {
-      spdlog::warn("failed to refresh scan-root directory-tree hash for {}: {}", rootPath.generic_string(), error.what());
+      spdlog::warn("failed to refresh scan-root directory-tree hash for {}: {}", pathToUtf8(rootPath), error.what());
     }
   }
 
   void rewriteAllSongsForRename(const ClassifierRename& rename) {
-    const auto oldRelText = rename.oldRel.generic_string();
-    const auto newRelText = rename.newRel.generic_string();
+    const auto oldRelText = pathToUtf8(rename.oldRel);
+    const auto newRelText = pathToUtf8(rename.newRel);
     const auto oldAbsText = pathKey(rename.oldAbs);
     const auto newAbsText = pathKey(rename.newAbs);
     const auto rewrite = [&](const std::string& text) -> std::string {
@@ -2343,17 +2346,17 @@ private:
       return text;
     };
     for (auto& entry : allSongs_) {
-      const auto relative = entry.treeRelativePath.generic_string();
+      const auto relative = pathToUtf8(entry.treeRelativePath);
       if (relative != oldRelText && relative.rfind(oldRelText + "/", 0) != 0) {
         continue;
       }
-      entry.treeRelativePath = std::filesystem::path{rewrite(relative)};
+      entry.treeRelativePath = pathFromUtf8(rewrite(relative));
       auto& metadata = entry.song.metadata;
       if (!metadata.filePath.empty()) {
-        metadata.filePath = std::filesystem::path{rewrite(metadata.filePath.generic_string())};
+        metadata.filePath = pathFromUtf8(rewrite(pathToUtf8(metadata.filePath)));
       }
       if (!metadata.sourceFilePath.empty()) {
-        metadata.sourceFilePath = std::filesystem::path{rewrite(metadata.sourceFilePath.generic_string())};
+        metadata.sourceFilePath = pathFromUtf8(rewrite(pathToUtf8(metadata.sourceFilePath)));
       }
       metadata.logicalTrackId = rewrite(metadata.logicalTrackId);
       metadata.trackId = rewrite(metadata.trackId);
@@ -2402,10 +2405,10 @@ private:
     const auto findRootFor = [&roots](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
       std::optional<std::filesystem::path> best;
       std::size_t bestLength = 0;
-      const auto normalized = path.lexically_normal().generic_string();
+      const auto normalized = pathToUtf8(path.lexically_normal());
       for (const auto& root : roots) {
         const auto rootPath = rootPathFor(root);
-        const auto rootText = rootPath.generic_string();
+        const auto rootText = pathToUtf8(rootPath);
         if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
           if (rootText.size() >= bestLength) {
             bestLength = rootText.size();
@@ -2611,7 +2614,7 @@ private:
         }
         if (!treeBuilder_->renameSubtree(rename.oldRel, rename.newRel)) {
           spdlog::warn("classifier rename could not be applied to tree, falling back: {} -> {}",
-                       rename.oldRel.generic_string(), rename.newRel.generic_string());
+                       pathToUtf8(rename.oldRel), pathToUtf8(rename.newRel));
           return false;
         }
         rewriteAllSongsForRename(rename);
@@ -2619,9 +2622,9 @@ private:
         // 否则重 upsert 用改名前的旧路径判定隐藏，CUE 源音频被误插为幽灵可见曲目。
         cueSourcePaths = cueReferencedAudioPaths(allSongs_);
         cache.replaceLocationsBySubtree(pathKey(rename.root), pathKey(rename.oldAbs), pathKey(rename.newAbs));
-        const auto newRelText = rename.newRel.generic_string();
+        const auto newRelText = pathToUtf8(rename.newRel);
         for (const auto& entry : allSongs_) {
-          const auto relative = entry.treeRelativePath.generic_string();
+          const auto relative = pathToUtf8(entry.treeRelativePath);
           if (relative != newRelText && relative.rfind(newRelText + "/", 0) != 0) {
             continue;
           }
@@ -2635,9 +2638,9 @@ private:
       for (const auto& remove : removes) {
         treeBuilder_->removeSubtree(remove.rel);
         cache.deleteLocationsByPathPrefix(pathKey(remove.root), pathKey(remove.abs));
-        const auto relText = remove.rel.generic_string();
+        const auto relText = pathToUtf8(remove.rel);
         std::erase_if(allSongs_, [&](const RootResult::PublishedSong& entry) {
-          const auto relative = entry.treeRelativePath.generic_string();
+          const auto relative = pathToUtf8(entry.treeRelativePath);
           return relative == relText || relative.rfind(relText + "/", 0) == 0;
         });
         touchedRoots.insert(remove.root);

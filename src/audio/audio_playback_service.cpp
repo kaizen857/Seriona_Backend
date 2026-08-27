@@ -1,5 +1,6 @@
 #include "seriona/audio/audio_playback_service.h"
 
+#include "path_text.h"
 #include "thread_priority.h"
 
 #include "spdlog/spdlog.h"
@@ -311,7 +312,7 @@ private:
   }
 
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
-    spdlog::info("loading track '{}'", request.filePath.string());
+    spdlog::info("loading track '{}'", pathToUtf8(request.filePath));
     stopProgressWorker();
     stopDevice();
     device_.uninitialize();
