@@ -17,6 +17,7 @@
 
 ## 构建、运行与依赖
 - 配置并构建：`cmake -S . -B build -DSERIONA_BUILD_TESTS=ON && cmake --build build -j<N>`。
+- **Windows 构建工具链固定为 MSVC（Visual Studio 2022 x64 + Visual Studio 生成器，依赖经 vcpkg 提供），是 Windows 下唯一受支持的构建工具；禁止使用 MinGW/msys2 等其它工具链构建或验证本仓库**（ABI 与 Windows SDK 链接语义不同，会产出 MSVC 下不存在的构建路径与测试结果，例如 WASAPI 枚举缺 `ksuser` 链接、symlink/文件时间等权限行为差异）。命令行工具 `build/seriona` 的交互终端模式仅支持 Unix 类系统（Windows 上恒报 `interactive terminal input is required`，属预期，验证走前端应用或测试二进制）。
 - 运行：`build/seriona /path/to/music-root-or-file`；只接受一个已存在的文件或目录路径。
 - 配置要求 CMake 3.20+、C++23、`pkg-config` 可解析 FFmpeg 的 `libavformat libavcodec libavutil libavfilter libswresample` 与 `libxxhash`，CMake 可找到 `spdlog`、`SQLite3`。
 - 仅当 CMake 条件 `UNIX AND NOT APPLE` 成立时还要求 `pkg-config` 可解析 `sdbus-c++`；不要把该条件改写成“Linux”。

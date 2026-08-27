@@ -17,6 +17,13 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+  # 源码与注释为 UTF-8 无 BOM；MSVC 默认按系统 ANSI 代码页（如 GBK/936）解析，
+  # 中文注释的 UTF-8 字节可能被误解码为续行符而吞掉代码行（C4819 系列）。
+  # /utf-8 强制按 UTF-8 读取与输出，与 GCC/Clang 默认行为一致（Linux 不受影响）。
+  add_compile_options(/utf-8)
+endif()
+
 add_compile_definitions($<$<CONFIG:Release>:SERIONA_RELEASE_BUILD>)
 
 if(WIN32)
@@ -117,7 +124,7 @@ elseif(WIN32)
   target_sources(seriona_audio PRIVATE
     src/audio/device/windows_device_format_enumerator.cpp
   )
-  target_link_libraries(seriona_audio PRIVATE ole32)
+  target_link_libraries(seriona_audio PRIVATE ole32 ksuser)
 endif()
 
 get_target_property(SERIONA_AUDIO_LINK_LIBRARIES seriona_audio LINK_LIBRARIES)
