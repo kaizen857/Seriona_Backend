@@ -182,6 +182,30 @@
   `SerionaData\logs` 下的日志、explorer.exe 正浏览该目录），非代码问题；关闭后重跑
   `scripts\build-package-windows.ps1 -Force` 即可（staging 验证已全部通过）。
 
+### 4.3 增量扫描缓存水合读回窄转换（2026-08-28，第三轮）
+
+- **现象**：Windows 实机（本机 `D:\cloudmusic` 与另一台电脑 `C:\Users\Amadeus\Music`）二次扫描时
+  大量 `failed to hydrate scanner cache hit for <路径>: No mapping for the Unicode character
+  exists in the target multi-byte code page`；且部分非 ASCII 文件**不报错但路径被污染**
+  （播放日志 `loading track 'C:/Users/Amadeus/Music/Lube - 袛邪胁邪泄 蟹邪.mp3'` → ffmpeg
+  file not found——`袛邪胁邪泄 蟹邪` 正是 `Боевая машина` 的 UTF-8 字节被 GBK 解码的乱码）。
+- **根因**：`SQLiteCache::loadLocation`（缓存水合路径）内联 `const char* → std::string →
+  std::filesystem::path` **隐式窄构造**（MSVC 按 CP_ACP 解释 UTF-8 字节）：GBK 不可映射
+  字节抛 `ERROR_NO_UNICODE_TRANSLATION`（hydrate 失败、回退全量重扫）；GBK 恰好可映射
+  字节（中文/俄语）**静默产生乱码路径**（hydrate"成功"但后续播放/file 操作全部指向错误
+  文件）。而计划阶段 `loadLocationsByRoot` 已走 `readLocation`（`pathFromUtf8`），
+  **两个入口不一致**——第一轮修复只覆盖了后者。
+- **修复**：`readLocation` 改为裸 `sqlite3_stmt*` 单一实现（路径列 2/3/6/14/15/17 全部
+  `pathFromUtf8`），`Statement` 暴露 `raw()`，`loadLocation` 复用预编译 `locationStmt_`
+  调用 `readLocation`——统一解码、零重复、无 prepare 性能损失。
+- **回归测试**（新增「scanner incremental e2e hydrates non-ANSI UTF-8 paths from cache
+  without narrow conversion」）：日文目录/文件名（U+20BB7/U+9AD9）全量扫描 → 增量二次
+  扫描断言 `skipped=1`（缓存命中成功）且 reader 不重读——修复前该用例 skipped=0（抛
+  1113 回退重扫）。
+- **验证**：后端 `build-msvc2` **117/117**（e2e 二进制 27 用例）；`D:\cloudmusic` 实机
+  扫描 0 错误。已入库的缓存数据本身是 UTF-8（写入端 `pathText` 对称），**无需重建库**，
+  升级后重扫即恢复正确路径。
+
 ## 5. 文档与约束更新
 
 - `Seriona_Backend/AGENTS.md`「构建、运行与依赖」与根 `AGENTS.md`「跨仓库约定」已写入：
