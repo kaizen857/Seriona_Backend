@@ -106,6 +106,10 @@ public:
   void bindOptionalMilliseconds(const int index, const std::optional<std::chrono::milliseconds> value) { value.has_value() ? bind(index, value->count()) : bindNull(index); }
   void bindOptionalString(const int index, const std::optional<std::string>& value) { value.has_value() ? bind(index, *value) : bindNull(index); }
 
+  // 暴露底层语句：供行解码函数复用（如 readLocation），
+  // 调用方不得 finalize——所有权仍归本 Statement。
+  [[nodiscard]] sqlite3_stmt* raw() noexcept { return statement_; }
+
   [[nodiscard]] bool stepRow() {
     const auto result = sqlite3_step(statement_);
     if (result == SQLITE_ROW) {
@@ -137,30 +141,34 @@ private:
   sqlite3_stmt* statement_{};
 };
 
-[[nodiscard]] CachedLocation readLocation(Statement& row) {
+// 行解码统一入口：location 表的 22 列（0-21）。路径列（2,3,6,14,15,17）存
+// UTF-8 文本（写入端 pathText=pathToUtf8），读回必须经 pathFromUtf8 构造，
+// 不得走 const char* → std::string → path 的隐式窄构造（MSVC 按 CP_ACP 解释，
+// 非 ASCII 字符抛 ERROR_NO_UNICODE_TRANSLATION 或产生乱码路径）。
+[[nodiscard]] CachedLocation readLocation(sqlite3_stmt* stmt) {
   CachedLocation location{};
-  location.locationId = row.textColumn(0);
-  location.contentId = row.textColumn(1);
-  location.rootPath = pathFromUtf8(row.textColumn(2));
-  location.filePath = pathFromUtf8(row.textColumn(3));
-  location.fileSizeBytes = static_cast<std::uint64_t>(row.int64Column(4));
-  location.fileMtimeNs = row.int64Column(5);
-  location.sourceFilePath = pathFromUtf8(row.textColumn(6));
-  if (row.columnType(7) == SQLITE_INTEGER) { location.cueTrackOffset = std::chrono::milliseconds{row.int64Column(7)}; }
-  if (row.columnType(8) == SQLITE_INTEGER) { location.cueTrackIndex = static_cast<std::uint32_t>(row.int64Column(8)); }
-  if (row.columnType(9) == SQLITE_INTEGER) { location.cueTrackDuration = std::chrono::milliseconds{row.int64Column(9)}; }
-  if (row.columnType(10) == SQLITE_INTEGER) { location.cueFileSizeBytes = static_cast<std::uint64_t>(row.int64Column(10)); }
-  if (row.columnType(11) == SQLITE_INTEGER) { location.cueFileMtimeNs = row.int64Column(11); }
-  if (row.columnType(12) == SQLITE_INTEGER) { location.sourceFileSizeBytes = static_cast<std::uint64_t>(row.int64Column(12)); }
-  if (row.columnType(13) == SQLITE_INTEGER) { location.sourceFileMtimeNs = row.int64Column(13); }
-  if (row.columnType(14) == SQLITE_TEXT) { location.artworkPath = pathFromUtf8(row.textColumn(14)); }
-  if (row.columnType(15) == SQLITE_TEXT) { location.thumbnailPath = pathFromUtf8(row.textColumn(15)); }
-  location.lyricsSource = parseLyricsSource(row.textColumn(16));
-  if (row.columnType(17) == SQLITE_TEXT) { location.externalLrcPath = pathFromUtf8(row.textColumn(17)); }
-  if (row.columnType(18) == SQLITE_INTEGER) { location.externalLrcMtimeNs = row.int64Column(18); }
-  if (row.columnType(19) == SQLITE_TEXT) { location.externalLrcHash = row.textColumn(19); }
-  location.discoveredAt = msToSystemTime(row.int64Column(20));
-  location.scannedAt = msToSystemTime(row.int64Column(21));
+  location.locationId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+  location.contentId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+  location.rootPath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+  location.filePath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+  location.fileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
+  location.fileMtimeNs = sqlite3_column_int64(stmt, 5);
+  location.sourceFilePath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6)));
+  if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) { location.cueTrackOffset = std::chrono::milliseconds{sqlite3_column_int64(stmt, 7)}; }
+  if (sqlite3_column_type(stmt, 8) == SQLITE_INTEGER) { location.cueTrackIndex = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 8)); }
+  if (sqlite3_column_type(stmt, 9) == SQLITE_INTEGER) { location.cueTrackDuration = std::chrono::milliseconds{sqlite3_column_int64(stmt, 9)}; }
+  if (sqlite3_column_type(stmt, 10) == SQLITE_INTEGER) { location.cueFileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 10)); }
+  if (sqlite3_column_type(stmt, 11) == SQLITE_INTEGER) { location.cueFileMtimeNs = sqlite3_column_int64(stmt, 11); }
+  if (sqlite3_column_type(stmt, 12) == SQLITE_INTEGER) { location.sourceFileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 12)); }
+  if (sqlite3_column_type(stmt, 13) == SQLITE_INTEGER) { location.sourceFileMtimeNs = sqlite3_column_int64(stmt, 13); }
+  if (sqlite3_column_type(stmt, 14) == SQLITE_TEXT) { location.artworkPath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14))); }
+  if (sqlite3_column_type(stmt, 15) == SQLITE_TEXT) { location.thumbnailPath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 15))); }
+  location.lyricsSource = parseLyricsSource(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 16)));
+  if (sqlite3_column_type(stmt, 17) == SQLITE_TEXT) { location.externalLrcPath = pathFromUtf8(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 17))); }
+  if (sqlite3_column_type(stmt, 18) == SQLITE_INTEGER) { location.externalLrcMtimeNs = sqlite3_column_int64(stmt, 18); }
+  if (sqlite3_column_type(stmt, 19) == SQLITE_TEXT) { location.externalLrcHash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 19)); }
+  location.discoveredAt = msToSystemTime(sqlite3_column_int64(stmt, 20));
+  location.scannedAt = msToSystemTime(sqlite3_column_int64(stmt, 21));
   return location;
 }
 
@@ -399,54 +407,9 @@ std::optional<CachedLocation> SQLiteCache::loadLocation(const std::string& locat
     throw sqliteError(asDb(db_), "step location query");
   }
   
-  CachedLocation location{};
-  location.locationId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-  location.contentId = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-  location.rootPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-  location.filePath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-  location.fileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
-  location.fileMtimeNs = sqlite3_column_int64(stmt, 5);
-  location.sourceFilePath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-  if (sqlite3_column_type(stmt, 7) == SQLITE_INTEGER) {
-    location.cueTrackOffset = std::chrono::milliseconds{sqlite3_column_int64(stmt, 7)};
-  }
-  if (sqlite3_column_type(stmt, 8) == SQLITE_INTEGER) {
-    location.cueTrackIndex = static_cast<std::uint32_t>(sqlite3_column_int64(stmt, 8));
-  }
-  if (sqlite3_column_type(stmt, 9) == SQLITE_INTEGER) {
-    location.cueTrackDuration = std::chrono::milliseconds{sqlite3_column_int64(stmt, 9)};
-  }
-  if (sqlite3_column_type(stmt, 10) == SQLITE_INTEGER) {
-    location.cueFileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 10));
-  }
-  if (sqlite3_column_type(stmt, 11) == SQLITE_INTEGER) {
-    location.cueFileMtimeNs = sqlite3_column_int64(stmt, 11);
-  }
-  if (sqlite3_column_type(stmt, 12) == SQLITE_INTEGER) {
-    location.sourceFileSizeBytes = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 12));
-  }
-  if (sqlite3_column_type(stmt, 13) == SQLITE_INTEGER) {
-    location.sourceFileMtimeNs = sqlite3_column_int64(stmt, 13);
-  }
-  if (sqlite3_column_type(stmt, 14) == SQLITE_TEXT) {
-    location.artworkPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
-  }
-  if (sqlite3_column_type(stmt, 15) == SQLITE_TEXT) {
-    location.thumbnailPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 15));
-  }
-  location.lyricsSource = parseLyricsSource(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 16)));
-  if (sqlite3_column_type(stmt, 17) == SQLITE_TEXT) {
-    location.externalLrcPath = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 17));
-  }
-  if (sqlite3_column_type(stmt, 18) == SQLITE_INTEGER) {
-    location.externalLrcMtimeNs = sqlite3_column_int64(stmt, 18);
-  }
-  if (sqlite3_column_type(stmt, 19) == SQLITE_TEXT) {
-    location.externalLrcHash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 19));
-  }
-  location.discoveredAt = msToSystemTime(sqlite3_column_int64(stmt, 20));
-  location.scannedAt = msToSystemTime(sqlite3_column_int64(stmt, 21));
-  return location;
+  // 与 loadLocationsByRoot 共用 readLocation（路径列经 pathFromUtf8 读回，
+  // 与写入端 pathToUtf8 对称；禁止内联窄赋值，否则非 ASCII 路径抛 1113/乱码）。
+  return readLocation(stmt);
 }
 
 std::vector<CachedLocation> SQLiteCache::loadLocationsByRoot(const std::filesystem::path& rootPath) const {
@@ -463,7 +426,7 @@ std::vector<CachedLocation> SQLiteCache::loadLocationsByRoot(const std::filesyst
   select.bind(1, pathText(rootPath));
   std::vector<CachedLocation> locations;
   while (select.stepRow()) {
-    locations.push_back(readLocation(select));
+    locations.push_back(readLocation(select.raw()));
   }
   return locations;
 }

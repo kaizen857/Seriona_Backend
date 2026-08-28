@@ -1271,6 +1271,51 @@ TEST_CASE("scanner e2e resolves folder thumbnails for non-ANSI UTF-8 directory n
   CHECK(called[1] == folderSub);
 }
 
+TEST_CASE("scanner incremental e2e hydrates non-ANSI UTF-8 paths from cache without narrow conversion") {
+  // 回归保护：SQLiteCache::loadLocation 曾内联 `const char* → std::string → path`
+  // 隐式窄构造（MSVC 按 CP_ACP 解释 UTF-8 字节），与 loadLocationsByRoot 走
+  // readLocation（pathFromUtf8）不一致。非 ASCII 路径在增量扫描缓存水合时，
+  // GBK 不可映射字节抛 ERROR_NO_UNICODE_TRANSLATION（回退 worker 重扫），
+  // 可映射字节产生乱码路径（后续播放 file not found）。本用例断言第二次增量
+  // 扫描缓存命中成功（skipped=1、reader 不再读取），证明 loadLocation 读回
+  // 路径与文件系统路径逐字节一致。
+  test::TempScannerRoot temp{"scanner-incremental-hydrate-cjk"};
+  const auto folder = temp.path() / std::filesystem::path{std::u8string{u8"音楽𠮷-髙"}};
+  std::filesystem::create_directories(folder);
+  const auto audio = test::writeAudioFixture(
+      folder, std::string{reinterpret_cast<const char*>(u8"初音ミク-鏡音リン.flac")});
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(audio, rawMetadata("CJK Hydrate"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  const auto full = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full,
+                                   [](const PlaylistTreeSnapshot& snapshot) {
+                                     return songsIn(snapshot).size() == 1U;
+                                   });
+  REQUIRE(songsIn(full.snapshot).size() == 1U);
+  CHECK(reader->readCount() == 1U);
+  CHECK(songsIn(full.snapshot)[0].filePath == audio);
+
+  // 第二次增量扫描必须命中缓存：skipped=1、reader 不重读；若 loadLocation 仍做
+  // 窄转换，会抛 1113 并回退 worker 重扫（readCount 变 2、skipped 变 0）。
+  const auto incremental = runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental,
+                                          [](const PlaylistTreeSnapshot& snapshot) {
+                                            return songsIn(snapshot).size() == 1U;
+                                          });
+  const auto songs = songsIn(incremental.snapshot);
+  REQUIRE(songs.size() == 1U);
+  CHECK(reader->readCount() == 1U);
+  CHECK(songs[0].filePath == audio);
+
+  const auto progressEvents = eventLog.progressEvents();
+  REQUIRE_FALSE(progressEvents.empty());
+  CHECK(progressEvents.back().filesSkipped == 1U);
+  CHECK(progressEvents.back().filesScanned == 0U);
+}
+
 TEST_CASE("scanner e2e resolves folder thumbnails consistently after incremental scan") {
   test::TempScannerRoot temp{"scanner-folder-thumbnail-incremental"};
   const auto folderA = temp.path() / "A";
