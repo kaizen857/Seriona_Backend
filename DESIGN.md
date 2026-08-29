@@ -137,7 +137,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 main(argc=2, 路径存在)                       main.cpp
   └─ runTerminalController(musicPath)        terminal_controller.cpp
       ├─ TerminalMode 检查（非 tty 退出）
-      ├─ resolveRuntimePaths → ensureDirectoriesExist     SerionaData/{logs,library.sqlite,artwork}
+      ├─ resolveRuntimePaths → ensureDirectoriesExist     SerionaData/（便携）或 XDG 目录（安装模式）
       ├─ (Release) av_log_set_level(AV_LOG_QUIET)
       ├─ prepareLogFile(logs/) → 生成时间戳日志名 → logging::initialize(console=off, file, level)
       ├─ makeProductionMediaController({}, library.sqlite, artwork)
@@ -149,7 +149,10 @@ main(argc=2, 路径存在)                       main.cpp
       └─ Stop → controller.shutdown() → 退订 → spdlog::shutdown()
 ```
 
-运行时路径规则（`runtime_paths.cpp`）：可执行文件目录（Linux 经 `/proc/self/exe`）下的 `SerionaData/` 为 data root；日志实际文件为 `logs/seriona-<时间戳>.log`（`RuntimePaths.logFile` 中的 `seriona.log` 仅为逻辑位），数据库 `library.sqlite`，封面目录 `artwork`。
+运行时路径规则（`runtime_paths.cpp`）分两种构建模式（编译期宏 `SERIONA_INSTALLED_MODE` 选择，默认便携）：
+- 便携模式：可执行文件目录（Linux 经 `/proc/self/exe`）下的 `SerionaData/` 为 data root。
+- 安装模式（Linux 安装版，`cmake -DSERIONA_INSTALLED_MODE=ON`）：遵循 XDG Base Directory，应用 ID 为 `org.kaizen857.Seriona`——数据 `$XDG_DATA_HOME/org.kaizen857.Seriona`、日志 `$XDG_STATE_HOME/org.kaizen857.Seriona/logs`、封面缓存 `$XDG_CACHE_HOME/org.kaizen857.Seriona/artwork`；`XDG_*` 未设置时回退 `$HOME` 默认值，相对路径忽略（规范要求）。
+- 两种模式下布局一致：日志实际文件为 `logs/seriona-<时间戳>.log`（`RuntimePaths.logFile` 中的 `seriona.log` 仅为逻辑位），数据库 `library.sqlite`，封面目录 `artwork`；`resolvePortableRuntimePaths`/`resolveInstalledRuntimePaths` 均无条件编译，`resolveRuntimePaths` 依宏选择，测试直接以环境变量注入覆盖 installed 分支。
 
 ## 7. 核心运行流程
 

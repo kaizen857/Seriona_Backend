@@ -7,6 +7,7 @@ include(FetchContent)
 option(SERIONA_BUILD_APP "Build Seriona standalone app" ON)
 option(SERIONA_BUILD_TESTS "Build Seriona tests" ON)
 option(SERIONA_BUILD_TOOLS "Build optional Seriona tools" OFF)
+option(SERIONA_INSTALLED_MODE "Resolve runtime paths via XDG Base Directory (installed layout)" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
 option(SERIONA_METADATA_SIMULATE_MISSING_SDBUS "Simulate missing metadata sdbus-c++ dependency" OFF)
@@ -344,6 +345,17 @@ add_library(SerionaBackend::metadata ALIAS seriona_metadata)
 
 if(SERIONA_BUILD_APP)
   add_subdirectory(app)
+endif()
+
+if(SERIONA_INSTALLED_MODE)
+  # 仅施加于生产目标（seriona_app 静态库与 seriona 可执行文件），测试目标不携带：
+  # 测试依赖 resolveRuntimePaths 的便携行为，installed 分支由测试直接调用
+  # resolveInstalledRuntimePaths() + 环境变量注入覆盖。
+  # seriona 可执行文件在 SERIONA_BUILD_APP=OFF（前端嵌入）时不存在，需 TARGET 保护。
+  target_compile_definitions(seriona_app PRIVATE SERIONA_INSTALLED_MODE=1)
+  if(TARGET seriona)
+    target_compile_definitions(seriona PRIVATE SERIONA_INSTALLED_MODE=1)
+  endif()
 endif()
 
 if(SERIONA_BUILD_TESTS)
