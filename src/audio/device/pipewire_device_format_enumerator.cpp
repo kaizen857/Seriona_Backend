@@ -292,20 +292,12 @@ void coreDone(void* data, std::uint32_t id, int seq) {
   }
 }
 
-// core 事件表：字段按 struct pw_core_events 声明顺序全部列出
-// （version, info, done, ping, error, remove_id, bound_id, add_mem,
-// remove_mem, bound_props），避免部分初始化告警。
+// core 事件表：只列用到的字段（designated init，未列字段自动为空）。
+// 注意：pw_core_events 随版本扩展（0.3.61 起含 bound_props 等），positional
+// 全列会因版本字段数不同而编译失败（ubuntu 22.04 为 0.3.48，仅 9 个字段）。
 const struct pw_core_events kCoreEvents = {
-    PW_VERSION_CORE_EVENTS,
-    nullptr,
-    coreDone,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
-    nullptr,
+    .version = PW_VERSION_CORE_EVENTS,
+    .done = coreDone,
 };
 
 const struct pw_registry_events kRegistryEvents = {
