@@ -81,9 +81,10 @@ flowchart TD
     Hub --> Audio["🎧 seriona_audio (FFmpeg 解码 / miniaudio 输出 / AVX2 波形)"]
     Hub --> Scanner["📁 seriona_scanner (Merkle 增量扫描 / SQLite v3 / Watcher)"]
     Hub --> Metadata["🏷️ seriona_metadata (TagReader 适配 / Linux MPRIS)"]
+    App["📦 seriona_app (运行时路径 / 应用日志 / 设置存储)"] --> Hub
 ```
 
-对外统一通过 `inc/seriona/` 下的纯 C++ 抽象头文件交互，绝不向上层泄漏底层 FFmpeg、SQLite 或 D-Bus 实现细节。
+对外统一通过 `inc/seriona/` 下的纯 C++ 抽象头文件交互，绝不向上层泄漏底层 FFmpeg、SQLite 或 D-Bus 实现细节。运行时路径支持便携（`exeDir/SerionaData`）与安装版（XDG Base Directory）双模式，按构建开关自动选择。
 
 ---
 

@@ -5,8 +5,8 @@
 - 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于完整项目文档 `README.md`（2026-08 public 准备时重写）与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
 - 仓库无 CI、格式化配置和 `CMakePresets.json`；`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
-- 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。已跟踪的 `src/thumbnail/`、`inc/seriona/thumbnail/` 未被任何 CMake 目标包含，禁止接入生产；Qt 类型（`QImage`/`QImageReader`）只出现在 `src/thumbnail/*.cpp` 实现里，`inc/seriona/thumbnail/` 头文件本身是纯 C++。
-- 根目录两个跟踪文件非源码：`detailed-scanner-perf-report.txt`（生成的性能报告产物）与 `FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），均只作背景材料；根目录 `docs/` 是已跟踪的历史分析/方案文档（watcher 修复方案、性能研究等），同样只作背景材料，不是事实来源。
+- 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。
+- 根目录跟踪文件非源码：`FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），只作背景材料；根目录 `docs/` 是已跟踪的历史分析/方案文档（watcher 修复方案、性能研究等），同样只作背景材料，不是事实来源。
 
 ## DESIGN.md 维护规范
 - `DESIGN.md` 是描述项目长期稳定设计的架构文档，不是开发日志、变更记录或实现细节文档；应保持稳定，避免随开发逐渐演变为实现文档或变更日志。
@@ -47,7 +47,7 @@
 - doctest 测试二进制必须恰有一个 `main`；多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，少数自带普通入口，禁止重复定义。
 - cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 240s，`seriona.control_artwork_resolver` 超时 60s，`seriona.scanner.wtr_integration` 超时 180s。
 - `seriona_scanner_cache_tests`、`seriona_scanner_cache_content_tests`、v2→v3 migration、backup rollback、phase1 integration 目标在 `tests/CMakeLists.txt` 中禁用，不要假设可运行或已有迁移。
-- `tests/control/shuffle_playback_tests.cpp` 未接入任何 CMake/CTest 目标（孤儿测试源）；`scanner_song_identity_tests.cpp` 无独立目标，song identity 用例经 `seriona.scanner.song_identity`（`seriona_scanner_hash_tests --test-case="scanner song identity*"`）运行；`seriona.scanner.cue_parsing` 与 `seriona.scanner.folder_thumbnail` 是各自独立目标。
+- `scanner_song_identity_tests.cpp` 无独立目标，song identity 用例经 `seriona.scanner.song_identity`（`seriona_scanner_hash_tests --test-case="scanner song identity*"`）运行；`seriona.scanner.cue_parsing` 与 `seriona.scanner.folder_thumbnail` 是各自独立目标。
 - `seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test` 只构建不注册 CTest，直接运行 `build/tests/<target>`；`seriona.audio_fixture`、`seriona.scanner.cache.perf` 已注册。
 - `-DSERIONA_BUILD_TOOLS=ON` 才加入 `seriona_scanner_cold_perf`、`seriona_miniaudio_platform_probe` 和 `seriona_watch_root_move_audit`；只有 `seriona_miniaudio_platform_probe` 是 `EXCLUDE_FROM_ALL`（用 `cmake --build build --target seriona_miniaudio_platform_probe` 显式构建），`seriona_watch_root_move_audit` 随默认 `all` 目标构建、链接 `seriona_scanner` 且 include 路径伸入 `src/` 私有头 `file_scanner_service_internal.h`（审计“目录移出监视根”场景）。
 - `SERIONA_SCANNER_SIMULATE_MISSING_SQLITE`、`SERIONA_SCANNER_SIMULATE_MISSING_XXHASH`、`SERIONA_METADATA_SIMULATE_MISSING_SDBUS` 会故意令配置失败；第三项仅在 `UNIX AND NOT APPLE` 分支生效，正常构建不要开启。
