@@ -258,7 +258,7 @@ enum class ExternalLyricsCacheAction {
                                                    const std::uint64_t totalFiles,
                                                    const std::chrono::milliseconds scanDuration) {
   return {.rootPath = rootPath,
-          .directoryTreeHash = decision.directoryTreeHash.value_or({}),
+          .directoryTreeHash = decision.directoryTreeHash.value_or(std::string{}),
           .totalFiles = totalFiles,
           .lastScanMode = decision.mode,
           .lastScanDuration = scanDuration,
