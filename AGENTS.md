@@ -32,7 +32,7 @@
 - 前端应用设置的公共契约在 `inc/seriona/control/app_settings_store.h`：`AppSettingsStore`（`set`/`get`/`remove`/`listByGroup`，value 为不透明字符串，前端负责 QVariant ↔ 字符串编解码）+ `makeSQLiteAppSettingsStore` 工厂，编入 `seriona_control`，与 FolderSortSettingsStore 同库不同表、实现须线程安全。
 - 对外契约以 `inc/seriona/` 为边界：audio 看 `audio_contracts.h`，scanner 稳定入口只看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，跨模块编排走 control；`inc/` 中的 TagReader adapter、SQLite cache 等实现导向头不属稳定边界，新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus 或 Windows 类型。
 - 公共契约错误风格：typed enum（`MediaControllerErrorCode`、`ScannerErrorCode` 等）+ result struct（`MediaControllerCommandResult`、`ScannerTaskResult` 等），异常（`std::runtime_error`/`std::invalid_argument`）只从实现抛出；公共头不声明 `throw`、不用 `std::expected`。
-- `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging` 与 `setLogLevel`（运行时日志等级），入口公共 API 还包括 `runtime_paths.h`。
+- `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging` 与 `setLogLevel`（运行时日志等级），入口公共 API 还包括 `runtime_paths.h`：提供 `RuntimePaths`（dataRoot/logFile/databasePath/artworkDir，`ensureDirectoriesExist()`）与 `resolveRuntimePaths` 双模式——编译定义 `SERIONA_INSTALLED_MODE` 时走 XDG（`resolveInstalledRuntimePaths`），否则便携模式（exeDir/SerionaData，`resolvePortableRuntimePaths` 在 Linux 经 `/proc/self/exe` 解析，否则回退传入的 executablePath（绝对路径时），再回退 `current_path()`）。
 - 部分 `inc/seriona/` 头（`scan_scheduler.h`、`song_identity.h`）与 `src/audio/audio_player.cpp` 的实现只被测试目标直接编译，未进任何静态库：生产代码调用这些符号会在最终链接报 undefined reference；`AudioPlayer` 类本质是测试专用封装，生产走 `makeAudioPlaybackService`。
 
 ## 不可破坏的约束
