@@ -1229,6 +1229,7 @@ target_link_libraries(seriona_terminal_controller_tests PRIVATE
   seriona_third_party_headers
   seriona_control
   spdlog::spdlog
+  PkgConfig::SERIONA_FFMPEG
 )
 
 if(TARGET seriona_metadata_mpris_tests)
