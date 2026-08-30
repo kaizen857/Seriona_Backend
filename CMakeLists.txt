@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 include(FetchContent)
 
 option(SERIONA_BUILD_APP "Build Seriona standalone app" ON)
@@ -11,6 +13,7 @@ option(SERIONA_INSTALLED_MODE "Resolve runtime paths via XDG Base Directory (ins
 option(SERIONA_SCANNER_SIMULATE_MISSING_SQLITE "Simulate missing scanner SQLite3 dependency" OFF)
 option(SERIONA_SCANNER_SIMULATE_MISSING_XXHASH "Simulate missing scanner libxxhash dependency" OFF)
 option(SERIONA_METADATA_SIMULATE_MISSING_SDBUS "Simulate missing metadata sdbus-c++ dependency" OFF)
+option(SERIONA_INSTALL_EXPORT "Install and export SerionaBackend CMake package (CI build-chain reuse)" OFF)
 set(SERIONA_TAGREADER_SOURCE_DIR "" CACHE PATH "Path to the TagReader source directory")
 set(SERIONA_TAGREADER_BINARY_DIR "")
 
@@ -23,6 +26,14 @@ if(MSVC)
   # 中文注释的 UTF-8 字节可能被误解码为续行符而吞掉代码行（C4819 系列）。
   # /utf-8 强制按 UTF-8 读取与输出，与 GCC/Clang 默认行为一致（Linux 不受影响）。
   add_compile_options(/utf-8)
+endif()
+
+# Release 优化基线（三仓库统一方案）：编译选项由 CMake 默认 Release
+# （GCC -O3 -DNDEBUG / MSVC /O2 /DNDEBUG）+ CMakePresets.json 的
+# CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE（GCC -flto / MSVC /GL+/LTCG）提供；
+# 指令集显式 x86-64 基线（替代 -march=native，保证产物可跨机器分发）。
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-march=x86-64)
 endif()
 
 add_compile_definitions($<$<CONFIG:Release>:SERIONA_RELEASE_BUILD>)
@@ -99,6 +110,7 @@ endif()
 target_include_directories(seriona_audio
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(seriona_audio
@@ -164,7 +176,18 @@ if(UNIX AND NOT APPLE)
   pkg_check_modules(SERIONA_SDBUS_CPP REQUIRED IMPORTED_TARGET sdbus-c++)
 endif()
 
-if(NOT TARGET TagReaderCore)
+# 优先复用已安装的 TagReaderCore（CI 顺序链：TagReader 先独立构建+全量测试并
+# install 到共享前缀，后端 find_package 命中后不再重复编译）；未命中走源码嵌入链。
+find_package(TagReaderCore CONFIG QUIET)
+set(SERIONA_TAGREADER_INCLUDE_DIR "")
+if(TARGET TagReaderCore::TagReaderCore)
+  message(STATUS "Seriona backend: reusing installed TagReaderCore via find_package")
+  set(SERIONA_TAGREADER_TARGET TagReaderCore::TagReaderCore)
+  # IMPORTED target 的 INTERFACE_INCLUDE_DIRECTORIES 经静态库递归传播到
+  # 间接链接方（测试）不可靠，scanner 直接公开该目录最稳（BUILD_INTERFACE
+  # 在 install(EXPORT) 时剥离，不影响导出）。
+  get_target_property(SERIONA_TAGREADER_INCLUDE_DIR TagReaderCore::TagReaderCore INTERFACE_INCLUDE_DIRECTORIES)
+elseif(NOT TARGET TagReaderCore)
   if(SERIONA_TAGREADER_SOURCE_DIR STREQUAL "")
     set(SERIONA_TAGREADER_CANDIDATES
       "../TagReader"
@@ -214,6 +237,10 @@ if(NOT TARGET TagReaderCore)
   set(BUILD_TESTING ${SERIONA_BUILD_TESTING_BEFORE_TAGREADER} CACHE BOOL "Build tests" FORCE)
   unset(SERIONA_BUILD_TESTING_BEFORE_TAGREADER)
   set_property(DIRECTORY "${SERIONA_TAGREADER_BINARY_DIR}/test" PROPERTY TESTS "")
+  set(SERIONA_TAGREADER_TARGET TagReaderCore)
+else()
+  # 已有 TagReaderCore 目标（嵌入链提前构建），沿用
+  set(SERIONA_TAGREADER_TARGET TagReaderCore)
 endif()
 
 add_library(seriona_scanner STATIC
@@ -276,6 +303,8 @@ endif()
 target_include_directories(seriona_scanner
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    $<BUILD_INTERFACE:${SERIONA_TAGREADER_INCLUDE_DIR}>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
@@ -283,6 +312,7 @@ target_include_directories(seriona_scanner
 target_include_directories(seriona_metadata
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/src/metadata
@@ -291,6 +321,7 @@ target_include_directories(seriona_metadata
 target_include_directories(seriona_app
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
@@ -302,6 +333,7 @@ target_link_libraries(seriona_app PRIVATE
 target_include_directories(seriona_control
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/inc>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE
     ${PROJECT_SOURCE_DIR}/src
 )
@@ -310,11 +342,12 @@ target_link_libraries(seriona_scanner
   PUBLIC
     SQLite3::SQLite3
     PkgConfig::SERIONA_XXHASH
-    TagReaderCore
+    ${SERIONA_TAGREADER_TARGET}
     BS::thread_pool
     seriona_watcher_headers
     spdlog::spdlog
 )
+
 
 target_link_libraries(seriona_control
   PRIVATE
@@ -366,4 +399,66 @@ endif()
 
 if(SERIONA_BUILD_TOOLS)
   add_subdirectory(tools)
+endif()
+
+# ---------------------------------------------------------------------------
+# 安装导出（CI 顺序链复用：Seriona 前端 find_package(SerionaBackend) 命中后不再
+# add_subdirectory 后端；仅独立构建时启用 SERIONA_INSTALL_EXPORT=ON，
+# 前端嵌入（add_subdirectory）时默认 OFF，不生成导出规则）
+# ---------------------------------------------------------------------------
+if(SERIONA_INSTALL_EXPORT)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  # 头库补 INSTALL_INTERFACE（install(EXPORT) 不允许导出构建机源码绝对路径）
+  target_include_directories(seriona_third_party_headers INTERFACE
+    $<INSTALL_INTERFACE:include/third_party/doctest>
+    $<INSTALL_INTERFACE:include/third_party/miniaudio>
+  )
+  target_include_directories(seriona_watcher_headers INTERFACE
+    $<INSTALL_INTERFACE:include/third_party/watcher>
+  )
+  target_include_directories(BS_thread_pool SYSTEM INTERFACE
+    $<INSTALL_INTERFACE:include/third_party/thread_pool>
+  )
+
+  install(TARGETS seriona_audio seriona_scanner seriona_metadata seriona_app seriona_control
+          seriona_third_party_headers seriona_watcher_headers BS_thread_pool
+    EXPORT SerionaBackendTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+
+  install(DIRECTORY inc/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(DIRECTORY third_party/doctest third_party/miniaudio
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party)
+  install(DIRECTORY third_party/watcher/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/watcher)
+  install(DIRECTORY "${thread_pool_SOURCE_DIR}/include/"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/thread_pool)
+
+  install(EXPORT SerionaBackendTargets
+    FILE SerionaBackendTargets.cmake
+    NAMESPACE SerionaBackend::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SerionaBackend
+  )
+
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/SerionaBackendConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+  )
+
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SerionaBackendConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/SerionaBackendConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SerionaBackend
+  )
+
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/SerionaBackendConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/SerionaBackendConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SerionaBackend
+  )
 endif()

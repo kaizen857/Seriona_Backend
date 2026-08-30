@@ -1,3 +1,10 @@
+# TagReader 公共头（find_package 模式）：IMPORTED target 的 include 经
+# seriona_scanner 静态库递归传播到测试 target 不可靠（CMake 4.x 行为），
+# 这里目录级全局补充；add_subdirectory 模式该变量为空，跳过。
+if(SERIONA_TAGREADER_INCLUDE_DIR)
+  include_directories(SYSTEM "${SERIONA_TAGREADER_INCLUDE_DIR}")
+endif()
+
 add_executable(seriona_tests main.cpp)
 add_executable(seriona_audio_contract_tests
   audio/audio_contract_tests.cpp
@@ -1363,12 +1370,12 @@ target_link_libraries(seriona_scanner_cache_perf_tests PRIVATE
 #   PkgConfig::SERIONA_XXHASH
 # )
 target_link_libraries(seriona_scanner_tagreader_tests PRIVATE
-  TagReaderCore
+  ${SERIONA_TAGREADER_TARGET}
   spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_tagreader_concurrency_stress_tests PRIVATE
   seriona_scanner
-  TagReaderCore
+  ${SERIONA_TAGREADER_TARGET}
   spdlog::spdlog
 )
 target_link_libraries(seriona_scanner_paths_tests PRIVATE
@@ -1405,7 +1412,7 @@ target_link_libraries(seriona_scanner_scan_mode_decision_tests PRIVATE
   seriona_watcher_headers
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
-  TagReaderCore
+  ${SERIONA_TAGREADER_TARGET}
   BS::thread_pool
   spdlog::spdlog
 )
@@ -1413,7 +1420,7 @@ target_link_libraries(seriona_scanner_incremental_plan_tests PRIVATE
   seriona_watcher_headers
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
-  TagReaderCore
+  ${SERIONA_TAGREADER_TARGET}
   BS::thread_pool
   spdlog::spdlog
 )

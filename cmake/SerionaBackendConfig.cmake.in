@@ -1,0 +1,28 @@
+@PACKAGE_INIT@
+
+# SerionaBackend 消费方配置：重建后端库构建时的外部依赖 target
+#（pkg-config 的 SERIONA_*、SQLite3、spdlog、TagReaderCore），
+# 导出文件（SerionaBackendTargets.cmake）里的接口/链接引用才会可解析。
+include(CMakeFindDependencyMacro)
+
+find_dependency(PkgConfig)
+pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
+  libavformat
+  libavcodec
+  libavutil
+  libavfilter
+  libswresample
+)
+pkg_check_modules(SERIONA_XXHASH REQUIRED IMPORTED_TARGET libxxhash)
+find_dependency(SQLite3)
+find_dependency(spdlog)
+find_dependency(TagReaderCore CONFIG)
+
+# 平台分支依赖：与构建时条件一致（UNIX AND NOT APPLE 才需要 pipewire/sdbus）
+if(UNIX AND NOT APPLE)
+  pkg_check_modules(SERIONA_PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+  pkg_check_modules(SERIONA_SDBUS_CPP REQUIRED IMPORTED_TARGET sdbus-c++)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SerionaBackendTargets.cmake")
+check_required_components(SerionaBackend)
