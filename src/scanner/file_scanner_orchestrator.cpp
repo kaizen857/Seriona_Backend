@@ -2400,6 +2400,7 @@ private:
     std::unordered_map<std::string, ClassifierUpsert> upsertByKey;
     std::unordered_map<std::string, ClassifierDestroy> destroyByKey;
     std::unordered_map<std::string, std::filesystem::path> moveSelfByRaw;
+    std::unordered_set<std::string> createdInBatch;
     bool unclassifiable = false;
 
     const auto findRootFor = [&roots](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
@@ -2463,6 +2464,9 @@ private:
             unclassifiable = true;
             return;
           }
+          if (event.effectKind == WatchEffectKind::Created) {
+            createdInBatch.insert(pathKey(event.path));
+          }
           upsertByKey[pathKey(event.path)] = ClassifierUpsert{.root = {},
                                                               .raw = event.path,
                                                               .abs = {},
@@ -2501,13 +2505,33 @@ private:
       return false;
     }
 
+    // upsert 的判定统一以磁盘当前状态为准，而不是只看事件类型 —— macOS 的
+    // FSEvents 与 Linux inotify 在这里差异很大：
+    //   - 删除：FSEvents 会在 destroyed 之后再补一个 modified（文件已不存在）；
+    //   - 移出被监视目录：FSEvents 只给一个 modified，完全没有 destroyed。
+    // 只要 upsert 的路径已不存在，就不可能真的 upsert，按删除处理才是对的。
     for (auto iterator = upsertByKey.begin(); iterator != upsertByKey.end();) {
-      if (destroyByKey.contains(iterator->first)) {
+      std::error_code existsError;
+      if (std::filesystem::exists(iterator->second.raw, existsError) && !existsError) {
+        // 路径仍在：净效果是 upsert（先删后建也归此类），撤掉同批的 destroy。
         destroyByKey.erase(iterator->first);
-        iterator = upsertByKey.erase(iterator);
-      } else {
         ++iterator;
+        continue;
       }
+
+      const auto key = iterator->first;
+      const auto raw = iterator->second.raw;
+      const auto createdHere = createdInBatch.contains(key);
+      iterator = upsertByKey.erase(iterator);
+
+      if (createdHere) {
+        // 批内建了又没了（如 TagReader 的封面导出探针文件），净效果为零。
+        // 不能留下 destroy：那会让一个从未进过缓存的路径触发整根回落重扫。
+        destroyByKey.erase(key);
+        continue;
+      }
+
+      destroyByKey.try_emplace(key, ClassifierDestroy{.raw = raw, .pathKind = WatchPathKind::File});
     }
 
     for (const auto& [key, raw] : moveSelfByRaw) {
