@@ -433,7 +433,12 @@ MetadataSyncResult LinuxMprisAdapter::start(const PlatformMediaState& state) {
     currentState_ = state;
   }
   if (!bus_) {
-    bus_ = std::make_unique<SdbusMprisBus>();
+    try {
+      bus_ = std::make_unique<SdbusMprisBus>();
+    } catch (const sdbus::Error& error) {
+      spdlog::warn("MPRIS unavailable (no session DBus): {}", error.what());
+      return makeFailureResult("metadata.backend.mpris_no_session_bus", "no session DBus available");
+    }
   }
   if (!object_) {
     object_ = bus_->createObject(kMprisObjectPath);
