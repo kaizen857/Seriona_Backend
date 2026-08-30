@@ -80,6 +80,15 @@ target_include_directories(seriona_watcher_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/watcher/include>
 )
 
+if(APPLE)
+  # watcher 在 macOS 下走 FSEvents（Linux inotify / Windows ReadDirectoryChangesW
+  # 无需额外库），CFArrayCreate/FSEventStreamCreate 等符号来自这两个框架。
+  target_link_libraries(seriona_watcher_headers INTERFACE
+    "-framework CoreFoundation"
+    "-framework CoreServices"
+  )
+endif()
+
 add_library(seriona_audio STATIC
   src/audio/audio_playback_service.cpp
   src/audio/buffer/pcm_buffer_queue.cpp
