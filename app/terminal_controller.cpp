@@ -234,11 +234,20 @@ int runTerminalControllerSession(const std::filesystem::path& musicPath,
     return 1;
   }
   spdlog::info("media controller started");
-  printControls(output);
+  {
+    // 订阅已注册，通知投递线程随时可能往同一个 output 写（renderStatus
+    // 内部拿的就是这把锁），主线程这里必须同步，否则两边并发写入会
+    // 在缓冲区重分配时造成 use-after-free。
+    std::scoped_lock outputLock{outputMutex};
+    printControls(output);
+  }
   const auto scanResult = controller.scanLibrary({scanner::ScannerRoot{.path = musicPath, .recursive = true}}, scanner::ScanMode::Full);
   if (!scanResult.accepted) {
     spdlog::warn("library scan rejected: {}", scanResult.message);
-    error << "\nseriona: failed to scan library: " << scanResult.message << '\n';
+    {
+      std::scoped_lock outputLock{outputMutex};
+      error << "\nseriona: failed to scan library: " << scanResult.message << '\n';
+    }
     spdlog::info("seriona shutting down");
     controller.shutdown();
     unsubscribeAll();
@@ -274,6 +283,7 @@ int runTerminalControllerSession(const std::filesystem::path& musicPath,
         }
       }
     } else {
+      std::scoped_lock outputLock{outputMutex};
       error << "\nseriona: terminal keyboard control is not implemented on this platform\n";
     }
   } catch (const std::exception& e) {
@@ -288,7 +298,10 @@ int runTerminalControllerSession(const std::filesystem::path& musicPath,
   controller.shutdown();
   spdlog::info("seriona shutting down");
   unsubscribeAll();
-  output << "\nseriona: stopped\n";
+  {
+    std::scoped_lock outputLock{outputMutex};
+    output << "\nseriona: stopped\n";
+  }
   return 0;
 }
 
