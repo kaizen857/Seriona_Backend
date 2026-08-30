@@ -1,6 +1,8 @@
 #include "waveform_internal.h"
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#endif
 
 #include <array>
 #include <cstddef>
@@ -10,6 +12,8 @@
 #include <type_traits>
 
 namespace seriona::audio::detail {
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 
 namespace {
 
@@ -241,5 +245,15 @@ WaveformKernelResult computeAvx2WaveformKernel(const WaveformKernelInput& input)
 
   throw kernelInputError("unknown sample format");
 }
+
+
+#else // 非 x86 架构（如 arm64）：AVX2 内核不可用，回落 scalar 实现。
+      // 运行期 supportsAvx2() 已返回 false，此定义仅用于满足链接期符号引用。
+
+WaveformKernelResult computeAvx2WaveformKernel(const WaveformKernelInput& input) {
+  return computeScalarWaveformKernel(input);
+}
+
+#endif
 
 }

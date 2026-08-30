@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include <xxhash.h>
 
@@ -48,12 +49,15 @@ constexpr std::uint64_t kSongIdentitySeed = 0U;
   return output;
 }
 
-[[nodiscard]] std::string toStableText(std::uint64_t value) {
-  return std::to_string(value);
-}
-
-[[nodiscard]] std::string toStableText(std::filesystem::file_time_type::rep value) {
-  return std::to_string(value);
+// macOS/libc++ 下 file_time_type::rep 为 __int128，与 std::uint64_t 重载互相
+// 二义（且 std::to_string 无 __int128 重载），统一收敛为单个模板。
+template <typename T>
+[[nodiscard]] std::string toStableText(T value) {
+  if constexpr (std::is_unsigned_v<T>) {
+    return std::to_string(static_cast<unsigned long long>(value));
+  } else {
+    return std::to_string(static_cast<long long>(value));
+  }
 }
 
 [[nodiscard]] std::string hashTextParts(std::initializer_list<std::string_view> parts) {
