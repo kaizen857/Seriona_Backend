@@ -165,7 +165,11 @@ TEST_CASE("linux mpris production object is visible on the session bus") {
   REQUIRE(start.accepted);
 
   try {
-    auto proxy = sdbus::createProxy(sdbus::ServiceName{seriona::metadata::detail::kMprisBusName},
+    // 必须显式走 session 总线：MPRIS 对象就导出在 session 总线上，而不带连接的
+    // createProxy 重载用的是 createBusConnection()（sd_bus_open，默认总线）。在 CI
+    // 容器里以 root 运行时它会去连不存在的系统总线，报 Failed to open bus。
+    auto proxy = sdbus::createProxy(sdbus::createSessionBusConnection(),
+                                    sdbus::ServiceName{seriona::metadata::detail::kMprisBusName},
                                     sdbus::ObjectPath{seriona::metadata::detail::kMprisObjectPath},
                                     sdbus::dont_run_event_loop_thread);
     std::string introspectionXml;
