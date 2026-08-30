@@ -6,9 +6,20 @@
 
 #include <filesystem>
 #include <fstream>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 using namespace seriona::scanner;
 using namespace seriona::scanner::test;
+
+namespace {
+#if defined(_WIN32)
+constexpr bool isRootUser = false;
+#else
+const bool isRootUser = ::geteuid() == 0;
+#endif
+}
 
 TEST_CASE("CUE error isolation: single bad CUE with good CUE and audio") {
   TempScannerRoot temp{"cue_error_isolation_bad_good"};
@@ -60,7 +71,7 @@ TEST_CASE("CUE error isolation: single bad CUE with good CUE and audio") {
 }
 
 #if !defined(_WIN32)
-TEST_CASE("CUE error isolation: unreadable CUE file records error") {
+TEST_CASE("CUE error isolation: unreadable CUE file records error" * doctest::skip(isRootUser)) {
   TempScannerRoot temp{"test"};
   
   const auto cuePath = temp.path() / "unreadable.cue";
@@ -230,7 +241,7 @@ TEST_CASE("CUE error isolation: exception during parsing does not crash") {
   CHECK(audioCount >= 1);
 }
 
-TEST_CASE("CUE error isolation: error details are structured") {
+TEST_CASE("CUE error isolation: error details are structured" * doctest::skip(isRootUser)) {
   TempScannerRoot temp{"test"};
   
   const auto cuePath = temp.path() / "fail.cue";
