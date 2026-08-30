@@ -3,7 +3,7 @@
 ## 边界与事实来源
 - 当前目录即仓库根；不要向上扫描 Seriona。`build/`、`build-*/`、`.omo/` 是生成或工作目录，不是源码。
 - 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于完整项目文档 `README.md`（2026-08 public 准备时重写）与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
-- 仓库无 CI、格式化配置和 `CMakePresets.json`；`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
+- 仓库无 CI 和格式化配置；`CMakePresets.json` 提供 `release` 预设（输出 `build/release`，`CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON` 与 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`）。`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
 - 这是独立 C++23 后端；生产代码不得引入 Qt/QML/UI，平台媒体集成留在 metadata 私有实现。
 - 根目录跟踪文件非源码：`FILE_SCANNER_ANALYSIS.md`（旧项目历史分析，同工作区根 `docs/` 性质），只作背景材料；根目录 `docs/` 是已跟踪的历史分析/方案文档（watcher 修复方案、性能研究等），同样只作背景材料，不是事实来源。
@@ -21,7 +21,9 @@
 - 运行：`build/seriona /path/to/music-root-or-file`；只接受一个已存在的文件或目录路径。
 - 配置要求 CMake 3.20+、C++23、`pkg-config` 可解析 FFmpeg 的 `libavformat libavcodec libavutil libavfilter libswresample` 与 `libxxhash`，CMake 可找到 `spdlog`、`SQLite3`。
 - 仅当 CMake 条件 `UNIX AND NOT APPLE` 成立时还要求 `pkg-config` 可解析 `sdbus-c++`；不要把该条件改写成“Linux”。
-- 若无现成 `TagReaderCore`，依次使用 `-DSERIONA_TAGREADER_SOURCE_DIR=<path>`、相邻 `../TagReader`，否则 FetchContent 拉取 `https://github.com/kaizen857/TagReader.git` 的 `main`；vendored 的 TagReader 以 `EXCLUDE_FROM_ALL` 加入且其测试目标被剥离，ctest 里不会有 TagReader 测试。
+- TagReader 依赖：优先 `find_package(TagReaderCore CONFIG QUIET)`（CI 顺序链复用已安装产物）；未命中时依次使用 `-DSERIONA_TAGREADER_SOURCE_DIR=<path>`、相邻 `../TagReader`，否则 FetchContent 拉取 `https://github.com/kaizen857/TagReader.git` 的 `main`；vendored 的 TagReader 以 `EXCLUDE_FROM_ALL` 加入且其测试目标被剥离，ctest 里不会有 TagReader 测试。
+- `SERIONA_INSTALL_EXPORT=ON`（默认 OFF，前端嵌入时不受影响）：独立构建时安装导出 5 库 + 3 头库 + BS_thread_pool，生成 `SerionaBackendConfig`（模板 `cmake/SerionaBackendConfig.cmake.in`，`find_dependency` 重建 FFMPEG/XXHASH/PIPEWIRE/SDBUS/SQLite3/spdlog/TagReaderCore），供 CI 顺序链 `find_package(SerionaBackend)` 复用。
+- Release 优化三仓库统一：LTO 由 `release` preset 提供，GNU/Clang 下 `-march=x86-64` 基线（替代 `-march=native`，产物可跨机器分发）；警告级别经 `seriona_enable_warnings()`（GNU/Clang `-Wall -Wextra -Wpedantic`，MSVC `/W4 /permissive-`），全仓无 `-Werror`。
 - `SERIONA_BUILD_APP`、`SERIONA_BUILD_TESTS`、`SERIONA_BUILD_TOOLS` 默认分别为 ON、ON、OFF；线程池 FetchContent 固定 `bshoshany/thread-pool` v4.1.0。
 
 ## 入口与模块边界
@@ -40,6 +42,7 @@
 - scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底。
 - 音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture；不要依赖真实硬件、版权媒体或仓库媒体样本。
 - `seriona_audio` 必须 PRIVATE 链接 `BS::thread_pool`，根 CMake 有 FATAL_ERROR 守卫；AVX2/FMA 参数仅允许施加于 `src/audio/waveform_simd_avx2.cpp`。
+- 路径文本必须经 `src/scanner/path_utf8.h` 的 `pathToUtf8`/`pathFromUtf8` 往返（`src/audio/path_text.h` 同规则），禁止直接 `std::filesystem::path::string()/generic_string()` 进路径通道（Windows 按 ANSI 代码页转换，非 ASCII 路径抛异常或乱码；约束注释另见 sqlite_cache.cpp、logging.h、sqlite_folder_sort_settings_store.cpp）。
 
 ## 测试与工具
 - 发现：`ctest --test-dir build -N`；全量：`ctest --test-dir build --output-on-failure`；聚焦：`ctest --test-dir build -R '<regex>' --output-on-failure`。
