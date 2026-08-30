@@ -1609,9 +1609,12 @@ struct defer_dm_rm_wd {
       auto wd = ke.rm_wd_buf[i];
       auto p_at = ke.wd_to_p.find(wd);
       if (p_at != ke.wd_to_p.end()) {
-        ke.wd_to_p.erase(p_at);
+        //  先用 p_at->second 查 p_to_wd，再擦除 wd_to_p。
+        //  原先先 erase(p_at) 会销毁该节点，随后的 p_at->second 即悬垂引用
+        //  （ASan：heap-use-after-free）。
         auto wd_at = ke.p_to_wd.find(p_at->second);
         if (wd_at != ke.p_to_wd.end()) ke.p_to_wd.erase(wd_at);
+        ke.wd_to_p.erase(p_at);
       }
     }
   };
