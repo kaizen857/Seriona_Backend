@@ -202,6 +202,22 @@ void waitForLyrics(const FileScannerService& service, LyricsSource source, std::
   }));
 }
 
+// 等待回落重扫真正开始，而不是固定 sleep：慢机器（CI runner）上 30ms 常常
+// 不够，断言会在重扫启动前就跑完。
+void waitForScanStartedCount(const std::vector<ScannerEvent>& events, std::mutex& mutex, std::size_t expected) {
+  for (auto attempt = 0; attempt != 200; ++attempt) {
+    {
+      std::scoped_lock lock{mutex};
+      if (scanStartedCount(events) >= expected) {
+        return;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for fallback rescan to start");
+}
+
+
 [[nodiscard]] WatchEvent fileEvent(std::filesystem::path path, WatchEffectKind effect) {
   return WatchEvent{.path = std::move(path), .pathKind = WatchPathKind::File, .effectKind = effect, .associated = {}};
 }
@@ -1057,11 +1073,7 @@ TEST_CASE("scanner watcher falls back to rescan when move-self path still exists
   // 目录仍存在于磁盘（歧义：可能是移出后被同名目录顶替）→ 无法精准判定 → 回落全根重扫。
   watchers->states[0]->callback(directorySelfEvent(music));
   waitForSnapshotSongCount(*service, 1U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{30});
-  {
-    std::scoped_lock lock{eventsMutex};
-    CHECK(scanStartedCount(events) >= 2U);
-  }
+  waitForScanStartedCount(events, eventsMutex, 2U);
   const auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].filePath == track);
