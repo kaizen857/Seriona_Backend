@@ -32,7 +32,8 @@ endif()
 # （GCC -O3 -DNDEBUG / MSVC /O2 /DNDEBUG）+ CMakePresets.json 的
 # CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE（GCC -flto / MSVC /GL+/LTCG）提供；
 # 指令集显式 x86-64 基线（替代 -march=native，保证产物可跨机器分发）。
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   add_compile_options(-march=x86-64)
 endif()
 
@@ -103,7 +104,8 @@ add_library(seriona_audio STATIC
 
 if(MSVC)
   set_source_files_properties(src/audio/waveform_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"
+       AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   set_source_files_properties(src/audio/waveform_simd_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 
