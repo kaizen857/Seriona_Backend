@@ -68,7 +68,14 @@ void ControlEventLoop::drainForTests() {
     }
 
     for (auto& task : work) {
-      task();
+      // 与 workerMain 保持一致：任务抛出的异常不得越过事件循环边界。
+      // inline 模式（测试）原先裸调 task()，异常会逃逸到调用方；调用方若处于
+      // noexcept 上下文即 std::terminate（macOS CI 上表现为 SIGABRT）。
+      try {
+        task();
+      } catch (...) {
+        discardUnhandledException(std::current_exception());
+      }
     }
   }
 }
