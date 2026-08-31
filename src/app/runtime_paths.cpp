@@ -106,7 +106,8 @@ RuntimePaths resolveInstalledRuntimePaths() {
 #endif
 }
 
-RuntimePaths resolveRuntimePaths(const std::filesystem::path& executablePath) {
+//  installed 模式下不看可执行文件位置，故参数可能未使用
+RuntimePaths resolveRuntimePaths([[maybe_unused]] const std::filesystem::path& executablePath) {
 #ifdef SERIONA_INSTALLED_MODE
   return resolveInstalledRuntimePaths();
 #else
