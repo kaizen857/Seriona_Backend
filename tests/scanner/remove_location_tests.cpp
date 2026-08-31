@@ -60,11 +60,11 @@ struct ScanState {
     if (event.type != ScannerEventType::ScanCompleted) {
       return;
     }
-    if (const auto* snap = std::get_if<PlaylistTreeSnapshot>(&event.payload)) {
-      snapshot = *snap;
-    }
     {
       std::lock_guard lock{mutex};
+      if (const auto* snap = std::get_if<PlaylistTreeSnapshot>(&event.payload)) {
+        snapshot = *snap;  //  与等待侧同一把锁，避免快照被无同步写入
+      }
       completed.store(true);
     }
     cv.notify_all();
@@ -112,6 +112,23 @@ struct ServiceFixture {
         .reconcileInterval = std::chrono::milliseconds{60000}});
     service->setEventSink([this](const ScannerEvent& event) { scanState.onEvent(event); });
   }
+
+  ~ServiceFixture() {
+    //  service 声明在 scanState 之前，析构逆序会先销毁 scanState，
+    //  而此时去抖线程可能仍在往事件回调里投递快照，写的是已释放内存
+    //  （ASan：heap-use-after-free，Linux 上表现为偶发 munmap_chunk 崩溃）。
+    //  故先停服务、再摘掉回调，之后成员析构才是安全的。
+    if (service) {
+      service->stopWatching();
+      service->stop();
+      service->setEventSink(nullptr);
+    }
+  }
+
+  ServiceFixture(const ServiceFixture&) = delete;
+  ServiceFixture& operator=(const ServiceFixture&) = delete;
+  ServiceFixture(ServiceFixture&&) = delete;
+  ServiceFixture& operator=(ServiceFixture&&) = delete;
 
   void putSong(const fs::path& relative, std::string title) {
     const auto absolute = root / relative;
