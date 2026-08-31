@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <string_view>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <pwd.h>
 #include <unistd.h>
 #endif
@@ -32,6 +32,18 @@ std::filesystem::path resolveExecutableDir(const std::filesystem::path& executab
   return std::filesystem::current_path();
 }
 
+std::filesystem::path homeDirectory() {
+  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
+    return std::filesystem::path{home};
+  }
+#if defined(__linux__) || defined(__APPLE__)
+  if (const auto* pw = getpwuid(getuid()); pw != nullptr && pw->pw_dir != nullptr) {
+    return std::filesystem::path{pw->pw_dir};
+  }
+#endif
+  return std::filesystem::current_path();
+}
+
 std::filesystem::path xdgBase(const char* envName, const char* fallbackSuffix) {
   if (const char* value = std::getenv(envName); value != nullptr && *value != '\0') {
     std::filesystem::path candidate{value};
@@ -40,20 +52,7 @@ std::filesystem::path xdgBase(const char* envName, const char* fallbackSuffix) {
     }
   }
 
-  std::filesystem::path homeBase;
-  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-    homeBase = std::filesystem::path{home};
-  } else {
-#ifdef __linux__
-    if (const auto* pw = getpwuid(getuid()); pw != nullptr && pw->pw_dir != nullptr) {
-      homeBase = std::filesystem::path{pw->pw_dir};
-    }
-#endif
-    if (homeBase.empty()) {
-      homeBase = std::filesystem::current_path();
-    }
-  }
-  return homeBase / fallbackSuffix;
+  return homeDirectory() / fallbackSuffix;
 }
 
 }  // namespace
@@ -77,6 +76,20 @@ RuntimePaths resolvePortableRuntimePaths(const std::filesystem::path& executable
 }
 
 RuntimePaths resolveInstalledRuntimePaths() {
+#if defined(__APPLE__)
+  //  macOS 不用 XDG，走系统约定的 ~/Library。更要紧的是：.app bundle 绝不能
+  //  被写入 —— 向 bundle 内写文件会破坏代码签名的封印，带 quarantine 的分发产物
+  //  会直接被 Gatekeeper SIGKILL；/Applications 下通常也不可写。
+  const auto home = homeDirectory();
+  const auto dataRoot = home / "Library" / "Application Support" / kInstalledAppId;
+
+  return {
+      dataRoot,
+      home / "Library" / "Logs" / kInstalledAppId / "seriona.log",
+      dataRoot / "library.sqlite",
+      home / "Library" / "Caches" / kInstalledAppId / "artwork",
+  };
+#else
   const auto dataRoot = xdgBase("XDG_DATA_HOME", ".local/share") / kInstalledAppId;
   const auto stateRoot = xdgBase("XDG_STATE_HOME", ".local/state") / kInstalledAppId;
   const auto cacheRoot = xdgBase("XDG_CACHE_HOME", ".cache") / kInstalledAppId;
@@ -87,6 +100,7 @@ RuntimePaths resolveInstalledRuntimePaths() {
       dataRoot / "library.sqlite",
       cacheRoot / "artwork",
   };
+#endif
 }
 
 RuntimePaths resolveRuntimePaths(const std::filesystem::path& executablePath) {

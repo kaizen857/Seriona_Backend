@@ -118,6 +118,37 @@ TEST_CASE("RuntimePaths fallback for empty/relative path uses current_path") {
   (void)expectedDataRoot;
 }
 
+#if defined(__APPLE__)
+
+TEST_CASE("Installed paths on macOS live under ~/Library, never inside the bundle") {
+  ScopedEnvVar home("HOME");
+
+  const auto homeDir = uniqueTestRoot() / "home";
+  setEnv("HOME", homeDir.string().c_str());
+
+  const auto paths = resolveInstalledRuntimePaths();
+  //  写进 .app 内部会破坏代码签名封印，带 quarantine 的产物会被 Gatekeeper 直接 SIGKILL
+  CHECK(paths.dataRoot == homeDir / "Library/Application Support/org.kaizen857.Seriona");
+  CHECK(paths.logFile == homeDir / "Library/Logs/org.kaizen857.Seriona" / "seriona.log");
+  CHECK(paths.databasePath ==
+        homeDir / "Library/Application Support/org.kaizen857.Seriona" / "library.sqlite");
+  CHECK(paths.artworkDir == homeDir / "Library/Caches/org.kaizen857.Seriona" / "artwork");
+}
+
+TEST_CASE("Installed paths on macOS ignore XDG overrides") {
+  ScopedEnvVar data("XDG_DATA_HOME");
+  ScopedEnvVar home("HOME");
+
+  const auto homeDir = uniqueTestRoot() / "home";
+  setEnv("HOME", homeDir.string().c_str());
+  setEnv("XDG_DATA_HOME", (uniqueTestRoot() / "xdg").string().c_str());
+
+  const auto paths = resolveInstalledRuntimePaths();
+  CHECK(paths.dataRoot == homeDir / "Library/Application Support/org.kaizen857.Seriona");
+}
+
+#else
+
 TEST_CASE("Installed paths honor explicit XDG dirs") {
   ScopedEnvVar data("XDG_DATA_HOME");
   ScopedEnvVar state("XDG_STATE_HOME");
@@ -175,6 +206,8 @@ TEST_CASE("Installed paths ignore relative XDG values") {
   CHECK(paths.databasePath == homeDir / ".local/share/org.kaizen857.Seriona" / "library.sqlite");
   CHECK(paths.artworkDir == homeDir / ".cache/org.kaizen857.Seriona" / "artwork");
 }
+
+#endif  // __APPLE__
 
 TEST_CASE("RuntimePaths ensureDirectoriesExist does not crash") {
   const auto root = uniqueTestRoot();
