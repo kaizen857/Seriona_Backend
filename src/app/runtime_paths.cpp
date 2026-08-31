@@ -44,6 +44,8 @@ std::filesystem::path homeDirectory() {
   return std::filesystem::current_path();
 }
 
+#if !defined(__APPLE__)
+//  macOS 走 ~/Library，不使用 XDG；此处按平台裁掉，避免 -Wunused-function
 std::filesystem::path xdgBase(const char* envName, const char* fallbackSuffix) {
   if (const char* value = std::getenv(envName); value != nullptr && *value != '\0') {
     std::filesystem::path candidate{value};
@@ -54,6 +56,7 @@ std::filesystem::path xdgBase(const char* envName, const char* fallbackSuffix) {
 
   return homeDirectory() / fallbackSuffix;
 }
+#endif  // !__APPLE__
 
 }  // namespace
 
