@@ -2,6 +2,8 @@
 
 ## 边界与事实来源
 - 当前目录即仓库根；不要向上扫描 Seriona。`build/`、`build-*/`、`.omo/` 是生成或工作目录，不是源码。
+- 本仓库后续所有更改必须且只能提交到 `develop` 分支；禁止直接在 `main` 分支提交。修改、暂存或提交前运行 `git status --short --branch` 确认当前分支为 `develop`。
+- `main` 只作为稳定基线或同步来源；推送 `develop`、创建合并请求或合并回 `main` 必须由用户明确要求。
 - 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于完整项目文档 `README.md`（2026-08 public 准备时重写）与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
 - 仓库无 CI 和格式化配置；`CMakePresets.json` 提供 `release` 预设（输出 `build/release`，`CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON` 与 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`）。`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
