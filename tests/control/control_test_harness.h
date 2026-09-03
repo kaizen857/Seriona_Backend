@@ -62,6 +62,7 @@ class FakeAudioPlaybackService final : public audio::AudioPlaybackService {
 public:
   void setEventSink(audio::BackendEventSink sink) override;
   void configureOutput(const audio::AudioOutputConfig& config) override;
+  void configureTransition(const audio::TransitionConfig& config) override;
   void loadTrack(const audio::TrackPlaybackRequest& request) override;
   void prepareNext(const audio::TrackPlaybackRequest& request) override;
   void play() override;
@@ -77,6 +78,7 @@ public:
 
   [[nodiscard]] std::size_t setEventSinkCalls() const noexcept;
   [[nodiscard]] std::size_t configureOutputCalls() const noexcept;
+  [[nodiscard]] std::size_t configureTransitionCalls() const noexcept;
   [[nodiscard]] std::size_t loadTrackCalls() const noexcept;
   [[nodiscard]] std::size_t prepareNextCalls() const noexcept;
   [[nodiscard]] std::size_t playCalls() const noexcept;
@@ -90,6 +92,7 @@ public:
   [[nodiscard]] std::size_t emitEventCalls() const noexcept;
 
   [[nodiscard]] const std::optional<audio::AudioOutputConfig>& lastConfiguredOutput() const noexcept;
+  [[nodiscard]] const std::optional<audio::TransitionConfig>& lastConfiguredTransition() const noexcept;
   [[nodiscard]] const std::optional<audio::TrackPlaybackRequest>& lastLoadedTrack() const noexcept;
   [[nodiscard]] const std::optional<audio::TrackPlaybackRequest>& lastPreparedTrack() const noexcept;
   [[nodiscard]] const std::optional<std::chrono::milliseconds>& lastSeekPosition() const noexcept;
@@ -113,6 +116,7 @@ private:
   audio::PlaybackClockSnapshot clock_{};
   std::size_t setEventSinkCalls_{0};
   std::size_t configureOutputCalls_{0};
+  std::size_t configureTransitionCalls_{0};
   std::size_t loadTrackCalls_{0};
   std::size_t prepareNextCalls_{0};
   std::size_t playCalls_{0};
@@ -125,6 +129,7 @@ private:
   std::size_t selectOutputDeviceCalls_{0};
   std::size_t emitEventCalls_{0};
   std::optional<audio::AudioOutputConfig> lastConfiguredOutput_{};
+  std::optional<audio::TransitionConfig> lastConfiguredTransition_{};
   std::optional<audio::TrackPlaybackRequest> lastLoadedTrack_{};
   std::optional<audio::TrackPlaybackRequest> lastPreparedTrack_{};
   std::optional<std::chrono::milliseconds> lastSeekPosition_{};

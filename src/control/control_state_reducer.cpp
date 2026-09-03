@@ -252,6 +252,21 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   return intent;
 }
 
+[[nodiscard]] ControlIntent makeSetTransitionConfigIntent(const audio::TransitionConfig& config) {
+  auto intent = makeIntent(ControlIntentKind::SetTransitionConfig);
+  intent.transitionConfig = config;
+  return intent;
+}
+
+// 过渡参数数值域（用户裁定表；与前端任务 2/12 校验完全一致）：
+// 交叉长度 0-10000ms；传送/seek/手动短交叉 0-3000ms；预加载 0-5000ms。
+// 0 = 时长 0 = 该淡变即时完成（等效关闭），不做下界钳制。
+[[nodiscard]] bool inTransitionRange(std::chrono::milliseconds value, std::chrono::milliseconds max) {
+  return value.count() >= 0 && value <= max;
+}
+
+[[nodiscard]] bool validTransitionMode(int mode) { return mode >= 0 && mode <= 2; }
+
 [[nodiscard]] ControlDomainNotification makeNotification(ControlDomainNotificationKind kind, std::string message) {
   ControlDomainNotification notification{};
   notification.kind = kind;
@@ -578,6 +593,8 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   }
   case MediaControlCommandKind::ConfigureOutput:
     return handleConfigureOutput(reduction, command);
+  case MediaControlCommandKind::SetTransitionConfig:
+    return handleSetTransitionConfig(reduction, command);
   case MediaControlCommandKind::DeleteTrack:
   case MediaControlCommandKind::DeleteFolder:
     // 删除涉及文件系统与 scanner 缓存，必须经 MediaController（service 层）执行；
@@ -641,6 +658,39 @@ ControlReduction ControlStateReducer::handleConfigureOutput(ControlReduction& re
   case PlaybackStatus::Error:
     break;
   }
+  return reduction;
+}
+
+ControlReduction ControlStateReducer::handleSetTransitionConfig(ControlReduction& reduction, const MediaControlCommand& command) {
+  if (!command.transitionConfig.has_value()) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig requires a transition config");
+  }
+  const auto& config = *command.transitionConfig;
+  if (!validTransitionMode(static_cast<int>(config.autoAdvanceFadeMode))) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig auto advance fade mode is out of range (0-2)");
+  }
+  if (!validTransitionMode(static_cast<int>(config.manualAdvanceFadeMode))) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig manual advance fade mode is out of range (0-2)");
+  }
+  if (!inTransitionRange(config.crossfadeMs, std::chrono::milliseconds{10000})) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig crossfade length is out of range (0-10000 ms)");
+  }
+  if (!inTransitionRange(config.transportFadeMs, std::chrono::milliseconds{3000})) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig transport fade length is out of range (0-3000 ms)");
+  }
+  if (!inTransitionRange(config.seekFadeMs, std::chrono::milliseconds{3000})) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig seek fade length is out of range (0-3000 ms)");
+  }
+  if (!inTransitionRange(config.manualShortCrossfadeMs, std::chrono::milliseconds{3000})) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig manual short crossfade length is out of range (0-3000 ms)");
+  }
+  if (!inTransitionRange(config.gaplessPreloadMs, std::chrono::milliseconds{5000})) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetTransitionConfig gapless preload lead is out of range (0-5000 ms)");
+  }
+
+  // 与 ConfigureOutput 语义隔离：仅生成单意图转发配置，不触发任何重载
+  // （无 LoadTrack/Seek/Play 尾意图）、不改播放快照。
+  reduction.intents.push_back(makeSetTransitionConfigIntent(config));
   return reduction;
 }
 

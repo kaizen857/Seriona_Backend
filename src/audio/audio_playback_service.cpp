@@ -12,6 +12,7 @@
 #include "seriona/audio/ffmpeg_audio_source.h"
 #include "seriona/audio/ffmpeg_filter_pipeline.h"
 #include "seriona/audio/playback_state_machine.h"
+#include "transition/gain_envelope.h"
 
 #include <algorithm>
 #include <atomic>
@@ -34,6 +35,11 @@ namespace seriona::audio {
 namespace {
 
 constexpr auto kProgressPublishInterval = std::chrono::milliseconds{100};
+
+// T6 归零判定阈值：包络读回为回调块末写回（粒度 ≈ 1/淡出帧数，块恰好止于轨迹终点
+// 时读回 1/duration≈0，其后一块读回精确 0.0）；阈值 0.02 吸收该粒度且远小于淡出中段
+// 增益——finishing ticker 仅在单程下行期间使用它，增益单调下降无假阳性。
+constexpr float kFadeCompleteGainEpsilon = 0.02F;
 
 std::uint32_t bytesPerSample(AudioSampleFormat format) {
   switch (format) {
@@ -214,6 +220,12 @@ public:
     enqueueCommand([this, config] { config_ = config; });
   }
 
+  // 过渡参数：worker 命令仅存配置，零重载/零设备操作/零事件（区别于 configureOutput
+  // 的整轨重载语义）；消费在过渡引擎任务（T5/T11）接线。
+  void configureTransition(const TransitionConfig& config) override {
+    enqueueCommand([this, config] { transitionConfig_ = config; });
+  }
+
   void loadTrack(const TrackPlaybackRequest& request) override {
     enqueueCommand([this, request] { loadTrackOnWorker(request); });
   }
@@ -277,6 +289,10 @@ public:
   }
 
 private:
+  // T6 物理收尾动作（仅 audio worker 线程访问；finishingAction_ != None = 收尾中）。
+  // 嵌套类型须先于类内成员函数体声明（类内作用域自声明点起可见）。
+  enum class FinishingAction { None, PauseFreeze, StopCleanup };
+
   // worker 线程内的枚举：先取播放后端（miniaudio）设备列表，再用平台
   // 原生枚举器（PipeWire/WASAPI）的能力数据覆盖格式/采样率列表。
   std::vector<AudioDeviceFormat> enumeratePlaybackDevicesOnWorker() {
@@ -326,6 +342,9 @@ private:
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     spdlog::info("loading track '{}'", pathToUtf8(request.filePath));
     stopProgressWorker();
+    // T6：新曲命令到达 = 任何在途收尾/淡入握手作废（stopDevice 会复位包络轨迹）。
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
     // T7（D4）：uninitialize/协商/initialize 不再无条件执行——Mixed 同参数切歌在
     // canReuseOutputDevice 短路后跳过整段，仅重建 source/pipeline/queue。此处仍先
     // stopDevice：切歌到达时旧曲可能仍在播放（手动切歌路径），保持既有"切歌即
@@ -531,7 +550,17 @@ private:
       return;
     }
 
+    // T6：淡出收尾在途时的 play = "暂停中再播放"——中止物理收尾监督（不再于归零后停
+    // 设备），设备保持运行；随后发布的 0→1 淡入由执行器在在途淡出结束后自动受理
+    // （T5 账本：在途轨迹期间竞争发布被推迟，起点恒取回调 currentGain，连续无跳变）。
+    const bool wasFinishing = abortFinishingForRestart();
+
     clock_.resume();
+    // 冷启动淡入握手：先即时落 0.0（设备已停、包络已被 stop 复位到 1.0；0→1 轨迹须先
+    // 经即时 0 把回调 currentGain 落到 0，否则执行器从 1.0 起跑 = 无淡入效果——T5-B2 前置）。
+    if (transportFadeEnabled() && !wasFinishing) {
+      armTransportFadeIn();
+    }
     if (!device_.start()) {
       spdlog::error("play failed: device start returned false");
       clock_.pause();
@@ -541,17 +570,40 @@ private:
 
     stateMachine_.play();
     startProgressWorker();
+    if (wasFinishing) {
+      if (transportFadeEnabled()) {
+        publishTransportFadeIn();
+      } else {
+        // fade 在淡出在途时被禁用（configureTransition 任意态合法）：收尾监督已中止、
+        // 在途 1→0 轨迹仍会在回调里走完，若无后续发布增益将停在 0（逻辑 Playing 但
+        // 永久静音）→ 即时发布回满增益。执行器受理：在途轨迹结束后当前块直落 target
+        // （duration==0 跳变 = "无淡入"语义，一次电平阶跃，非平滑回升——正确）。
+        publishMasterEnvelope(1.0F, std::chrono::milliseconds{0});
+      }
+    }
     publishPosition();
   }
 
   void pauseOnWorker() {
     spdlog::info("pause");
-    stopProgressWorker();
-    stopDevice();
-    updateClockFromQueue();
-    clock_.pause();
+    if (finishingAction_ != FinishingAction::None) {
+      // 淡出在途的重复/迟到 pause：物理淡出不打断（单程无中途反转）；状态机处理
+      // 幂等/非法迁移（Paused/Stopped 下 pause 报错与现状一致）。
+      stateMachine_.pause();
+      return;
+    }
+    // R1：逻辑 Paused 立即发出（先于任何物理动作/淡出——UI 即刻响应）。
     stateMachine_.pause();
-    publishPosition();
+    if (!transportFadeEnabled() || !device_.started()) {
+      // —— fade 关 / transportFadeMs==0 / 设备未运行：现状瞬时路径，零行为变化 ——
+      stopProgressWorker();
+      stopDevice();
+      updateClockFromQueue();
+      clock_.pause();
+      publishPosition();
+      return;
+    }
+    beginFinishing(FinishingAction::PauseFreeze);
   }
 
   void resumeOnWorker() {
@@ -566,7 +618,14 @@ private:
       return;
     }
 
+    // T6：暂停淡出在途的恢复 = "暂停中再播放"——中止收尾监督、不打断在途淡出；
+    // 0→1 淡入随后由执行器自动受理（起点=回调 currentGain，从≈0 连续回升）。
+    const bool wasFinishing = abortFinishingForRestart();
+
     clock_.resume();
+    if (transportFadeEnabled() && !wasFinishing) {
+      armTransportFadeIn();
+    }
     if (!device_.start()) {
       spdlog::error("resume failed: device start returned false");
       clock_.pause();
@@ -576,26 +635,47 @@ private:
 
     stateMachine_.resume();
     startProgressWorker();
+    if (wasFinishing) {
+      if (transportFadeEnabled()) {
+        publishTransportFadeIn();
+      } else {
+        // 同 playOnWorker：fade 在淡出在途时被禁用 → 即时发布回满增益，防增益停在 0
+        // （逻辑 Playing 永久静音）。duration==0 直落 target = "无淡入"语义。
+        publishMasterEnvelope(1.0F, std::chrono::milliseconds{0});
+      }
+    }
     publishPosition();
   }
 
   void stopOnWorker() {
     spdlog::info("stop");
-    stopProgressWorker();
-    stopDevice();
-    updateClockFromQueue();
-    clock_.pause();
-    if (queue_) {
-      queue_->clearForSeek();
+    if (finishingAction_ != FinishingAction::None) {
+      // 淡出在途的 stop：物理淡出不打断；收尾动作升级为 stop 清理（归零后清队列、
+      // 复位挂起帧——位置清理照旧，只是推迟到归零点执行）。
+      finishingAction_ = FinishingAction::StopCleanup;
+      stateMachine_.stop();
+      return;
     }
-    pendingFrameWrite_.reset();
+    // R2：逻辑 Stopped 立即发出（先于物理动作）。
     stateMachine_.stop();
-    publishPosition();
+    if (!transportFadeEnabled() || !device_.started()) {
+      // —— fade 关 / transportFadeMs==0 / 设备未运行：现状瞬时路径，零行为变化 ——
+      stopProgressWorker();
+      stopDevice();
+      updateClockFromQueue();
+      clock_.pause();
+      if (queue_) {
+        queue_->clearForSeek();
+      }
+      pendingFrameWrite_.reset();
+      publishPosition();
+      return;
+    }
+    beginFinishing(FinishingAction::StopCleanup);
   }
 
   void seekOnWorker(std::chrono::milliseconds position) {
     spdlog::info("seek to {}ms", position.count());
-    stopProgressWorker();
     if (!source_ || !pipeline_ || !queue_) {
       spdlog::error("seek failed: no pipeline");
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
@@ -603,9 +683,18 @@ private:
     }
     if (stateMachine_.state() != PlaybackState::Ready && stateMachine_.state() != PlaybackState::Playing &&
         stateMachine_.state() != PlaybackState::Paused) {
+      // 非法态 seek（逻辑 Stopped 等）：状态机只发错误事件。在途收尾监督必须保留——
+      // 若在此清 finishing/停 ticker，淡出会在回调里走完而无人停设备（gain 停在 0 的
+      // 僵尸设备）。淡出照常归零，completeFinishing 正常停设备（F2）。
       stateMachine_.seek(position);
       return;
     }
+
+    // 合法 seek：现在才中止任何在途收尾/淡入握手（stopDevice 会复位包络轨迹）。
+    // finishing 期 seek 的"不打断淡出、仅更新定格位置"语义属任务 11 接线，本任务只防僵尸收尾。
+    stopProgressWorker();
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
 
     updateClockFromQueue();
     const bool shouldResume = stateMachine_.state() == PlaybackState::Playing;
@@ -1168,6 +1257,18 @@ private:
 
   void servicePlaybackProgress() {
     const auto deferredUnderrun = updateClockFromQueue(UnderrunReporting::Suppress);
+
+    if (finishingAction_ != FinishingAction::None) {
+      // —— T6 物理收尾 ticker：不受 Playing 门控（逻辑态已 Paused/Stopped）——
+      tickFinishing(deferredUnderrun);
+      return;  // 收尾完成后已停设备/定格发布；Playing 分支不属于收尾期
+    }
+
+    if (fadeInPending_ && device_.started() && device_.masterEnvelopeGain() <= kFadeCompleteGainEpsilon) {
+      // 恢复淡入握手第二步：即时 0.0 已被回调执行（观测归零）→ 发布 0→1 单程淡入。
+      publishTransportFadeIn();
+    }
+
     if (stateMachine_.state() == PlaybackState::Playing && !loadedToEnd_) {
       const bool filled = fillQueue();
       if (filled && deferredUnderrun.silenceFrames > 0U && !loadedToEnd_) {
@@ -1319,13 +1420,142 @@ private:
   }
 
   void stopDevice() {
+    // 设备停止 = 任何未决恢复淡入握手作废（T6：握手只活在运行态）。
+    fadeInPending_ = false;
     if (device_.started()) {
       static_cast<void>(device_.stop());
     }
   }
 
+  // ================= T6 物理收尾（finishing）与传送淡变 =================
+  // 逻辑态 vs 物理淡出（Metis 缺口 3）：pause/stop 命令立即翻转逻辑态（Paused/Stopped
+  // 事件先出），finishing 期间设备继续运行、按 master 包络单程淡出到零；时钟随消费
+  // 走到归零点定格。纯 worker 线程内部模式，不是状态机状态（对外枚举/事件零变化）。
+
+  bool transportFadeEnabled() const {
+    return transitionConfig_.fadeOnTransport && transitionConfig_.transportFadeMs.count() > 0;
+  }
+
+  std::uint32_t envelopeSampleRate() const {
+    if (currentTarget_.sampleRate != 0U) {
+      return currentTarget_.sampleRate;
+    }
+    return device_.currentFormat().sampleRate;
+  }
+
+  // worker 侧包络发布（T5 纪律）：经 GainEnvelopeController 账本产出快照（版本递增、
+  // ms→帧换算、目标钳制），发布前用回调原子读回同步账本增益。只允许 worker 线程调用。
+  void publishMasterEnvelope(float targetGain, std::chrono::milliseconds durationMs) {
+    masterEnvelope_.syncCurrentGain(device_.masterEnvelopeGain());
+    const auto snapshot = masterEnvelope_.makeRampSnapshot(targetGain,
+                                                           durationMs,
+                                                           GainEnvelopeCurve::Linear,
+                                                           envelopeSampleRate());
+    device_.setMasterEnvelope(snapshot);
+  }
+
+  // pause/stop 收尾入口（调用前逻辑态已翻转）：发布单程淡出（时长=transportFadeMs、
+  // 线性、1.0→0），ticker 保持运行负责归零检测与解码续喂。
+  void beginFinishing(FinishingAction action) {
+    fadeInPending_ = false;  // 若有未决淡入握手，被本次淡出取代（握手即时 0 已落零）
+    publishMasterEnvelope(0.0F, transitionConfig_.transportFadeMs);
+    finishingAction_ = action;
+    startProgressWorker();  // 收尾 ticker：2ms 轮询不 gate 于 Playing
+    spdlog::info("finishing fade-out started ({}ms, action={})",
+                 transitionConfig_.transportFadeMs.count(),
+                 static_cast<int>(action));
+  }
+
+  // play/resume 冷恢复淡入握手第一步：先发布即时 0.0（durationFrames=0）。设备已停、
+  // 包络已被 stop 复位到 1.0——T5-B2 前置：0→1 轨迹须先经即时 0 把回调 currentGain
+  // 落到 0，ticker 观测归零后再发布淡入（第二步见 servicePlaybackProgress）。
+  void armTransportFadeIn() {
+    publishMasterEnvelope(0.0F, std::chrono::milliseconds{0});
+    fadeInPending_ = true;
+  }
+
+  // 恢复淡入（0→1 单程，时长=transportFadeMs）。冷恢复由 ticker 在观测到即时 0 落零后
+  // 调用；finishing 在途恢复由命令路径直接调用——执行器把竞争发布推迟到在途淡出结束，
+  // 然后从回调 currentGain（≈0，块末粒度）自动受理，连续回升。
+  void publishTransportFadeIn() {
+    fadeInPending_ = false;
+    publishMasterEnvelope(1.0F, transitionConfig_.transportFadeMs);
+    spdlog::info("transport fade-in published ({}ms)", transitionConfig_.transportFadeMs.count());
+  }
+
+  // 中止收尾监督（play/resume 到达收尾淡出在途时）：finishing 不再于归零后停设备；
+  // 在途淡出轨迹继续走完（执行器不接受中途取消），竞争淡入由执行器在轨迹结束后受理。
+  // 返回 true 表示确实中止了一个在途收尾（调用方据此选择冷/热恢复淡入路径）。
+  bool abortFinishingForRestart() {
+    if (finishingAction_ == FinishingAction::None) {
+      return false;
+    }
+    spdlog::info("finishing aborted by play/resume (action={})", static_cast<int>(finishingAction_));
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
+    return true;
+  }
+
+  // 收尾 ticker（servicePlaybackProgress 内、Playing 门控之前调用）：淡出期解码按需
+  // 续喂（裁定④：淡出是否走完取决于缓冲/引擎策略——防淡出长于缓冲深度时欠载提前静音）；
+  // 归零（或帧耗尽：曲目在淡出期播完）后 stopDevice + 定格时钟 + 收尾动作（R3/R5）。
+  void tickFinishing(const QueueUnderrunDelta& deferredUnderrun) {
+    if (!loadedToEnd_) {
+      if (!fillQueue()) {
+        return;  // 解码错误：fillQueue 已 fail()——立即 stopDevice + 取消淡出 + Error（R6）
+      }
+      if (deferredUnderrun.silenceFrames > 0U && !loadedToEnd_) {
+        emitBufferUnderrun(deferredUnderrun.silenceFrames, deferredUnderrun.underrunCount);
+      }
+      updateClockFromQueue(UnderrunReporting::Report);
+    }
+    if (loadedToEnd_ && pendingFrameWrite_) {
+      static_cast<void>(writePendingFrame());
+      updateClockFromQueue(UnderrunReporting::Report);
+    }
+    if (!finishingReachedZero()) {
+      return;
+    }
+    completeFinishing();
+  }
+
+  bool finishingReachedZero() const {
+    // 归零读回：包络轨迹结束后回调写回 0.0（块末粒度 1/duration≈0 由 ε 吸收）。
+    if (device_.masterEnvelopeGain() <= kFadeCompleteGainEpsilon) {
+      return true;
+    }
+    // 帧耗尽兜底：曲目已解码到末端且队列排空——无帧可淡，立即收尾（防欠载静音块
+    // 不推进包络导致的悬挂）。
+    return loadedToEnd_ && !pendingFrameWrite_ && queue_ && queue_->availableFrames() == 0U;
+  }
+
+  // 归零点收尾：停设备（包络复位）、时钟定格 = 归零点（R3：暂停定格位置，不得被淡出
+  // 前旧位置覆盖——时钟在淡出期从未 pause，冻结只发生在此处）；StopCleanup 额外做
+  // stop 的队列清理（位置清理照旧，推迟到归零点）。
+  void completeFinishing() {
+    const auto action = finishingAction_;
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
+    spdlog::info("finishing fade-out complete (action={})", static_cast<int>(action));
+    stopProgressWorkerAsync();
+    stopDevice();
+    updateClockFromQueue();
+    clock_.pause();
+    if (action == FinishingAction::StopCleanup) {
+      if (queue_) {
+        queue_->clearForSeek();
+      }
+      pendingFrameWrite_.reset();
+    }
+    publishPosition();
+  }
+
   void fail(PlaybackErrorCode code, std::string message, std::string detail) {
     spdlog::error("playback error (code={}): {} - {}", static_cast<int>(code), message, detail);
+    // T6（R6）：finishing 期间错误 → 立即 stopDevice（取消在途淡出）+ 转 Error，
+    // 不留残余淡出窗口——收尾 ticker 随 stopProgressWorker 停止。
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
     stopProgressWorker();
     stopDevice();
     stateMachine_.fail(code, std::move(message), std::move(detail));
@@ -1370,6 +1600,16 @@ private:
   AudioOutputConfig config_{};
   // T7：最近一次成功开启设备时的 config_ 快照（免重开短路"设备目标未变"判据）。
   std::optional<AudioOutputConfig> activeDeviceConfig_{};
+  TransitionConfig transitionConfig_{};
+
+  // ---- T6 传送淡变状态（均仅 audio worker 线程访问）----
+  // finishingAction_ != None = 物理收尾中（pause/stop 已翻转逻辑态、设备运行淡出中）。
+  FinishingAction finishingAction_{FinishingAction::None};
+  // 恢复淡入握手进行中：冷恢复先发即时 0.0，ticker 观测归零后发布 0→1 淡入。
+  bool fadeInPending_{false};
+  // T5 worker 侧包络账本（版本递增/ms→帧换算/增益钳制），发布唯一入口。
+  GainEnvelopeController masterEnvelope_{1.0F};
+
   AudioOutputDevice device_;
   std::unique_ptr<DeviceFormatEnumerator> formatEnumerator_{};
   AudioEventDispatcher dispatcher_;

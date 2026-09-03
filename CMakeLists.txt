@@ -102,6 +102,7 @@ add_library(seriona_audio STATIC
   src/audio/ffmpeg/ffmpeg_audio_source.cpp
   src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   src/audio/playback_state_machine.cpp
+  src/audio/transition/gain_envelope.cpp
   src/audio/waveform_ffmpeg.cpp
   src/audio/waveform_generator.cpp
   src/audio/waveform_scalar.cpp

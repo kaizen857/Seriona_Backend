@@ -55,6 +55,12 @@ void FakeAudioPlaybackService::configureOutput(const audio::AudioOutputConfig& c
   lastConfiguredOutput_ = config;
 }
 
+void FakeAudioPlaybackService::configureTransition(const audio::TransitionConfig& config) {
+  ++configureTransitionCalls_;
+  callLog_.push_back("configureTransition");
+  lastConfiguredTransition_ = config;
+}
+
 void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& request) {
   if (loadTrackException_) {
     std::rethrow_exception(loadTrackException_);
@@ -130,6 +136,10 @@ std::size_t FakeAudioPlaybackService::configureOutputCalls() const noexcept {
   return configureOutputCalls_;
 }
 
+std::size_t FakeAudioPlaybackService::configureTransitionCalls() const noexcept {
+  return configureTransitionCalls_;
+}
+
 std::size_t FakeAudioPlaybackService::loadTrackCalls() const noexcept {
   return loadTrackCalls_;
 }
@@ -176,6 +186,10 @@ std::size_t FakeAudioPlaybackService::emitEventCalls() const noexcept {
 
 const std::optional<audio::AudioOutputConfig>& FakeAudioPlaybackService::lastConfiguredOutput() const noexcept {
   return lastConfiguredOutput_;
+}
+
+const std::optional<audio::TransitionConfig>& FakeAudioPlaybackService::lastConfiguredTransition() const noexcept {
+  return lastConfiguredTransition_;
 }
 
 const std::optional<audio::TrackPlaybackRequest>& FakeAudioPlaybackService::lastLoadedTrack() const noexcept {

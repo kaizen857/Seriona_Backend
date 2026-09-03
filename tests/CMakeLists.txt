@@ -34,6 +34,14 @@ add_executable(seriona_audio_output_device_tests
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
+# 增益包络执行器测试（任务 5-B2 测试轮）：独立二进制承载 envelope 用例（doctest 每二进制
+# 恰一个 main；发布面 + 轨迹数学 + 生命周期集成，经 fake backend 驱动真实 renderCallback）。
+add_executable(seriona_audio_output_device_envelope_tests
+  audio/audio_output_device_envelope_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
 add_executable(seriona_playback_clock_tests
   audio/playback_clock_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
@@ -54,6 +62,7 @@ add_executable(seriona_audio_player_single_track_tests
   audio/audio_player_single_track_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -67,6 +76,7 @@ add_executable(seriona_audio_player_small_buffer_tests
   audio/audio_player_small_buffer_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -80,6 +90,7 @@ add_executable(seriona_output_format_negotiation_tests
   audio/output_format_negotiation_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -93,6 +104,7 @@ add_executable(seriona_audio_player_seamless_tests
   audio/audio_player_seamless_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -106,6 +118,7 @@ add_executable(seriona_audio_error_matrix_tests
   audio/audio_error_matrix_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -119,6 +132,7 @@ add_executable(seriona_audio_shutdown_lifecycle_tests
   audio/audio_shutdown_lifecycle_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -132,6 +146,7 @@ add_executable(seriona_audio_enumerate_devices_tests
   audio/audio_enumerate_playback_devices_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -145,6 +160,7 @@ add_executable(seriona_audio_device_format_enumerator_tests
   audio/device_format_enumerator_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
@@ -248,6 +264,16 @@ add_executable(seriona_configure_output_reducer_tests
 )
 add_executable(seriona_configure_output_executes_tests
   control/configure_output_executes_tests.cpp
+  control/control_test_harness.cpp
+)
+add_executable(seriona_set_transition_config_command_tests
+  control/set_transition_config_command_tests.cpp
+)
+add_executable(seriona_set_transition_config_reducer_tests
+  control/set_transition_config_reducer_tests.cpp
+)
+add_executable(seriona_set_transition_config_executes_tests
+  control/set_transition_config_executes_tests.cpp
   control/control_test_harness.cpp
 )
 add_executable(seriona_media_controller_tests
@@ -514,6 +540,7 @@ target_compile_definitions(seriona_ffmpeg_audio_source_tests PRIVATE DOCTEST_CON
 target_compile_definitions(seriona_ffmpeg_filter_pipeline_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_pcm_buffer_queue_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_output_device_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_output_device_envelope_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_clock_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_playback_state_machine_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_event_dispatcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -552,6 +579,9 @@ target_compile_definitions(seriona_control_contract_tests PRIVATE DOCTEST_CONFIG
 target_compile_definitions(seriona_configure_output_command_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_configure_output_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_configure_output_executes_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_set_transition_config_command_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_set_transition_config_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_set_transition_config_executes_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_folder_sort_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_app_settings_store_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -628,6 +658,11 @@ target_include_directories(seriona_pcm_buffer_queue_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_audio_output_device_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_output_device_envelope_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -788,6 +823,19 @@ target_include_directories(seriona_configure_output_reducer_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_configure_output_executes_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_set_transition_config_command_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_set_transition_config_reducer_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_set_transition_config_executes_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
@@ -1038,6 +1086,10 @@ target_link_libraries(seriona_audio_output_device_tests PRIVATE
   seriona_third_party_headers
   spdlog::spdlog
 )
+target_link_libraries(seriona_audio_output_device_envelope_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+)
 target_link_libraries(seriona_playback_clock_tests PRIVATE
   seriona_third_party_headers
 )
@@ -1169,6 +1221,18 @@ target_link_libraries(seriona_configure_output_executes_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_set_transition_config_command_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
+target_link_libraries(seriona_set_transition_config_reducer_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
+target_link_libraries(seriona_set_transition_config_executes_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
 target_link_libraries(seriona_media_controller_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1244,6 +1308,7 @@ seriona_enable_warnings(seriona_ffmpeg_audio_source_tests)
 seriona_enable_warnings(seriona_ffmpeg_filter_pipeline_tests)
 seriona_enable_warnings(seriona_pcm_buffer_queue_tests)
 seriona_enable_warnings(seriona_audio_output_device_tests)
+seriona_enable_warnings(seriona_audio_output_device_envelope_tests)
 seriona_enable_warnings(seriona_playback_clock_tests)
 seriona_enable_warnings(seriona_playback_state_machine_tests)
 seriona_enable_warnings(seriona_audio_event_dispatcher_tests)
@@ -1264,6 +1329,9 @@ seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_configure_output_command_tests)
 seriona_enable_warnings(seriona_configure_output_reducer_tests)
 seriona_enable_warnings(seriona_configure_output_executes_tests)
+seriona_enable_warnings(seriona_set_transition_config_command_tests)
+seriona_enable_warnings(seriona_set_transition_config_reducer_tests)
+seriona_enable_warnings(seriona_set_transition_config_executes_tests)
 seriona_enable_warnings(seriona_media_controller_tests)
 seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
 seriona_enable_warnings(seriona_control_app_settings_store_tests)
@@ -1505,6 +1573,7 @@ add_test(NAME seriona.ffmpeg_filter_pipeline_errors COMMAND seriona_ffmpeg_filte
 add_test(NAME seriona.ffmpeg_filter_pipeline_int24 COMMAND seriona_ffmpeg_filter_pipeline_tests --test-case=*Int24*)
 add_test(NAME seriona.pcm_buffer_queue COMMAND seriona_pcm_buffer_queue_tests)
 add_test(NAME seriona.audio_output_device COMMAND seriona_audio_output_device_tests)
+add_test(NAME seriona.audio_output_device_envelope COMMAND seriona_audio_output_device_envelope_tests)
 add_test(NAME seriona.playback_clock COMMAND seriona_playback_clock_tests)
 add_test(NAME seriona.playback_state_machine COMMAND seriona_playback_state_machine_tests --test-case-exclude=*cancellation*)
 add_test(NAME seriona.playback_state_machine_cancellation COMMAND seriona_playback_state_machine_tests --test-case=*cancellation*)
@@ -1544,6 +1613,9 @@ add_test(NAME seriona.control.contract.configure_output_command COMMAND seriona_
 add_test(NAME seriona.control.reducer.configure_output COMMAND seriona_configure_output_reducer_tests)
 add_test(NAME seriona.control.configure_output_executes COMMAND seriona_configure_output_executes_tests --test-case=*configure_output*)
 add_test(NAME seriona.control.enumerate_devices COMMAND seriona_configure_output_executes_tests --test-case=*enumerate_devices*)
+add_test(NAME seriona.control.contract.set_transition_config COMMAND seriona_set_transition_config_command_tests)
+add_test(NAME seriona.control.reducer.set_transition_config COMMAND seriona_set_transition_config_reducer_tests)
+add_test(NAME seriona.control.set_transition_config_executes COMMAND seriona_set_transition_config_executes_tests)
 add_test(NAME seriona.control_controller COMMAND seriona_media_controller_tests)
 add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control_folder_sort_settings_store_tests)
 add_test(NAME seriona.control_app_settings_store COMMAND seriona_control_app_settings_store_tests)

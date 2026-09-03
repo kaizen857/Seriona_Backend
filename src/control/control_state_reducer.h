@@ -44,6 +44,8 @@ enum class ControlIntentKind : std::uint8_t {
   ResolveArtwork,
   // Appended at the end: existing enumerators keep their ordinal positions.
   ConfigureOutput,
+  // 过渡参数配置意图（T1）：转发 TransitionConfig 至音频服务，不触发重载。
+  SetTransitionConfig,
 };
 
 struct ControlIntent {
@@ -56,6 +58,8 @@ struct ControlIntent {
   // Last member on purpose: appended fields never disturb designated or
   // value-initialization of existing intents.
   std::optional<audio::AudioOutputConfig> outputConfig;
+  // SetTransitionConfig 载荷（T1）。追加末尾保持序列化兼容。
+  std::optional<audio::TransitionConfig> transitionConfig;
 };
 
 struct ControlReduction {
@@ -131,6 +135,8 @@ private:
   void selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback);
   void stopPlayback(ControlReduction& reduction);
   ControlReduction handleConfigureOutput(ControlReduction& reduction, const MediaControlCommand& command);
+  // SetTransitionConfig：校验过渡参数并生成单意图（不重载、不改快照）。
+  ControlReduction handleSetTransitionConfig(ControlReduction& reduction, const MediaControlCommand& command);
 
   PlayerStateSnapshot player_{};
   LibraryStateSnapshot library_{};

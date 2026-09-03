@@ -702,6 +702,11 @@ private:
           dependencies_.audio->configureOutput(*intent.outputConfig);
         }
         break;
+      case ControlIntentKind::SetTransitionConfig:
+        if (intent.transitionConfig.has_value()) {
+          dependencies_.audio->configureTransition(*intent.transitionConfig);
+        }
+        break;
       }
     }
   }

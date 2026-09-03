@@ -89,6 +89,48 @@ struct AudioOutputConfig {
   std::string preferredDeviceId;
 };
 
+// 播放过渡参数（淡入淡出/交叉/预加载），用户裁定表 9 项设置的后端值类型。
+// 纯 C++23 值类型，不暴露任何第三方类型。默认构造 == 裁定默认 == "旧行为等价"：
+// 全部 9 项默认下采样路径与改动前逐位一致（Direct 恒重开+硬切，Mixed 无交叉）。
+// 字段声明顺序即跨端契约（前端任务 12 按此顺序组包），勿随意调整。
+// 与 AudioOutputConfig 语义隔离：仅描述过渡行为，绝不触发输出重载/设备操作。
+enum class AutoAdvanceFadeMode {
+  // 设置 1：自动前进（当前曲自然播完）淡入淡出。仅 Mixed 生效。
+  Off,               // 无（默认）——除 CUE 无间隙组内尽力无缝外不做交叉
+  ExceptGaplessGroup,  // 除 CUE 邻曲/无间隙组外交叉（组内尽力无缝硬切）
+  All,               // 全交叉（对 CUE 组也交叉，按字面）
+};
+
+enum class ManualAdvanceFadeMode {
+  // 设置 8：手动改变音轨淡入淡出。仅 Mixed 生效；Direct 下整项无效。
+  Off,           // 无（默认）
+  ShortDip,      // 短时交叉渐隐（dip，时长=manualShortCrossfadeMs，对半分解）
+  FullCrossfade, // 交叉淡入淡出（时长=crossfadeMs，与自动档共用）
+};
+
+struct TransitionConfig {
+  AutoAdvanceFadeMode autoAdvanceFadeMode{AutoAdvanceFadeMode::Off};
+  // 设置 2：播放/暂停/停止淡入淡出开关（全局，含 Direct）。
+  bool fadeOnTransport{false};
+  // 设置 3：调整播放进度（seek）淡入淡出开关（全局）。
+  bool fadeOnSeek{false};
+  // 设置 4：无间隙音轨预解码触发提前量（仅 Mixed）。
+  std::chrono::milliseconds gaplessPreloadMs{0};
+  // 设置 5：交叉淡入淡出长度（自动交叉与手动档 3 共用，仅 Mixed）。
+  std::chrono::milliseconds crossfadeMs{3000};
+  // 设置 6：播放/暂停/停止淡变长度（全局）。
+  std::chrono::milliseconds transportFadeMs{300};
+  // 设置 7：seek 淡变长度（全局）。
+  std::chrono::milliseconds seekFadeMs{300};
+  ManualAdvanceFadeMode manualAdvanceFadeMode{ManualAdvanceFadeMode::Off};
+  // 设置 9：短时手动交叉长度（档 2 dip 用，仅 Mixed）。
+  std::chrono::milliseconds manualShortCrossfadeMs{500};
+
+  // 语义：0 时长 = 该淡变即时完成（等效关闭），不做下界钳制。
+  // 相等比较供任务 7 免重开短路判据与 L1 实变判定复用；默认构造 == 裁定默认。
+  friend bool operator==(const TransitionConfig&, const TransitionConfig&) = default;
+};
+
 struct AudioDeviceFormat {
   std::string deviceId;
   std::string deviceName;
@@ -183,6 +225,12 @@ public:
 
   virtual void setEventSink(BackendEventSink sink) = 0;
   virtual void configureOutput(const AudioOutputConfig& config) = 0;
+  // 过渡参数配置（淡入淡出/交叉/预加载）。与 configureOutput 语义隔离：仅更新
+  // 过渡配置，绝不触发重载/设备生命周期操作/事件。非纯虚 + 默认空实现：实现者
+  // 共 4 个（SingleTrack 业务实现、Noop、后端 Fake、前端 Fake），纯虚会同时打破
+  // 两仓库编译；no-op 也是 Noop/Fake 的既有机制，无需逐个覆写（同下方
+  // enumeratePlaybackDevices 先例）。
+  virtual void configureTransition(const TransitionConfig& config) { (void)config; }
   virtual void loadTrack(const TrackPlaybackRequest& request) = 0;
   virtual void prepareNext(const TrackPlaybackRequest& request) = 0;
   virtual void play() = 0;
