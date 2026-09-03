@@ -1514,6 +1514,7 @@ add_test(NAME seriona.audio_player_single_track COMMAND seriona_audio_player_sin
 add_test(NAME seriona.audio_player_small_buffer COMMAND seriona_audio_player_small_buffer_tests)
 add_test(NAME seriona.output_format_negotiation COMMAND seriona_output_format_negotiation_tests --test-case=*covers*)
 add_test(NAME seriona.output_format_negotiation_failure COMMAND seriona_output_format_negotiation_tests --test-case=*failure*)
+add_test(NAME seriona.audio.mixed_noreopen COMMAND seriona_output_format_negotiation_tests --test-case=*noreopen*)
 add_test(NAME seriona.audio_player_seamless_mix COMMAND seriona_audio_player_seamless_tests --test-case=*seamless_mix*)
 add_test(NAME seriona.audio_player_redundant_play COMMAND seriona_audio_player_seamless_tests --test-case=*redundant_play*)
 add_test(NAME seriona.audio_player_direct_preload COMMAND seriona_audio_player_seamless_tests --test-case=*direct_preload*)

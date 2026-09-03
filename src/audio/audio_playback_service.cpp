@@ -97,6 +97,18 @@ bool sameTarget(const FfmpegFilterTargetFormat& left, const FfmpegFilterTargetFo
          left.channelCount == right.channelCount;
 }
 
+// T7 免重开判定（D4）：驱动设备开启的输出配置是否未变。configureOutput/
+// selectOutputDevice 的变更命令都先于其触发的 LoadTrack 到达 worker，配置级比较
+// 能覆盖"仅缓冲时长/目标设备等变化"的场景——这类变化不改变请求格式三要素，
+// 若短路判据只比格式会漏判而错误复用旧设备。
+bool sameOutputConfig(const AudioOutputConfig& left, const AudioOutputConfig& right) {
+  return left.outputMode == right.outputMode && left.targetSampleRate == right.targetSampleRate &&
+         left.targetSampleFormat == right.targetSampleFormat &&
+         left.targetChannelCount == right.targetChannelCount &&
+         left.bufferDuration == right.bufferDuration && left.keepDeviceOpen == right.keepDeviceOpen &&
+         left.allowFallback == right.allowFallback && left.preferredDeviceId == right.preferredDeviceId;
+}
+
 std::string formatFallbackReason(AudioSampleFormat from, AudioSampleFormat to) {
   const auto bitDepthName = [](AudioSampleFormat format) -> const char* {
     switch (format) {
@@ -314,9 +326,19 @@ private:
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     spdlog::info("loading track '{}'", pathToUtf8(request.filePath));
     stopProgressWorker();
+    // T7（D4）：uninitialize/协商/initialize 不再无条件执行——Mixed 同参数切歌在
+    // canReuseOutputDevice 短路后跳过整段，仅重建 source/pipeline/queue。此处仍先
+    // stopDevice：切歌到达时旧曲可能仍在播放（手动切歌路径），保持既有"切歌即
+    // 静音"时序，也让随后原地换队列时无活跃回调（未启动时 stop 为 no-op）。
     stopDevice();
-    device_.uninitialize();
-    queue_.reset();
+
+    // 协商前设备格式快照：AudioOutputDevice::uninitialize 会清空 currentFormat，
+    // OutputFormatChanged 的"实变收紧"（L1 已决）需与拆卸前实际格式比较。
+    std::optional<AudioDeviceFormat> previousDeviceFormat;
+    if (device_.initialized()) {
+      previousDeviceFormat = device_.currentFormat();
+    }
+
     source_ = std::make_unique<FfmpegAudioSource>();
     pipeline_ = std::make_unique<FfmpegFilterPipeline>();
     currentRequest_ = request;
@@ -351,12 +373,43 @@ private:
       spdlog::debug("seeked to CUE track offset: {}ms", request.offset->count());
     }
 
+    // 免重开判定需要新曲 streamInfo（决定协商目标），故把设备拆卸移到打开成功之后。
     const auto& streamInfo = source_->streamInfo();
     spdlog::debug("source stream: {}Hz {}ch {}", streamInfo.sampleRate, streamInfo.channelCount,
                   sampleFormatName(streamInfo.sampleFormat));
     std::string negotiationFailure;
     std::optional<AudioOutputDeviceError> negotiationDeviceError;
-    const auto negotiation = negotiateOutput(streamInfo, negotiationFailure, negotiationDeviceError);
+    std::optional<OutputNegotiationResult> negotiation;
+
+    if (canReuseOutputDevice(streamInfo)) {
+      // —— T7 免重开短路：跳过 stopDevice(已停)/uninitialize/negotiateOutput/initialize
+      // 整段，仅重建 source/pipeline/queue（任务 9 双队列面未启用时为单 ring 重建）。
+      // 目标与设备当前格式一致由判定保证，候选即 requestedTarget；队列指针经
+      // rebindQueue 原子发布到回调面后旧队列方可析构（设备已停、无活跃回调）。
+      const auto target = requestedTarget(streamInfo);
+      if (const auto error = pipeline_->configure(target)) {
+        spdlog::error("track load failed (reuse pipeline configure): {} - {}", error->message, error->detail);
+        fail(PlaybackErrorCode::FormatNegotiationFailed,
+             "failed to negotiate an output format",
+             error->detail);
+        return;
+      }
+      const auto capacityFrames = bufferFrameCount(target.sampleRate, config_.bufferDuration);
+      auto nextQueue = std::make_unique<PcmBufferQueue>(
+          PcmBufferQueueConfig{capacityFrames, target.channelCount * bytesPerSample(target.sampleFormat)});
+      device_.rebindQueue(*nextQueue);
+      queue_ = std::move(nextQueue);
+      negotiation = OutputNegotiationResult{explicitConfig(config_, AudioOutputMode::Mixed, target),
+                                            target,
+                                            device_.currentFormat(),
+                                            {}};
+      spdlog::info("track load kept device open (mixed output, identical format)");
+    } else {
+      // —— 原路径：拆卸设备后整段协商（Direct 恒走此处；Mixed 参数实变也走此处）——
+      device_.uninitialize();
+      queue_.reset();
+      negotiation = negotiateOutput(streamInfo, negotiationFailure, negotiationDeviceError);
+    }
     if (!negotiation) {
       spdlog::error("track load failed (negotiation): {}", negotiationFailure);
       if (negotiationDeviceError) {
@@ -371,12 +424,13 @@ private:
     }
     currentTarget_ = negotiation->target;
     hasCurrentTarget_ = true;
+    activeDeviceConfig_ = config_;
     spdlog::debug("output negotiated: {}Hz {}ch {} mode={}",
                   currentTarget_.sampleRate, currentTarget_.channelCount,
                   sampleFormatName(currentTarget_.sampleFormat),
                   outputModeName(negotiation->effectiveConfig.outputMode));
 
-    // pipeline 已由 negotiateOutput 候选循环内的 configure（validateTarget）完成配置。
+    // pipeline 已由 negotiateOutput 候选循环或免重开分支完成配置。
     clock_.reset(request.trackId, currentTarget_.sampleRate, request.offset.value_or(std::chrono::milliseconds{0}));
     observedQueueCounters_ = {};
 
@@ -389,8 +443,23 @@ private:
                                               negotiation->fallbackReason});
     }
 
-    dispatcher_.dispatch(BackendEventType::OutputFormatChanged,
-                         OutputFormatChanged{config_, negotiation->deviceFormat});
+    // L1 已决：OutputFormatChanged 收紧为设备格式实变才发（短路路径无实变天然不发；
+    // 协商结果与开段前格式一致时同样不发）。唯一消费者 reducer:markPlayerChanged 只
+    // 标记快照重发，载荷不进快照；切歌时的快照刷新由 TrackChanged/状态/位置事件照常
+    // 驱动，无测试依赖"同参数必发"（output_format_negotiation_tests :292/:362 语义复核）。
+    const auto& deviceFormat = negotiation->deviceFormat;
+    const bool formatChanged = !previousDeviceFormat.has_value() ||
+                               previousDeviceFormat->sampleRate != deviceFormat.sampleRate ||
+                               previousDeviceFormat->sampleFormat != deviceFormat.sampleFormat ||
+                               previousDeviceFormat->channelCount != deviceFormat.channelCount ||
+                               previousDeviceFormat->bufferFrames != deviceFormat.bufferFrames ||
+                               previousDeviceFormat->actualMode != deviceFormat.actualMode ||
+                               previousDeviceFormat->fallbackApplied != deviceFormat.fallbackApplied;
+    if (formatChanged) {
+      dispatcher_.dispatch(BackendEventType::OutputFormatChanged, OutputFormatChanged{config_, deviceFormat});
+    } else {
+      spdlog::debug("output format unchanged; OutputFormatChanged suppressed");
+    }
     if (!fillQueue()) {
       return;
     }
@@ -823,6 +892,29 @@ private:
 
     failureDetail = failures.str();
     return std::nullopt;
+  }
+
+  // T7 免重开短路判据（D4，调用点保证设备已停）：outputMode==Mixed 且设备已初始化、
+  // 驱动设备开启的配置未变（同上 sameOutputConfig：配置变更先于 LoadTrack 到达 worker）、
+  // 设备当前实际模式仍为 Mixed，且本次协商将选出的目标（requestedTarget = 用户
+  // target* 覆盖或流原生参数）与设备当前格式（采样率/格式/声道）一致。注意不能依赖
+  // hasCurrentTarget_——loadTrackOnWorker 开头会把它复位，短路判定在复位之后执行；
+  // activeDeviceConfig_（仅协商成功时写入）+ initialized 已等价表示"此前成功开过设备"。
+  bool canReuseOutputDevice(const FfmpegAudioStreamInfo& streamInfo) const {
+    if (config_.outputMode != AudioOutputMode::Mixed || !device_.initialized() ||
+        !activeDeviceConfig_.has_value()) {
+      return false;
+    }
+    if (!sameOutputConfig(config_, *activeDeviceConfig_)) {
+      return false;
+    }
+    const auto& current = device_.currentFormat();
+    if (current.sampleRate == 0U || current.actualMode != AudioOutputMode::Mixed) {
+      return false;
+    }
+    const auto requested = requestedTarget(streamInfo);
+    return requested.sampleRate == current.sampleRate && requested.sampleFormat == current.sampleFormat &&
+           requested.channelCount == current.channelCount;
   }
 
   bool fillQueue() {
@@ -1276,6 +1368,8 @@ private:
   }
 
   AudioOutputConfig config_{};
+  // T7：最近一次成功开启设备时的 config_ 快照（免重开短路"设备目标未变"判据）。
+  std::optional<AudioOutputConfig> activeDeviceConfig_{};
   AudioOutputDevice device_;
   std::unique_ptr<DeviceFormatEnumerator> formatEnumerator_{};
   AudioEventDispatcher dispatcher_;
