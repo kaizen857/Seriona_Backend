@@ -222,8 +222,29 @@ public:
 
   // 过渡参数：worker 命令仅存配置，零重载/零设备操作/零事件（区别于 configureOutput
   // 的整轨重载语义）；消费在过渡引擎任务（T5/T11）接线。
+  // T8：配置变化 = 预解码预告重新武装（endApproachEmitted_ 复位），阈值按裁定
+  // max(crossfadeMs, gaplessPreloadMs) 即时读取、无需存储。
+  // T10：配置变化同时撤除在途重叠面（第二源/源包络轨迹/窗口裁决锁存）并弃预解码槽——
+  // 新配置 = 新臂，旧槽作废（同 abortTransition 语义；服务侧直接重配不再残留一臂旧槽
+  // 做最后一次直切）。endApproachEmitted_ 复位重新武装预告。
   void configureTransition(const TransitionConfig& config) override {
-    enqueueCommand([this, config] { transitionConfig_ = config; });
+    enqueueCommand([this, config] {
+      cancelOverlapFaceOnWorker();
+      preloadSlot_.reset();
+      transitionConfig_ = config;
+      endApproachEmitted_ = false;
+    });
+  }
+
+  // T10：中止在途过渡（裁定基线⑦ 失效域的服务侧落地）。控制器在重叠窗口内收到失效
+  // 操作命令/版本校验失败时经 AbortTransition 意图调用：撤第二源 + 打断源包络轨迹 +
+  // 弃预解码槽 + 重新武装预告（服务将再次发 EndApproaching → 控制器按新状态重调度）。
+  void abortTransition() override {
+    enqueueCommand([this] {
+      cancelOverlapFaceOnWorker();
+      preloadSlot_.reset();
+      endApproachEmitted_ = false;
+    });
   }
 
   void loadTrack(const TrackPlaybackRequest& request) override {
@@ -231,7 +252,11 @@ public:
   }
 
   void prepareNext(const TrackPlaybackRequest& request) override {
-    enqueueCommand([this, request] { prepareNextOnWorker(request); });
+    prepareNext(request, PrepareNextMeta{});
+  }
+
+  void prepareNext(const TrackPlaybackRequest& request, const PrepareNextMeta& meta) override {
+    enqueueCommand([this, request, meta] { prepareNextOnWorker(request, meta); });
   }
 
   void play() override { enqueueCommand([this] { playOnWorker(); }); }
@@ -366,6 +391,12 @@ private:
     currentTarget_ = {};
     pendingFrameWrite_.reset();
     preloadSlot_.reset();
+    // T8：新曲加载 = 预解码预告重新武装（手动切歌/自然播完后的下一曲均走本路径）。
+    endApproachEmitted_ = false;
+    // T10：新曲 = 新臂（交叉窗口裁决锁存/第二腿待发复位；在途交叉面已随上方
+    // stopDevice 清空——设备停边界撤销第二源 + 复位包络）。
+    overlapWindowSettled_ = false;
+    overlapRampPending_ = false;
 
     trackEndPosition_ = endPositionFor(request);
     if (trackEndPosition_.has_value()) {
@@ -489,7 +520,10 @@ private:
     publishPosition();
   }
 
-  void prepareNextOnWorker(const TrackPlaybackRequest& request) {
+  void prepareNextOnWorker(const TrackPlaybackRequest& request, const PrepareNextMeta& kindMeta) {
+    // T9/T10：作废旧槽前先撤除在途交叉面（未激活时 = 原 preloadSlot_.reset 语义；
+    // 已激活时额外退第二源 + 打断源包络轨迹 + 复位窗口锁存——新槽 = 新臂）。
+    cancelOverlapFaceOnWorker();
     preloadSlot_.reset();
 
     PreloadSlot slot{};
@@ -497,6 +531,7 @@ private:
     slot.source = std::make_unique<FfmpegAudioSource>();
     slot.pipeline = std::make_unique<FfmpegFilterPipeline>();
     slot.endPosition = endPositionFor(request);
+    slot.kindMeta = kindMeta;
 
     if (const auto error = slot.source->open(request.filePath)) {
       emitPreloadError(error->code, error->message, error->detail);
@@ -765,6 +800,8 @@ private:
     bool loadedToEnd{false};
     bool ready{false};
     bool seamlessEligible{false};
+    // T8：控制器选定的交接方式（SeamlessDirect=就绪直切副源；Crossfade=任务 9 重叠面源）。
+    PrepareNextMeta kindMeta{};
   };
 
   struct OutputNegotiationCandidate {
@@ -1281,9 +1318,23 @@ private:
       updateClockFromQueue(UnderrunReporting::Report);
     }
 
+    if (stateMachine_.state() == PlaybackState::Playing) {
+      // —— T8 预解码接线：槽续解码驱动 + EndApproaching 预告 ——
+      servicePreloadDecodeIfDue();
+      maybeEmitEndApproaching();
+      // —— T10 自动交叉重叠窗口调度（裁定⑦：窗内就绪即启；单发/臂裁决不延迟）——
+      maybeStartAutoOverlap();
+      tickOverlapRamp();
+    }
+
     if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && !pendingFrameWrite_ && queue_ &&
         queue_->availableFrames() == 0U) {
       updateClockFromQueue(UnderrunReporting::Suppress);
+      // T10：主源排空 = 重叠期满 → 提升第二源为主源（AdvanceCompleted 先于新曲状态
+      // 事件；见 completeOverlapHandoff）。未在重叠期时回落直切 handoff / 自然结束。
+      if (completeOverlapHandoff()) {
+        return;
+      }
       if (handoffToPreparedNext()) {
         return;
       }
@@ -1311,14 +1362,88 @@ private:
 
   void stopProgressWorkerAsync() { progressWorkerRunning_.store(false, std::memory_order_release); }
 
+  // T8：预解码槽续解码驱动（仅 Playing tick 调用）。槽就绪且未解码到末尾时按需续解码：
+  // fillPreloadSlot 只在队列有空位/有未决帧时真正工作——任务 9 双源回调面未启用时槽队列
+  // 在 handoff 前无人消费 → 满队列零操作（维持"填满即停"，无交接目标的预载不空转）；
+  // 任务 9 第二源启用后本驱动即"随消费持续解码"的供数点（分块喂双路防饿死）。
+  void servicePreloadDecodeIfDue() {
+    if (preloadSlot_ && preloadSlot_->ready && !preloadSlot_->loadedToEnd) {
+      static_cast<void>(fillPreloadSlot(*preloadSlot_));
+    }
+  }
+
+  // T8：剩余量估算——当前曲距自然终点的毫秒估计（EndApproaching 载荷来源）。
+  // - CUE bounded 段：endPosition（offset+duration）− 时钟（精确，复用 trackEndPosition_）；
+  // - 普通整轨（无 offset、带时长元数据）且未到 EOS：整轨时长 − 时钟（近似——仅作预解码
+  //   提前量，绝不作硬停，时长元数据"非硬停"既有语义不变）；
+  // - 已到 EOS：剩余 = 队列内 PCM（兜底，任何曲式可用）；
+  // - 已到终点（loadedToEnd 且队列空）：无剩余——交由 naturalEnd 路径，EndApproaching
+  //   不作 naturalEnd 的替代（裁定）。
+  std::optional<std::chrono::milliseconds> estimateRemainingMs() const {
+    if (!queue_) {
+      return std::nullopt;
+    }
+    if (loadedToEnd_ && queue_->availableFrames() == 0U) {
+      return std::nullopt;
+    }
+    const auto position = clock_.snapshot().position;
+    if (trackEndPosition_.has_value()) {
+      return *trackEndPosition_ - position;
+    }
+    if (!loadedToEnd_ && currentRequest_.duration.has_value() && !currentRequest_.offset.has_value() &&
+        !currentRequest_.boundedSegment) {
+      return *currentRequest_.duration - position;
+    }
+    if (loadedToEnd_) {
+      const auto rate = currentTarget_.sampleRate != 0U ? currentTarget_.sampleRate : clock_.sampleRate();
+      if (rate == 0U) {
+        return std::nullopt;
+      }
+      return std::chrono::milliseconds{static_cast<std::chrono::milliseconds::rep>(
+          (static_cast<std::uint64_t>(queue_->availableFrames()) * 1000ULL) / rate)};
+    }
+    return std::nullopt;
+  }
+
+  // T8：进度轮询中的 EndApproaching 发射（armed 去重：一次性/臂）。
+  // 触发阈值 = max(crossfadeMs, gaplessPreloadMs)（裁定）。仅当本臂存在"需要预解码"的
+  // 语义才武装：Mixed +（自动档可交叉（长度>0）或 预加载>0）。Direct 与默认配置
+  // （自动档=无 且 预加载=0）不武装 → 默认路径零新事件（Must Have 默认值等价回归）。
+  void maybeEmitEndApproaching() {
+    if (endApproachEmitted_) {
+      return;
+    }
+    const auto threshold = std::max(transitionConfig_.crossfadeMs, transitionConfig_.gaplessPreloadMs);
+    if (threshold.count() <= 0 || config_.outputMode != AudioOutputMode::Mixed) {
+      return;
+    }
+    if (transitionConfig_.autoAdvanceFadeMode == AutoAdvanceFadeMode::Off &&
+        transitionConfig_.gaplessPreloadMs.count() <= 0) {
+      return;
+    }
+    const auto remaining = estimateRemainingMs();
+    if (!remaining.has_value() || remaining->count() <= 0 || *remaining > threshold) {
+      return;
+    }
+    endApproachEmitted_ = true;
+    spdlog::debug("end approaching: remaining={}ms (threshold={}ms)", remaining->count(), threshold.count());
+    dispatcher_.dispatch(BackendEventType::EndApproaching, EndApproaching{*remaining});
+  }
+
   bool handoffToPreparedNext() {
     if (!preloadSlot_ || !preloadSlot_->ready || !preloadSlot_->seamlessEligible || !queue_ ||
-        !sameTarget(preloadSlot_->target, currentTarget_)) {
+        !sameTarget(preloadSlot_->target, currentTarget_) || device_.secondSourceActive()) {
+      // T9 守卫：槽队列已作为第二源发布（交叉重叠中）时禁止 handoff——回调正在消费该
+      // ring，排空移交会撕裂第二源且随后的槽析构触碰已发布队列。重叠期结束/退役由
+      // 任务 10/11 调度；此刻无生产 activate 调用方，本守卫恒不生效（现状不变）。
       return false;
     }
 
     auto slot = std::move(*preloadSlot_);
     preloadSlot_.reset();
+    // T10：无缝直切同为接管提交——AdvanceCompleted 最先发出（先于新曲 TrackChanged/
+    // 状态事件；控制器据此校验 pendingAdvance 账本并提交，窗口内无 pending 时丢弃）。
+    dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
     source_ = std::move(slot.source);
     pipeline_ = std::move(slot.pipeline);
     currentRequest_ = slot.request;
@@ -1333,6 +1458,12 @@ private:
     stateMachine_.loadTrack(currentRequest_);
     stateMachine_.completeLoad();
     stateMachine_.play();
+    // T8：handoff = 新曲接管（等价新 loadTrack）——预解码预告重新武装，使 RepeatOne
+    // 自身重播/自动前进链上的每首新曲都能再次触发 EndApproaching。
+    endApproachEmitted_ = false;
+    // T10：直切同样开启新臂（交叉窗口裁决锁存复位——declined 臂在直切兜底后不残留）。
+    overlapWindowSettled_ = false;
+    overlapRampPending_ = false;
 
     transferPreloadedPcm(slot);
     loadedToEnd_ = slot.loadedToEnd && slot.queue && slot.queue->availableFrames() == 0U;
@@ -1425,6 +1556,173 @@ private:
     if (device_.started()) {
       static_cast<void>(device_.stop());
     }
+    // T9/T10：退役 ring 的销毁点——设备已停（无活跃回调）才允许析构已发布过的队列
+    // （见 retireSecondSourceOnWorker / completeOverlapHandoff / retiredQueue_）；stop
+    // 失败时 device 仍 started → 不移交销毁。
+    if (!device_.started()) {
+      retiredQueue_.reset();
+    }
+  }
+
+  // ---- T9/T10 第二源退役与自动交叉重叠窗口（worker 线程）----
+  // 第二源 = 经 device_.activateSecondSource 发布到回调面的 preloadSlot_ 队列。撤销
+  // 纪律：设备运行中 deactivate（淡交结束/中止/提升）后回调至多再持有一个 block 的旧
+  // 指针 → ring 不可立即析构：先停入 retiredQueue_（延迟回收），销毁点 = 下一次
+  // stopDevice（设备停 = 无活跃回调，同 T7「先停后换」纪律）。设备硬停路径自身安全：
+  // AudioOutputDevice::stop/uninitialize 会把第二源回调面一并清空（active=false/代次
+  // 递增/指针置空），停后 preloadSlot_.reset() 无竞态。
+  void retireSecondSourceOnWorker() {
+    if (!preloadSlot_ || !preloadSlot_->queue || !device_.secondSourceActive()) {
+      return;
+    }
+    device_.deactivateSecondSource();
+    retiredQueue_ = std::move(preloadSlot_->queue);
+  }
+
+  // T10：撤除在途交叉重叠面（幂等；不触碰 preloadSlot_ 本体与预解码预告武装——
+  // 调用方按语义决定是否弃槽/重新武装）。步骤：退第二源（若激活）→ 两源包络轨迹
+  // 打断（层复位到常量 1.0，version→0 使下臂发布直接可受理；打断即瞬时，裁定）→
+  // 窗口锁存复位。configureTransition / prepareNextOnWorker / abortTransition 共用。
+  void cancelOverlapFaceOnWorker() {
+    retireSecondSourceOnWorker();
+    device_.resetSourceEnvelope(0);
+    device_.resetSourceEnvelope(1);
+    overlapRampPending_ = false;
+    overlapWindowSettled_ = false;
+  }
+
+  // T10：源层包络发布唯一入口（worker；纪律同 publishMasterEnvelope——账本同步读回
+  // 回调真值 → 产出快照（版本递增）→ 发布）。slot < kActiveSourceEnvelopeSlots。
+  void publishSourceEnvelope(std::size_t slot,
+                             float targetGain,
+                             std::chrono::milliseconds durationMs,
+                             GainEnvelopeCurve curve) {
+    auto& controller = sourceEnvelopeControllers_[slot];
+    controller.syncCurrentGain(device_.sourceEnvelopeGain(slot));
+    const auto snapshot = controller.makeRampSnapshot(targetGain, durationMs, curve, envelopeSampleRate());
+    device_.setSourceEnvelope(slot, snapshot);
+  }
+
+  // T10：自动交叉重叠窗口调度（Playing tick 调用；裁定⑦ 时序、⑧ 就绪度不延迟）。
+  // 窗口点 = 估剩 ≤ crossfadeMs 的首个 tick；单发/臂裁决（overlapWindowSettled_）：
+  // - 槽尚未建立（控制器 PrepareNext 在途/未下发）：等待——不裁决（裁定⑧ 不延迟指
+  //   不拖慢自然终点；prepare 已在管线中，非"未就绪硬等"，见 EA 阈值 == crossfadeMs
+  //   时两者同 tick 的竞争场景）；
+  // - 槽已建立但未就绪 / 交接方式非 Crossfade：本臂放弃交叉（declined——不等待不
+  //   延迟，自然终点按直切/普通自然结束兜底，裁定⑧）；
+  // - 槽就绪且交接方式 = Crossfade：启动交叉（就绪即启）。
+  void maybeStartAutoOverlap() {
+    if (overlapWindowSettled_ || device_.secondSourceActive()) {
+      return;
+    }
+    const auto crossfadeMs = transitionConfig_.crossfadeMs;
+    if (crossfadeMs.count() <= 0 || config_.outputMode != AudioOutputMode::Mixed) {
+      return;
+    }
+    const auto remaining = estimateRemainingMs();
+    if (!remaining.has_value() || *remaining > crossfadeMs) {
+      return;
+    }
+    if (!preloadSlot_) {
+      return;  // prepare 在途：等槽建立后再裁决（下个 tick 自然受理）。
+    }
+    // 窗口到点且槽已存在：一次性裁决（锁定——不重试；裁定⑧ 就绪即启/未就绪不延迟）。
+    overlapWindowSettled_ = true;
+    if (!preloadSlot_->ready || preloadSlot_->kindMeta.kind != PrepareNextKind::Crossfade) {
+      spdlog::debug("overlap window declined for arm (slot ready={}, meta kind=crossfade={})",
+                    preloadSlot_->ready,
+                    preloadSlot_->kindMeta.kind == PrepareNextKind::Crossfade);
+      return;
+    }
+    startOverlap(crossfadeMs);
+  }
+
+  // T10：启动交叉重叠。N7 典序：先以「即时 0」包络激活第二源（槽 1 层落零——B2 前置：
+  // 0→1 EQ 轨迹须先经即时 0 把回调 currentGain 落到 0），激活成功后再发布主源 1→0
+  // 腿（EQ 对、时长 = crossfadeMs）；槽 1 的 0→1 腿由 tickOverlapRamp 观测归零后发布
+  // （同长 EQ 对）。设备拒绝激活（N8 格式守卫）→ 本臂已裁决、放弃交叉（兜底直切）。
+  void startOverlap(std::chrono::milliseconds crossfadeMs) {
+    sourceEnvelopeControllers_[1].syncCurrentGain(device_.sourceEnvelopeGain(1));
+    const auto instantZero = sourceEnvelopeControllers_[1].makeRampSnapshot(
+        0.0F, std::chrono::milliseconds{0}, GainEnvelopeCurve::Linear, envelopeSampleRate());
+    device_.activateSecondSource(*preloadSlot_->queue, instantZero);
+    if (!device_.secondSourceActive()) {
+      spdlog::error("overlap start refused by device (second source inactive); arm declined");
+      return;
+    }
+    publishSourceEnvelope(0, 0.0F, crossfadeMs, GainEnvelopeCurve::EqualPowerPair);
+    overlapRampPending_ = true;
+    spdlog::debug("overlap started: crossfade={}ms", crossfadeMs.count());
+  }
+
+  // T10：交叉第二腿发布（Playing tick 调用）：槽 1 回调增益归零（即时 0 已被执行）后
+  // 发布 0→1 腿（时长 = crossfadeMs 的 EQ 对，与主源 1→0 腿功率互补）。
+  void tickOverlapRamp() {
+    if (!overlapRampPending_) {
+      return;
+    }
+    if (device_.sourceEnvelopeGain(1) <= kFadeCompleteGainEpsilon) {
+      overlapRampPending_ = false;
+      publishSourceEnvelope(1, 1.0F, transitionConfig_.crossfadeMs, GainEnvelopeCurve::EqualPowerPair);
+      spdlog::debug("overlap second leg published (0->1, {}ms)", transitionConfig_.crossfadeMs.count());
+    }
+  }
+
+  // T10：重叠期满（主源排空）→ 第二源提升为主源。时序：
+  // 1) AdvanceCompleted 最先（先于新曲 TrackChanged/状态事件——控制器先提交后同步）；
+  // 2) 撤第二源面（回调至多再持一块旧指针）→ 主 face rebind 到槽 ring；
+  // 3) 两源包络复位（打断在途交叉轨迹 → 常量 1.0，打断即瞬时，裁定）；
+  // 4) 旧主 ring 停入 retiredQueue_（回调可能仍持有一块，延迟回收，见 stopDevice）。
+  // 其余（时钟重置/状态机加载/重新武装/续解码/位置发布）与 handoffToPreparedNext 同构。
+  bool completeOverlapHandoff() {
+    if (!preloadSlot_ || !preloadSlot_->queue || !device_.secondSourceActive() || !queue_) {
+      return false;
+    }
+    auto slot = std::move(*preloadSlot_);
+    preloadSlot_.reset();
+    overlapRampPending_ = false;
+    overlapWindowSettled_ = false;
+    // T10：第二源在重叠窗口期已被回调消费（主源排空前同步播放）——新曲时钟须从
+    // 已消费帧对应的位置续走（而非 0），否则新曲总时长被重叠期截短（位置失真）。
+    // 消费帧计数来自 ring 自身（prepare 期仅写不读、activate 前无人消费 → 计数值
+    // 即激活后回调消费量；与 clock/observedQueueCounters_ 无关，无竞态）。
+    const auto rate = slot.target.sampleRate != 0U ? slot.target.sampleRate : clock_.sampleRate();
+    std::chrono::milliseconds consumedMs{0};
+    if (rate != 0U) {
+      consumedMs = std::chrono::milliseconds{
+          (slot.queue->counters().consumedFrames * 1000ULL) / rate};
+    }
+    dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
+    device_.deactivateSecondSource();
+    device_.resetSourceEnvelope(0);
+    device_.resetSourceEnvelope(1);
+    retiredQueue_ = std::move(queue_);
+    device_.rebindQueue(*slot.queue);
+    queue_ = std::move(slot.queue);
+    source_ = std::move(slot.source);
+    pipeline_ = std::move(slot.pipeline);
+    currentRequest_ = slot.request;
+    currentTarget_ = slot.target;
+    trackEndPosition_ = slot.endPosition;
+    pendingFrameWrite_ = std::move(slot.pendingFrameWrite);
+    hasCurrentTarget_ = true;
+
+    const auto basePosition =
+        currentRequest_.offset.value_or(std::chrono::milliseconds{0}) + consumedMs;
+    clock_.reset(currentRequest_.trackId, currentTarget_.sampleRate, basePosition);
+    clock_.resume();
+    stateMachine_.loadTrack(currentRequest_);
+    stateMachine_.completeLoad();
+    stateMachine_.play();
+    // 新曲臂重新武装（同 handoff 语义）。
+    endApproachEmitted_ = false;
+    loadedToEnd_ = slot.loadedToEnd && queue_->availableFrames() == 0U;
+    if (!loadedToEnd_) {
+      static_cast<void>(fillQueue());
+    }
+    observedQueueCounters_ = queue_->counters();
+    publishPosition();
+    return true;
   }
 
   // ================= T6 物理收尾（finishing）与传送淡变 =================
@@ -1601,6 +1899,20 @@ private:
   // T7：最近一次成功开启设备时的 config_ 快照（免重开短路"设备目标未变"判据）。
   std::optional<AudioOutputConfig> activeDeviceConfig_{};
   TransitionConfig transitionConfig_{};
+  // T8：EndApproaching 是否已在本臂（当前曲/当前配置）发出——一次性去重；
+  // 由新 loadTrack / configureTransition / handoff 重新武装（裁定复位矩阵）。
+  bool endApproachEmitted_{false};
+  // T10：本臂交叉窗口裁决锁存——true = 已裁决（已启动交叉或已放弃，不重试；
+  // 裁定⑧ 就绪即启/未就绪不延迟）。复位矩阵 = 新 loadTrack / configureTransition /
+  // abortTransition / 两种 handoff（新曲臂）。
+  bool overlapWindowSettled_{false};
+  // T10：交叉第二腿（槽 1 0→1）待发——第二源已即时 0 激活、主源 1→0 腿已发布，
+  // 等待槽 1 回调增益归零观测后发布 0→1 腿（B2：EQ 0→1 须先经即时 0 落底）。
+  bool overlapRampPending_{false};
+  // T10：源层包络发布账本（纪律同 masterEnvelope_；version 跨臂单调递增——与设备
+  // resetSourceEnvelope 的版本清零并存：发布版本 > 0 恒被受理，A5 语义）。
+  std::array<GainEnvelopeController, 2> sourceEnvelopeControllers_{
+      GainEnvelopeController{1.0F}, GainEnvelopeController{1.0F}};
 
   // ---- T6 传送淡变状态（均仅 audio worker 线程访问）----
   // finishingAction_ != None = 物理收尾中（pause/stop 已翻转逻辑态、设备运行淡出中）。
@@ -1623,6 +1935,10 @@ private:
   FfmpegFilterTargetFormat currentTarget_{};
   std::optional<PendingFrameWrite> pendingFrameWrite_{};
   std::optional<PreloadSlot> preloadSlot_{};
+  // T9/T10：退役 ring 停放处（延迟回收，见 retireSecondSourceOnWorker / stopDevice）。
+  // 两类 ring 停入：撤第二源面后的槽 ring（T9）、重叠提升后仍可能被回调持有一块的旧
+  // 主 ring（T10）。持有期间设备已撤销对它的发布；析构只发生在设备停边界（无活跃回调）。
+  std::unique_ptr<PcmBufferQueue> retiredQueue_{};
   bool loadedToEnd_{false};
   bool hasCurrentTarget_{false};
   std::optional<std::chrono::milliseconds> trackEndPosition_{};

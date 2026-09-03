@@ -282,10 +282,37 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 }
 
 [[nodiscard]] ControlDomainNotification makeErrorNotification(ControlDomainNotificationKind kind, MediaControllerErrorCode code,
-                                                             std::string message) {
+                                                              std::string message) {
   auto notification = makeNotification(kind, std::move(message));
   notification.errorCode = code;
   return notification;
+}
+
+// T10 失效域（裁定基线⑦）：重叠窗口（EndApproaching 记录 pendingAdvance 至
+// AdvanceCompleted 提交）内收到以下命令类 = 窗口内失效操作 → 立即中止过渡并重新调度；
+// 窗口外（无 pending = 已提交/未进入窗口）这些命令走普通路径、零影响。
+[[nodiscard]] bool isAdvanceWindowInvalidator(MediaControlCommandKind kind) {
+  switch (kind) {
+  case MediaControlCommandKind::Pause:
+  case MediaControlCommandKind::Stop:
+  case MediaControlCommandKind::TogglePlayPause:
+  case MediaControlCommandKind::SeekTo:
+  case MediaControlCommandKind::SeekBy:
+  case MediaControlCommandKind::SkipNext:
+  case MediaControlCommandKind::SkipPrevious:
+  case MediaControlCommandKind::SelectTrack:
+  case MediaControlCommandKind::SetRepeatMode:
+  case MediaControlCommandKind::SetShuffle:
+  case MediaControlCommandKind::PlayNextTrack:
+  case MediaControlCommandKind::ClearPlayQueue:
+  case MediaControlCommandKind::RemoveFromQueue:
+  case MediaControlCommandKind::ConfigureOutput:
+  case MediaControlCommandKind::SetTransitionConfig:
+  case MediaControlCommandKind::StartPlaybackFromContext:
+    return true;
+  default:
+    return false;
+  }
 }
 
 }
@@ -347,6 +374,16 @@ const std::vector<ControlDomainNotification>& ControlStateReducer::recentNotific
 
 ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& command) {
   auto reduction = accept();
+
+  // T10 N1：reject 回补标志每命令复位（事件路径 abort 的置位不得跨命令残留生效）。
+  carryAbortTransitionOnReject_ = false;
+
+  // T10 失效域门控（裁定基线⑦）：pendingAdvance 在窗（EndApproaching→提交）内收到
+  // 失效操作类命令 → 立即中止过渡（撤第二源/预解码槽 + 服务侧重新武装），随后照常
+  // 执行本命令自己的重调度。窗口外（无 pending = 已提交或未进入窗口）零影响。
+  if (isAdvanceWindowInvalidator(command.kind)) {
+    abortPendingAdvance(reduction);
+  }
 
   switch (command.kind) {
   case MediaControlCommandKind::Play:
@@ -552,6 +589,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
       }
       playbackQueue_.push_front(QueueEntry{.trackId = track->identity.trackId,
                                            .nodeId = track->parentNodeId.value_or(std::string{})});
+      ++queueVersion_;
       syncQueueSnapshot();
       markPlayerChanged(reduction);
       spdlog::debug("play queue entry added at front: '{}' (queue size {})", track->identity.trackId, playbackQueue_.size());
@@ -560,6 +598,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
   case MediaControlCommandKind::ClearPlayQueue:
     if (!playbackQueue_.empty()) {
       playbackQueue_.clear();
+      ++queueVersion_;
       syncQueueSnapshot();
       markPlayerChanged(reduction);
       spdlog::debug("play queue cleared");
@@ -571,6 +610,7 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     }
     if (*command.queueIndex < playbackQueue_.size()) {
       playbackQueue_.erase(playbackQueue_.begin() + static_cast<std::ptrdiff_t>(*command.queueIndex));
+      ++queueVersion_;
       syncQueueSnapshot();
       markPlayerChanged(reduction);
       spdlog::debug("play queue entry removed at index {}", *command.queueIndex);
@@ -616,6 +656,9 @@ ControlReduction ControlStateReducer::handleConfigureOutput(ControlReduction& re
   if (mode != static_cast<int>(audio::AudioOutputMode::Direct) && mode != static_cast<int>(audio::AudioOutputMode::Mixed)) {
     return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput requires a valid output mode");
   }
+  // T10：留存当前输出模式（pendingAdvance 版本 token 组成部分；配置命令本身在窗内
+  // 已由门控中止过渡——此处仅镜像状态供提交校验）。
+  outputMode_ = config.outputMode;
   if (config.targetSampleRate.has_value() && (*config.targetSampleRate < 8000U || *config.targetSampleRate > 768000U)) {
     return reject(MediaControllerErrorCode::InvalidCommand, "ConfigureOutput sample rate is out of range (8000-768000)");
   }
@@ -630,6 +673,9 @@ ControlReduction ControlStateReducer::handleConfigureOutput(ControlReduction& re
   if (!selectedTrack_.has_value()) {
     return reduction;
   }
+  // T10：ConfigureOutput 强制整轨重载 = 任何在途预解码/重叠作废（LoadTrack 将重置
+  // 服务侧武装与槽）；窗口内的本命令已由门控发过 abort，这里兜底清账本防悬挂。
+  pendingAdvance_.reset();
   auto track = findPlayableTrack(*selectedTrack_);
   if (!track.has_value()) {
     track = selectedPlaybackContextTrack();
@@ -691,6 +737,11 @@ ControlReduction ControlStateReducer::handleSetTransitionConfig(ControlReduction
   // 与 ConfigureOutput 语义隔离：仅生成单意图转发配置，不触发任何重载
   // （无 LoadTrack/Seek/Play 尾意图）、不改播放快照。
   reduction.intents.push_back(makeSetTransitionConfigIntent(config));
+  // T8：留存决策表输入（EndApproaching → PrepareNext 的档位/预加载判定来源）。
+  transitionConfig_ = config;
+  // T10：过渡配置变更版本递增（pendingAdvance 版本 token 组成；窗口内本命令已由
+  // 门控中止过渡，服务侧以新配置重新武装）。
+  ++transitionConfigVersion_;
   return reduction;
 }
 
@@ -767,59 +818,48 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           }
           player_.timeline.position = trackPosition;
           markPlayerChanged(reduction, payload.after.sampledAt);
-	        } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
-	          if (selectedTrack_.has_value() && !sameTrack(identityFromRequest(payload.request), *selectedTrack_)) {
-	            spdlog::debug("ignoring stale playback-ended event for track '{}'", payload.request.trackId);
-	            return;
-	          }
-	          visibleStateDuringSeek_.reset();
-	          {
-            auto filePosition = payload.finalClock.position;
-            auto trackPosition = filePosition;
-            if (currentTrackOffset_.has_value()) {
-              trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
-            }
-            if (player_.timeline.duration.has_value()) {
-              trackPosition = std::min(trackPosition, *player_.timeline.duration);
-            }
-            player_.timeline.position = trackPosition;
-	          }
-          if (const auto queued = consumeQueueFront(); queued.has_value()) {
-            // 临时队列优先（T7）：消费队列头部，播放上下文 index 冻结不动；
-            // 队列空后由文件夹序列从冻结 index 的下一曲继续。
-            selectTrack(reduction, *queued, true);
-            playingQueuedTrack_ = true;
-          } else if (player_.repeatMode == RepeatMode::One) {
-            if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
-              selectTrack(reduction, *track, true);
-            } else {
-              stopPlayback(reduction);
-            }
-          } else if (player_.shuffle && playbackContext_.has_value() && !playbackContext_->order.empty()) {
-	            if (const auto track = shuffledTrack(playbackContext_->order, /*reshuffleWhenExhausted=*/true); track.has_value()) {
-	              selectTrack(reduction, *track, true);
-	            } else if (const auto current = selectedPlaybackContextTrack(); current.has_value()) {
-	              selectTrack(reduction, *current, true);
-	            } else {
-	              stopPlayback(reduction);
+	          } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
+	            if (selectedTrack_.has_value() && !sameTrack(identityFromRequest(payload.request), *selectedTrack_)) {
+	              spdlog::debug("ignoring stale playback-ended event for track '{}'", payload.request.trackId);
+	              return;
 	            }
-          } else if (isLastTrackInContext()) {
-            addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
-	            if (player_.repeatMode == RepeatMode::All) {
-	              if (const auto track = firstTrackOfCurrentFolder(); track.has_value()) {
-	                selectTrack(reduction, *track, true);
-	              } else {
-	                stopPlayback(reduction);
+	            visibleStateDuringSeek_.reset();
+	            {
+	              auto filePosition = payload.finalClock.position;
+	              auto trackPosition = filePosition;
+	              if (currentTrackOffset_.has_value()) {
+	                trackPosition = std::max(std::chrono::milliseconds{0}, filePosition - *currentTrackOffset_);
 	              }
-	            } else {
-	              stopPlayback(reduction);
+	              if (player_.timeline.duration.has_value()) {
+	                trackPosition = std::min(trackPosition, *player_.timeline.duration);
+	              }
+	              player_.timeline.position = trackPosition;
 	            }
-          } else if (const auto track = nextTrack(true); track.has_value()) {
-            selectTrack(reduction, *track, true);
-          } else {
-            stopPlayback(reduction);
-          }
-	          markPlayerChanged(reduction, payload.finalClock.sampledAt);
+	            // T10（Metis 缺口 1b）：推进逻辑抽取为共享 commitAdvance（临时队列/RepeatOne/
+	            // shuffle/RepeatAll/nextTrack + 索引推进 + 快照发布）。无预载普通自然结束路径
+	            // 行为逐事件一致（本分支语义与抽取前等价——回归锁定）。
+	            commitAdvance(reduction, AdvanceEventSource::PlaybackEnded, payload.finalClock.sampledAt);
+	          } else if constexpr (std::is_same_v<Payload, audio::AdvanceCompleted>) {
+	            // T10：接管提交（Metis 缺口 1b）。服务在重叠交叉/无缝直切 handoff 完成时发本
+	            // 事件（先于新曲 TrackChanged/状态事件）。校验 pendingAdvance 账本：无账本 =
+	            // 陈旧/双提交 → 丢弃（双提交防重）；版本 token 或 trackId 失配 = 服务接管了
+	            // 未经批准的推进 → abort（撤账本 + 服务侧撤第二源）并按控制器当前决策重发
+	            // 普通 LoadTrack（音频层绝不自主选曲，提交语义永远由控制器裁决）。
+	            if (!pendingAdvance_.has_value()) {
+	              spdlog::debug("ignoring advance-completed for '{}' without pending ledger (stale or double commit)",
+	                            payload.trackId);
+	              return;
+	            }
+	            if (payload.trackId != pendingAdvance_->target.identity.trackId || !pendingTokenMatches()) {
+	              spdlog::warn("advance-completed validation failed for '{}' (pending target '{}'): aborting transition",
+	                           payload.trackId, pendingAdvance_->target.identity.trackId);
+	              abortPendingAdvance(reduction);
+	              commitAdvance(reduction, AdvanceEventSource::PlaybackEnded, event.timestamp);
+	              return;
+	            }
+	            commitAdvance(reduction, AdvanceEventSource::AdvanceCompleted, event.timestamp);
+	          } else if constexpr (std::is_same_v<Payload, audio::EndApproaching>) {
+	          handleEndApproaching(reduction);
 	        } else if constexpr (std::is_same_v<Payload, audio::OutputFormatChanged>) {
           markPlayerChanged(reduction, event.timestamp);
         } else if constexpr (std::is_same_v<Payload, audio::OutputModeFallback>) {
@@ -1340,6 +1380,14 @@ ControlReduction ControlStateReducer::accept() {
 ControlReduction ControlStateReducer::reject(MediaControllerErrorCode code, std::string message) {
   spdlog::warn("command rejected ({}): {}", errorCodeText(code), message);
   auto reduction = ControlReduction{.result = MediaControllerCommandResult{.accepted = false, .code = code, .message = message}};
+  // T10 N1：本命令帧被失效域门控 abort 过（意图已压入旧 reduction）→ 回补 AbortTransition，
+  // 防窗内非法失效命令漏撤服务侧过渡（账本已清但重叠残留 → 后续 AC 落 stale-drop）。
+  if (carryAbortTransitionOnReject_) {
+    carryAbortTransitionOnReject_ = false;
+    ControlIntent intent{};
+    intent.kind = ControlIntentKind::AbortTransition;
+    reduction.intents.push_back(std::move(intent));
+  }
   addNotification(reduction, makeErrorNotification(ControlDomainNotificationKind::CommandRejected, code, std::move(message)));
   return reduction;
 }
@@ -1478,6 +1526,9 @@ ControlReduction ControlStateReducer::reduceArtworkResolved(const ArtworkResolve
 }
 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
+  // T10：任何显式切轨都是对在途过渡的否决（裁定基线⑦窗口外硬清理兜底：门控之外的
+  // 内部切轨路径同样不能遗留悬挂账本，否则下一首 EndApproaching 会基于过期账本）。
+  pendingAdvance_.reset();
   // 切轨抑制（需求 4 按钮锁定）：startPlayback=true 时立即发布乐观 Playing 快照，
   // 并设置可见状态抑制 —— 音频层随后发布的 Loading 会被 reduceAudioEvent 压回
   // Playing（:621-629），直到真实 Playing/Stopped/Error 到达时解除；Error 必放行，
@@ -1513,13 +1564,274 @@ void ControlStateReducer::selectTrack(ControlReduction& reduction, const Playabl
   markPlayerChanged(reduction);
 }
 
+std::optional<ControlStateReducer::NaturalEndPeek> ControlStateReducer::peekNaturalEndSelection() const {
+  // 只读镜像 reduceAudioEvent(PlaybackEnded) 的推进级联（提交在任务 10 统一抽取），
+  // 保证预解码目标 = 自然播完时实际会选中的曲目；零副作用（不消费队列/不推进索引/
+  // 不消耗 shuffle 随机序列与历史）。
+  if (!playbackContext_.has_value() || playbackContext_->order.empty()) {
+    return std::nullopt;
+  }
+
+  // 1) 临时队列队首（首个可解析条目；提交时 consumeQueueFront 跳过不可解析条目，
+  //    这里只扫描不弹出）。
+  for (const auto& entry : playbackQueue_) {
+    if (const auto track = findPlayableTrackByTrackId(entry.trackId); track.has_value()) {
+      return NaturalEndPeek{*track, /*fromTempQueue=*/true, /*repeatSelf=*/false};
+    }
+  }
+
+  // 2) RepeatOne → 自身无缝重播（裁定基线①；目标=当前上下文曲目）。
+  if (player_.repeatMode == RepeatMode::One && selectedTrack_.has_value()) {
+    const auto currentIndex = selectedContextIndex();
+    if (!currentIndex.has_value()) {
+      return std::nullopt;  // 提交级联同路径 stopPlayback
+    }
+    return NaturalEndPeek{playbackContext_->order[*currentIndex], false, true};
+  }
+
+  // 3) shuffle 激活 → 随机选取不可预解码（决策表：不 armed 不发；降级=自然硬切）。
+  if (player_.shuffle) {
+    return std::nullopt;
+  }
+
+  // 4) 定位当前曲在上下文 order 中的位置（提交级联 nextTrack/selectedContextIndex 同构）：
+  //    上下文漂移时仅临时队列路径允许从冻结 index 继续。
+  const auto currentIndex = selectedContextIndex();
+  if (selectedTrack_.has_value() && !currentIndex.has_value()) {
+    if (!playingQueuedTrack_) {
+      return std::nullopt;
+    }
+  }
+  if (!selectedTrack_.has_value()) {
+    return NaturalEndPeek{playbackContext_->order.front(), false, false};
+  }
+  const auto& order = playbackContext_->order;
+
+  // 5) 队列末端（最后一首）：RepeatAll → 回绕容器直属第一首（提交级联
+  //    firstTrackOfCurrentFolder 同构，仅返回不写 index）；其余 → 无下一曲。
+  if (currentIndex.has_value() && *currentIndex + 1U >= order.size()) {
+    if (player_.repeatMode != RepeatMode::All) {
+      return std::nullopt;
+    }
+    std::optional<std::string> containerNodeId;
+    if (playbackContext_->descriptor.scope == PlaybackContextScope::Folder) {
+      containerNodeId = playbackContext_->descriptor.folderNodeId;
+    } else if (library_.libraryTree.has_value() && library_.libraryTree->rootNodeId.has_value()) {
+      containerNodeId = library_.libraryTree->rootNodeId;
+    }
+    if (!containerNodeId.has_value()) {
+      return NaturalEndPeek{order.front(), false, false};
+    }
+    const auto firstIt = std::find_if(order.begin(), order.end(), [&](const PlayableTrack& track) {
+      return track.parentNodeId.has_value() && *track.parentNodeId == *containerNodeId;
+    });
+    if (firstIt == order.end()) {
+      return std::nullopt;
+    }
+    return NaturalEndPeek{*firstIt, false, false};
+  }
+
+  // 6) 顺序推进：nextTrack(true) 的只读镜像（含 RepeatAll 在 order 末端回绕 index 0）。
+  auto nextIndex = currentIndex.value_or(playbackContext_->index) + 1U;
+  if (nextIndex >= order.size()) {
+    if (player_.repeatMode != RepeatMode::All) {
+      return std::nullopt;
+    }
+    nextIndex = 0U;
+  }
+  return NaturalEndPeek{order[nextIndex], false, false};
+}
+
+bool ControlStateReducer::sharesCueFileWithCurrent(const PlayableTrack& candidate) const {
+  if (!selectedTrack_.has_value() || !playbackContext_.has_value()) {
+    return false;
+  }
+  const auto currentIndex = selectedContextIndex();
+  if (!currentIndex.has_value()) {
+    return false;
+  }
+  const auto& current = playbackContext_->order[*currentIndex];
+  // 同一 .cue 文件相邻轨道：identity.filePath = scanner 的 cue 路径（CUE 派生曲的
+  // filePath 语义），request.boundedSegment 标识段请求；候选由顺序邻接天然保证连续。
+  return current.request.boundedSegment && candidate.request.boundedSegment &&
+         current.identity.filePath == candidate.identity.filePath;
+}
+
+void ControlStateReducer::handleEndApproaching(ControlReduction& reduction) {
+  // 仅稳定播放/暂停态受理：Stopped/Loading 等状态下的在途事件为陈旧预告。
+  if (player_.playback.state != PlaybackStatus::Playing && player_.playback.state != PlaybackStatus::Paused) {
+    return;
+  }
+  if (!selectedTrack_.has_value()) {
+    return;
+  }
+  const auto peek = peekNaturalEndSelection();
+  if (!peek.has_value()) {
+    return;
+  }
+  // T10（裁定基线⑦）：记录待提交推进账本——本预告对应的自然结束推进候选 + 版本
+  // token 快照（临时队列/输出模式/过渡配置变更版本 + 重复/随机模式）。服务侧接管
+  // （AdvanceCompleted）到达时据此校验；窗内任何失效操作先经门控 abort 清账本。
+  pendingAdvance_ = PendingAdvance{
+      .target = peek->track,
+      .queueVersion = queueVersion_,
+      .outputMode = outputMode_,
+      .repeatMode = player_.repeatMode,
+      .shuffle = player_.shuffle,
+      .transitionConfigVersion = transitionConfigVersion_,
+  };
+
+  audio::PrepareNextMeta meta{};
+  const auto mode = transitionConfig_.autoAdvanceFadeMode;
+  if (peek->fromTempQueue) {
+    // 临时队列队首：提交级联的首选、确定性直插——按"普通下一曲"档位行处理。
+    meta.kind = mode == audio::AutoAdvanceFadeMode::Off ? audio::PrepareNextKind::SeamlessDirect
+                                                        : audio::PrepareNextKind::Crossfade;
+  } else if (peek->repeatSelf) {
+    // RepeatOne → 自身无缝重播（裁定基线①）：kind=无缝直切，无交叉（不受档位影响）。
+    meta.kind = audio::PrepareNextKind::SeamlessDirect;
+  } else {
+    // 顺序推进（含 RepeatAll 回绕）：CUE 无间隙组判定 + 档位决策表（裁定）。
+    meta.isGaplessGroup = sharesCueFileWithCurrent(peek->track);
+    switch (mode) {
+    case audio::AutoAdvanceFadeMode::Off:
+      // 仅预加载>0 时会收到预告（服务侧武装条件）——就绪时无缝直切（裁定基线③）。
+      meta.kind = audio::PrepareNextKind::SeamlessDirect;
+      break;
+    case audio::AutoAdvanceFadeMode::ExceptGaplessGroup:
+      // 除 CUE 邻曲/无间隙组外交叉：组内尽力无缝直切。
+      meta.kind = meta.isGaplessGroup ? audio::PrepareNextKind::SeamlessDirect
+                                      : audio::PrepareNextKind::Crossfade;
+      break;
+    case audio::AutoAdvanceFadeMode::All:
+      // 全交叉：对 CUE 组也交叉（按字面，例外仅限自动档）。
+      meta.kind = audio::PrepareNextKind::Crossfade;
+      break;
+    }
+  }
+
+  ControlIntent intent{};
+  intent.kind = ControlIntentKind::PrepareNext;
+  intent.track = peek->track.request;
+  intent.prepareNextMeta = meta;
+  reduction.intents.push_back(std::move(intent));
+  spdlog::debug("end approaching: prepare next '{}' (kind={}, gaplessGroup={})",
+                peek->track.identity.trackId,
+                meta.kind == audio::PrepareNextKind::Crossfade ? "crossfade" : "seamless",
+                meta.isGaplessGroup);
+}
+
 void ControlStateReducer::stopPlayback(ControlReduction& reduction) {
+  // T10：停止 = 无条件终止在途过渡（残留账本防悬挂）。
+  pendingAdvance_.reset();
   visibleStateDuringSeek_.reset();
   currentTrackOffset_.reset();
   player_.playback.state = PlaybackStatus::Stopped;
   player_.timeline.position = std::chrono::milliseconds{0};
   spdlog::debug("state: {}", playbackStatusName(PlaybackStatus::Stopped));
   markPlayerChanged(reduction);
+}
+
+void ControlStateReducer::abortPendingAdvance(ControlReduction& reduction) {
+  if (!pendingAdvance_.has_value()) {
+    return;
+  }
+  pendingAdvance_.reset();
+  spdlog::debug("aborting in-flight advance: pushing AbortTransition intent");
+  ControlIntent intent{};
+  intent.kind = ControlIntentKind::AbortTransition;
+  reduction.intents.push_back(std::move(intent));
+  // T10 N1：标记本命令帧已压 abort 意图。若 handler 载荷校验失败走 reject()（返回全新
+  // reduction、丢弃已压意图），reject() 据此回补，保证窗内非法失效命令也撤服务侧过渡。
+  carryAbortTransitionOnReject_ = true;
+}
+
+bool ControlStateReducer::pendingTokenMatches() const {
+  if (!pendingAdvance_.has_value()) {
+    return false;
+  }
+  return pendingAdvance_->queueVersion == queueVersion_ &&
+         pendingAdvance_->outputMode == outputMode_ &&
+         pendingAdvance_->repeatMode == player_.repeatMode &&
+         pendingAdvance_->shuffle == player_.shuffle &&
+         pendingAdvance_->transitionConfigVersion == transitionConfigVersion_;
+}
+
+void ControlStateReducer::commitAdvance(ControlReduction& reduction,
+                                        AdvanceEventSource source,
+                                        std::chrono::steady_clock::time_point sampledAt) {
+  // T10：提交级联（抽取自原 PlaybackEnded 分支；裁定基线⑦/⑧）。窗口内状态无变化时
+  // 重算结果必与账本目标一致（peek 同构保证），故 AC 与 PBE 共用同一条级联，仅
+  // 选曲应用方式不同（applyCommittedTrack 按 source 分发）。
+  pendingAdvance_.reset();
+  if (const auto queued = consumeQueueFront(); queued.has_value()) {
+    // 临时队列优先（T7）：消费队列头部，播放上下文 index 冻结不动；
+    // 队列空后由文件夹序列从冻结 index 的下一曲继续。
+    applyCommittedTrack(reduction, *queued, source);
+    playingQueuedTrack_ = true;
+  } else if (player_.repeatMode == RepeatMode::One) {
+    if (const auto track = selectedTrack_.has_value() ? this->selectedPlaybackContextTrack() : std::nullopt; track.has_value()) {
+      applyCommittedTrack(reduction, *track, source);
+    } else {
+      stopPlayback(reduction);
+    }
+  } else if (player_.shuffle && playbackContext_.has_value() && !playbackContext_->order.empty()) {
+    if (const auto track = shuffledTrack(playbackContext_->order, /*reshuffleWhenExhausted=*/true); track.has_value()) {
+      applyCommittedTrack(reduction, *track, source);
+    } else if (const auto current = selectedPlaybackContextTrack(); current.has_value()) {
+      applyCommittedTrack(reduction, *current, source);
+    } else {
+      stopPlayback(reduction);
+    }
+  } else if (isLastTrackInContext()) {
+    addNotification(reduction, makeNotification(ControlDomainNotificationKind::PlaybackEnded, "Playback ended"));
+    if (player_.repeatMode == RepeatMode::All) {
+      if (const auto track = firstTrackOfCurrentFolder(); track.has_value()) {
+        applyCommittedTrack(reduction, *track, source);
+      } else {
+        stopPlayback(reduction);
+      }
+    } else {
+      stopPlayback(reduction);
+    }
+  } else if (const auto track = nextTrack(true); track.has_value()) {
+    applyCommittedTrack(reduction, *track, source);
+  } else {
+    stopPlayback(reduction);
+  }
+  markPlayerChanged(reduction, sampledAt);
+}
+
+void ControlStateReducer::applyCommittedTrack(ControlReduction& reduction,
+                                              const PlayableTrack& track,
+                                              AdvanceEventSource source) {
+  if (source == AdvanceEventSource::PlaybackEnded) {
+    selectTrack(reduction, track, true);
+    return;
+  }
+  // AdvanceCompleted：音频服务已完成接管（trackId/版本 token 已在上游校验），曲目在
+  // 服务侧已加载并输出。此处只镜像 selectTrack 的状态应用，但不产生 LoadTrack/Play
+  // 意图（避免重复加载）——artwork 解析仍需推进（新曲目封面）。
+  visibleStateDuringSeek_ = PlaybackStatus::Playing;
+  playingQueuedTrack_ = false;
+  selectedTrack_ = track.identity;
+  currentTrackOffset_ = track.request.offset;
+  player_.currentTrack = track.identity;
+  player_.display = track.display;
+  player_.artwork = track.artwork;
+  player_.timeline.position = std::chrono::milliseconds{0};
+  player_.timeline.duration = track.request.duration;
+  player_.playback.state = PlaybackStatus::Playing;
+  player_.playback.errorCode.reset();
+  player_.playback.errorMessage.reset();
+  spdlog::debug("advance completed: committed track '{}'", track.identity.trackId);
+  ++artworkGeneration_;
+  ArtworkResolveRequest artworkRequest{};
+  artworkRequest.generation = artworkGeneration_;
+  artworkRequest.identity = track.identity;
+  artworkRequest.artworkSourcePath = track.artworkSourcePath;
+  artworkRequest.fallbackThumbnailPath = track.fallbackThumbnailPath;
+  reduction.intents.push_back(makeArtworkResolveIntent(std::move(artworkRequest)));
 }
 
 }

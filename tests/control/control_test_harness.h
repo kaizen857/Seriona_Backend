@@ -64,7 +64,11 @@ public:
   void configureOutput(const audio::AudioOutputConfig& config) override;
   void configureTransition(const audio::TransitionConfig& config) override;
   void loadTrack(const audio::TrackPlaybackRequest& request) override;
+  // T10：中止在途过渡（AbortTransition 意图落地）。fake 只记账——真实撤第二源/弃槽
+  // 语义由服务层测试覆盖；控制器侧仅需断言意图到达顺序与次数。
+  void abortTransition() override;
   void prepareNext(const audio::TrackPlaybackRequest& request) override;
+  void prepareNext(const audio::TrackPlaybackRequest& request, const audio::PrepareNextMeta& meta) override;
   void play() override;
   void pause() override;
   void resume() override;
@@ -80,6 +84,7 @@ public:
   [[nodiscard]] std::size_t configureOutputCalls() const noexcept;
   [[nodiscard]] std::size_t configureTransitionCalls() const noexcept;
   [[nodiscard]] std::size_t loadTrackCalls() const noexcept;
+  [[nodiscard]] std::size_t abortTransitionCalls() const noexcept;
   [[nodiscard]] std::size_t prepareNextCalls() const noexcept;
   [[nodiscard]] std::size_t playCalls() const noexcept;
   [[nodiscard]] std::size_t pauseCalls() const noexcept;
@@ -95,6 +100,8 @@ public:
   [[nodiscard]] const std::optional<audio::TransitionConfig>& lastConfiguredTransition() const noexcept;
   [[nodiscard]] const std::optional<audio::TrackPlaybackRequest>& lastLoadedTrack() const noexcept;
   [[nodiscard]] const std::optional<audio::TrackPlaybackRequest>& lastPreparedTrack() const noexcept;
+  // T8：最近一次 prepareNext 携带的交接方式（2 参重载记录；1 参重载 = 默认直切语义）。
+  [[nodiscard]] const std::optional<audio::PrepareNextMeta>& lastPrepareNextMeta() const noexcept;
   [[nodiscard]] const std::optional<std::chrono::milliseconds>& lastSeekPosition() const noexcept;
   [[nodiscard]] const std::optional<float>& lastVolume() const noexcept;
   [[nodiscard]] const std::optional<bool>& lastMuted() const noexcept;
@@ -118,6 +125,7 @@ private:
   std::size_t configureOutputCalls_{0};
   std::size_t configureTransitionCalls_{0};
   std::size_t loadTrackCalls_{0};
+  std::size_t abortTransitionCalls_{0};
   std::size_t prepareNextCalls_{0};
   std::size_t playCalls_{0};
   std::size_t pauseCalls_{0};
@@ -132,6 +140,7 @@ private:
   std::optional<audio::TransitionConfig> lastConfiguredTransition_{};
   std::optional<audio::TrackPlaybackRequest> lastLoadedTrack_{};
   std::optional<audio::TrackPlaybackRequest> lastPreparedTrack_{};
+  std::optional<audio::PrepareNextMeta> lastPrepareNextMeta_{};
   std::optional<std::chrono::milliseconds> lastSeekPosition_{};
   std::optional<float> lastVolume_{};
   std::optional<bool> lastMuted_{};

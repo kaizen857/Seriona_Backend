@@ -278,10 +278,12 @@ TEST_CASE("audio_output_device envelope instant publish master and source read b
   }
 }
 
-TEST_CASE("audio_output_device envelope source slot one publish ignored") {
+TEST_CASE("audio_output_device envelope source slot one pending until second source active") {
   Float32Rig rig;
 
-  // 槽 1 发布被编译期关闭：输出不缩放、读回恒 1.0（发布面无副作用可观测）。
+  // 任务 9 起槽 1 成为第二源包络层（kActiveSourceEnvelopeSlots=2）：发布被受理为 PENDING，
+  // 但第二源未激活（secondActive=false）时执行器不跑槽 1 → 输出不缩放、读回恒 1.0
+  // （发布面无副作用可观测；激活后同版本会从 currentGain=1.0 起跑——见 dual 用例）。
   rig.device.setSourceEnvelope(1U, envelopeSnapshot(0.5F, 0U, GainEnvelopeCurve::Linear, 1U));
   const auto gains = rig.runBlock();
   for (const float gain : gains) {
@@ -290,13 +292,21 @@ TEST_CASE("audio_output_device envelope source slot one publish ignored") {
   CHECK(closeTo(rig.device.sourceEnvelopeGain(0U), 1.0F));
   CHECK(closeTo(rig.device.sourceEnvelopeGain(1U), 1.0F));
 
-  // 对照：槽 0 同参数发布生效——证明上面的 1.0 确因槽 1 被忽略而非管线失效。
+  // 对照：槽 0 同参数发布生效——证明上面的 1.0 确因槽 1 未执行而非管线失效。
   rig.device.setSourceEnvelope(0U, envelopeSnapshot(0.5F, 0U, GainEnvelopeCurve::Linear, 1U));
   const auto gainsAfterSlot0 = rig.runBlock();
   for (const float gain : gainsAfterSlot0) {
     CHECK(closeTo(gain, 0.5F));
   }
   CHECK(closeTo(rig.device.sourceEnvelopeGain(0U), 0.5F));
+
+  // 槽 2 及以上仍编译期忽略（超出 sourceEnvelopes 数组边界守卫）——发布无副作用。
+  rig.device.setSourceEnvelope(2U, envelopeSnapshot(0.25F, 0U, GainEnvelopeCurve::Linear, 2U));
+  const auto gainsAfterSlot2 = rig.runBlock();
+  for (const float gain : gainsAfterSlot2) {
+    CHECK(closeTo(gain, 0.5F));  // 仍只受槽 0 影响
+  }
+  CHECK(closeTo(rig.device.sourceEnvelopeGain(2U), 1.0F));
 }
 
 TEST_CASE("audio_output_device envelope nan target publish ignored then valid publish works") {

@@ -707,6 +707,15 @@ private:
           dependencies_.audio->configureTransition(*intent.transitionConfig);
         }
         break;
+      case ControlIntentKind::PrepareNext:
+        if (intent.track.has_value()) {
+          dependencies_.audio->prepareNext(*intent.track,
+                                           intent.prepareNextMeta.value_or(audio::PrepareNextMeta{}));
+        }
+        break;
+      case ControlIntentKind::AbortTransition:
+        dependencies_.audio->abortTransition();
+        break;
       }
     }
   }

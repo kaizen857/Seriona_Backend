@@ -268,6 +268,24 @@ void publishEnvelopeLayer(GainEnvelopeLayerState& layer, const GainEnvelopeSnaps
   layer.version.store(snapshot.version, std::memory_order_release);
 }
 
+// 单层全字段复位（resetEnvelopes 与 resetSourceEnvelope 共用）：清 PENDING 与 EXEC
+// （含 currentGain→1.0、latchedVersion→0、exec* 锁存）——设备已停时无竞争；设备运行中
+// 的槽级复位与回调并发窗口见 resetSourceEnvelope 头注释（块首快照已锁存，下块自愈）。
+void clearEnvelopeLayer(GainEnvelopeLayerState& layer) noexcept {
+  layer.version.store(0, std::memory_order_release);
+  layer.targetGain.store(1.0F, std::memory_order_relaxed);
+  layer.startGain.store(1.0F, std::memory_order_relaxed);
+  layer.durationFrames.store(0, std::memory_order_relaxed);
+  layer.curve.store(GainEnvelopeCurve::Linear, std::memory_order_relaxed);
+  layer.currentGain.store(1.0F, std::memory_order_relaxed);
+  layer.rampFramesDone.store(0, std::memory_order_relaxed);
+  layer.latchedVersion.store(0, std::memory_order_relaxed);
+  layer.execStartGain.store(1.0F, std::memory_order_relaxed);
+  layer.execTargetGain.store(1.0F, std::memory_order_relaxed);
+  layer.execDurationFrames.store(0U, std::memory_order_relaxed);
+  layer.execCurve.store(GainEnvelopeCurve::Linear, std::memory_order_relaxed);
+}
+
 // --- 包络执行器账本（任务 5-B2；仅回调线程调用，EXEC/进度域字段回调独占写）----------------
 // 块内执行轨迹的一次性快照（受理/拒绝后稳定，块内逐帧复用；回调线程独占写 exec*，块内无竞态）。
 struct ExecutedTrajectory {
@@ -354,6 +372,165 @@ void finalizeTrajectory(GainEnvelopeLayerState& layer,
   layer.currentGain.store(trajectoryGain(t, copiedFrames - 1U), std::memory_order_relaxed);
 }
 
+// --- 双源逐帧混音（任务 9；D1 渲染序）------------------------------------------------------
+// 输入就位：output = 源 0 整块（readIfGeneration 结果，欠载尾已补零）；secondSrc = 源 1 整块
+// （同纪律）。逐帧：两腿各按自身包络轨迹缩放 → 加宽样本域求和 → master×volume → 落回
+// output。执行器三件套（planEnvelopeLayer/trajectoryGain/finalizeTrajectory）原样复用，
+// 腿增益在帧循环内联求值（零分配、零锁、零间接）。求和域按格式加宽：
+//   Int16：leg 数学同 applyInt16FrameGains（float+lround），int32 域求和（|sum| ≤ 2^16）；
+//   Int32：leg 数学同 applyInt32FrameGains（double+llround），int64 域求和（|sum| ≤ 2^32）；
+//   Int24：解包左对齐 → leg 数学同 applyInt24FrameGains → int64 域求和（两路 |x| ≤ 2^31-256，
+//     和 ≤ 2^32-512 无溢出；见 unpackS24ToLeftAlignedS32 区注释）→ clamp ±2^31 →
+//     packLeftAlignedS32ToS24 落回（任务 4 预留的累加后打包入口）；
+//   Float32：float 域直接求和。
+// 混音覆盖整块 frameCount（含两路补零尾：零 × 腿增益 = 零——整数域 round(0)=0 逐位中性；
+// float 域零尾贡献 +0.0×g≥0=+0.0，除 ±0.0F 符号边缘外逐位中性：(-0.0·g0)+(+0.0·g1)=+0.0
+// ≠ 单源路径的 -0.0 原样保留）；muted/音量 0 走调用方 memset 早退，与单源活动路径同纪律。
+void mixDualInt16Frames(void* output,
+                        const void* secondSrc,
+                        std::uint32_t frameCount,
+                        std::uint16_t channelCount,
+                        const ExecutedTrajectory& source0,
+                        const ExecutedTrajectory& source1,
+                        const ExecutedTrajectory& master,
+                        float volume) noexcept {
+  auto* out = static_cast<std::int16_t*>(output);
+  auto const* src1 = static_cast<std::int16_t const*>(secondSrc);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float leg0 = trajectoryGain(source0, frame);
+    const float leg1 = trajectoryGain(source1, frame);
+    const float masterVol = trajectoryGain(master, frame) * volume;
+    auto* const frameOut = out + static_cast<std::size_t>(frame) * channels;
+    auto const* const frame1 = src1 + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      const auto from0 = std::lround(static_cast<float>(frameOut[ch]) * leg0);
+      const auto from1 = std::lround(static_cast<float>(frame1[ch]) * leg1);
+      const auto summed = from0 + from1;
+      const auto scaled = std::lround(static_cast<float>(summed) * masterVol);
+      frameOut[ch] = static_cast<std::int16_t>(
+          std::clamp<long>(scaled, std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()));
+    }
+  }
+}
+
+void mixDualInt24Frames(void* output,
+                        const void* secondSrc,
+                        std::uint32_t frameCount,
+                        std::uint16_t channelCount,
+                        const ExecutedTrajectory& source0,
+                        const ExecutedTrajectory& source1,
+                        const ExecutedTrajectory& master,
+                        float volume) noexcept {
+  auto* outBytes = static_cast<std::uint8_t*>(output);
+  auto const* src1Bytes = static_cast<std::uint8_t const*>(secondSrc);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float leg0 = trajectoryGain(source0, frame);
+    const float leg1 = trajectoryGain(source1, frame);
+    const float masterVol = trajectoryGain(master, frame) * volume;
+    auto* const frameOut = outBytes + static_cast<std::size_t>(frame) * channels * 3U;
+    auto const* const frame1 = src1Bytes + static_cast<std::size_t>(frame) * channels * 3U;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      auto* const sampleOut = frameOut + ch * 3U;
+      auto const* const sample1 = frame1 + ch * 3U;
+      const auto sample32 = unpackS24ToLeftAlignedS32(sampleOut);
+      const auto other32 = unpackS24ToLeftAlignedS32(sample1);
+      const auto from0 = std::llround(static_cast<double>(sample32) * static_cast<double>(leg0));
+      const auto from1 = std::llround(static_cast<double>(other32) * static_cast<double>(leg1));
+      const auto summed = from0 + from1;  // |sum| ≤ 2^32-512，int64 无溢出
+      const auto scaled = std::llround(static_cast<double>(summed) * static_cast<double>(masterVol));
+      const auto clamped = static_cast<std::int32_t>(std::clamp<long long>(
+          scaled, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()));
+      packLeftAlignedS32ToS24(clamped, sampleOut);
+    }
+  }
+}
+
+void mixDualInt32Frames(void* output,
+                        const void* secondSrc,
+                        std::uint32_t frameCount,
+                        std::uint16_t channelCount,
+                        const ExecutedTrajectory& source0,
+                        const ExecutedTrajectory& source1,
+                        const ExecutedTrajectory& master,
+                        float volume) noexcept {
+  auto* out = static_cast<std::int32_t*>(output);
+  auto const* src1 = static_cast<std::int32_t const*>(secondSrc);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float leg0 = trajectoryGain(source0, frame);
+    const float leg1 = trajectoryGain(source1, frame);
+    const float masterVol = trajectoryGain(master, frame) * volume;
+    auto* const frameOut = out + static_cast<std::size_t>(frame) * channels;
+    auto const* const frame1 = src1 + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      const auto from0 = std::llround(static_cast<double>(frameOut[ch]) * static_cast<double>(leg0));
+      const auto from1 = std::llround(static_cast<double>(frame1[ch]) * static_cast<double>(leg1));
+      const auto summed = from0 + from1;
+      const auto scaled = std::llround(static_cast<double>(summed) * static_cast<double>(masterVol));
+      frameOut[ch] = static_cast<std::int32_t>(std::clamp<long long>(
+          scaled, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()));
+    }
+  }
+}
+
+void mixDualFloat32Frames(void* output,
+                          const void* secondSrc,
+                          std::uint32_t frameCount,
+                          std::uint16_t channelCount,
+                          const ExecutedTrajectory& source0,
+                          const ExecutedTrajectory& source1,
+                          const ExecutedTrajectory& master,
+                          float volume) noexcept {
+  auto* out = static_cast<float*>(output);
+  auto const* src1 = static_cast<float const*>(secondSrc);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float leg0 = trajectoryGain(source0, frame);
+    const float leg1 = trajectoryGain(source1, frame);
+    const float masterVol = trajectoryGain(master, frame) * volume;
+    auto* const frameOut = out + static_cast<std::size_t>(frame) * channels;
+    auto const* const frame1 = src1 + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      const auto from0 = frameOut[ch] * leg0;
+      const auto from1 = frame1[ch] * leg1;
+      frameOut[ch] = (from0 + from1) * masterVol;
+    }
+  }
+}
+
+void mixDualFrames(void* output,
+                   const void* secondSrc,
+                   std::uint32_t frameCount,
+                   std::uint16_t channelCount,
+                   AudioSampleFormat sampleFormat,
+                   const ExecutedTrajectory& source0,
+                   const ExecutedTrajectory& source1,
+                   const ExecutedTrajectory& master,
+                   float volume) noexcept {
+  if (output == nullptr || secondSrc == nullptr || frameCount == 0U || channelCount == 0U) {
+    return;
+  }
+  switch (sampleFormat) {
+  case AudioSampleFormat::Int16:
+    mixDualInt16Frames(output, secondSrc, frameCount, channelCount, source0, source1, master, volume);
+    return;
+  case AudioSampleFormat::Int24:
+    mixDualInt24Frames(output, secondSrc, frameCount, channelCount, source0, source1, master, volume);
+    return;
+  case AudioSampleFormat::Int32:
+    mixDualInt32Frames(output, secondSrc, frameCount, channelCount, source0, source1, master, volume);
+    return;
+  case AudioSampleFormat::Float32:
+    mixDualFloat32Frames(output, secondSrc, frameCount, channelCount, source0, source1, master, volume);
+    return;
+  case AudioSampleFormat::Unknown:
+    return;
+  }
+}
+
+
 }
 
 AudioOutputDevice::AudioOutputDevice(std::unique_ptr<AudioOutputDeviceBackend> backend)
@@ -396,6 +573,10 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
 
   currentFormat_ = backend_->currentFormat();
   currentQueue_ = request.pcmQueue;
+  // 任务 9：双源混音暂存容量 = 主队列容量 × 帧字节。只在此处（initialize，无活跃回调）
+  // 调整——rebind/start 的重发布在设备运行期可能发生，绝不边跑边改回调工作区。
+  mixScratch_.resize(static_cast<std::size_t>(request.pcmQueue->capacityFrames()) *
+                     bytesPerSample(currentFormat_.sampleFormat) * currentFormat_.channelCount);
   publishCallbackQueue(*request.pcmQueue, currentFormat_);
   callbackCount_.store(0U, std::memory_order_relaxed);
   requestedFrames_.store(0U, std::memory_order_relaxed);
@@ -455,6 +636,7 @@ bool AudioOutputDevice::stop() {
   }
 
   deactivateCallbackQueue();
+  deactivateSecondSource();  // 任务 9：停 = 双回调面全清（含第二源；防重启后陈旧指针复活）
   resetEnvelopes(); // 任务 5：清包络目标与版本防陈旧快照
   started_ = false;
   spdlog::info("device stopped");
@@ -480,6 +662,7 @@ void AudioOutputDevice::uninitialize() noexcept {
   }
 
   deactivateCallbackQueue();
+  deactivateSecondSource();  // 任务 9：uninitialize 同样清第二源回调面
   resetEnvelopes(); // 任务 5：清包络目标与版本防陈旧快照
   backend_->uninitialize();
   currentFormat_ = {};
@@ -516,7 +699,7 @@ void AudioOutputDevice::setMasterEnvelope(const GainEnvelopeSnapshot& snapshot) 
 }
 
 void AudioOutputDevice::setSourceEnvelope(std::size_t slot, const GainEnvelopeSnapshot& snapshot) noexcept {
-  if (slot >= kActiveSourceEnvelopeSlots) return; // 槽 1 预留（任务 9），编译期关闭
+  if (slot >= kActiveSourceEnvelopeSlots) return; // 槽 ≥ kActiveSourceEnvelopeSlots（≥2）的发布被忽略（槽 1 自任务 9 起随第二源激活参与执行）
   publishEnvelopeLayer(callbackState_.sourceEnvelopes[slot], snapshot);
 }
 
@@ -524,23 +707,9 @@ void AudioOutputDevice::setSourceEnvelope(std::size_t slot, const GainEnvelopeSn
 // 最后一次淡变值会滞留，下一次 start() 将从陈旧点受理包络（任务 5-B1 缺陷的修复点）。
 // 在 stop()/uninitialize() 内调用（设备已停、无活跃回调，无竞争）。
 void AudioOutputDevice::resetEnvelopes() noexcept {
-  const auto clearLayer = [](GainEnvelopeLayerState& layer) noexcept {
-    layer.version.store(0, std::memory_order_release);
-    layer.targetGain.store(1.0F, std::memory_order_relaxed);
-    layer.startGain.store(1.0F, std::memory_order_relaxed);
-    layer.durationFrames.store(0, std::memory_order_relaxed);
-    layer.curve.store(GainEnvelopeCurve::Linear, std::memory_order_relaxed);
-    layer.currentGain.store(1.0F, std::memory_order_relaxed);
-    layer.rampFramesDone.store(0, std::memory_order_relaxed);
-    layer.latchedVersion.store(0, std::memory_order_relaxed);
-    layer.execStartGain.store(1.0F, std::memory_order_relaxed);
-    layer.execTargetGain.store(1.0F, std::memory_order_relaxed);
-    layer.execDurationFrames.store(0U, std::memory_order_relaxed);
-    layer.execCurve.store(GainEnvelopeCurve::Linear, std::memory_order_relaxed);
-  };
-  clearLayer(callbackState_.masterEnvelope);
+  clearEnvelopeLayer(callbackState_.masterEnvelope);
   for (auto& layer : callbackState_.sourceEnvelopes) {
-    clearLayer(layer);
+    clearEnvelopeLayer(layer);
   }
 }
 
@@ -551,6 +720,48 @@ float AudioOutputDevice::masterEnvelopeGain() const noexcept {
 float AudioOutputDevice::sourceEnvelopeGain(std::size_t slot) const noexcept {
   if (slot >= kActiveSourceEnvelopeSlots) return 1.0F;
   return callbackState_.sourceEnvelopes[slot].currentGain.load(std::memory_order_acquire);
+}
+
+void AudioOutputDevice::resetSourceEnvelope(std::size_t slot) noexcept {
+  if (slot >= kActiveSourceEnvelopeSlots) {
+    return;
+  }
+  clearEnvelopeLayer(callbackState_.sourceEnvelopes[slot]);
+}
+
+void AudioOutputDevice::activateSecondSource(PcmBufferQueue& queue,
+                                             const GainEnvelopeSnapshot& sourceEnvelope) noexcept {
+  // N8（任务 9 评审潜伏项，T10 生产激活首调用方）：第二 ring 帧字节必须与设备当前格式
+  // 一致——双源路径把第二源读入 mixScratch_（容量按主队列 × 主 bpf 在 initialize 时一次性
+  // 调整，见头注释），ring 自身 bpf 更大的失配环会在 frameCount×ringBpf 写入时溢出暂存。
+  // 守卫失败 = 激活请求作废（状态零变更：代次/指针/包络/激活标志均未动），调用方（调度器）
+  // 应走无重叠降级路径。currentFormat_ 未初始化（bpf=0）时同样拒绝。
+  const auto deviceBpf =
+      bytesPerSample(currentFormat_.sampleFormat) * currentFormat_.channelCount;
+  if (deviceBpf == 0U || queue.bytesPerFrame() != deviceBpf) {
+    spdlog::error("second source activation rejected: ring bpf {} != device bpf {}",
+                  queue.bytesPerFrame(), deviceBpf);
+    return;
+  }
+  // 发布序同 publishCallbackQueue 纪律：ring 内容先就绪（代次 → 指针 → 包络），
+  // secondActive=true 最后 release——回调看到激活标志时全部字段已发布完毕。
+  callbackState_.secondGeneration.store(queue.generation(), std::memory_order_release);
+  callbackState_.secondQueue.store(&queue, std::memory_order_release);
+  publishEnvelopeLayer(callbackState_.sourceEnvelopes[1], sourceEnvelope);
+  callbackState_.secondActive.store(true, std::memory_order_release);
+}
+
+void AudioOutputDevice::deactivateSecondSource() noexcept {
+  // 撤销序同 deactivateCallbackQueue：active 先清（后续块不再混入），代次递增 + 指针置空。
+  // 回调撤销窗口内至多再持有一个 block 的旧指针：代次对旧队列仍匹配时混入该块数据
+  // （ring 对象此时仍存活——销毁归 worker 延迟回收），之后一律按代次校验即弃。
+  callbackState_.secondActive.store(false, std::memory_order_release);
+  callbackState_.secondGeneration.fetch_add(1U, std::memory_order_acq_rel);
+  callbackState_.secondQueue.store(nullptr, std::memory_order_release);
+}
+
+bool AudioOutputDevice::secondSourceActive() const noexcept {
+  return callbackState_.secondActive.load(std::memory_order_acquire);
 }
 
 void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept {
@@ -579,16 +790,28 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
   const float volume = device->volume_.load(std::memory_order_acquire);
   const bool muted = device->muted_.load(std::memory_order_acquire);
 
-  // ---- 增益包络执行器（任务 5-B2）----
-  // 活动层：masterEnvelope 与 sourceEnvelopes[0]（kActiveSourceEnvelopeSlots=1；槽 1 任务 9）。
-  // 默认快速路径：本设备代从未发布包络（两版本均 0）→ 调任务 4 单值 applyGain，逐字节不变。
+  // ---- 增益包络执行器（任务 5-B2 / 任务 9 双源）----
+  // 活动层：masterEnvelope、sourceEnvelopes[0]（主源）；sourceEnvelopes[1] 仅第二源激活时参与。
+  // 默认快速路径：本设备代从未发布包络（master/source0 版本均 0）且第二源未激活 → 调任务 4
+  // 单值 applyGain，逐字节不变。
   auto& masterLayer = state.masterEnvelope;
   auto& sourceLayer = state.sourceEnvelopes[0];
   const bool envelopePublished = masterLayer.version.load(std::memory_order_acquire) != 0U ||
                                  sourceLayer.version.load(std::memory_order_acquire) != 0U;
-  if (!envelopePublished) {
+  // 任务 9 第二源门控：secondActive=false → 下述 dualMix=false，本块严格走既有单源路径
+  // （不读第二队列、不碰暂存、不执行槽 1 层——逐位回归由测试锁定）。撤销竞态窗口内
+  // （active 已清、指针未空）读到的旧指针+旧代次仍匹配 → 至多再混一个块；指针已空即视同
+  // 无第二源。暂存容量守卫：frameCount 超出 mixScratch_ 时本块退回单源路径（生产不可达）。
+  const bool secondActive = state.secondActive.load(std::memory_order_acquire);
+  PcmBufferQueue* secondQueue = nullptr;
+  if (secondActive) {
+    secondQueue = state.secondQueue.load(std::memory_order_acquire);
+  }
+  const bool dualMix = secondQueue != nullptr &&
+                       static_cast<std::size_t>(frameCount) * bytesPerFrame <= device->mixScratch_.size();
+  if (!envelopePublished && !dualMix) {
     applyGain(output, copiedFrames, channelCount, sampleFormat, volume, muted);
-  } else {
+  } else if (!dualMix) {
     // 受理账本先于增益应用（每块每活动层一次，master 后 source0）。
     const auto masterTrajectory = planEnvelopeLayer(masterLayer);
     const auto sourceTrajectory = planEnvelopeLayer(sourceLayer);
@@ -608,6 +831,30 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
     // 的纯静音块保持原位（finalizeTrajectory 内不推进，恢复出声后续跑）。
     finalizeTrajectory(masterLayer, masterTrajectory, copiedFrames);
     finalizeTrajectory(sourceLayer, sourceTrajectory, copiedFrames);
+  } else {
+    // ---- 双源活动路径（任务 9；D1 渲染序）----
+    // 两源各自独立 readIfGeneration（代次各自校验、欠载各自补零，互不串扰）；随后
+    // source0×腿0 + source1×腿1 → master×volume（mixDualFrames，见匿名命名空间注释）。
+    // 主源读已就位于 output；第二源读入 mixScratch_（块内瞬态，内容不跨块保留）。
+    auto& secondLayer = state.sourceEnvelopes[1];
+    const auto secondGeneration = state.secondGeneration.load(std::memory_order_acquire);
+    static_cast<void>(
+        secondQueue->readIfGeneration(device->mixScratch_.data(), frameCount, secondGeneration));
+    const auto masterTrajectory = planEnvelopeLayer(masterLayer);
+    const auto sourceTrajectory = planEnvelopeLayer(sourceLayer);
+    const auto secondTrajectory = planEnvelopeLayer(secondLayer);
+    if (muted || volume <= 0.0F) {
+      if (output != nullptr && frameCount != 0U && channelCount != 0U) {
+        std::memset(output, 0, static_cast<std::size_t>(frameCount) * channelCount * bytesPerSample(sampleFormat));
+      }
+    } else {
+      mixDualFrames(output, device->mixScratch_.data(), frameCount, channelCount, sampleFormat, sourceTrajectory,
+                    secondTrajectory, masterTrajectory, volume);
+    }
+    // 轨迹推进同单源纪律：按主源 copiedFrames（第二源欠载不冻结淡变——出声帧以主源计）。
+    finalizeTrajectory(masterLayer, masterTrajectory, copiedFrames);
+    finalizeTrajectory(sourceLayer, sourceTrajectory, copiedFrames);
+    finalizeTrajectory(secondLayer, secondTrajectory, copiedFrames);
   }
   device->callbackCount_.fetch_add(1U, std::memory_order_relaxed);
   device->requestedFrames_.fetch_add(result.requestedFrames, std::memory_order_relaxed);

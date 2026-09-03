@@ -70,10 +70,21 @@ void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& requ
   lastLoadedTrack_ = request;
 }
 
+void FakeAudioPlaybackService::abortTransition() {
+  ++abortTransitionCalls_;
+  callLog_.push_back("abortTransition");
+}
+
 void FakeAudioPlaybackService::prepareNext(const audio::TrackPlaybackRequest& request) {
+  prepareNext(request, audio::PrepareNextMeta{});
+}
+
+void FakeAudioPlaybackService::prepareNext(const audio::TrackPlaybackRequest& request,
+                                           const audio::PrepareNextMeta& meta) {
   ++prepareNextCalls_;
   callLog_.push_back("prepareNext");
   lastPreparedTrack_ = request;
+  lastPrepareNextMeta_ = meta;
 }
 
 void FakeAudioPlaybackService::play() {
@@ -144,6 +155,10 @@ std::size_t FakeAudioPlaybackService::loadTrackCalls() const noexcept {
   return loadTrackCalls_;
 }
 
+std::size_t FakeAudioPlaybackService::abortTransitionCalls() const noexcept {
+  return abortTransitionCalls_;
+}
+
 std::size_t FakeAudioPlaybackService::prepareNextCalls() const noexcept {
   return prepareNextCalls_;
 }
@@ -198,6 +213,10 @@ const std::optional<audio::TrackPlaybackRequest>& FakeAudioPlaybackService::last
 
 const std::optional<audio::TrackPlaybackRequest>& FakeAudioPlaybackService::lastPreparedTrack() const noexcept {
   return lastPreparedTrack_;
+}
+
+const std::optional<audio::PrepareNextMeta>& FakeAudioPlaybackService::lastPrepareNextMeta() const noexcept {
+  return lastPrepareNextMeta_;
 }
 
 const std::optional<std::chrono::milliseconds>& FakeAudioPlaybackService::lastSeekPosition() const noexcept {

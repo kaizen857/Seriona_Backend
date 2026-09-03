@@ -73,7 +73,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.1 seriona_audio（播放与波形）
 
-- `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：12 个异步控制方法 + 1 个同步 `queryPlaybackClock`（合计 13，勿与测试专用 `AudioPlayer` 的 13 个方法混淆）；所有操作入命令队列由单音频工作线程执行。
+- `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：13 个异步控制方法 + 1 个同步 `queryPlaybackClock`（合计 14，勿与测试专用 `AudioPlayer` 的 13 个方法混淆）；所有操作入命令队列由单音频工作线程执行。
 - 播放状态机 `PlaybackStateMachine`：Idle → Loading → Ready → Playing ⇄ Paused，另有瞬时 Draining、Stopped、Error；每次迁移发 `PlaybackStateChanged`。seek 为 begin/cancel/complete 三阶段，带 generation 防过期完成。
 - `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取），`AudioOutputConfig.preferredDeviceId`（枚举索引字符串）经 `resolvePreferredDevice` 解析并绑定对应设备，选错格式自动回退并通知。
 - `PcmBufferQueue`：无锁 SPSC 字节环 + generation 失效机制（seek 防竞态）；`PlaybackClock`：帧计数驱动（非墙钟）。

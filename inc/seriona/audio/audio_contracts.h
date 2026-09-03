@@ -60,6 +60,14 @@ enum class BackendEventType {
   OutputFormatChanged,
   OutputModeFallback,
   PlaybackError,
+  // T8：预解码预告（服务→控制器）——当前曲目距自然终点剩余 remainingMs（armed 去重，
+  // 一次性/臂）。追加末尾保持序数兼容。
+  EndApproaching,
+  // T10：接管提交（服务→控制器，Metis 缺口 1b）——重叠交叉/无缝直切 handoff 完成、
+  // 新曲已作为主源播放时发出，携带新曲 trackId；控制器据 pendingAdvance 账本做
+  // advance 提交（不重发 LoadTrack）。无预载的普通自然结束仍走 PlaybackEnded。
+  // 发射序 = 提交事件先于新曲的 TrackChanged/状态事件（控制器提交需先于状态漂移）。
+  AdvanceCompleted,
 };
 
 struct TrackPlaybackRequest {
@@ -199,6 +207,31 @@ struct PlaybackError {
   std::optional<PlaybackClockSnapshot> clock;
 };
 
+// T8：预解码预告载荷。remainingMs = 距自然终点（endPosition−clock）的毫秒估计；
+// 控制器据此决定是否 PrepareNext 预解码（Metis 缺口 1a 选曲侧）。
+struct EndApproaching {
+  std::chrono::milliseconds remainingMs{0};
+};
+
+// T10：接管提交载荷（服务→控制器）。trackId = 已接管的下一曲标识（与控制器
+// EndApproaching 时经 PrepareNext 下发的选定曲一致）。无预载的普通自然结束不发本事件。
+struct AdvanceCompleted {
+  std::string trackId;
+};
+
+// T8：控制器在 EndApproaching 时选定的预解码交接方式（PrepareNext 元数据）。
+// 字段声明顺序即跨端契约，追加字段只能放末尾。
+enum class PrepareNextKind : std::uint8_t {
+  SeamlessDirect,  // 就绪即无缝直切（handoff，无交叉）：RepeatOne 自身重播 / CUE 组内 / 自动档=无+预加载
+  Crossfade,       // 交叉淡入淡出（任务 9 双源重叠启用；T8 期间槽就绪时自然终点仍按直切兜底）
+};
+
+struct PrepareNextMeta {
+  PrepareNextKind kind{PrepareNextKind::SeamlessDirect};
+  // 同一 .cue 文件相邻轨道（无间隙组内）：中间档据此豁免交叉（组内尽力无缝）。
+  bool isGaplessGroup{false};
+};
+
 using PlaybackEvent = std::variant<
     PlaybackStateChanged,
     TrackChanged,
@@ -207,7 +240,9 @@ using PlaybackEvent = std::variant<
     PlaybackEnded,
     OutputFormatChanged,
     OutputModeFallback,
-    PlaybackError>;
+    PlaybackError,
+    EndApproaching,
+    AdvanceCompleted>;
 
 struct BackendEvent {
   BackendEventType type{BackendEventType::PlaybackStateChanged};
@@ -233,6 +268,17 @@ public:
   virtual void configureTransition(const TransitionConfig& config) { (void)config; }
   virtual void loadTrack(const TrackPlaybackRequest& request) = 0;
   virtual void prepareNext(const TrackPlaybackRequest& request) = 0;
+  // T8：预解码交接方式重载。非纯虚 + 默认转发单参版（= SeamlessDirect 语义）：实现者共
+  // 4 个（SingleTrack 业务实现、Noop、后端 Fake、前端 Fake），纯虚/改签单参版会同时打破
+  // 两仓库编译——同 configureTransition / enumeratePlaybackDevices 先例。
+  virtual void prepareNext(const TrackPlaybackRequest& request, const PrepareNextMeta& meta) {
+    (void)meta;
+    prepareNext(request);
+  }
+  // T10：中止在途过渡（重叠交叉/预解码槽退役 + 预解码预告重新武装）。非纯虚 +
+  // 默认空实现：实现者共 4 个（SingleTrack 业务实现、Noop、后端 Fake、前端 Fake），
+  // 同 configureTransition 先例（Noop/Fake 靠默认空实现维持，无需逐个覆写）。
+  virtual void abortTransition() {}
   virtual void play() = 0;
   virtual void pause() = 0;
   virtual void resume() = 0;
