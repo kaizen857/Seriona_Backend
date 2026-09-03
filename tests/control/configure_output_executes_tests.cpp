@@ -129,6 +129,13 @@ MediaControlCommand configureOutputCommand(audio::AudioOutputConfig config) {
   return value;
 }
 
+MediaControlCommand seekToCommand(std::chrono::milliseconds position) {
+  MediaControlCommand value{};
+  value.kind = MediaControlCommandKind::SeekTo;
+  value.position = position;
+  return value;
+}
+
 }  // namespace
 
 TEST_CASE("controller forwards configure_output intent to audio service") {
@@ -193,6 +200,44 @@ TEST_CASE("controller forwards configure_output intent to audio service") {
     CHECK(*fixture.fakeAudio->lastSeekPosition() == std::chrono::milliseconds{0});
     CHECK(fixture.fakeAudio->playCalls() == 2U);
     CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Playing);
+  }
+
+  SUBCASE("reloads the current track while paused with seek and pause after configuration") {
+    ControllerFixture fixture{};
+    fixture.controller->start();
+    installLibrary(fixture);
+
+    const auto playResult = fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
+    REQUIRE(playResult.accepted);
+    const auto seekResult = fixture.controller->submitCommand(seekToCommand(std::chrono::milliseconds{1234}));
+    REQUIRE(seekResult.accepted);
+    const auto pauseResult = fixture.controller->submitCommand(command(MediaControlCommandKind::Pause));
+    REQUIRE(pauseResult.accepted);
+    REQUIRE(fixture.fakeAudio->callLog() ==
+            std::vector<std::string>{"setEventSink", "loadTrack", "play", "seek", "pause"});
+
+    audio::AudioOutputConfig config{};
+    config.outputMode = audio::AudioOutputMode::Mixed;
+    config.bufferDuration = std::chrono::milliseconds{250};
+
+    const auto result = fixture.controller->submitCommand(configureOutputCommand(config));
+
+    CHECK(result.accepted);
+    CHECK(result.code == MediaControllerErrorCode::None);
+    // 暂停中重载序列：configureOutput → loadTrack → seek → pause（audio 状态机在
+    // 重载完成后的 Ready 上接受 pause 转 Paused，见 playback_state_machine_tests）
+    const std::vector<std::string> expected{"setEventSink", "loadTrack", "play", "seek", "pause",
+                                            "configureOutput", "loadTrack", "seek", "pause"};
+    CHECK(fixture.fakeAudio->callLog() == expected);
+    CHECK(fixture.fakeAudio->configureOutputCalls() == 1U);
+    CHECK(fixture.fakeAudio->loadTrackCalls() == 2U);
+    REQUIRE(fixture.fakeAudio->lastLoadedTrack().has_value());
+    CHECK(fixture.fakeAudio->lastLoadedTrack()->trackId == "a");
+    CHECK(fixture.fakeAudio->seekCalls() == 2U);
+    REQUIRE(fixture.fakeAudio->lastSeekPosition().has_value());
+    CHECK(*fixture.fakeAudio->lastSeekPosition() == std::chrono::milliseconds{1234});
+    CHECK(fixture.fakeAudio->pauseCalls() == 2U);
+    CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
   }
 
   SUBCASE("rejects ConfigureOutput missing config before touching the audio service") {

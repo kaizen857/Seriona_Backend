@@ -209,4 +209,35 @@ TEST_CASE("playback_state_machine clear sink prevents delivery after shutdown") 
   CHECK(sink.events.size() == deliveredBeforeClear);
 }
 
+TEST_CASE("playback_state_machine pause from Ready is legal (output reload hold)") {
+  PlaybackStateMachine machine;
+  FakeSink sink;
+  machine.setEventSink(sink.callback());
+
+  // 输出模式重载序列（控制层 LoadTrack → Seek → Pause）：重载完成后状态机
+  // 位于 Ready（时钟已停），补发的 pause 必须把就绪转成暂停而非非法迁移。
+  machine.loadTrack(request());
+  machine.completeLoad();
+  CHECK(machine.state() == PlaybackState::Ready);
+
+  machine.pause();
+  CHECK(machine.state() == PlaybackState::Paused);
+  CHECK_FALSE(machine.clock().continuous);
+
+  machine.pause();
+  REQUIRE(sink.events.size() == 5);
+  CHECK(eventTypeAt(sink.events, 4) == BackendEventType::PlaybackError);
+  CHECK(std::get<PlaybackError>(sink.events[4].payload).code == PlaybackErrorCode::OpenFailed);
+
+  machine.resume();
+  CHECK(machine.state() == PlaybackState::Playing);
+  CHECK(machine.clock().continuous);
+
+  const auto states = stateEvents(sink.events);
+  CHECK(states == std::vector<PlaybackState>{PlaybackState::Loading,
+                                             PlaybackState::Ready,
+                                             PlaybackState::Paused,
+                                             PlaybackState::Playing});
+}
+
 }

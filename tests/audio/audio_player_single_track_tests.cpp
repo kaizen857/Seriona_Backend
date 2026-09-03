@@ -563,4 +563,65 @@ TEST_CASE("audio_player_single_track honors bounded segment duration when the se
   player.setEventSink(BackendEventSink{});
 }
 
+TEST_CASE("audio_player_single_track paused output reload stays paused without error") {
+  const auto path = sineFixture("audio_player_paused_reload.wav", kSampleRate * 2U);
+  auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
+  auto* fake = backend.get();
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  EventLog eventLog;
+  player.setEventSink(eventLog.sink());
+
+  TrackPlaybackRequest request{};
+  request.trackId = "paused-reload";
+  request.filePath = path;
+
+  player.loadTrack(request);
+  waitForState(eventLog, PlaybackState::Ready);
+  player.play();
+  waitForState(eventLog, PlaybackState::Playing);
+  player.pause();
+  waitForState(eventLog, PlaybackState::Paused);
+
+  // 模拟控制层 ConfigureOutput 立即重载序列：loadTrack → seek → pause。
+  AudioOutputConfig config{};
+  config.outputMode = AudioOutputMode::Mixed;
+  config.bufferDuration = 100ms;
+  const auto stateCountBeforeReload = statesFrom(eventLog.snapshot()).size();
+  player.configureOutput(config);
+  player.loadTrack(request);
+  player.seek(1200ms);
+  player.pause();
+
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto states = statesFrom(eventLog.snapshot());
+    if (states.size() > stateCountBeforeReload && states.back() == PlaybackState::Paused) {
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  const auto reloadStates = statesFrom(eventLog.snapshot());
+  REQUIRE(reloadStates.size() > stateCountBeforeReload);
+  CHECK(reloadStates.back() == PlaybackState::Paused);
+
+  for (const auto& event : eventLog.snapshot()) {
+    if (event.type == BackendEventType::PlaybackError) {
+      const auto& error = std::get<PlaybackError>(event.payload);
+      CHECK(error.message != "pause requires active playback");
+    }
+  }
+
+  const auto pausedAfterReload = player.queryPlaybackClock();
+  CHECK(pausedAfterReload.trackId == "paused-reload");
+  CHECK(pausedAfterReload.position >= 1150ms);
+  CHECK(pausedAfterReload.position <= 1250ms);
+
+  player.resume();
+  waitForState(eventLog, PlaybackState::Playing);
+  CHECK(fake->startCalls == 2);
+  player.stop();
+  waitForState(eventLog, PlaybackState::Stopped);
+  player.setEventSink(BackendEventSink{});
+}
+
 }
