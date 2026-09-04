@@ -217,7 +217,12 @@ public:
   void setEventSink(BackendEventSink sink) override { dispatcher_.setEventSink(std::move(sink)); }
 
   void configureOutput(const AudioOutputConfig& config) override {
-    enqueueCommand([this, config] { config_ = config; });
+    enqueueCommand([this, config] {
+      config_ = config;
+      // T11：输出配置变更后的首个 LoadTrack = 配置整轨重载（非"改变音轨"），手动切歌
+      // 档位对重载不生效（现状瞬时体保持）；标志在 loadTrackOnWorker 消费。
+      outputConfigChangePending_ = true;
+    });
   }
 
   // 过渡参数：worker 命令仅存配置，零重载/零设备操作/零事件（区别于 configureOutput
@@ -276,7 +281,10 @@ public:
   void setMuted(bool muted) override { enqueueCommand([this, muted] { device_.setMuted(muted); }); }
 
   void selectOutputDevice(const std::string& deviceId) override {
-    enqueueCommand([this, deviceId] { config_.preferredDeviceId = deviceId; });
+    enqueueCommand([this, deviceId] {
+      config_.preferredDeviceId = deviceId;
+      outputConfigChangePending_ = true;
+    });
   }
 
   PlaybackClockSnapshot queryPlaybackClock() const override {
@@ -314,9 +322,11 @@ public:
   }
 
 private:
-  // T6 物理收尾动作（仅 audio worker 线程访问；finishingAction_ != None = 收尾中）。
-  // 嵌套类型须先于类内成员函数体声明（类内作用域自声明点起可见）。
-  enum class FinishingAction { None, PauseFreeze, StopCleanup };
+  // T6/T11 物理过渡监督动作（仅 audio worker 线程访问；finishingAction_ != None = 过渡中）。
+  // 命名沿用 T6"finishing"：PauseFreeze/StopCleanup = T6 收尾；T11 追加的 SeekDipDown/
+  // ManualDipDown 复用同一监督通道（ticker 分支 + 归零点分派），语义同为"逻辑态保持/
+  // 已翻转、物理包络单程在途"。嵌套类型须先于类内成员函数体声明（类内作用域自声明点起可见）。
+  enum class FinishingAction { None, PauseFreeze, StopCleanup, SeekDipDown, ManualDipDown };
 
   // worker 线程内的枚举：先取播放后端（miniaudio）设备列表，再用平台
   // 原生枚举器（PipeWire/WASAPI）的能力数据覆盖格式/采样率列表。
@@ -366,10 +376,154 @@ private:
 
   void loadTrackOnWorker(const TrackPlaybackRequest& request) {
     spdlog::info("loading track '{}'", pathToUtf8(request.filePath));
+    // T10/T11：新曲命令 = 中止在途过渡面（第二源撤销 + 源包络打断 + 窗口锁存复位；幂等，
+    // 无重叠面时零操作）。控制器流已在重叠窗口内先发 AbortTransition，此处是服务侧兜底
+    // （手动切歌/重载直连 LoadTrack 同样先撤面再执行，裁定⑦ 打断即瞬时）。
+    cancelOverlapFaceOnWorker();
+
+    // T11：手动切歌档位接线。判别 = 本 LoadTrack 非输出配置重载 + 档位适用（Mixed、Playing
+    // 且出声、长度 > 0、非冷启动淡入握手期）。满足 → 按档位进入切换监督（档 2 dip / 档 3
+    // 真重叠或降级 dip），瞬时体（performPlainLoadTrack）延后到监督归零点执行。
+    const bool reloadAfterOutputChange = outputConfigChangePending_;
+    outputConfigChangePending_ = false;
+    if (!reloadAfterOutputChange && manualSwitchTransitionEligible() && manualSwitchLoadTrack(request)) {
+      return;
+    }
+    performPlainLoadTrack(request);
+  }
+
+  // T11：手动切歌监督适用性（调用前提：LoadTrack 非配置重载）。
+  bool manualSwitchTransitionEligible() const {
+    if (config_.outputMode != AudioOutputMode::Mixed || stateMachine_.state() != PlaybackState::Playing ||
+        !device_.started() || !queue_ || !source_ || !pipeline_ || fadeInPending_) {
+      return false;
+    }
+    const auto mode = transitionConfig_.manualAdvanceFadeMode;
+    if (mode == ManualAdvanceFadeMode::Off) {
+      return false;
+    }
+    const auto lengthMs = mode == ManualAdvanceFadeMode::FullCrossfade ? transitionConfig_.crossfadeMs
+                                                                       : transitionConfig_.manualShortCrossfadeMs;
+    return lengthMs.count() > 0;
+  }
+
+  // T11：手动切歌档位分发（档 3 真重叠优先；未就绪/档 2 走 dip；长度不足降级硬切）。
+  // 返回 true = 已进入切换监督（LoadTrack 瞬时体暂停执行）。
+  bool manualSwitchLoadTrack(const TrackPlaybackRequest& request) {
+    const auto mode = transitionConfig_.manualAdvanceFadeMode;
+    if (mode == ManualAdvanceFadeMode::FullCrossfade && preloadSlot_ && preloadSlot_->queue &&
+        preloadSlot_->ready && preloadSlot_->request.trackId == request.trackId &&
+        preloadSlot_->request.filePath == request.filePath &&
+        sameTarget(preloadSlot_->target, currentTarget_)) {
+      // —— 档 3 且目标恰为已预解码槽（裁定⑤ 复用）：真重叠交叉（任务 9 双源面）。
+      // 交叉长 = min(crossfadeMs, 当前曲剩余)（裁定⑧ 临近曲末钳制）；不足一腿 → 硬切降级。
+      auto legMs = transitionConfig_.crossfadeMs;
+      if (const auto remaining = estimateRemainingMs(); remaining.has_value() && *remaining < legMs) {
+        legMs = *remaining;
+      }
+      if (legMs.count() <= 0) {
+        preloadSlot_.reset();
+        spdlog::debug("manual overlap window exhausted; falling back to instant switch");
+        return false;
+      }
+      if (startManualOverlap(legMs)) {
+        // F1：档 3 就绪槽重叠接管在途 dip 监督（seek dip / 手动 dip 下行在途时）。
+        // 手动切歌取代了 dip 的 pending 目标（裁定 打断=立即中断并接管）——陈旧 seek/
+        // staging 绝不能在重叠中途被应用：清 pendings + 解除 dip 屏蔽（finishingAction_
+        // 清空 → Playing 段恢复：预解码续喂/重叠腿推进不停顿）。在途 master 下行腿
+        // 按旧参数走完（执行器不接受中途取消），其后必须把 master 升回 1.0（重叠交叉
+        // 在源层 EQ 上，master 应持平 1.0）——预发布恢复腿（时长 = 被取代 dip 的上行
+        // 腿对称长），执行器自动延迟受理（下行终点后从 ≈0 平滑回升）；只清 pending
+        // 留 action 会落入 completeSeekDip/completeManualDip 空 pending 早退 → master
+        // 冻结于 0（永久静音，不可取）。
+        if (finishingAction_ == FinishingAction::SeekDipDown ||
+            finishingAction_ == FinishingAction::ManualDipDown) {
+          auto restoreMs = std::chrono::milliseconds{0};
+          if (seekDip_) {
+            restoreMs = seekDip_->upMs;
+          } else if (manualDip_) {
+            restoreMs = manualDip_->upMs;
+          }
+          if (restoreMs.count() <= 0) {
+            restoreMs = legMs / 2;
+          }
+          seekDip_.reset();
+          manualDip_.reset();
+          finishingAction_ = FinishingAction::None;
+          fadeInPending_ = false;
+          publishMasterEnvelope(1.0F, restoreMs);
+          spdlog::info("manual overlap superseded in-flight dip supervision: master restore ({}ms)",
+                       restoreMs.count());
+        }
+        spdlog::info("manual switch: full crossfade via preloaded slot ({}ms)", legMs.count());
+        return true;
+      }
+      // 设备拒绝激活（N8 守卫，槽已弃）→ 落入下方 dip 降级（重新现解 staging，永不等待）。
+      spdlog::debug("manual switch: overlap refused by device, degrading to dip");
+    }
+
+    // —— 档 2 dip，或档 3 槽未就绪/不匹配 → 降级 dip（裁定⑧：可重叠就重叠、就绪不足降级、
+    //    永不等待）。dip 全长 = 档位长度，档 3 另受剩余时长钳制（min(L, 剩余)）。
+    auto dipMs = mode == ManualAdvanceFadeMode::FullCrossfade ? transitionConfig_.crossfadeMs
+                                                              : transitionConfig_.manualShortCrossfadeMs;
+    if (mode == ManualAdvanceFadeMode::FullCrossfade) {
+      if (const auto remaining = estimateRemainingMs(); remaining.has_value() && *remaining < dipMs) {
+        dipMs = *remaining;
+      }
+    }
+    if (dipMs.count() <= 0) {
+      preloadSlot_.reset();
+      return false;
+    }
+    // 目标预解码（staging）：复用匹配的就绪槽；否则弃旧槽、经 prepareNextOnWorker 现解。
+    // 现解失败（已发 preload 风格错误）→ 回退瞬时体（重新尝试加载并走正常错误路径）。
+    if (preloadSlot_ && preloadSlot_->queue && preloadSlot_->ready &&
+        preloadSlot_->request.trackId == request.trackId &&
+        preloadSlot_->request.filePath == request.filePath) {
+      manualDip_ = PendingManualDip{request,
+                                    std::move(*preloadSlot_),
+                                    dipMs - dipMs / 2};
+      preloadSlot_.reset();
+    } else {
+      preloadSlot_.reset();
+      prepareNextOnWorker(request, PrepareNextMeta{});
+      if (!preloadSlot_ || !preloadSlot_->queue || !preloadSlot_->ready) {
+        spdlog::error("manual switch target decode failed; falling back to plain load");
+        return false;
+      }
+      manualDip_ = PendingManualDip{request, std::move(*preloadSlot_), dipMs - dipMs / 2};
+      preloadSlot_.reset();
+    }
+    spdlog::info("manual switch: dip transition (down {}ms + up {}ms)",
+                 (dipMs / 2).count(),
+                 (dipMs - dipMs / 2).count());
+    // 下行腿：若已有在途下行（seek dip / 先前手动 dip 被打断）则不重复发布——在途轨迹
+    // 继续走完（打断即瞬时），归零点按新 pending 目标交接。seek dip 被手动切换接管时
+    // 其 pending 一并作废（seekDip_ 不得残留——否则归零点分派后 seekDip_ 成陈旧悬挂）。
+    seekDip_.reset();
+    if (finishingAction_ != FinishingAction::SeekDipDown &&
+        finishingAction_ != FinishingAction::ManualDipDown) {
+      finishingAction_ = FinishingAction::ManualDipDown;
+      fadeInPending_ = false;
+      publishMasterEnvelope(0.0F, dipMs / 2);
+      startProgressWorker();
+    } else {
+      finishingAction_ = FinishingAction::ManualDipDown;
+    }
+    return true;
+  }
+
+  // 现状瞬时加载体（原 loadTrackOnWorker 主体；Direct/档关/非出声态/降级硬切恒走此处）。
+  void performPlainLoadTrack(const TrackPlaybackRequest& request) {
+    spdlog::info("loading track '{}'", pathToUtf8(request.filePath));
     stopProgressWorker();
     // T6：新曲命令到达 = 任何在途收尾/淡入握手作废（stopDevice 会复位包络轨迹）。
     finishingAction_ = FinishingAction::None;
     fadeInPending_ = false;
+    // T11：切换监督 pending 一并作废（seek dip / 手动 dip / finishing 期定格 seek）。
+    seekDip_.reset();
+    manualDip_.reset();
+    pendingFrozenSeekPosition_.reset();
     // T7（D4）：uninitialize/协商/initialize 不再无条件执行——Mixed 同参数切歌在
     // canReuseOutputDevice 短路后跳过整段，仅重建 source/pipeline/queue。此处仍先
     // stopDevice：切歌到达时旧曲可能仍在播放（手动切歌路径），保持既有"切歌即
@@ -573,6 +727,20 @@ private:
 
   void playOnWorker() {
     spdlog::info("play");
+    // T11：切换监督在途时 reducer 批尾的 Play/Resume 意图由交接自行 play——此处吞掉，
+    // 避免 Playing 态重复 play 报非法迁移。覆盖三类在途：
+    // 1) seek dip / 手动 dip 下行（finishingAction_）：归零点 adopt 自行 play；
+    // 2) 档 3 真重叠激活（manualOverlapActive_，F3 扩展）：重叠入口不动状态机（机器
+    //    保持 Playing），adopt（promote/drain-promote）自行 stateMachine_.play()——
+    //    重叠期批尾 Play 恒冗余。F1 接管把在途 dip 清成 None 后旧吞掉条件失守：Play
+    //    打上 Playing 即非法迁移 PlaybackError（伪错误 UI 全程交叉窗），故须显式覆盖。
+    // resumeOnWorker 不扩展：重叠只在 Playing 激活（pause/stop 先撤重叠），reducer
+    // 批尾恒 Play（selectTrack 无 Resume 尾），Playing 态无 Resume 来源 → Resume∧
+    // manualOverlapActive_ 不可达。
+    if (finishingAction_ == FinishingAction::SeekDipDown || finishingAction_ == FinishingAction::ManualDipDown ||
+        manualOverlapActive_) {
+      return;
+    }
     if (!queue_ || !source_ || !pipeline_) {
       spdlog::error("play failed: no loaded track");
       fail(PlaybackErrorCode::OpenFailed, "play requires a loaded track", "missing playback pipeline");
@@ -621,7 +789,20 @@ private:
 
   void pauseOnWorker() {
     spdlog::info("pause");
+    // T11：重叠面激活时先撤副源（立即中止重叠——裁定打断即瞬时）再对主源执行 pause。
+    if (device_.secondSourceActive()) {
+      abortInFlightOverlapOnWorker();
+    }
     if (finishingAction_ != FinishingAction::None) {
+      if (finishingAction_ == FinishingAction::SeekDipDown || finishingAction_ == FinishingAction::ManualDipDown) {
+        // T11：切换 dip 下行在途的 pause = 立即接管：撤 pending 交接目标，动作转为
+        // PauseFreeze——在途下行腿继续走完（执行器不接受中途取消），归零点停设备定格。
+        seekDip_.reset();
+        manualDip_.reset();
+        finishingAction_ = FinishingAction::PauseFreeze;
+        stateMachine_.pause();
+        return;
+      }
       // 淡出在途的重复/迟到 pause：物理淡出不打断（单程无中途反转）；状态机处理
       // 幂等/非法迁移（Paused/Stopped 下 pause 报错与现状一致）。
       stateMachine_.pause();
@@ -643,6 +824,9 @@ private:
 
   void resumeOnWorker() {
     spdlog::info("resume");
+    if (finishingAction_ == FinishingAction::SeekDipDown || finishingAction_ == FinishingAction::ManualDipDown) {
+      return;
+    }
     if (!queue_) {
       spdlog::error("resume failed: no queue");
       fail(PlaybackErrorCode::OpenFailed, "resume requires a loaded track", "missing playback queue");
@@ -684,7 +868,20 @@ private:
 
   void stopOnWorker() {
     spdlog::info("stop");
+    // T11：重叠面激活时先撤副源再执行 stop（同 pause——立即中止重叠）。
+    if (device_.secondSourceActive()) {
+      abortInFlightOverlapOnWorker();
+    }
     if (finishingAction_ != FinishingAction::None) {
+      if (finishingAction_ == FinishingAction::SeekDipDown || finishingAction_ == FinishingAction::ManualDipDown) {
+        // T11：切换 dip 下行在途的 stop = 立即接管：撤 pending 交接目标，动作转为
+        // StopCleanup（归零点停设备并做 stop 队列清理，不执行换源）。
+        seekDip_.reset();
+        manualDip_.reset();
+        finishingAction_ = FinishingAction::StopCleanup;
+        stateMachine_.stop();
+        return;
+      }
       // 淡出在途的 stop：物理淡出不打断；收尾动作升级为 stop 清理（归零后清队列、
       // 复位挂起帧——位置清理照旧，只是推迟到归零点执行）。
       finishingAction_ = FinishingAction::StopCleanup;
@@ -716,6 +913,33 @@ private:
       fail(PlaybackErrorCode::SeekFailed, "seek requires a loaded track", "missing playback pipeline");
       return;
     }
+
+    // T11：finishing（PauseFreeze 收尾淡出）期 seek = 仅更新定格位置——不打断淡出、
+    // 不触发新 dip、不动状态机；物理 seek 推迟到归零点补做（设备已停安全，见 completeFinishing）。
+    if (finishingAction_ == FinishingAction::PauseFreeze && stateMachine_.state() == PlaybackState::Paused) {
+      pendingFrozenSeekPosition_ = position;
+      spdlog::info("seek during finishing fade: frozen position will update to {}ms", position.count());
+      return;
+    }
+
+    // T11：seek dip 下行在途（状态保持 Playing）→ 覆盖 pending 目标：在途下行腿继续走完
+    // （进行中淡变按旧参数收尾），归零点按最新目标交接。
+    if (finishingAction_ == FinishingAction::SeekDipDown && seekDip_) {
+      seekDip_->target = position;
+      spdlog::info("seek during seek dip: target updated to {}ms", position.count());
+      return;
+    }
+    // 手动 dip 下行在途 + seek = 立即接管：撤换源 pending，转入 seek dip（复用下行腿）。
+    if (finishingAction_ == FinishingAction::ManualDipDown) {
+      manualDip_.reset();
+      seekDip_ = PendingSeekDip{position, transitionConfig_.seekFadeMs - transitionConfig_.seekFadeMs / 2};
+      finishingAction_ = FinishingAction::SeekDipDown;
+      spdlog::info("manual dip interrupted by seek: target={}ms, up={}ms",
+                   position.count(),
+                   seekDip_->upMs.count());
+      return;
+    }
+
     if (stateMachine_.state() != PlaybackState::Ready && stateMachine_.state() != PlaybackState::Playing &&
         stateMachine_.state() != PlaybackState::Paused) {
       // 非法态 seek（逻辑 Stopped 等）：状态机只发错误事件。在途收尾监督必须保留——
@@ -725,14 +949,33 @@ private:
       return;
     }
 
+    // 重叠面激活时先撤副源（seek 属窗口失效操作，服务侧直达命令同样先撤再执行）。
+    if (device_.secondSourceActive()) {
+      abortInFlightOverlapOnWorker();
+    }
+
     // 合法 seek：现在才中止任何在途收尾/淡入握手（stopDevice 会复位包络轨迹）。
     // finishing 期 seek 的"不打断淡出、仅更新定格位置"语义属任务 11 接线，本任务只防僵尸收尾。
+    // 淡入握手状态须在清除前捕获——dip 判据要的是"命令到达时"是否处于握手期（见下）。
+    const bool fadeHandshakePending = fadeInPending_;
     stopProgressWorker();
     finishingAction_ = FinishingAction::None;
     fadeInPending_ = false;
 
     updateClockFromQueue();
     const bool shouldResume = stateMachine_.state() == PlaybackState::Playing;
+
+    // T11：播放中 seek dip（对半分解：下 ½ + 上 ½，归零点即转向）。命令时刻只发下行腿并
+    // 进入 SeekDipDown 监督——状态机保持 Playing（状态机 seek 事件整体推迟到归零点，见
+    // completeSeekDip：beginSeek/completeSeek 背靠背发出，二次 seek 只覆盖 pending 目标）。
+    // 冷启动淡入握手期（增益仍为 0）内容不可闻 → dip 无意义，走瞬时路径。
+    if (shouldResume && transitionConfig_.fadeOnSeek && transitionConfig_.seekFadeMs.count() > 0 &&
+        !fadeHandshakePending) {
+      beginSeekDip(position);
+      return;
+    }
+
+    // —— 瞬时 seek 路径（暂停/Ready 中 seek 不淡变：设备不重开事实保持；或 dip 未启用）——
     const auto seekGeneration = stateMachine_.beginSeek(position);
 
     stopDevice();
@@ -802,6 +1045,21 @@ private:
     bool seamlessEligible{false};
     // T8：控制器选定的交接方式（SeamlessDirect=就绪直切副源；Crossfade=任务 9 重叠面源）。
     PrepareNextMeta kindMeta{};
+  };
+
+  // T11：seek dip 监督 pending（finishingAction_ == SeekDipDown 时有效）。target 可被在途
+  // 期间的后续 seek 覆盖（进行中淡变按旧参数收尾，归零点按最新目标交接）。
+  struct PendingSeekDip {
+    std::chrono::milliseconds target{0};
+    std::chrono::milliseconds upMs{0};
+  };
+
+  // T11：手动 dip 监督 pending（finishingAction_ == ManualDipDown 时有效）。slot = 归零点
+  // 采纳的新主源（已预解码）；upMs = 上行腿时长（全长 − 下行腿，奇数毫秒归上行）。
+  struct PendingManualDip {
+    TrackPlaybackRequest request{};
+    PreloadSlot slot{};
+    std::chrono::milliseconds upMs{0};
   };
 
   struct OutputNegotiationCandidate {
@@ -1325,11 +1583,24 @@ private:
       // —— T10 自动交叉重叠窗口调度（裁定⑦：窗内就绪即启；单发/臂裁决不延迟）——
       maybeStartAutoOverlap();
       tickOverlapRamp();
+      // —— T11 手动交叉（档 3）：腿完采纳（无 AdvanceCompleted）——
+      tickManualOverlapPromote();
     }
 
     if (stateMachine_.state() == PlaybackState::Playing && loadedToEnd_ && !pendingFrameWrite_ && queue_ &&
         queue_->availableFrames() == 0U) {
       updateClockFromQueue(UnderrunReporting::Suppress);
+      if (manualOverlapActive_) {
+        // F2：手动交叉主源排空（当前曲先于交叉腿结束——剩余估算超前/钳制到剩余）
+        // → 立即采纳（同下方自动路径排空提升语义）。双腿推进只随主源 copiedFrames
+        // （设备双源 finalize 按主源计）——主源 EOF 后双腿冻结于残余值，promote 双条件
+        // 永不达：不采纳 = 槽内容以冻结增益播至 EOF 后永久静音 + manualOverlapActive_
+        // 卡死 + TrackChanged(B) 永不发（控制器已切 B → UI/后端漂移）。主源已空 =
+        // source0 零贡献；source1 从冻结增益（≈1−数块/腿长）经采纳的源包络复位升至
+        // 1.0，跳变 ≤ 残余量（数块增益，无半增益爆音——屏蔽注释的顾虑在排空态不成立）。
+        completeManualOverlap();
+        return;
+      }
       // T10：主源排空 = 重叠期满 → 提升第二源为主源（AdvanceCompleted 先于新曲状态
       // 事件；见 completeOverlapHandoff）。未在重叠期时回落直切 handoff / 自然结束。
       if (completeOverlapHandoff()) {
@@ -1589,6 +1860,69 @@ private:
     device_.resetSourceEnvelope(1);
     overlapRampPending_ = false;
     overlapWindowSettled_ = false;
+    // T11：面已撤 = 任何手动交叉随之死亡（锁存清除；否则主源排空后自然结束被
+    // manualOverlapActive_ 误屏蔽——configureTransition/abort/新 loadTrack 都经本函数）。
+    manualOverlapActive_ = false;
+    overlapLegMs_ = std::chrono::milliseconds{0};
+  }
+
+  // T11：重叠面激活时中止在途交叉（pause/stop/seek 服务侧直达命令共用；与 abortTransition
+  // 语义对齐 = 撤面 + 弃槽 + 预解码预告重新武装）。
+  void abortInFlightOverlapOnWorker() {
+    cancelOverlapFaceOnWorker();
+    preloadSlot_.reset();
+    endApproachEmitted_ = false;
+  }
+
+  // T11：手动交叉启动（档 3 复用已预解码槽；裁定⑤）。与自动 startOverlap 同典序
+  // （槽 1 即时 0 激活 → source0 等功率下行腿；槽 1 上行腿由 tickOverlapRamp 观测归零
+  // 后发布），差异：腿长 = min(crossfadeMs, 当前曲剩余)（裁定⑧ 临近曲末钳制）、preload
+  // 槽由调用方按匹配选定（kindMeta 无关）、窗口锁存置位防自动调度干扰。返回 false =
+  // 设备拒绝激活（N8 守卫；槽已废）——调用方按降级链转 dip/硬切，永不等待。
+  bool startManualOverlap(std::chrono::milliseconds legMs) {
+    overlapLegMs_ = legMs;
+    sourceEnvelopeControllers_[1].syncCurrentGain(device_.sourceEnvelopeGain(1));
+    const auto instantZero = sourceEnvelopeControllers_[1].makeRampSnapshot(
+        0.0F, std::chrono::milliseconds{0}, GainEnvelopeCurve::Linear, envelopeSampleRate());
+    device_.activateSecondSource(*preloadSlot_->queue, instantZero);
+    if (!device_.secondSourceActive()) {
+      spdlog::error("manual overlap start refused by device (second source inactive); "
+                    "falling back to degraded transition");
+      overlapLegMs_ = std::chrono::milliseconds{0};
+      preloadSlot_.reset();
+      return false;
+    }
+    overlapWindowSettled_ = true;
+    manualOverlapActive_ = true;
+    publishSourceEnvelope(0, 0.0F, legMs, GainEnvelopeCurve::EqualPowerPair);
+    overlapRampPending_ = true;
+    spdlog::debug("manual overlap started: legs={}ms", legMs.count());
+    return true;
+  }
+
+  // T11：手动交叉腿完采纳（Playing tick 调用；裁定手动切换无 AC——控制器已自行选曲切换，
+  // pendingAdvance 账本不存在，发射 AC 只会落 stale-drop，显式不发出）。复用自动提升主体
+  // （含时钟基 = offset + 重叠期槽 ring 消费量），仅跳过 AdvanceCompleted 事件。
+  void completeManualOverlap() {
+    if (!manualOverlapActive_) {
+      return;
+    }
+    manualOverlapActive_ = false;
+    overlapLegMs_ = std::chrono::milliseconds{0};
+    static_cast<void>(completeOverlapHandoff(/*emitAdvanceCompleted=*/false));
+  }
+
+  // T10：手动交叉腿完判定（Playing tick 调用，紧跟 tickOverlapRamp）：source0 下行腿归零
+  // 且 source1 上行腿到顶 → 采纳。等功率对两腿同长、槽 1 腿约晚 1 块启动 → source1 到顶
+  // 时 source0 必然已归零（双条件防提前 reset 源包络 = 半增益跳变爆音）。
+  void tickManualOverlapPromote() {
+    if (!manualOverlapActive_) {
+      return;
+    }
+    if (device_.sourceEnvelopeGain(0) <= kFadeCompleteGainEpsilon &&
+        device_.sourceEnvelopeGain(1) >= 1.0F - kFadeCompleteGainEpsilon) {
+      completeManualOverlap();
+    }
   }
 
   // T10：源层包络发布唯一入口（worker；纪律同 publishMasterEnvelope——账本同步读回
@@ -1642,6 +1976,7 @@ private:
   // 腿（EQ 对、时长 = crossfadeMs）；槽 1 的 0→1 腿由 tickOverlapRamp 观测归零后发布
   // （同长 EQ 对）。设备拒绝激活（N8 格式守卫）→ 本臂已裁决、放弃交叉（兜底直切）。
   void startOverlap(std::chrono::milliseconds crossfadeMs) {
+    overlapLegMs_ = crossfadeMs;
     sourceEnvelopeControllers_[1].syncCurrentGain(device_.sourceEnvelopeGain(1));
     const auto instantZero = sourceEnvelopeControllers_[1].makeRampSnapshot(
         0.0F, std::chrono::milliseconds{0}, GainEnvelopeCurve::Linear, envelopeSampleRate());
@@ -1656,25 +1991,29 @@ private:
   }
 
   // T10：交叉第二腿发布（Playing tick 调用）：槽 1 回调增益归零（即时 0 已被执行）后
-  // 发布 0→1 腿（时长 = crossfadeMs 的 EQ 对，与主源 1→0 腿功率互补）。
+  // 发布 0→1 腿（时长 = overlapLegMs_ 的 EQ 对，与主源 1→0 腿功率互补）。腿长来源：
+  // 自动 = crossfadeMs（startOverlap 设定）；手动 = min(crossfadeMs, 剩余)
+  // （startManualOverlap 设定）——两腿必须同长，EQ 互补才成立。
   void tickOverlapRamp() {
     if (!overlapRampPending_) {
       return;
     }
     if (device_.sourceEnvelopeGain(1) <= kFadeCompleteGainEpsilon) {
       overlapRampPending_ = false;
-      publishSourceEnvelope(1, 1.0F, transitionConfig_.crossfadeMs, GainEnvelopeCurve::EqualPowerPair);
-      spdlog::debug("overlap second leg published (0->1, {}ms)", transitionConfig_.crossfadeMs.count());
+      publishSourceEnvelope(1, 1.0F, overlapLegMs_, GainEnvelopeCurve::EqualPowerPair);
+      spdlog::debug("overlap second leg published (0->1, {}ms)", overlapLegMs_.count());
     }
   }
 
   // T10：重叠期满（主源排空）→ 第二源提升为主源。时序：
-  // 1) AdvanceCompleted 最先（先于新曲 TrackChanged/状态事件——控制器先提交后同步）；
+  // 1) AdvanceCompleted 最先（先于新曲 TrackChanged/状态事件——控制器先提交后同步；
+  //    仅自动交接发射——手动交叉（emitAdvanceCompleted=false）无 pendingAdvance 账本，
+  //    控制器已自行选曲切换，AC 只会落 stale-drop）；
   // 2) 撤第二源面（回调至多再持一块旧指针）→ 主 face rebind 到槽 ring；
   // 3) 两源包络复位（打断在途交叉轨迹 → 常量 1.0，打断即瞬时，裁定）；
   // 4) 旧主 ring 停入 retiredQueue_（回调可能仍持有一块，延迟回收，见 stopDevice）。
   // 其余（时钟重置/状态机加载/重新武装/续解码/位置发布）与 handoffToPreparedNext 同构。
-  bool completeOverlapHandoff() {
+  bool completeOverlapHandoff(bool emitAdvanceCompleted = true) {
     if (!preloadSlot_ || !preloadSlot_->queue || !device_.secondSourceActive() || !queue_) {
       return false;
     }
@@ -1692,7 +2031,9 @@ private:
       consumedMs = std::chrono::milliseconds{
           (slot.queue->counters().consumedFrames * 1000ULL) / rate};
     }
-    dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
+    if (emitAdvanceCompleted) {
+      dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
+    }
     device_.deactivateSecondSource();
     device_.resetSourceEnvelope(0);
     device_.resetSourceEnvelope(1);
@@ -1791,12 +2132,136 @@ private:
     spdlog::info("finishing aborted by play/resume (action={})", static_cast<int>(finishingAction_));
     finishingAction_ = FinishingAction::None;
     fadeInPending_ = false;
+    // T11：finishing 期 seek 的定格目标随收尾取消一并作废（不会在下次收尾误用）。
+    pendingFrozenSeekPosition_.reset();
     return true;
+  }
+
+  // ================= T11 seek dip 与手动切歌 dip（master 单腿对半监督） =================
+  // 对半分解 dip（seek 与手动切换共用形状）：下行腿（1→0，线性，全长 ½）→ 归零点换数据/
+  // 换源 → 即时 0（帧耗尽兜底时残余增益无声落零）+ 上行腿（0→1，全长 − ½）。两腿发布
+  // 间隔内执行器自动延迟受理：下行在途时上行的竞争发布被拒（PENDING 保留），下行终点
+  // 的下一块从回调 currentGain(=0) 受理上行 → 归零驻留 ≤1 块，即 dip 中点。设备全程不
+  // 停止（stopDevice 复位包络会杀死下行腿），数据交换走 rebindQueue + retiredQueue_。
+
+  void beginSeekDip(std::chrono::milliseconds position) {
+    const auto totalMs = transitionConfig_.seekFadeMs;
+    const auto downMs = totalMs / 2;
+    const auto upMs = totalMs - downMs;
+    seekDip_ = PendingSeekDip{position, upMs};
+    finishingAction_ = FinishingAction::SeekDipDown;
+    fadeInPending_ = false;
+    publishMasterEnvelope(0.0F, downMs);
+    startProgressWorker();
+    spdlog::info("seek dip started: target={}ms, down={}ms, up={}ms",
+                 position.count(), downMs.count(), upMs.count());
+  }
+
+  // SeekDipDown 归零点：物理 seek + 新 ring 换面 + 状态机 seek 事件 + 上行腿。
+  void completeSeekDip() {
+    if (!seekDip_) {
+      finishingAction_ = FinishingAction::None;
+      return;
+    }
+    const auto target = seekDip_->target;
+    const auto upMs = seekDip_->upMs;
+    seekDip_.reset();
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
+    spdlog::info("seek dip zero point: applying seek to {}ms", target.count());
+
+    // 状态机 seek 先行（Loading + pendingSeek）——失败路径可 cancelSeek 回滚。
+    const auto generation = stateMachine_.beginSeek(target);
+    if (const auto error = source_->seek(target)) {
+      spdlog::error("seek dip source seek failed: {} - {}", error->message, error->detail);
+      // 源 seek 失败：放弃 dip（旧内容归零后仍可闻——即时回满增益恢复播放），
+      // 状态机 cancelSeek 回滚（Loading → Playing + PlaybackError）。
+      stateMachine_.cancelSeek(error->code, error->message, error->detail);
+      publishMasterEnvelope(1.0F, std::chrono::milliseconds{0});
+      publishPosition();
+      return;
+    }
+
+    // 新 ring 构建并解码填满（设备运行中——回调只经代次读 face，worker 写 ring 安全；
+    // 填满期间回调仍消费旧 ring（增益 0 静音），旧 ring 存活于本作用域直到换面或 fail）。
+    auto previousRing = std::move(queue_);
+    queue_ = std::make_unique<PcmBufferQueue>(PcmBufferQueueConfig{
+        bufferFrameCount(currentTarget_.sampleRate, config_.bufferDuration),
+        currentTarget_.channelCount * bytesPerSample(currentTarget_.sampleFormat)});
+    pipeline_->reset();
+    pendingFrameWrite_.reset();
+    loadedToEnd_ = false;
+    observedQueueCounters_ = queue_->counters();
+    if (!fillQueue()) {
+      return;  // fillQueue 已 fail()（含 stopDevice）；previousRing 于作用域末销毁，设备已停
+    }
+    observedQueueCounters_ = queue_->counters();
+    clock_.seek(target);
+    retiredQueue_ = std::move(previousRing);
+    device_.rebindQueue(*queue_);
+    stateMachine_.completeSeek(generation);
+    publishMasterEnvelope(0.0F, std::chrono::milliseconds{0});
+    publishMasterEnvelope(1.0F, upMs);
+    publishPosition();
+    spdlog::info("seek dip complete: target={}ms, up={}ms", target.count(), upMs.count());
+  }
+
+  // ManualDipDown 归零点：采纳已预解码的 staging 槽为新主源 + 上行腿（上行从首块起算——
+  // 槽 ring 已满，换面即出声，裁定"不等待解码完成才出声"语义保持）。
+  void completeManualDip() {
+    if (!manualDip_) {
+      finishingAction_ = FinishingAction::None;
+      return;
+    }
+    auto dip = std::move(*manualDip_);
+    manualDip_.reset();
+    finishingAction_ = FinishingAction::None;
+    fadeInPending_ = false;
+    spdlog::info("manual dip zero point: adopting '{}'", pathToUtf8(dip.request.filePath));
+    adoptStagedSlotAsMain(dip);
+    publishMasterEnvelope(0.0F, std::chrono::milliseconds{0});
+    publishMasterEnvelope(1.0F, dip.upMs);
+    publishPosition();
+  }
+
+  // 手动 dip 采纳：staging 槽对象（source/pipeline/queue/边界/挂起帧）整体接管为主源；
+  // 单面 rebind 使槽 ring 成为主 face，旧主 ring 停入 retiredQueue_。状态机事件
+  // （Loading→Ready→Playing + TrackChanged）在此背靠背发出（手动切换逻辑切换点 = 归零点，
+  // dip 下行期间旧曲仍是逻辑当前曲）。时钟从新曲 offset 起算（设备运行，立即 resume）。
+  void adoptStagedSlotAsMain(PendingManualDip& dip) {
+    auto slot = std::move(dip.slot);
+    source_ = std::move(slot.source);
+    pipeline_ = std::move(slot.pipeline);
+    currentRequest_ = dip.request;
+    currentTarget_ = slot.target;
+    trackEndPosition_ = slot.endPosition;
+    pendingFrameWrite_ = std::move(slot.pendingFrameWrite);
+    hasCurrentTarget_ = true;
+    loadedToEnd_ = false;
+    endApproachEmitted_ = false;
+    overlapWindowSettled_ = false;
+    overlapRampPending_ = false;
+
+    clock_.reset(dip.request.trackId, slot.target.sampleRate,
+                 dip.request.offset.value_or(std::chrono::milliseconds{0}));
+    clock_.resume();
+    retiredQueue_ = std::move(queue_);
+    device_.rebindQueue(*slot.queue);
+    queue_ = std::move(slot.queue);
+    stateMachine_.loadTrack(dip.request);
+    stateMachine_.completeLoad();
+    stateMachine_.play();
+    loadedToEnd_ = slot.loadedToEnd && queue_->availableFrames() == 0U;
+    if (!loadedToEnd_) {
+      static_cast<void>(fillQueue());
+    }
+    observedQueueCounters_ = queue_->counters();
   }
 
   // 收尾 ticker（servicePlaybackProgress 内、Playing 门控之前调用）：淡出期解码按需
   // 续喂（裁定④：淡出是否走完取决于缓冲/引擎策略——防淡出长于缓冲深度时欠载提前静音）；
-  // 归零（或帧耗尽：曲目在淡出期播完）后 stopDevice + 定格时钟 + 收尾动作（R3/R5）。
+  // 归零（或帧耗尽：曲目在淡出期播完）后按监督动作分派归零点处理（pause/stop=completeFinishing；
+  // seek dip / 手动 dip = 各自换数据/换源续播）。
   void tickFinishing(const QueueUnderrunDelta& deferredUnderrun) {
     if (!loadedToEnd_) {
       if (!fillQueue()) {
@@ -1814,6 +2279,18 @@ private:
     if (!finishingReachedZero()) {
       return;
     }
+    switch (finishingAction_) {
+    case FinishingAction::SeekDipDown:
+      completeSeekDip();
+      return;
+    case FinishingAction::ManualDipDown:
+      completeManualDip();
+      return;
+    case FinishingAction::PauseFreeze:
+    case FinishingAction::StopCleanup:
+    case FinishingAction::None:
+      break;
+    }
     completeFinishing();
   }
 
@@ -1829,7 +2306,9 @@ private:
 
   // 归零点收尾：停设备（包络复位）、时钟定格 = 归零点（R3：暂停定格位置，不得被淡出
   // 前旧位置覆盖——时钟在淡出期从未 pause，冻结只发生在此处）；StopCleanup 额外做
-  // stop 的队列清理（位置清理照旧，推迟到归零点）。
+  // stop 的队列清理（位置清理照旧，推迟到归零点）。T11：finishing 期 seek 的定格目标
+  // （pendingFrozenSeekPosition_）在此补做物理 seek（设备已停、无并发回调——paused-seek
+  // 语义：无淡变、设备不重开，恢复时从定格位置淡入）。
   void completeFinishing() {
     const auto action = finishingAction_;
     finishingAction_ = FinishingAction::None;
@@ -1839,6 +2318,27 @@ private:
     stopDevice();
     updateClockFromQueue();
     clock_.pause();
+    if (pendingFrozenSeekPosition_.has_value()) {
+      const auto target = *pendingFrozenSeekPosition_;
+      pendingFrozenSeekPosition_.reset();
+      if (queue_ && source_ && pipeline_) {
+        if (const auto error = source_->seek(target)) {
+          spdlog::error("frozen-position seek failed ({}ms): {} - {}",
+                        target.count(), error->message, error->detail);
+        } else {
+          pipeline_->reset();
+          queue_->clearForSeek();
+          pendingFrameWrite_.reset();
+          loadedToEnd_ = false;
+          observedQueueCounters_ = queue_->counters();
+          if (fillQueue()) {
+            observedQueueCounters_ = queue_->counters();
+            clock_.seek(target);
+          }
+          // fillQueue 失败已走 fail()（Error 态）；定格位置保持原样。
+        }
+      }
+    }
     if (action == FinishingAction::StopCleanup) {
       if (queue_) {
         queue_->clearForSeek();
@@ -1854,6 +2354,10 @@ private:
     // 不留残余淡出窗口——收尾 ticker 随 stopProgressWorker 停止。
     finishingAction_ = FinishingAction::None;
     fadeInPending_ = false;
+    // T11：切换监督 pending 随 Error 作废（含 finishing 期定格 seek——恢复前须重载曲目）。
+    seekDip_.reset();
+    manualDip_.reset();
+    pendingFrozenSeekPosition_.reset();
     stopProgressWorker();
     stopDevice();
     stateMachine_.fail(code, std::move(message), std::move(detail));
@@ -1913,12 +2417,32 @@ private:
   // resetSourceEnvelope 的版本清零并存：发布版本 > 0 恒被受理，A5 语义）。
   std::array<GainEnvelopeController, 2> sourceEnvelopeControllers_{
       GainEnvelopeController{1.0F}, GainEnvelopeController{1.0F}};
+  // T11：交叉腿长（自动 = crossfadeMs；手动 = min(crossfadeMs, 当前曲剩余)）。tickOverlapRamp
+  // 据此发布槽 1 上行腿——两腿必须同长，EQ 互补才成立。置位点 = startOverlap/startManualOverlap。
+  std::chrono::milliseconds overlapLegMs_{0};
+  // T11：手动交叉（档 3）在途锁存——source0/source1 腿完（或主源排空后腿完）时经
+  // completeManualOverlap 采纳新主源（无 AdvanceCompleted）。撤面路径（cancelOverlapFace）
+  // 清零（见其注释）；采纳路径清零。
+  bool manualOverlapActive_{false};
+  // T11：输出配置变更标志——configureOutput/selectOutputDevice 置位、下一次 LoadTrack
+  // 消费。置位时该 LoadTrack = 配置整轨重载（非"改变音轨"），手动切歌档位对其不生效。
+  bool outputConfigChangePending_{false};
 
-  // ---- T6 传送淡变状态（均仅 audio worker 线程访问）----
-  // finishingAction_ != None = 物理收尾中（pause/stop 已翻转逻辑态、设备运行淡出中）。
+  // ---- T6/T11 传送淡变与切换监督状态（均仅 audio worker 线程访问）----
+  // finishingAction_ != None = 物理过渡监督中（pause/stop 已翻转逻辑态、设备运行淡出中；
+  // T11：seek dip / 手动 dip 下行在途时逻辑态保持 Playing，归零点按动作分派交接）。
   FinishingAction finishingAction_{FinishingAction::None};
   // 恢复淡入握手进行中：冷恢复先发即时 0.0，ticker 观测归零后发布 0→1 淡入。
   bool fadeInPending_{false};
+  // T11：seek dip pending（finishingAction_ == SeekDipDown 时有效；target 可被在途期间
+  // 的后续 seek 覆盖，upMs = 上行腿长按首个命令配置快照）。
+  std::optional<PendingSeekDip> seekDip_{};
+  // T11：手动 dip pending（finishingAction_ == ManualDipDown 时有效；slot = 归零点采纳的
+  // 已预解码新主源）。
+  std::optional<PendingManualDip> manualDip_{};
+  // T11：finishing（PauseFreeze）期 seek 的定格目标——淡出不打断，归零点补做物理 seek
+  // 后时钟定格于此（completeFinishing 消费；abortFinishingForRestart/fail 作废）。
+  std::optional<std::chrono::milliseconds> pendingFrozenSeekPosition_{};
   // T5 worker 侧包络账本（版本递增/ms→帧换算/增益钳制），发布唯一入口。
   GainEnvelopeController masterEnvelope_{1.0F};
 
