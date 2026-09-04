@@ -2,6 +2,8 @@
 
 ## 边界与事实来源
 - 当前目录即仓库根；不要向上扫描 Seriona。`build/`、`build-*/`、`.omo/` 是生成或工作目录，不是源码。
+- 本仓库后续所有更改必须且只能提交到 `develop` 分支；禁止直接在 `main` 分支提交。修改、暂存或提交前运行 `git status --short --branch` 确认当前分支为 `develop`。
+- `main` 只作为稳定基线或同步来源；推送 `develop`、创建合并请求或合并回 `main` 必须由用户明确要求。
 - 当前事实按根/子目录 `CMakeLists.txt`、源码、测试排序核对；它们高于完整项目文档 `README.md`（2026-08 public 准备时重写）与描述长期稳定设计的 `DESIGN.md`（后者的定位与维护规范见「DESIGN.md 维护规范」）。
 - 仓库无 CI 和格式化配置；`CMakePresets.json` 提供 `release` 预设（输出 `build/release`，`CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON` 与 `CMAKE_EXPORT_COMPILE_COMMANDS=ON`）。`.clangd` 与 VS Code clangd 固定读取 `build/` 编译数据库。
 - 面向用户的回复、新增项目文档和提交信息使用中文。
@@ -34,7 +36,7 @@
 - 前端应用设置的公共契约在 `inc/seriona/control/app_settings_store.h`：`AppSettingsStore`（`set`/`get`/`remove`/`listByGroup`，value 为不透明字符串，前端负责 QVariant ↔ 字符串编解码）+ `makeSQLiteAppSettingsStore` 工厂，编入 `seriona_control`，与 FolderSortSettingsStore 同库不同表、实现须线程安全。
 - 对外契约以 `inc/seriona/` 为边界：audio 看 `audio_contracts.h`，scanner 稳定入口只看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，跨模块编排走 control；`inc/` 中的 TagReader adapter、SQLite cache 等实现导向头不属稳定边界，新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus 或 Windows 类型。
 - 公共契约错误风格：typed enum（`MediaControllerErrorCode`、`ScannerErrorCode` 等）+ result struct（`MediaControllerCommandResult`、`ScannerTaskResult` 等），异常（`std::runtime_error`/`std::invalid_argument`）只从实现抛出；公共头不声明 `throw`、不用 `std::expected`。
-- `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging` 与 `setLogLevel`（运行时日志等级），入口公共 API 还包括 `runtime_paths.h`：提供 `RuntimePaths`（dataRoot/logFile/databasePath/artworkDir，`ensureDirectoriesExist()`）与 `resolveRuntimePaths` 双模式——编译定义 `SERIONA_INSTALLED_MODE` 时走 XDG（`resolveInstalledRuntimePaths`），否则便携模式（exeDir/SerionaData，`resolvePortableRuntimePaths` 在 Linux 经 `/proc/self/exe` 解析，否则回退传入的 executablePath（绝对路径时），再回退 `current_path()`）。
+- `src/logging/` 是无公共头的 `seriona::logging` 内部模块，编入 scanner/app/可执行文件及测试；公共入口是 `inc/seriona/app/application_logging.h` 的 `initializeApplicationLogging` 与 `setLogLevel`（运行时日志等级），入口公共 API 还包括 `runtime_paths.h`：提供 `RuntimePaths`（dataRoot/logFile/databasePath/artworkDir，`ensureDirectoriesExist()`）与 `resolveRuntimePaths` 双模式——编译定义 `SERIONA_INSTALLED_MODE` 时走安装路径（`resolveInstalledRuntimePaths`：Linux/Unix 走 XDG；macOS 不用 XDG 而走 `~/Library/Application Support|Logs|Caches/<appId>`，.app bundle 绝不能写入，否则破坏代码签名封印被 Gatekeeper 拒绝），否则便携模式（exeDir/SerionaData，`resolvePortableRuntimePaths` 在 Linux 经 `/proc/self/exe` 解析，否则回退传入的 executablePath（绝对路径时），再回退 `current_path()`）。
 - 部分 `inc/seriona/` 头（`scan_scheduler.h`、`song_identity.h`）与 `src/audio/audio_player.cpp` 的实现只被测试目标直接编译，未进任何静态库：生产代码调用这些符号会在最终链接报 undefined reference；`AudioPlayer` 类本质是测试专用封装，生产走 `makeAudioPlaybackService`。
 
 ## 不可破坏的约束
@@ -46,6 +48,7 @@
 
 ## 测试与工具
 - 发现：`ctest --test-dir build -N`；全量：`ctest --test-dir build --output-on-failure`；聚焦：`ctest --test-dir build -R '<regex>' --output-on-failure`。
+- 大量测试目标把被测 `src/*.cpp` 直接编入测试二进制（`${PROJECT_SOURCE_DIR}/src/...`，tests/CMakeLists.txt 共 199 处 src 引用）而非链接五个静态库；新增白盒测试沿用该模式，并注意目标之间的共享实现依赖（如 ffmpeg_audio_source.cpp 同时被 filter pipeline 测试直接编译）。
 - 常用正则有 `seriona\.audio`、`seriona\.scanner`、`seriona\.metadata`、`seriona\.control`、`seriona\.logging`、`seriona\.runtime_paths`、`seriona\.application_logging`。
 - doctest 测试二进制必须恰有一个 `main`；多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，少数自带普通入口，禁止重复定义。
 - cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 240s，`seriona.control_artwork_resolver` 超时 60s，`seriona.scanner.wtr_integration` 超时 180s。

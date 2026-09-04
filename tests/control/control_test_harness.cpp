@@ -55,6 +55,12 @@ void FakeAudioPlaybackService::configureOutput(const audio::AudioOutputConfig& c
   lastConfiguredOutput_ = config;
 }
 
+void FakeAudioPlaybackService::configureTransition(const audio::TransitionConfig& config) {
+  ++configureTransitionCalls_;
+  callLog_.push_back("configureTransition");
+  lastConfiguredTransition_ = config;
+}
+
 void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& request) {
   if (loadTrackException_) {
     std::rethrow_exception(loadTrackException_);
@@ -64,10 +70,21 @@ void FakeAudioPlaybackService::loadTrack(const audio::TrackPlaybackRequest& requ
   lastLoadedTrack_ = request;
 }
 
+void FakeAudioPlaybackService::abortTransition() {
+  ++abortTransitionCalls_;
+  callLog_.push_back("abortTransition");
+}
+
 void FakeAudioPlaybackService::prepareNext(const audio::TrackPlaybackRequest& request) {
+  prepareNext(request, audio::PrepareNextMeta{});
+}
+
+void FakeAudioPlaybackService::prepareNext(const audio::TrackPlaybackRequest& request,
+                                           const audio::PrepareNextMeta& meta) {
   ++prepareNextCalls_;
   callLog_.push_back("prepareNext");
   lastPreparedTrack_ = request;
+  lastPrepareNextMeta_ = meta;
 }
 
 void FakeAudioPlaybackService::play() {
@@ -130,8 +147,16 @@ std::size_t FakeAudioPlaybackService::configureOutputCalls() const noexcept {
   return configureOutputCalls_;
 }
 
+std::size_t FakeAudioPlaybackService::configureTransitionCalls() const noexcept {
+  return configureTransitionCalls_;
+}
+
 std::size_t FakeAudioPlaybackService::loadTrackCalls() const noexcept {
   return loadTrackCalls_;
+}
+
+std::size_t FakeAudioPlaybackService::abortTransitionCalls() const noexcept {
+  return abortTransitionCalls_;
 }
 
 std::size_t FakeAudioPlaybackService::prepareNextCalls() const noexcept {
@@ -178,12 +203,20 @@ const std::optional<audio::AudioOutputConfig>& FakeAudioPlaybackService::lastCon
   return lastConfiguredOutput_;
 }
 
+const std::optional<audio::TransitionConfig>& FakeAudioPlaybackService::lastConfiguredTransition() const noexcept {
+  return lastConfiguredTransition_;
+}
+
 const std::optional<audio::TrackPlaybackRequest>& FakeAudioPlaybackService::lastLoadedTrack() const noexcept {
   return lastLoadedTrack_;
 }
 
 const std::optional<audio::TrackPlaybackRequest>& FakeAudioPlaybackService::lastPreparedTrack() const noexcept {
   return lastPreparedTrack_;
+}
+
+const std::optional<audio::PrepareNextMeta>& FakeAudioPlaybackService::lastPrepareNextMeta() const noexcept {
+  return lastPrepareNextMeta_;
 }
 
 const std::optional<std::chrono::milliseconds>& FakeAudioPlaybackService::lastSeekPosition() const noexcept {

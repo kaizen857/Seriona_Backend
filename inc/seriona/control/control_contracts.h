@@ -316,6 +316,10 @@ enum class MediaControlCommandKind {
   PlayNextTrack,
   ClearPlayQueue,
   RemoveFromQueue,
+  // 过渡参数命令（T1）：SetTransitionConfig=配置播放过渡参数（淡入淡出/交叉/预
+  // 加载），载荷=MediaControlCommand::transitionConfig。与 ConfigureOutput 语义隔
+  // 离：仅存配置，绝不触发整轨重载/设备操作。追加末尾保持序列化兼容。
+  SetTransitionConfig,
 };
 
 struct MediaControlCommand {
@@ -337,6 +341,8 @@ struct MediaControlCommand {
   std::optional<std::filesystem::path> targetPath;
   // RemoveFromQueue 目标索引（queueEntries 下标）。追加末尾保持序列化兼容。
   std::optional<std::size_t> queueIndex;
+  // SetTransitionConfig 载荷（T1）。追加末尾保持序列化兼容。
+  std::optional<audio::TransitionConfig> transitionConfig;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;

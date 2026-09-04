@@ -71,7 +71,10 @@ void PlaybackStateMachine::play() {
 }
 
 void PlaybackStateMachine::pause() {
+  // Ready（已加载未播放，时钟已停）→ Paused 合法：ConfigureOutput 重载当前曲目
+  // 后控制层补发 pause 以保持暂停，物理上无副作用；重复 pause 仍被拒绝。
   if (state_ == PlaybackState::Playing || state_ == PlaybackState::Draining ||
+      state_ == PlaybackState::Ready ||
       (state_ == PlaybackState::Loading && pendingSeekAfter_.has_value())) {
     clock_.continuous = false;
     pendingSeekBefore_.reset();
