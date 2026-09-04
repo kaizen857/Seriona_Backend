@@ -77,7 +77,16 @@ docs/、*.md          项目演进记录文档，非事实来源
 - 播放状态机 `PlaybackStateMachine`：Idle → Loading → Ready → Playing ⇄ Paused，另有瞬时 Draining、Stopped、Error；每次迁移发 `PlaybackStateChanged`。seek 为 begin/cancel/complete 三阶段，带 generation 防过期完成。
 - `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取），`AudioOutputConfig.preferredDeviceId`（枚举索引字符串）经 `resolvePreferredDevice` 解析并绑定对应设备，选错格式自动回退并通知。
 - `PcmBufferQueue`：无锁 SPSC 字节环 + generation 失效机制（seek 防竞态）；`PlaybackClock`：帧计数驱动（非墙钟）。
-- `AudioEventDispatcher`：锁内取 sink 副本、锁外回调；`BackendEvent` 信封带 monotonicVersion/timestamp。
+- `AudioEventDispatcher`：锁内取 sink 副本、锁外回调；`BackendEvent` 信封带 monotonicVersion/timestamp；事件面含过渡域 `EndApproaching{remainingMs}`（终点预告）与 `AdvanceCompleted{trackId}`（交接提交）两个载荷（追加于 `BackendEventType` 枚举末尾，见下）。
+- 播放过渡域（淡入淡出/交叉/预加载，整体自任务组 B1-B4 落地）：
+  - 过渡契约：`TransitionConfig`（`audio_contracts.h`，9 项，字段声明顺序即跨端契约）描述自动前进淡变（Off / 除 CUE 无间隙组外 / 全交叉三档）、手动切歌淡变（Off / 短时 dip / 全交叉三档）、传送与 seek 淡变、无间隙预解码提前量。默认构造即裁定默认，全部 9 项默认下采样路径与过渡引擎引入前基线逐位一致（仓库内 17 键哈希回归总闸持续锁定，Direct 恒重开+硬切、Mixed 无交叉的旧行为不变）。控制面经 `SetTransitionConfig` 命令（§4.4）到达 `AudioPlaybackService::configureTransition`，与 `ConfigureOutput` 语义隔离：只更新配置，不触发 LoadTrack、设备重开或任何事件。
+  - 增益包络引擎（过渡的物理执行面）：`GainEnvelopeController`（`src/audio/transition/`，音频 worker 侧账本）产出轨迹快照（Linear / EqualPowerPair 两族，version 单调递增），经 `AudioOutputDevice::setMasterEnvelope`/`setSourceEnvelope` 发布。master 包络承载传送层淡变（pause/stop/seek/play），`sourceEnvelopes[2]` 承载源级淡变（槽 0 主源、槽 1 交叉第二源）。`renderCallback` 在块首按版本受理、逐帧推进增益：整数格式在加宽样本域做增益数学，S24 解包为左对齐 S32 后与 Int32 路径同构再打包；静音/零音量块照常推进包络，音量/静音与包络正交（回调内相乘）。`resetEnvelopes`/`resetSourceEnvelope` 复位层账本。
+  - 传送收尾（finishing）语义：pause/stop 命令到达即翻转逻辑态并发布状态事件（Paused/Stopped），物理淡出由音频 worker 监督（`FinishingAction`：PauseFreeze / StopCleanup / SeekDipDown / ManualDipDown）；淡出期间解码继续喂队列，包络归零后设备才停止，冷启动/恢复经先即时落零再 0→1 的淡入握手，避免切尾爆音与残余出声。暂停淡出（PauseFreeze）期间到达的 seek 只更新冻结目标、收尾后补做物理 seek；停止收尾（StopCleanup）中 seek 为非法（照发 SeekFailed、收尾监督保留）。
+  - Mixed 同目标切歌免重开：输出协商短路。请求曲目标格式与设备已协商参数一致时设备保持 initialized，`rebindQueue` 原子换代原地换队列（旧环退役，下次停设备时析构）；参数变化或 Direct 才拆卸重开。`OutputFormatChanged` 仅在实变时发布。
+  - 自动前进事件链（EndApproaching/PrepareNext/AdvanceCompleted）：Mixed 下自动前进侧启用预解码提前量或交叉档位时，曲目进入终点阈值窗由服务发一次性 `EndApproaching{remainingMs}`（armed 去重；Direct 与默认全关路径零发射、自然结束仍走 PlaybackEnded）。控制层按档位/RepeatOne/无间隙组语义决策选曲并定 `PrepareNextKind`（SeamlessDirect / Crossfade，`PrepareNextMeta` 带无间隙组标记），经 `prepareNext` 两参重载下发；服务把下一曲预解码入槽，自然终点按就绪槽直切（handoff）或双源交叉重叠提升。交接完成先发 `AdvanceCompleted{trackId}` 再发新曲 TrackChanged/状态事件，控制层据 pendingAdvance 账本提交（不重发 LoadTrack）；窗口内被判定失效的命令（选曲/seek/stop/重配过渡等）先经 `abortTransition` 中止（弃槽、第二源去活、预告重新武装）再执行本体。
+  - 双源交叉重叠面：第二源 ring 由 `AudioOutputDevice::activateSecondSource` 发布（指针+代次+源包络），回调按代次双读、在加宽样本域混音（等功率对 g0²+g1²≈1），代次失配整块补零，杜绝陈旧混音；主源排空按 drain-promote 语义即时完成交接，无静音缺口。
+  - 手动切歌三档（Mixed 且播放中生效；Direct 恒瞬时硬切并重开设备，档位与预解码不生效）：Off 为现状瞬时体；ShortDip 先把目标解码（复用匹配预载槽或临时解码，失败走错误路径），master 对半 dip 归零后原地采纳（rebind + 状态机 Loading/TrackChanged/Ready/Playing 背靠背，无位置跳变、设备不重开）；FullCrossfade 在预载槽匹配且就绪时走真重叠（腿长取交叉长度与剩余时长的较小值，等功率换腿，提升或排空提升后采纳且不发射 AdvanceCompleted，selectTrack 批尾 Play 在过渡在途被吞掉），未就绪则临时解码降级 dip、时长不足则硬切，永不等待。播放中 seek 在 fadeOnSeek 下走同类 dip（归零点集中发 Loading/PositionDiscontinuity/Playing）；暂停/就绪态 seek 保持瞬时。
+  - 早期设计稿（6.1.5/6.1.8/6.1.11）承诺的「混音模式必须支持无缝切歌」「切歌时不应因下一首源格式不同而重开设备」「同一输出格式的无缝切歌衔接处没有明显静音、爆音或设备重开」现均已落地：无缝直切与交叉重叠见上，免重开为协商短路，无爆音由等功率交叉腿、代次补零与归零收尾保证，并由默认值等价回归与帧级断言套件持续锁定。Direct 模式按承诺不承诺无缝（每次切歌重开设备、瞬时硬切）。
 - FFmpeg：`FfmpegAudioSource`（解复用+解码，含 MP3 尾部 ID3v1 净化与损坏尾部截断）、`FfmpegFilterPipeline`（libavfilter 图：abuffer→aformat→abuffersink，输入签名变化时惰性重建）；两者均 pimpl，公共头不暴露任何 AV 类型。
 - 波形生成：公共入口 `buildAudioWaveform`；按容器选择策略——MP4 族走 PacketBatches（单输入、250 包一批、克隆解码器）、其余走 SeekChunks（每 chunk 独立解码器 + 1 秒 preroll）；能量核运行时按 CPUID 选择 AVX2（仅 `waveform_simd_avx2.cpp` 编译期加 `-mavx2;-mfma`）/ 标量。波形生成当前仓库内无生产调用方（面向未来可视化消费）。
 - 测试专用：`AudioPlayer` 类（`src/audio/audio_player.cpp`）不在库内，仅测试目标直接编译。
@@ -106,8 +115,8 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.4 seriona_control（编排核心）
 
-- `MediaController`（pimpl 门面）：`submitCommand`（21 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
-- 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
+- `MediaController`（pimpl 门面）：`submitCommand`（22 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、播放过渡配置（`SetTransitionConfig`，携带 `TransitionConfig`，仅更新过渡配置、无整轨重载/设备副作用）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
+- 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One、EndApproaching 决策与 AdvanceCompleted 提交账本，窗口内失效命令先 abort 再执行本体）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
 - 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 多规则排序（缺失值 First/Last）+ 锚点定位；Root/Folder 两种作用域。
 - 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/appSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）、SQLite 应用设置存储（与排序存储共享 databasePath）。
 - 封面解析：`ArtworkResolver`（有界 latest-wins 队列 + 结果 epoch 失效）+ 归约器 generation 校验，结果回填 `player_.artwork.localPath`。
@@ -159,6 +168,8 @@ main(argc=2, 路径存在)                       main.cpp
 ### 7.1 播放控制链路
 
 `submitCommand(Play/Seek/...)` → 控制事件循环 → 归约器产出意图 → `executeIntents` 调 `AudioPlaybackService` → 音频工作线程执行（状态机迁移、解码填充、时钟推进）→ `BackendEvent`（100ms 节流的进度事件、状态变更、seek 不连续事件、错误）→ 控制事件循环 → 归约器按 monotonicVersion 去重 → 快照发布 → 订阅投递线程回调；同一快照同时传给 metadata 服务发布到平台。
+
+自动前进（自然播完）与过渡域（详见 §4.1）：Mixed 下自动前进侧启用预解码提前量或交叉档位时，终点阈值窗内服务发 `EndApproaching`，控制器决策下一曲与交接方式（直切/交叉）后经 `prepareNext` 预解码；交接或交叉重叠完成以 `AdvanceCompleted` 提交（先于新曲 TrackChanged），控制层按账本落曲、不重发 LoadTrack；窗口内失效命令先经 `AbortTransition` 中止。无预载路径（Direct、默认全关配置、预解码失败）维持 PlaybackEnded 触发控制层自动下一曲的既有流程。
 
 ### 7.2 扫描流程
 
