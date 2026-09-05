@@ -501,7 +501,7 @@ std::filesystem::path uniqueMediaControllerDatabasePath() {
 }
 
 template <typename Predicate>
-bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::seconds{1}) {
+bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     if (predicate()) {

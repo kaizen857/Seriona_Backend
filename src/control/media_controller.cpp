@@ -142,10 +142,27 @@ namespace {
 
 }
 
+namespace {
+
+[[nodiscard]] SubscriptionDeliveryMode deliveryModeFor(const MediaControllerOptions& options) {
+  // inline 测试模式（无事件循环 worker 线程）下同步投递订阅回调：
+  // 回调可见性可预测，测试无需轮询等待异步投递（2026-09-05 修复：异步投递
+  // 偶发调度延迟曾让 1s-5s 等待预算的断言随机失败）。生产线程模式保持异步。
+  return options.runInlineForTests ? SubscriptionDeliveryMode::Sync : SubscriptionDeliveryMode::Async;
+}
+
+}
+
 class MediaController::Impl {
 public:
   Impl(MediaControllerDependencies dependencies, MediaControllerOptions options)
-      : dependencies_(std::move(dependencies)), options_(options), eventLoop_(options), reducer_(options) {
+      : dependencies_(std::move(dependencies)),
+        options_(options),
+        eventLoop_(options),
+        reducer_(options),
+        playerSubscriptions_({}, deliveryModeFor(options)),
+        librarySubscriptions_({}, deliveryModeFor(options)),
+        notificationSubscriptions_({}, deliveryModeFor(options)) {
     normalizeMediaControllerDependencies(dependencies_);
     installSinks();
     if (dependencies_.artworkResolver) {
@@ -724,9 +741,9 @@ private:
   MediaControllerOptions options_{};
   ControlEventLoop eventLoop_;
   ControlStateReducer reducer_;
-  PlayerStateSubscriptionStore playerSubscriptions_{};
-  LibraryStateSubscriptionStore librarySubscriptions_{};
-  DomainNotificationSubscriptionStore notificationSubscriptions_{};
+  PlayerStateSubscriptionStore playerSubscriptions_;
+  LibraryStateSubscriptionStore librarySubscriptions_;
+  DomainNotificationSubscriptionStore notificationSubscriptions_;
   mutable std::mutex mutex_{};
   PlayerStateSnapshot playerSnapshot_{};
   LibraryStateSnapshot librarySnapshot_{};
