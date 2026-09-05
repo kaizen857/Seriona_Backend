@@ -5,6 +5,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <semaphore>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -34,7 +35,10 @@ public:
       }
       deliveries_.push_back(std::move(delivery));
     }
-    ready_.notify_one();
+    // 计数信号量 release：即使 worker 尚未进入等待也记账，不存在
+    // condvar 的"unlock 与 futex_wait 间隙 notify 丢失"窗口（2026-09-05
+    // 定位：偶发丢失曾让 waitUntilIdle/stop 的 barrier 永不执行 → 无界挂死）。
+    pending_.release();
   }
 
   void waitUntilIdle() {
@@ -53,7 +57,8 @@ public:
       stopping_ = true;
       deliveries_.clear();
     }
-    ready_.notify_one();
+    // 唤醒可能阻塞在 acquire 的 worker：其唤醒后见 stopping_ 且队列空即退出。
+    pending_.release();
     if (worker_.joinable()) {
       worker_.join();
     }
@@ -61,13 +66,21 @@ public:
 
 private:
   void run() {
-    while (true) {
+    for (;;) {
+      pending_.acquire();
       std::function<void()> delivery;
       {
         std::unique_lock lock{mutex_};
-        ready_.wait(lock, [this] { return stopping_ || !deliveries_.empty(); });
-        if (stopping_ && deliveries_.empty()) {
+        if (stopping_) {
+          if (deliveries_.empty()) {
+            return;
+          }
+          // stopping 但队列仍有任务：清空后退出（stop() 已 clear，此分支防御性保留）。
+          deliveries_.clear();
           return;
+        }
+        if (deliveries_.empty()) {
+          continue;  // spurious 计数（不应发生）：重新等待
         }
         delivery = std::move(deliveries_.front());
         deliveries_.pop_front();
@@ -77,8 +90,8 @@ private:
   }
 
   std::mutex mutex_{};
-  std::condition_variable ready_{};
   std::deque<std::function<void()>> deliveries_{};
+  std::counting_semaphore<> pending_{0};
   std::thread worker_{};
   bool stopping_{false};
 };
@@ -144,9 +157,11 @@ void waitForDeliveryWorkerIdle(const void* key) noexcept {
 }
 
 template <typename Snapshot>
-SubscriptionStore<Snapshot>::SubscriptionStore(SubscriptionExceptionReporter exceptionReporter)
+SubscriptionStore<Snapshot>::SubscriptionStore(SubscriptionExceptionReporter exceptionReporter,
+                                               SubscriptionDeliveryMode mode)
     : state_(std::make_shared<State>()) {
   state_->exceptionReporter = std::move(exceptionReporter);
+  state_->mode = mode;
 }
 
 template <typename Snapshot>
@@ -211,6 +226,20 @@ void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
         deliveries.emplace_back(subscriptionId, subscriber.callback);
       }
     }
+  }
+
+  const auto mode = state_->mode;
+  if (mode == SubscriptionDeliveryMode::Sync) {
+    // 同步投递：publish 调用线程内执行回调（测试 inline 模式）。deliveries 为
+    // 锁外拷贝，回调重入 subscribe/unsubscribe 安全；异常按异步路径同样记账。
+    for (const auto& [subscriptionId, callback] : deliveries) {
+      try {
+        callback(snapshot);
+      } catch (...) {
+        reportException(subscriptionId, std::current_exception());
+      }
+    }
+    return;
   }
 
   const auto worker = deliveryWorkerFor(state_.get());
@@ -285,6 +314,15 @@ template <typename Snapshot>
 void SubscriptionStore<Snapshot>::invokeSubscriber(std::size_t subscriptionId, const Snapshot& snapshot) {
   const auto callback = callbackFor(subscriptionId);
   if (!callback) {
+    return;
+  }
+
+  if (state_->mode == SubscriptionDeliveryMode::Sync) {
+    try {
+      callback(snapshot);
+    } catch (...) {
+      reportException(subscriptionId, std::current_exception());
+    }
     return;
   }
 

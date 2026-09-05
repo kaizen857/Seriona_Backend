@@ -20,12 +20,18 @@ struct SubscriptionExceptionReport {
 
 using SubscriptionExceptionReporter = std::function<void(const SubscriptionExceptionReport&)>;
 
+// 投递模式：Async（默认）经常驻投递 worker 线程执行订阅回调（生产：不阻塞
+// 控制器事件循环）；Sync 在 publish/invokeSubscriber 调用线程内同步执行
+// （测试 inline 模式：回调可见性可预测，避免等待异步投递的偶发超时）。
+enum class SubscriptionDeliveryMode { Async, Sync };
+
 template <typename Snapshot>
 class SubscriptionStore {
 public:
   using Callback = std::function<void(const Snapshot&)>;
 
-  explicit SubscriptionStore(SubscriptionExceptionReporter exceptionReporter = {});
+  explicit SubscriptionStore(SubscriptionExceptionReporter exceptionReporter = {},
+                              SubscriptionDeliveryMode mode = SubscriptionDeliveryMode::Async);
   ~SubscriptionStore();
 
   SubscriptionStore(const SubscriptionStore&) = delete;
@@ -50,6 +56,7 @@ private:
     std::size_t nextSubscriptionId{1};
     std::size_t exceptionCount{0};
     SubscriptionExceptionReporter exceptionReporter{};
+    SubscriptionDeliveryMode mode{SubscriptionDeliveryMode::Async};
   };
 
   [[nodiscard]] Callback callbackFor(std::size_t subscriptionId) const;

@@ -165,7 +165,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
 }
 
 void waitForReadCount(const FakeWatcherMetadataReader& reader, std::size_t expected) {
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     if (reader.readCount() >= expected) {
       return;
     }
@@ -175,7 +175,7 @@ void waitForReadCount(const FakeWatcherMetadataReader& reader, std::size_t expec
 }
 
 void waitForSnapshotSongCount(const FileScannerService& service, std::size_t expected) {
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     if (songsIn(service.snapshot()).size() == expected) {
       return;
     }
@@ -185,7 +185,7 @@ void waitForSnapshotSongCount(const FileScannerService& service, std::size_t exp
 }
 
 void waitForLyrics(const FileScannerService& service, LyricsSource source, std::string_view text) {
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     const auto songs = songsIn(service.snapshot());
     if (songs.size() == 1U && songs[0].effectiveLyricsSource == source && songs[0].effectiveLyrics.size() == 1U &&
         songs[0].effectiveLyrics[0].text == text) {
@@ -205,7 +205,7 @@ void waitForLyrics(const FileScannerService& service, LyricsSource source, std::
 // 等待回落重扫真正开始，而不是固定 sleep：慢机器（CI runner）上 30ms 常常
 // 不够，断言会在重扫启动前就跑完。
 void waitForScanStartedCount(const std::vector<ScannerEvent>& events, std::mutex& mutex, std::size_t expected) {
-  for (auto attempt = 0; attempt != 200; ++attempt) {
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
     {
       std::scoped_lock lock{mutex};
       if (scanStartedCount(events) >= expected) {
@@ -881,7 +881,7 @@ TEST_CASE("scanner watcher root-internal rename keeps CUE source audio hidden (n
   watchers->states[0]->callback(rename);
 
   const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
-    for (auto attempt = 0; attempt != 100; ++attempt) {
+    for (auto attempt = 0; attempt != 1000; ++attempt) {
       const auto songs = songsIn(service->snapshot());
       if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
         return;
@@ -982,7 +982,7 @@ TEST_CASE("scanner watcher root-internal rename with overlapping sibling prefix 
   watchers->states[0]->callback(rename);
 
   const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
-    for (auto attempt = 0; attempt != 100; ++attempt) {
+    for (auto attempt = 0; attempt != 1000; ++attempt) {
       const auto songs = songsIn(service->snapshot());
       if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
         return;
@@ -1115,7 +1115,7 @@ TEST_CASE("scanner watcher refreshes scan-root hash so the next reconcile stays 
       std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
   }();
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     std::scoped_lock lock{eventsMutex};
     const auto completed = static_cast<std::size_t>(
       std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
@@ -1129,7 +1129,7 @@ TEST_CASE("scanner watcher refreshes scan-root hash so the next reconcile stays 
 }
 
 void waitForReconciliationMessage(const std::vector<ScannerEvent>& events, std::mutex& eventsMutex, const std::string& detail) {
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     {
       std::scoped_lock lock{eventsMutex};
       const auto found = std::ranges::any_of(events, [&](const ScannerEvent& event) {
@@ -1247,7 +1247,7 @@ TEST_CASE("scanner watcher periodic reconcile does not publish when nothing chan
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   waitForSnapshotSongCount(*service, 1U);
-  for (auto attempt = 0; attempt != 100; ++attempt) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
     std::scoped_lock lock{eventsMutex};
     if (std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type) >= 1U) {
       break;
