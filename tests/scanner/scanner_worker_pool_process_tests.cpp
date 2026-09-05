@@ -4,6 +4,7 @@
 #include <doctest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>

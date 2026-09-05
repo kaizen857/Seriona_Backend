@@ -3,6 +3,7 @@
 
 #include "seriona/audio/audio_contracts.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
