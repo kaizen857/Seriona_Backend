@@ -37,8 +37,8 @@ seriona_app（静态库，仅 application_logging/runtime_paths/logging，当前
 
 | 线程 | 归属 | 职责 |
 |---|---|---|
-| 音频工作线程（单） | `seriona_audio` | 解码填充、状态机、seek、无缝交接、进度发布（全部串行化） |
-| miniaudio 回调线程 | `seriona_audio` | 无锁读 PCM 队列 + 增益（实时约束，见 §8） |
+| 音频工作线程（单） | `seriona_audio` | 解码填充、状态机、seek、无缝交接、进度发布与频谱节流分析（全部串行化） |
+| miniaudio 回调线程 | `seriona_audio` | 无锁读 PCM 环 + 增益/混音；EQ 激活时走 f32 中间域处理链（EQ→音量→限幅→量化）；频谱摘录零分配（实时约束，见 §11） |
 | 扫描线程（单） | `seriona_scanner` | 串行执行扫描请求（容量 16 的队列） |
 | 扫描 worker 池 | `seriona_scanner` | BS::thread_pool 并发读取元数据（TagReader 有信号量限流） |
 | watcher 线程 | `seriona_scanner` | 文件系统事件（含目录被移出监视根的 IN_MOVE_SELF；孤立 IN_MOVED_FROM 经 ~100ms 超时 flush 以 destroy 事件转发，单文件移出监视根即时感知）→ 完整事件入队 → 50ms 去抖归并 → 分类器精准增量更新；60s 周期对账兜底 |
@@ -87,6 +87,14 @@ docs/、*.md          项目演进记录文档，非事实来源
   - 双源交叉重叠面：第二源 ring 由 `AudioOutputDevice::activateSecondSource` 发布（指针+代次+源包络），回调按代次双读、在加宽样本域混音（等功率对 g0²+g1²≈1），代次失配整块补零，杜绝陈旧混音；主源排空按 drain-promote 语义即时完成交接，无静音缺口。
   - 手动切歌三档（Mixed 且播放中生效；Direct 恒瞬时硬切并重开设备，档位与预解码不生效）：Off 为现状瞬时体；ShortDip 先把目标解码（复用匹配预载槽或临时解码，失败走错误路径），master 对半 dip 归零后原地采纳（rebind + 状态机 Loading/TrackChanged/Ready/Playing 背靠背，无位置跳变、设备不重开）；FullCrossfade 在预载槽匹配且就绪时走真重叠（腿长取交叉长度与剩余时长的较小值，等功率换腿，提升或排空提升后采纳且不发射 AdvanceCompleted，selectTrack 批尾 Play 在过渡在途被吞掉），未就绪则临时解码降级 dip、时长不足则硬切，永不等待。播放中 seek 在 fadeOnSeek 下走同类 dip（归零点集中发 Loading/PositionDiscontinuity/Playing）；暂停/就绪态 seek 保持瞬时。
   - 早期设计稿（6.1.5/6.1.8/6.1.11）承诺的「混音模式必须支持无缝切歌」「切歌时不应因下一首源格式不同而重开设备」「同一输出格式的无缝切歌衔接处没有明显静音、爆音或设备重开」现均已落地：无缝直切与交叉重叠见上，免重开为协商短路，无爆音由等功率交叉腿、代次补零与归零收尾保证，并由默认值等价回归与帧级断言套件持续锁定。Direct 模式按承诺不承诺无缝（每次切歌重开设备、瞬时硬切）。
+- 均衡器/频谱域（音频侧处理面与频谱通道已落地；控制面见 §4.4）：`EqualizerConfig`（总开关、`EqualizerBandMode{Band10,Band31}`、前置增益、31 段 `bandGainsDb`、限幅器开关）、`EqualizerStateSnapshot`（generation/config/sampleRate/181 点 `curvePointsDb`+`curveFrequenciesHz`，对数频率轴 20–20k）、`SpectrumSnapshot`（generation/sampleRate/60 段 `binsDb`/timestampMs）为 `audio_contracts.h` 纯 C++23 值类型；`AudioPlaybackService` 虚表尾部追加非纯虚 `setEqualizer`/`equalizerState`/`setSpectrumEnabled`/`spectrumEnabled`（默认空实现/默认关，同 `configureTransition` 先例——4 个实现者免逐个覆写）。频段中心频率与 Q 常量单点定义于 `inc/seriona/audio/equalizer_tables.h`；生效快照（generation 单调递增 + RBJ peaking 增益曲线）由控制层 reducer 纯函数先行产生（控制层无输出采样率知识——快照 sampleRate 未回填、曲线按全轴计算、越界守卫不参与）。音频侧处理面与接线现状：
+  - 实时回调链两态：EQ 关闭 = 既有输出域快速路径，逐位直通保留（Direct 逐曲重开与 EQ 关的出厂行为同处理链引入前基线一致，render 级逐位回归锁定）；EQ 激活 = f32 中间域链——读环 → int 设备逐样本转 f32（f32 设备就地）→ 双源包络增益/混音（master×volume 推迟）→ EQ 级联（单实例逐 band 滤波、含 preGain；增益爬坡按块小步平滑，时间常数 ~20ms 量级，低采样率按块长钳制防大步进）→ 音量/包络（master×volume）→ 限幅器 → 末端单次量化写回输出域。补零欠载尾不喂链；muted/零音量与纯静音块跳过链（平滑与滤波/延迟线原位冻结，恢复出声续跑）。
+  - 停态窗口应用与重建语义：配置存储恒执行，DSP 生效只在停态窗口（设备未启动时配置入口即时应用；运行中到达仅存储——延后至下个 initialize/内容边界重配置生效）。initialize 幂等重放——格式重协商与 Direct 逐曲重开 = 重建（滤波历史/限幅延迟线/平滑清零，生效快照代际推进）；新曲加载协商成功与瞬时 seek 重启为内容边界，经设备清理入口显式清零。rebindQueue、T10 运行中交接、stop/pause/resume 非重建不清零——滤波/延迟线状态冻结跨越、线性精确续接（免 ~5ms 延迟线空洞与滤波阶跃瞬态）。
+  - 越界守卫：中心频率 ≥ 0.95×（采样率/2）的频段整体硬直通（不进滤波链，奈奎斯特外的增益命令零影响）。
+  - 限幅器：f32 域阈值限幅 + attack/release 平滑 + lookahead 延迟线（按采样率换算、>192k 封顶），开关过渡短时淡入淡出防爆音；与 EQ 同受停态窗口与重建语义约束。
+  - 生效快照：设备持原子镜像层（version 单调递增、停态窗口低频单写、跨线程一致读回，含实际输出率回填点），供 service 同步读回（见接线现状）。
+  - 频谱通道：实时回调内零分配摘录（预分配双缓冲 + 重建纪元防混率帧；链激活态摘录点 = EQ 后/音量前 f32、链关闭态 = 输出域最终，两态相对电平语义由域标注区分，激活态静音块补零帧）→ 音频 worker 播放中按 ~50ms 节流取最新帧 → av_tx FFT（Hann 窗、窗长按采样率分档、50% 重叠）→ 60 对数桶（20–20k）驻留快照（采样率 <40k 按奈奎斯特截断、不可测桶与静音同置 −120 dB 地板；独立单调代数；默认关）。
+  - 接线现状：控制命令链已贯通——意图经 setEqualizer 进入 worker 串行域（worker 侧目标存储 + 设备配置入口转发：配置存储恒执行、停态窗口即时应用、运行中仅存储、initialize/内容边界幂等重放，重建/交接不丢），生产经控制命令可激活 DSP。service 同步读回 equalizerState 直读设备生效面（generation = 设备单调代数，config/sampleRate = 生效真值；181 点增益曲线由控制层 reducer 先行产生并经订阅发布，读回面不编造、消费绘制以 reducer 快照曲线为准）。仍属后续接线：生效快照经 service 读回通道向控制层的重发布（控制器订阅现仍用 reducer 先行快照、sampleRate 未回填），与频谱驻留快照推送到控制层订阅面（订阅面无写者，频谱订阅仍收默认空快照）。
 - FFmpeg：`FfmpegAudioSource`（解复用+解码，含 MP3 尾部 ID3v1 净化与损坏尾部截断）、`FfmpegFilterPipeline`（libavfilter 图：abuffer→aformat→abuffersink，输入签名变化时惰性重建）；两者均 pimpl，公共头不暴露任何 AV 类型。
 - 波形生成：公共入口 `buildAudioWaveform`；按容器选择策略——MP4 族走 PacketBatches（单输入、250 包一批、克隆解码器）、其余走 SeekChunks（每 chunk 独立解码器 + 1 秒 preroll）；能量核运行时按 CPUID 选择 AVX2（仅 `waveform_simd_avx2.cpp` 编译期加 `-mavx2;-mfma`）/ 标量。波形生成当前仓库内无生产调用方（面向未来可视化消费）。
 - 测试专用：`AudioPlayer` 类（`src/audio/audio_player.cpp`）不在库内，仅测试目标直接编译。
@@ -115,7 +123,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.4 seriona_control（编排核心）
 
-- `MediaController`（pimpl 门面）：`submitCommand`（22 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、三路订阅（playerState/libraryState/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、播放过渡配置（`SetTransitionConfig`，携带 `TransitionConfig`，仅更新过渡配置、无整轨重载/设备副作用）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
+- `MediaController`（pimpl 门面）：`submitCommand`（23 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、五路订阅（playerState/libraryState/equalizerState/spectrum/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、播放过渡配置（`SetTransitionConfig`，携带 `TransitionConfig`，仅更新过渡配置、无整轨重载/设备副作用）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）、均衡器参数配置（`SetEqualizerConfig`，携带 `EqualizerConfig`，校验模式/±15 dB/NaN 后生效快照 generation++ 经 equalizerState 订阅发布；音频侧处理面与接线现状见 §4.1）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
 - 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One、EndApproaching 决策与 AdvanceCompleted 提交账本，窗口内失效命令先 abort 再执行本体）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
 - 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 多规则排序（缺失值 First/Last）+ 锚点定位；Root/Folder 两种作用域。
 - 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/appSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）、SQLite 应用设置存储（与排序存储共享 databasePath）。
@@ -214,7 +222,7 @@ main(argc=2, 路径存在)                       main.cpp
 - 排序存储：实现 `FolderSortSettingsStore` 抽象。
 - 应用设置：实现 `AppSettingsStore` 抽象（Noop 或 SQLite 落库）。
 - 控制器依赖：`MediaControllerDependencies` 全量注入，缺失项自动回退 noop——可用于无 UI/无真实硬件的场景。
-- 对外消费：订阅 `PlayerStateSnapshot`/`LibraryStateSnapshot`/领域通知即可构建新前端；`AudioPlaybackService` 与 `FileScannerService` 也可独立使用。
+- 对外消费：订阅 `PlayerStateSnapshot`/`LibraryStateSnapshot`/`EqualizerStateSnapshot`（生效配置 + 181 点增益曲线 + 单调代数）/`SpectrumSnapshot`（频谱：音频层驻留快照已产出、推送至订阅面尚未接线——当前订阅仍收默认空快照）/领域通知即可构建新前端；`AudioPlaybackService` 与 `FileScannerService` 也可独立使用。
 - 前端集成：终端控制器是 `TerminalActionReader` 抽象之上的唯一实现，新 UI 可替换入口层而保持 control 不变。
 
 ## 11. 开发建议

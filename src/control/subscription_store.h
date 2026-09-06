@@ -69,9 +69,13 @@ private:
 using PlayerStateSubscriptionStore = SubscriptionStore<PlayerStateSnapshot>;
 using LibraryStateSubscriptionStore = SubscriptionStore<LibraryStateSnapshot>;
 using DomainNotificationSubscriptionStore = SubscriptionStore<ControlDomainNotification>;
+using EqualizerStateSubscriptionStore = SubscriptionStore<audio::EqualizerStateSnapshot>;
+using SpectrumSubscriptionStore = SubscriptionStore<audio::SpectrumSnapshot>;
 
 extern template class SubscriptionStore<PlayerStateSnapshot>;
 extern template class SubscriptionStore<LibraryStateSnapshot>;
 extern template class SubscriptionStore<ControlDomainNotification>;
+extern template class SubscriptionStore<audio::EqualizerStateSnapshot>;
+extern template class SubscriptionStore<audio::SpectrumSnapshot>;
 
 }

@@ -15,6 +15,11 @@
 namespace seriona::audio {
 
 class AudioOutputDevice;
+// EQ/限幅 DSP 纯核心前向声明（任务 25 B2.4a）：实现类位于 src/audio/eq_dsp.h 与
+// src/audio/limiter.h（内部头，含 miniaudio 类型——公共头不引入内部依赖），本类以
+// 不透明 unique_ptr 持有，实例化/销毁在 audio_output_device.cpp（构造函数，非回调路径）。
+class EqualizerDspProcessor;
+class LimiterDspProcessor;
 
 struct AudioOutputDeviceCounters {
   std::uint64_t callbackCount{0};
@@ -90,6 +95,64 @@ struct GainEnvelopeLayerState {
   std::atomic<float> execTargetGain{1.0F};
   std::atomic<std::uint32_t> execDurationFrames{0};
   std::atomic<GainEnvelopeCurve> execCurve{GainEnvelopeCurve::Linear};
+};
+
+// EQ 生效快照（任务 26 B2.4b）——读侧 POD：实际生效的均衡器配置 + 实际输出率/声道数
+// + 单调发布代数。仿 GainEnvelopeSnapshot 的「发布→读回」定位；读侧 eqAppliedSnapshot()
+// 返回一致副本（原子镜像层 AudioOutputDeviceEqLayer + version seqlock，见下）。
+struct AudioOutputDeviceEqSnapshot {
+  EqualizerConfig config{};        // 实际生效配置（最后一次真实应用；非「仅存储」值）
+  std::uint32_t sampleRate = 0;    // 实际输出采样率（设备格式确定后才随应用发布；0 = 未应用）
+  std::uint16_t channelCount = 0;  // 实际输出声道数
+  std::uint32_t version = 0;       // 单调发布代数（每次真实应用 +1；0 = 从未应用）
+};
+
+// EQ 生效快照原子镜像层（任务 26 B2.4b；结构仿 GainEnvelopeLayerState / publishEnvelopeLayer
+// 发布序）：字段按角色分两套——
+//  - 写侧（worker，停态窗口 apply/clearDspState）：enabled/mode/preGainDb/bandGainsDb/
+//    limiterEnabled/sampleRate/channelCount 逐字段 relaxed 写，version release 最后写
+//    （发布序同 publishEnvelopeLayer：回调/读侧读到 version 变化时字段必然已就位）；
+//  - 读侧（eqAppliedSnapshot()，可为 worker 或控制线程）：version acquire 读后取一致
+//    字段视图，再复核 version——发布可发生于读取期间，字段为原子镜像无撕裂；版本变更
+//    仅表示读到相邻两代混合，低频读 + 停态写下重读一次自愈（同 planEnvelopeLayer 语义）。
+// 与包络层差异：EQ 应用只发生在停态窗口（无活跃回调），镜像层不是为了回调并发，而是
+// 为 worker 与未来控制线程（service.equalizerState 回读）提供无锁一致读。
+struct AudioOutputDeviceEqLayer {
+  std::atomic<std::uint32_t> version{0};
+  std::atomic<bool> enabled{false};
+  std::atomic<EqualizerBandMode> mode{EqualizerBandMode::Band10};
+  std::atomic<float> preGainDb{0.0F};
+  std::array<std::atomic<float>, 31> bandGainsDb{};
+  std::atomic<bool> limiterEnabled{false};
+  std::atomic<std::uint32_t> sampleRate{0};
+  std::atomic<std::uint16_t> channelCount{0};
+};
+
+// 频谱摘录帧电平语义标注（任务 29 B3.1）——两态电平语义不同、显示须按相对电平注明：
+//  · ChainInactiveOutput：链关闭态（EQ 链未激活）——帧取自设备输出域，volume/
+//    muted/混音/包络已应用（逐格式转换拷贝：f32 设备直取，int 设备逐样本按读侧
+//    冻结尺度 /2^15、/2^31、s24 左对齐语义 int→f32）；
+//  · ChainActiveF32：链激活态（EQ 链进入）——帧取自 EQ(含 preGain) 后、volume
+//    前的 f32 中间域，不含用户 volume/限幅/包络淡变——与输出域帧不可同标定比较。
+enum class AudioOutputDeviceCaptureDomain : std::uint8_t {
+  ChainInactiveOutput = 0,
+  ChainActiveF32 = 1,
+};
+
+// 摘录帧元数据（任务 29 B3.1；latestCaptureFrame 回填，消费契约）：
+//  - generation：设备重建纪元——initialize()（重新协商格式/容量）时 ++ 并清空帧
+//    内容；消费方发现 generation 变化必须丢弃全部跨代状态（FFT 窗缓冲/率标定），
+//    防混率帧被消费；
+//  - sequence：帧序（同纪元内每发布帧 +1，单调）；消费方据此判断是否出现新帧；
+//  - sampleRate：帧采样率（= 设备实际输出率；与 generation 双保险）；
+//  - frameCount：帧样本数（单声道 f32；= 整回调块帧数，含欠载静音尾）；
+//  - domain：电平语义来源（见 AudioOutputDeviceCaptureDomain）。
+struct AudioOutputDeviceCaptureMeta {
+  std::uint32_t generation{0};
+  std::uint32_t sequence{0};
+  std::uint32_t sampleRate{0};
+  std::uint32_t frameCount{0};
+  AudioOutputDeviceCaptureDomain domain{AudioOutputDeviceCaptureDomain::ChainInactiveOutput};
 };
 
 struct AudioOutputDeviceCallbackState {
@@ -171,6 +234,42 @@ public:
   // 当前激活的源包络槽数（任务 9：槽 1 随第二源激活参与执行）。
   static constexpr std::size_t kActiveSourceEnvelopeSlots = 2;
 
+  // ---- EQ 处理链发布面（任务 25 B2.4a + 任务 26 B2.4b）----
+  // 均衡器配置存储 + 应用入口（worker 线程调用）。语义：
+  //   · 已 initialize（设备格式确定）：按 currentFormat_（sampleRate/channelCount）
+  //     配置 DSP 单元（eqDsp_/limiter_，configure 允许分配——不得与活跃回调并发）；
+  //   · 未 initialize：仅存储 eqConfig_，待 initialize() 按生效格式应用（幂等）。
+  // 调用点必须是设备未启动/已停止窗口（eq_dsp.h/limiter.h 线程契约：configure 只在
+  // 与 process 不并发的时刻调用）。运行期（started_）调用按契约不得发生——防御性
+  // 仅存储（下个 initialize/内容边界生效）；生效路径与运行期参数变更由任务 26 快照链
+  // 接管的设备侧承载（applyEqualizerDspConfig 于每次真实应用后发布 eqAppliedSnapshot）。
+  void setEqualizerConfig(const EqualizerConfig& config) noexcept;
+  // 内容边界清理（任务 26 B2.4b）：重建 EQ/限幅 DSP 单元实例（滤波历史/limiter 延迟线/
+  // 检测/平滑全清零）并按当前设备格式重新应用存储配置（幂等）。eq_dsp/limiter 无公开
+  // 复位 API 且同参数 configure 不清态（fs/声道变化才重建），故以「重建实例 + 重配置」
+  // 达成清零，零单元改动。**仅限停态窗口调用**：①initialize() 内、②service 加载路径
+  // rebind/协商成功后、③瞬时 seek 重启点——设备已停（无活跃回调，结构性无竞态）。
+  // 禁止在 stop()/start()/rebindQueue() 及 T10 运行中交接（completeOverlapHandoff——
+  // 设备运行中 rebind）调用：pause/resume/同曲续接保留冻结状态；运行中清空 lookahead
+  // 延迟线 = ~5ms 空洞 + EQ 阶跃瞬态，违 F5「切换无爆音」。
+  void clearDspState() noexcept;
+  // EQ 生效快照一致读回（可跨线程；见 AudioOutputDeviceEqLayer 注释的锁存语义）。
+  [[nodiscard]] AudioOutputDeviceEqSnapshot eqAppliedSnapshot() const noexcept;
+
+  // ---- 频谱摘录读侧（任务 29 B3.1；FFT worker（任务 30）/测试调用，无锁）----
+  // 最新完整摘录帧的一致拷贝：把发布槽单声道 f32 样本（frameCount 帧）memcpy 到
+  // samplesOut（容量 ≥ captureCapacityFrames() 帧），meta 回填该帧元数据。与
+  // renderCallback（唯一写侧）并发安全（双缓冲 + 发布序 + 有界重试 ≤3；写侧在
+  // 回调内零分配/零锁/零自旋，见私有区注释）。与设备生命周期（initialize/
+  // uninitialize）须同线程（与 currentFormat() 同纪律——生命周期调用方 = 音频
+  // worker 线程）。返回 false = 尚无完整帧（从未摘录/重建后）或本次未取到一致
+  // 视图（写者连续发布/输出缓冲不足）——调用方下轮重试或沿用上一帧；帧的新旧
+  // 用 meta.sequence/meta.generation 判断（重复调用同一帧返回相同 sequence）。
+  [[nodiscard]] bool latestCaptureFrame(float* samplesOut, std::uint32_t capacityFrames,
+                                        AudioOutputDeviceCaptureMeta& meta) const noexcept;
+  // 摘录槽每帧样本容量（latestCaptureFrame 输出缓冲最小容量；0 = 尚未 initialize）。
+  [[nodiscard]] std::uint32_t captureCapacityFrames() const noexcept;
+
   static void renderCallback(void* userData, void* output, std::uint32_t frameCount) noexcept;
   [[nodiscard]] AudioOutputDeviceCounters counters() const noexcept;
 
@@ -184,6 +283,77 @@ private:
   // 帧字节」在 initialize()（无活跃回调）一次性调整，运行期不再改动；容量 < 当前块
   // 需求时该块退回单源路径（守卫；生产不可达——回调帧数 ≤ 后端 period ≤ 主队列容量）。
   std::vector<std::uint8_t> mixScratch_;
+  // ---- EQ f32 暂存（任务 24 B2.3）----
+  // EQ 激活路径的转换暂存：int 设备格式样本逐样本转 f32 后先落此（EQ/音量/限幅在
+  // f32 域处理，块末一次量化回设备格式；f32 设备格式就地处理，不占用本缓冲）。
+  // 内容不跨块保留；容量 = 主队列容量 × 4B（float32）× 声道数，在 initialize()
+  // （无活跃回调）一次性调整、运行期不再改动——与 mixScratch_ 同纪律，但不依赖/
+  // 不复用 mixScratch_（后者是双源 int 域混音暂存，尺寸随设备位深字节宽变化；
+  // 本暂存按固定 4B/f32 分配）。EQ 分支（任务 25 接线）处理帧数 ≤ 后端 period ≤
+  // 主队列容量，frameCount×4×ch ≤ 容量恒成立；f32ScratchFits 为未来集成提供越界
+  // 防御（装不下 = 该块退回既有路径，同 dualMix 守卫语义）。
+  std::vector<std::uint8_t> f32Scratch_;
+  // 守卫查询：EQ 块（frameCount 帧 × channelCount 声道 × 4B/f32）能否装入 f32Scratch_。
+  [[nodiscard]] bool f32ScratchFits(std::uint32_t frameCount, std::uint16_t channelCount) const noexcept;
+  // ---- EQ 处理链状态（任务 25 B2.4a + 任务 26 B2.4b）----
+  // DSP 纯核心实例（不透明持有，见头前向声明）：configure（可分配/重建）只发生在
+  // setEqualizerConfig()/initialize()（经 clearDspState 重建实例 + applyEqualizerDspConfig
+  // 重配置）——无活跃回调窗口（worker 侧契约，见发布面注释）；process（noexcept，
+  // 零分配/锁/日志）只发生在 renderCallback EQ 分支。filter/限幅状态跨 stop()/start()
+  // 保留（pause/resume 冻结续接纪律）；内容边界经 clearDspState() 显式清零。
+  std::unique_ptr<EqualizerDspProcessor> eqDsp_;
+  std::unique_ptr<LimiterDspProcessor> limiter_;
+  // renderCallback EQ 链进入条件（= eqConfig_.enabled 镜像；release 发布）。先
+  // configure 后置位：回调读到 true 时 DSP 必然已按同配置 + 当前设备格式就绪。
+  std::atomic<bool> eqChainActive_{false};
+  // worker 侧存储的均衡器配置（默认出厂直通）；无回调窗口写，render 不读（只读
+  // eqChainActive_）。setEqualizerConfig 在 started_ 时仅存储——下个 initialize/
+  // 内容边界（clearDspState 重配置）生效。
+  EqualizerConfig eqConfig_{};
+  // EQ 生效快照原子镜像层（任务 26 B2.4b）：实际应用后发布（applyEqualizerDspConfig
+  // 每次 configure 两单元成功 + eqChainActive_ 置位后调用 publishEqAppliedLayer）；
+  // 停态窗口写（无活跃回调），eqAppliedSnapshot() 跨线程一致读（结构注释为契约）。
+  AudioOutputDeviceEqLayer eqAppliedLayer_{};
+  // 停态应用辅助：按 currentFormat_ configure 两单元并发布 eqChainActive_ 与生效快照
+  // （格式未定 = 仅存储语义，initialize() 在格式确定后调用本方法幂等应用）。
+  void applyEqualizerDspConfig() noexcept;
+  // ---- 频谱摘录状态（任务 29 B3.1；写 = renderCallback，读 = latestCaptureFrame）----
+  // 双缓冲 + 纪元：写侧（设备线程）每回调至多一帧——把最新可听信号均值下混为
+  // 单声道 f32 写入非发布槽 → captureCommitSlot 填元数据后 release 翻转
+  // capturePublishedSlot_（发布序仿 publishCallbackQueue：内容/元数据先就绪、
+  // 索引翻转殿后）。读侧（worker）：acquire 取槽 → 拷贝样本 + 元数据 → 复核翻转
+  // 未回绕到本槽（写者须连续两轮发布才可能覆写正在拷贝的槽：µs 级拷贝 vs
+  // ~10ms 块周期实际不可达；复核失败有界重试 ≤3）。槽样本为普通 float——读/
+  // 写潜在重叠仅发生在读侧被抢占 ≥2 块周期（不可达），复核即弃。
+  // captureGeneration_ 纪元：initialize()（格式/容量重协商）时 captureReset() ++
+  // 并双槽清零（防混率帧被消费）；rebindQueue/T10 交接、stop()/seek 重启不清
+  // （交接不是重建；暂停冻结续接纪律）。
+  struct CaptureSlotMeta {
+    std::atomic<std::uint32_t> sequence{0};
+    std::atomic<std::uint32_t> frameCount{0};
+    std::atomic<std::uint32_t> sampleRate{0};
+    std::atomic<AudioOutputDeviceCaptureDomain> domain{AudioOutputDeviceCaptureDomain::ChainInactiveOutput};
+  };
+  std::vector<float> captureBuffers_;            // 2 × captureCapacityFrames_（槽 0/1 连续）
+  std::uint32_t captureCapacityFrames_{0};       // 每槽帧容量（initialize 按主队列容量定）
+  std::uint32_t captureNextSequence_{0};         // 写侧帧序（回调线程独占；每发布帧 +1）
+  std::atomic<std::uint32_t> capturePublishedSlot_{0};  // 0/1：最新完整帧所在槽；翻转 = 发布
+  std::atomic<std::uint32_t> captureGeneration_{0};     // 纪元（initialize ++；跨代帧禁混用）
+  CaptureSlotMeta captureSlotMeta_[2]{};         // 槽元数据（发布前 relaxed 写、acquire 后读）
+  // 摘录纪元推进（initialize 停态窗口调用，无活跃回调；见上注释）。
+  void captureReset(std::uint32_t capacityFrames) noexcept;
+  // 槽提交（发布序尾：元数据 relaxed 写全 → 索引 release 翻转）。
+  void captureCommitSlot(std::uint32_t slot, std::uint32_t frameCount,
+                         AudioOutputDeviceCaptureDomain domain) noexcept;
+  // 回调线程专用发布（零分配/零锁/零日志；blockFrames==0/容量不足 → 直接返回）：
+  // f32 交织源前 validFrames 帧均值下混 + 尾部清零至 blockFrames（静音帧传
+  // interleaved=nullptr、validFrames=0——全零帧照常发布）。
+  void capturePublishF32(const float* interleaved, std::uint32_t validFrames, std::uint32_t blockFrames,
+                         std::uint16_t channelCount, AudioOutputDeviceCaptureDomain domain) noexcept;
+  // 链关闭态发布：设备输出域前 validFrames 帧逐格式 int→f32（任务 24 冻结读侧
+  // 尺度）均值下混 + 尾部清零（f32 设备直取）。
+  void capturePublishOutputDomain(const void* output, std::uint32_t validFrames, std::uint32_t blockFrames,
+                                  std::uint16_t channelCount, AudioSampleFormat sampleFormat) noexcept;
   std::atomic<std::uint64_t> callbackCount_{0};
   std::atomic<std::uint64_t> requestedFrames_{0};
   std::atomic<std::uint64_t> copiedFrames_{0};

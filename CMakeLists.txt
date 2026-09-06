@@ -98,6 +98,9 @@ add_library(seriona_audio STATIC
   src/audio/device/audio_device_format_enumerator.cpp
   src/audio/device/audio_device_format_caching.cpp
   src/audio/device/miniaudio_output_device_backend.cpp
+  src/audio/eq_dsp.cpp
+  src/audio/limiter.cpp
+  src/audio/spectrum_analyzer.cpp
   src/audio/events/audio_event_dispatcher.cpp
   src/audio/ffmpeg/ffmpeg_audio_source.cpp
   src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp

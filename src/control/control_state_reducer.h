@@ -52,6 +52,8 @@ enum class ControlIntentKind : std::uint8_t {
   // 过渡中止意图（T10）：重叠窗口内失效操作/版本校验失败 → 撤第二源 + 弃预解码槽
   // + 服务侧重新武装预解码预告；随后照常执行本命令自己的意图（重调度）。
   AbortTransition,
+  // 均衡器参数配置意图（B1.4）：转发 EqualizerConfig 至音频服务，不触发重载。
+  SetEqualizerConfig,
 };
 
 struct ControlIntent {
@@ -69,6 +71,8 @@ struct ControlIntent {
   // PrepareNext 交接方式载荷（T8）：kind（直切/交叉）+ CUE 无间隙组标记。
   // 追加末尾保持序列化兼容。
   std::optional<audio::PrepareNextMeta> prepareNextMeta;
+  // SetEqualizerConfig 载荷（B1.4）：均衡器参数副本。追加末尾保持序列化兼容。
+  std::optional<audio::EqualizerConfig> equalizerConfig;
 };
 
 struct ControlReduction {
@@ -77,6 +81,9 @@ struct ControlReduction {
   std::vector<ControlDomainNotification> notifications{};
   bool playerStateChanged{false};
   bool libraryStateChanged{false};
+  // B1.4：SetEqualizerConfig 校验通过并已入 reducer 状态（commit 侧据此读取并发布
+  // EqualizerStateSnapshot——订阅推送机制见任务 19 接线，此处仅留变更信号）。
+  bool equalizerStateChanged{false};
 };
 
 class ControlStateReducer {
@@ -85,6 +92,9 @@ public:
 
   [[nodiscard]] const PlayerStateSnapshot& playerState() const noexcept;
   [[nodiscard]] const LibraryStateSnapshot& libraryState() const noexcept;
+  // B1.4：均衡器生效快照（generation=0 为空快照；每次 SetEqualizerConfig 校验通过
+  // 且入 state 后 generation++）。sampleRate 由音频服务生效路径以实际输出率填充。
+  [[nodiscard]] const audio::EqualizerStateSnapshot& equalizerState() const noexcept;
   [[nodiscard]] const std::vector<ControlDomainNotification>& recentNotifications() const noexcept;
 
   ControlReduction reduceCommand(const MediaControlCommand& command);
@@ -159,6 +169,8 @@ private:
   ControlReduction handleConfigureOutput(ControlReduction& reduction, const MediaControlCommand& command);
   // SetTransitionConfig：校验过渡参数并生成单意图（不重载、不改快照）。
   ControlReduction handleSetTransitionConfig(ControlReduction& reduction, const MediaControlCommand& command);
+  // B1.4 SetEqualizerConfig：校验均衡器参数 → 单意图（不重载）→ 快照入状态。
+  ControlReduction handleSetEqualizerConfig(ControlReduction& reduction, const MediaControlCommand& command);
 
   // —— T8 预解码（EndApproaching → PrepareNext，Metis 缺口 1a 选曲侧）——
   struct NaturalEndPeek {
@@ -200,6 +212,10 @@ private:
   // T8：最近一次 SetTransitionConfig 的校验通过配置（EndApproaching 决策表输入；
   // 与音频服务实际配置同源——SetTransitionConfig 单意图语义不变）。
   audio::TransitionConfig transitionConfig_{};
+  // B1.4：均衡器生效快照（generation=0 空快照 → 每次校验通过的 SetEqualizerConfig
+  // 重建并 ++generation；curvePoints/curveFrequencies 由 reducer 纯函数按 20–20k
+  // 181 点填充，sampleRate 在 reducer 侧恒 0=未定，由音频服务生效路径回填实际率）。
+  audio::EqualizerStateSnapshot equalizer_{};
   // 临时播放队列（T7）：不持久化（新实例即空）；消费期间播放上下文 index 冻结，
   // 队列空后才从冻结位置推进文件夹序列。
   std::deque<QueueEntry> playbackQueue_{};

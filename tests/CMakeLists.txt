@@ -34,6 +34,8 @@ add_executable(seriona_pcm_buffer_queue_tests
 add_executable(seriona_audio_output_device_tests
   audio/audio_output_device_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
@@ -42,6 +44,8 @@ add_executable(seriona_audio_output_device_tests
 add_executable(seriona_audio_output_device_envelope_tests
   audio/audio_output_device_envelope_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
@@ -50,6 +54,8 @@ add_executable(seriona_audio_output_device_envelope_tests
 add_executable(seriona_audio_output_device_dualsource_tests
   audio/audio_output_device_dualsource_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
@@ -79,6 +85,9 @@ add_executable(seriona_audio_player_single_track_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -96,6 +105,9 @@ add_executable(seriona_transition_equivalence_recorder
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -110,6 +122,9 @@ add_executable(seriona_audio_transition_equivalence_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -124,6 +139,29 @@ add_executable(seriona_audio_player_small_buffer_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
+)
+# EQ 服务转发集成测试（B2.6 服务侧补完）：真实 SingleTrack + 真实 device（fake
+# backend 直编）锁 setEqualizer 停态生效/运行仅存储重建重放/无重载三条，闭包同
+# audio_player_small_buffer 目标。
+add_executable(seriona_audio_eq_service_forward_tests
+  audio/eq_service_forward_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/audio_player.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/audio_playback_service.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/transition/gain_envelope.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_audio_source.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/ffmpeg/ffmpeg_filter_pipeline.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -138,6 +176,9 @@ add_executable(seriona_output_format_negotiation_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -152,6 +193,9 @@ add_executable(seriona_audio_player_seamless_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -166,6 +210,9 @@ add_executable(seriona_audio_error_matrix_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -180,6 +227,9 @@ add_executable(seriona_audio_shutdown_lifecycle_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -194,6 +244,9 @@ add_executable(seriona_audio_enumerate_devices_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
@@ -208,6 +261,9 @@ add_executable(seriona_audio_device_format_enumerator_tests
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/clock/playback_clock.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_device_format_caching.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/events/audio_event_dispatcher.cpp
@@ -226,6 +282,55 @@ endif()
 add_executable(seriona_miniaudio_device_capabilities_tests
   audio/miniaudio_device_capabilities_tests.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
+# EQ 帧级单测（任务 27，B2.5 三组）：eq_dsp.cpp 引用 ma_peak2_* 符号，链接需要
+# miniaudio 实现 TU（miniaudio_output_device_backend.cpp 单点提供，测试自身绝不
+# 定义 MINIAUDIO_IMPLEMENTATION——见 eq_dsp.h 52-55 行编译/链接注意）；limiter
+# 纯自研零 ma 依赖，其测试目标只编入 limiter.cpp。
+add_executable(seriona_audio_eq_coefficients_tests
+  audio/eq_coefficients_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
+add_executable(seriona_audio_eq_dsp_tests
+  audio/eq_dsp_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
+add_executable(seriona_audio_eq_limiter_tests
+  audio/eq_limiter_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+)
+# EQ/限幅 render 级集成单测（任务 28，B2.6）：fake backend 驱动真实 AudioOutputDevice
+# 全 render 链（EQ 分支/欠载/muted/停启/交接/格式换算），闭包同 eq_dsp 测试目标。
+add_executable(seriona_audio_eq_render_integration_tests
+  audio/eq_render_integration_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
+)
+# 频谱分析纯核心 + 摘录下混联测（任务 31，B3.3）：spectrum_analyzer.cpp 引用 av_tx
+# （libavutil）——直编测试目标必须补链 PkgConfig::SERIONA_FFMPEG（头注释/任务 30
+# notes 明示）；下混用例经真实 renderCallback 驱动 audio_output_device（闭包同
+# eq_render_integration 目标）。
+add_executable(seriona_audio_eq_spectrum_tests
+  audio/eq_spectrum_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/spectrum_analyzer.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/device/audio_output_device.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/eq_dsp.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/limiter.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/device/miniaudio_output_device_backend.cpp
   ${PROJECT_SOURCE_DIR}/src/audio/buffer/pcm_buffer_queue.cpp
 )
@@ -360,6 +465,10 @@ add_executable(seriona_track_switch_snapshot_reducer_tests
 )
 add_executable(seriona_play_queue_reducer_tests
   control/play_queue_reducer_tests.cpp
+)
+add_executable(seriona_eq_command_tests
+  control/eq_command_tests.cpp
+  control/control_test_harness.cpp
 )
 add_executable(seriona_scanner_remove_location_tests
   scanner/remove_location_tests.cpp
@@ -596,6 +705,7 @@ target_compile_definitions(seriona_audio_event_dispatcher_shutdown_tests PRIVATE
 target_compile_definitions(seriona_audio_player_single_track_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_transition_equivalence_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_player_small_buffer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_service_forward_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_output_format_negotiation_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_player_seamless_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_error_matrix_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -606,6 +716,11 @@ if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 target_compile_definitions(seriona_audio_pipewire_device_enumerator_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 endif()
 target_compile_definitions(seriona_miniaudio_device_capabilities_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_coefficients_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_dsp_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_limiter_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_render_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_audio_eq_spectrum_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_test_harness_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_internal_types_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -681,6 +796,7 @@ target_compile_definitions(seriona_media_controller_artwork_shutdown_tests PRIVA
 target_compile_definitions(seriona_delete_commands_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_track_switch_snapshot_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_play_queue_reducer_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_eq_command_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_remove_location_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_include_directories(seriona_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -763,6 +879,11 @@ target_include_directories(seriona_audio_player_small_buffer_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
 )
+target_include_directories(seriona_audio_eq_service_forward_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
 target_include_directories(seriona_output_format_negotiation_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -800,6 +921,30 @@ target_include_directories(seriona_audio_pipewire_device_enumerator_tests PRIVAT
 )
 endif()
 target_include_directories(seriona_miniaudio_device_capabilities_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_eq_coefficients_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_eq_dsp_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_eq_limiter_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_audio_eq_render_integration_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_audio_eq_spectrum_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -953,6 +1098,11 @@ target_include_directories(seriona_track_switch_snapshot_reducer_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_play_queue_reducer_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_eq_command_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1204,6 +1354,11 @@ target_link_libraries(seriona_audio_player_small_buffer_tests PRIVATE
   PkgConfig::SERIONA_FFMPEG
   spdlog::spdlog
 )
+target_link_libraries(seriona_audio_eq_service_forward_tests PRIVATE
+  seriona_third_party_headers
+  PkgConfig::SERIONA_FFMPEG
+  spdlog::spdlog
+)
 target_link_libraries(seriona_output_format_negotiation_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -1243,6 +1398,26 @@ endif()
 target_link_libraries(seriona_miniaudio_device_capabilities_tests PRIVATE
   seriona_third_party_headers
   spdlog::spdlog
+)
+target_link_libraries(seriona_audio_eq_coefficients_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+)
+target_link_libraries(seriona_audio_eq_dsp_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+)
+target_link_libraries(seriona_audio_eq_limiter_tests PRIVATE
+  seriona_third_party_headers
+)
+target_link_libraries(seriona_audio_eq_render_integration_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+)
+target_link_libraries(seriona_audio_eq_spectrum_tests PRIVATE
+  seriona_third_party_headers
+  spdlog::spdlog
+  PkgConfig::SERIONA_FFMPEG
 )
 target_link_libraries(seriona_scanner_test_harness_tests PRIVATE
   seriona_third_party_headers
@@ -1379,6 +1554,10 @@ target_link_libraries(seriona_play_queue_reducer_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_eq_command_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
 target_link_libraries(seriona_scanner_remove_location_tests PRIVATE
   seriona_scanner
   SQLite3::SQLite3
@@ -1414,6 +1593,7 @@ seriona_enable_warnings(seriona_audio_player_single_track_tests)
 seriona_enable_warnings(seriona_transition_equivalence_recorder)
 seriona_enable_warnings(seriona_audio_transition_equivalence_tests)
 seriona_enable_warnings(seriona_audio_player_small_buffer_tests)
+seriona_enable_warnings(seriona_audio_eq_service_forward_tests)
 seriona_enable_warnings(seriona_output_format_negotiation_tests)
 seriona_enable_warnings(seriona_audio_player_seamless_tests)
 seriona_enable_warnings(seriona_audio_error_matrix_tests)
@@ -1424,6 +1604,11 @@ if(TARGET seriona_audio_pipewire_device_enumerator_tests)
 seriona_enable_warnings(seriona_audio_pipewire_device_enumerator_tests)
 endif()
 seriona_enable_warnings(seriona_miniaudio_device_capabilities_tests)
+seriona_enable_warnings(seriona_audio_eq_coefficients_tests)
+seriona_enable_warnings(seriona_audio_eq_dsp_tests)
+seriona_enable_warnings(seriona_audio_eq_limiter_tests)
+seriona_enable_warnings(seriona_audio_eq_render_integration_tests)
+seriona_enable_warnings(seriona_audio_eq_spectrum_tests)
 seriona_enable_warnings(seriona_control_contract_tests)
 seriona_enable_warnings(seriona_configure_output_command_tests)
 seriona_enable_warnings(seriona_configure_output_reducer_tests)
@@ -1442,6 +1627,7 @@ seriona_enable_warnings(seriona_media_controller_artwork_shutdown_tests)
 seriona_enable_warnings(seriona_delete_commands_tests)
 seriona_enable_warnings(seriona_track_switch_snapshot_reducer_tests)
 seriona_enable_warnings(seriona_play_queue_reducer_tests)
+seriona_enable_warnings(seriona_eq_command_tests)
 seriona_enable_warnings(seriona_scanner_remove_location_tests)
 seriona_enable_warnings(seriona_terminal_controller_tests)
 seriona_enable_warnings(seriona_scanner_test_harness_tests)
@@ -1712,6 +1898,14 @@ if(UNIX AND NOT APPLE)
   add_test(NAME seriona.audio.pipewire_device_enumerator COMMAND seriona_audio_pipewire_device_enumerator_tests)
 endif()
 add_test(NAME seriona.audio.miniaudio_device_capabilities COMMAND seriona_miniaudio_device_capabilities_tests)
+add_test(NAME seriona.audio.eq_coefficients COMMAND seriona_audio_eq_coefficients_tests)
+add_test(NAME seriona.audio.eq_dsp COMMAND seriona_audio_eq_dsp_tests)
+add_test(NAME seriona.audio.eq_limiter COMMAND seriona_audio_eq_limiter_tests)
+add_test(NAME seriona.audio.eq_render_integration COMMAND seriona_audio_eq_render_integration_tests)
+add_test(NAME seriona.audio.eq_spectrum COMMAND seriona_audio_eq_spectrum_tests)
+add_test(NAME seriona.audio.eq_service_forward.stopped_applies COMMAND seriona_audio_eq_service_forward_tests --test-case=*stopped_window*)
+add_test(NAME seriona.audio.eq_service_forward.running_rebuild COMMAND seriona_audio_eq_service_forward_tests --test-case=*running*rebuild*)
+add_test(NAME seriona.audio.eq_service_forward.fresh_initialize COMMAND seriona_audio_eq_service_forward_tests --test-case=*fresh*initialize*)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
 add_test(NAME seriona.scanner.internal_types COMMAND seriona_scanner_internal_types_tests)
@@ -1742,6 +1936,7 @@ add_test(NAME seriona.control_artwork_shutdown COMMAND seriona_media_controller_
 add_test(NAME seriona.control.delete_commands COMMAND seriona_delete_commands_tests)
 add_test(NAME seriona.control.reducer.track_switch_snapshot COMMAND seriona_track_switch_snapshot_reducer_tests)
 add_test(NAME seriona.control.reducer.play_queue COMMAND seriona_play_queue_reducer_tests)
+add_test(NAME seriona.control.eq_command COMMAND seriona_eq_command_tests)
 add_test(NAME seriona.scanner.remove_location COMMAND seriona_scanner_remove_location_tests)
 set_tests_properties(seriona.control_artwork_resolver PROPERTIES TIMEOUT 60)
 add_test(NAME seriona.terminal_controller COMMAND seriona_terminal_controller_tests)

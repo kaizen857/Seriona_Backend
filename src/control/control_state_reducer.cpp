@@ -1,8 +1,11 @@
 #include "control_state_reducer.h"
 
+#include "seriona/audio/equalizer_tables.h"
+
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 #include <utility>
@@ -258,6 +261,12 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   return intent;
 }
 
+[[nodiscard]] ControlIntent makeSetEqualizerConfigIntent(const audio::EqualizerConfig& config) {
+  auto intent = makeIntent(ControlIntentKind::SetEqualizerConfig);
+  intent.equalizerConfig = config;
+  return intent;
+}
+
 // 过渡参数数值域（用户裁定表；与前端任务 2/12 校验完全一致）：
 // 交叉长度 0-10000ms；传送/seek/手动短交叉 0-3000ms；预加载 0-5000ms。
 // 0 = 时长 0 = 该淡变即时完成（等效关闭），不做下界钳制。
@@ -266,6 +275,86 @@ constexpr std::size_t kRecentNotificationLimit = 32;
 }
 
 [[nodiscard]] bool validTransitionMode(int mode) { return mode >= 0 && mode <= 2; }
+
+// —— B1.4 均衡器校验/曲线纯函数 ——
+
+// 频段与前置增益的 dB 范围（用户裁定表 ±15；越界即命令非法，不钳制）。
+constexpr double kEqualizerGainRangeDb = 15.0;
+
+[[nodiscard]] bool equalizerGainInRange(float value) noexcept {
+  return std::isfinite(value) && std::abs(static_cast<double>(value)) <= kEqualizerGainRangeDb;
+}
+
+[[nodiscard]] bool validEqualizerMode(audio::EqualizerBandMode mode) noexcept {
+  return mode == audio::EqualizerBandMode::Band10 || mode == audio::EqualizerBandMode::Band31;
+}
+
+// 活跃频段数：按 mode 取 bandGainsDb 前缀（Band10=10 段 / Band31=31 段）。
+[[nodiscard]] std::size_t equalizerActiveBandCount(audio::EqualizerBandMode mode) noexcept {
+  return mode == audio::EqualizerBandMode::Band31 ? audio::kEqualizer31BandCenterHz.size()
+                                                  : audio::kEqualizer10BandCenterHz.size();
+}
+
+// 曲线频率轴：181 点 20–20k Hz 对数均匀（f[i] = 20 × 1000^(i/180)）。
+// 与 EqualizerStateSnapshot::curveFrequenciesHz 定长一一对应。
+[[nodiscard]] std::array<float, 181> equalizerCurveFrequencyAxis() {
+  std::array<float, 181> axis{};
+  for (std::size_t i = 0; i < axis.size(); ++i) {
+    const auto exponent = static_cast<double>(i) / static_cast<double>(axis.size() - 1U);
+    axis[i] = static_cast<float>(20.0 * std::pow(1000.0, exponent));
+  }
+  return axis;
+}
+
+// RBJ peaking 均衡器幅频响应（连续时间原型，与采样率无关；任务 22 系数同源）：
+//   A = 10^(gainDb/40)，x = f/f0：
+//   |H(f)|² = ((1−x²)² + (x·A/Q)²) / ((1−x²)² + (x/(A·Q))²)
+// 曲线点 dB = 前置增益 + Σ(活跃频段 10·log10|H|²)。Q/f0 取 equalizer_tables.h 单点。
+[[nodiscard]] float equalizerBandResponseDb(const audio::EqualizerConfig& config,
+                                            std::size_t bandIndex,
+                                            double frequencyHz) {
+  if (config.mode == audio::EqualizerBandMode::Band31) {
+    const double q = audio::kEqualizer31BandQ;
+    const double a = std::pow(10.0, static_cast<double>(config.bandGainsDb[bandIndex]) / 40.0);
+    const double x = frequencyHz / audio::kEqualizer31BandCenterHz[bandIndex];
+    const double detuned = 1.0 - x * x;
+    return static_cast<float>(10.0 * std::log10((detuned * detuned + std::pow(x * a / q, 2.0)) /
+                                                (detuned * detuned + std::pow(x / (a * q), 2.0))));
+  }
+  const double q = audio::kEqualizer10BandQ;
+  const double a = std::pow(10.0, static_cast<double>(config.bandGainsDb[bandIndex]) / 40.0);
+  const double x = frequencyHz / audio::kEqualizer10BandCenterHz[bandIndex];
+  const double detuned = 1.0 - x * x;
+  return static_cast<float>(10.0 * std::log10((detuned * detuned + std::pow(x * a / q, 2.0)) /
+                                              (detuned * detuned + std::pow(x / (a * q), 2.0))));
+}
+
+// 纯函数：由 EqualizerConfig 构造生效快照（曲线点 + 频率轴 + sampleRate），
+// generation 由调用方（reducer 状态）维护。fs 仅作 2×Nyquist 上限参数：fs>0 时
+// f ≥ 0.95×(fs/2) 的曲线点按 0 dB（与任务 22 越界硬直通守卫同语义）；fs=0（未定）
+// 全轴计算（20k 内无越界——reducer 路径恒走此分支，实际率由任务 19 音频服务回填）。
+[[nodiscard]] audio::EqualizerStateSnapshot makeEqualizerStateSnapshot(const audio::EqualizerConfig& config,
+                                                                       std::uint32_t sampleRateOrZero) {
+  audio::EqualizerStateSnapshot snapshot{};
+  snapshot.config = config;
+  snapshot.sampleRate = sampleRateOrZero;
+  snapshot.curveFrequenciesHz = equalizerCurveFrequencyAxis();
+  const auto activeBands = equalizerActiveBandCount(config.mode);
+  const double nyquistCap = sampleRateOrZero > 0U ? 0.95 * (static_cast<double>(sampleRateOrZero) / 2.0) : 0.0;
+  for (std::size_t point = 0; point < snapshot.curvePointsDb.size(); ++point) {
+    const double frequencyHz = snapshot.curveFrequenciesHz[point];
+    if (nyquistCap > 0.0 && frequencyHz >= nyquistCap) {
+      snapshot.curvePointsDb[point] = 0.0F;
+      continue;
+    }
+    double responseDb = config.preGainDb;
+    for (std::size_t band = 0; band < activeBands; ++band) {
+      responseDb += equalizerBandResponseDb(config, band, frequencyHz);
+    }
+    snapshot.curvePointsDb[point] = static_cast<float>(responseDb);
+  }
+  return snapshot;
+}
 
 [[nodiscard]] ControlDomainNotification makeNotification(ControlDomainNotificationKind kind, std::string message) {
   ControlDomainNotification notification{};
@@ -358,6 +447,9 @@ ControlStateReducer::ControlStateReducer(MediaControllerOptions options)
       shuffleHistory_{options.shuffleHistorySize},
       shuffleHistorySize_{options.shuffleHistorySize} {
   player_.capabilities = defaultCapabilities();
+  // B1.4：从未生效的空快照 = 出厂默认（关闭直通 + 平直 0dB + 完整频率轴）；
+  // generation 保持 0，等首次 SetEqualizerConfig 校验通过后 +1。
+  equalizer_ = makeEqualizerStateSnapshot(audio::EqualizerConfig{}, 0U);
 }
 
 const PlayerStateSnapshot& ControlStateReducer::playerState() const noexcept {
@@ -366,6 +458,10 @@ const PlayerStateSnapshot& ControlStateReducer::playerState() const noexcept {
 
 const LibraryStateSnapshot& ControlStateReducer::libraryState() const noexcept {
   return library_;
+}
+
+const audio::EqualizerStateSnapshot& ControlStateReducer::equalizerState() const noexcept {
+  return equalizer_;
 }
 
 const std::vector<ControlDomainNotification>& ControlStateReducer::recentNotifications() const noexcept {
@@ -635,6 +731,8 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     return handleConfigureOutput(reduction, command);
   case MediaControlCommandKind::SetTransitionConfig:
     return handleSetTransitionConfig(reduction, command);
+  case MediaControlCommandKind::SetEqualizerConfig:
+    return handleSetEqualizerConfig(reduction, command);
   case MediaControlCommandKind::DeleteTrack:
   case MediaControlCommandKind::DeleteFolder:
     // 删除涉及文件系统与 scanner 缓存，必须经 MediaController（service 层）执行；
@@ -742,6 +840,39 @@ ControlReduction ControlStateReducer::handleSetTransitionConfig(ControlReduction
   // T10：过渡配置变更版本递增（pendingAdvance 版本 token 组成；窗口内本命令已由
   // 门控中止过渡，服务侧以新配置重新武装）。
   ++transitionConfigVersion_;
+  return reduction;
+}
+
+ControlReduction ControlStateReducer::handleSetEqualizerConfig(ControlReduction& reduction, const MediaControlCommand& command) {
+  if (!command.equalizerConfig.has_value()) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetEqualizerConfig requires an equalizer config");
+  }
+  const auto& config = *command.equalizerConfig;
+  if (!validEqualizerMode(config.mode)) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetEqualizerConfig band mode is out of range");
+  }
+  // enabled/limiterEnabled 为 bool 值类型（C++ 层无法表达第三态），无需运行期校验。
+  if (!equalizerGainInRange(config.preGainDb)) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetEqualizerConfig pre gain is out of range (±15 dB)");
+  }
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    if (!equalizerGainInRange(config.bandGainsDb[band])) {
+      return reject(MediaControllerErrorCode::InvalidCommand,
+                    "SetEqualizerConfig band gain at index " + std::to_string(band) + " is out of range (±15 dB)");
+    }
+  }
+
+  // 与 ConfigureOutput/SetTransitionConfig 语义隔离：仅生成单意图转发均衡器参数，
+  // 不触发任何重载（无 LoadTrack/Seek/Play 尾意图）、不改播放快照。
+  reduction.intents.push_back(makeSetEqualizerConfigIntent(config));
+  // B1.4：快照入 reducer 状态——reducer 无输出采样率知识（sampleRate=0 → 全轴曲线，
+  // 越界守卫不触发）；generation 从 0 起每次校验通过的配置生效 +1（重建前留存旧代数
+  // 再递增——makeEqualizerStateSnapshot 返回全新快照，直接 ++ 恒得 1）。任务 19 经
+  // equalizerStateChanged 信号在 commit 后发布，并以实际输出率回填 sampleRate 重发布。
+  const auto previousGeneration = equalizer_.generation;
+  equalizer_ = makeEqualizerStateSnapshot(config, 0U);
+  equalizer_.generation = previousGeneration + 1U;
+  reduction.equalizerStateChanged = true;
   return reduction;
 }
 
