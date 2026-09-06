@@ -9,6 +9,9 @@ add_executable(seriona_tests main.cpp)
 add_executable(seriona_audio_contract_tests
   audio/audio_contract_tests.cpp
 )
+add_executable(seriona_miniaudio_device_id_tests
+  audio/miniaudio_device_id_tests.cpp
+)
 add_executable(seriona_audio_fixture_tests
   audio/audio_fixture_tests.cpp
 )
@@ -575,6 +578,7 @@ add_executable(seriona_application_log_level_tests
 
 target_compile_definitions(seriona_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_miniaudio_device_id_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_waveform_generator_tests PRIVATE
   DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
   SERIONA_WAVEFORM_FIXTURE_DIR="${CMAKE_CURRENT_BINARY_DIR}/generated_waveform_fixtures"
@@ -686,6 +690,12 @@ target_include_directories(seriona_audio_contract_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
   ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+)
+target_include_directories(seriona_miniaudio_device_id_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+  ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+  ${PROJECT_SOURCE_DIR}/src/audio/device
 )
 target_include_directories(seriona_audio_fixture_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1125,6 +1135,9 @@ target_link_libraries(seriona_audio_contract_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
 )
+target_link_libraries(seriona_miniaudio_device_id_tests PRIVATE
+  seriona_third_party_headers
+)
 target_link_libraries(seriona_audio_fixture_tests PRIVATE
   seriona_third_party_headers
   PkgConfig::SERIONA_FFMPEG
@@ -1384,6 +1397,7 @@ endif()
 
 seriona_enable_warnings(seriona_tests)
 seriona_enable_warnings(seriona_audio_contract_tests)
+seriona_enable_warnings(seriona_miniaudio_device_id_tests)
 seriona_enable_warnings(seriona_audio_fixture_tests)
 seriona_enable_warnings(seriona_waveform_generator_tests)
 seriona_enable_warnings(seriona_ffmpeg_audio_source_tests)
@@ -1636,6 +1650,7 @@ target_link_libraries(seriona_application_log_level_tests PRIVATE
 
 add_test(NAME seriona.doctest.placeholder COMMAND seriona_tests)
 add_test(NAME seriona.audio_contract COMMAND seriona_audio_contract_tests)
+add_test(NAME seriona.miniaudio_device_id COMMAND seriona_miniaudio_device_id_tests)
 add_test(NAME seriona.audio_fixture COMMAND seriona_audio_fixture_tests)
 add_test(NAME seriona.audio.waveform.contract COMMAND seriona_waveform_generator_tests --test-case=*contract*)
 add_test(NAME seriona.audio.waveform.basic COMMAND seriona_waveform_generator_tests --test-case=*basic*)

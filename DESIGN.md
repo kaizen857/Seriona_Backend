@@ -75,7 +75,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 - `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：13 个异步控制方法 + 1 个同步 `queryPlaybackClock`（合计 14，勿与测试专用 `AudioPlayer` 的 13 个方法混淆）；所有操作入命令队列由单音频工作线程执行。
 - 播放状态机 `PlaybackStateMachine`：Idle → Loading → Ready → Playing ⇄ Paused，另有瞬时 Draining、Stopped、Error；每次迁移发 `PlaybackStateChanged`。seek 为 begin/cancel/complete 三阶段，带 generation 防过期完成。
-- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取），`AudioOutputConfig.preferredDeviceId`（枚举索引字符串）经 `resolvePreferredDevice` 解析并绑定对应设备，选错格式自动回退并通知。
+- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取）与 `isDefaultDevice`（miniaudio `isDefault` 透传），`deviceId` 为按 `context.backend` 编码的稳定文本 id（`miniaudio_device_id_encoding.h`，可持久化跨枚举复用；历史"枚举索引字符串"值在 `resolvePreferredDevice` 按纯数字兼容回退），`AudioOutputConfig.preferredDeviceId` 经 `resolvePreferredDevice` 精确匹配绑定对应设备，空串 = 系统默认，选错格式自动回退并通知。
 - `PcmBufferQueue`：无锁 SPSC 字节环 + generation 失效机制（seek 防竞态）；`PlaybackClock`：帧计数驱动（非墙钟）。
 - `AudioEventDispatcher`：锁内取 sink 副本、锁外回调；`BackendEvent` 信封带 monotonicVersion/timestamp；事件面含过渡域 `EndApproaching{remainingMs}`（终点预告）与 `AdvanceCompleted{trackId}`（交接提交）两个载荷（追加于 `BackendEventType` 枚举末尾，见下）。
 - 播放过渡域（淡入淡出/交叉/预加载，整体自任务组 B1-B4 落地）：

@@ -155,6 +155,11 @@ struct AudioDeviceFormat {
   // 采样率/位深下拉（空=显示全部）。
   std::vector<AudioSampleFormat> supportedSampleFormats;
   std::vector<std::uint32_t> supportedSampleRates;
+  // 是否系统默认播放设备（miniaudio ma_device_info.isDefault 透传）。
+  // 语义随后端而异：PulseAudio/PipeWire-pulse 下可靠（服务器默认 sink）；ALSA 下仅
+  // id=="default" 的伪设备为 true，硬件设备恒 false（miniaudio 源码注释自述无法判定）。
+  // 前端只应将其用于 UI 标记/默认高亮，不得作为"必须存在"的假设。
+  bool isDefaultDevice{false};
 };
 
 struct PlaybackClockSnapshot {
