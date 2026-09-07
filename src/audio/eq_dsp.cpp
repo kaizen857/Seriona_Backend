@@ -77,35 +77,10 @@ EqualizerDspProcessor::ConfigReport EqualizerDspProcessor::configure(const Equal
   activeBandCount_ = config.mode == EqualizerBandMode::Band10 ? kEqualizer10BandCenterHz.size()
                                                               : kEqualizer31BandCenterHz.size();
 
-  const double nyquistHz = 0.5 * static_cast<double>(sampleRate);
-  std::size_t bypassCount = 0;
-  for (std::size_t bandIndex = 0; bandIndex < kBandCount; ++bandIndex) {
-    auto& band = bands_[bandIndex];
-    const bool inUse = enabled_ && bandIndex < activeBandCount_;
-    const double centerHz = bandCenterHz(bandIndex);
-    // 越界判定：f_center ≥ 0.95×(fs/2)（configure 期一次判定，不每块刷）。
-    band.rangeBypass = inUse && centerHz >= kNyquistBypassRatio * nyquistHz;
-    if (band.rangeBypass) {
-      ++bypassCount;
-    }
-    // 目标：启用且未越界 → 配置增益；否则 0dB（未用/越界/关闭统一直通目标）。
-    const double newTargetDb =
-        inUse && !band.rangeBypass ? sanitizeDb(config.bandGainsDb[bandIndex]) : 0.0;
-    if (newTargetDb != band.targetDb) {
-      // 目标变化：从当前点重新规划线性斜坡段（不跳变、不重走旧段）。
-      band.segmentDeltaDb = newTargetDb - band.currentDb;
-      band.targetDb = newTargetDb;
-    }
-    if (modeChanged) {
-      // mode 切换改变中心频率/Q 表语义：系数参数失效，处理前强制 reinit。
-      band.coeffStale = true;
-    }
-  }
-  const double newPreGainTargetDb = enabled_ ? sanitizeDb(config.preGainDb) : 0.0;
-  if (newPreGainTargetDb != preGainTargetDb_) {
-    preGainSegmentDeltaDb_ = newPreGainTargetDb - preGainCurrentDb_;
-    preGainTargetDb_ = newPreGainTargetDb;
-  }
+  // 目标更新核心（configure/applyTargets 共用；越界判定/平滑段规划/系数失效置位，
+  // 见 applyTargetValues 注释）。format 已就位（sampleRate_/channelCount_ 已按本次
+  // 更新）→ 与 applyTargets 完全同路径，无双份语义漂移。
+  const std::size_t bypassCount = applyTargetValues(config, modeChanged);
 
   if (rebuild) {
     // fs/声道数变化：ma_biquad 不允许 reinit 改声道数，滤波器组整体重建（平滑
@@ -115,6 +90,71 @@ EqualizerDspProcessor::ConfigReport EqualizerDspProcessor::configure(const Equal
   }
 
   accepted_ = true;
+  recomputeSmoothingAndFastBypass();
+
+  report.accepted = true;
+  report.activeBandCount = activeBandCount_;
+  report.nyquistBypassBandCount = bypassCount;
+  return report;
+}
+
+bool EqualizerDspProcessor::applyTargets(const EqualizerConfig& config) noexcept {
+  // 实时目标更新（回调受理路径；方法注释为契约）。前提 = accepted_ 且格式已定
+  // （设备 initialize 停态窗口必然 configure 过，含出厂默认配置）；未 accepted =
+  // 无操作返回 false——不得走 configure 路径（可能分配/重建）。
+  if (!accepted_) {
+    return false;
+  }
+  const bool modeChanged = config.mode != mode_;
+  config_ = config;
+  enabled_ = config.enabled;
+  mode_ = config.mode;
+  activeBandCount_ = config.mode == EqualizerBandMode::Band10 ? kEqualizer10BandCenterHz.size()
+                                                              : kEqualizer31BandCenterHz.size();
+  static_cast<void>(applyTargetValues(config, modeChanged));
+  recomputeSmoothingAndFastBypass();
+  return true;
+}
+
+std::size_t EqualizerDspProcessor::applyTargetValues(const EqualizerConfig& config,
+                                                     bool modeChanged) noexcept {
+  // 逐 band 目标/越界/系数失效更新（configure 与 applyTargets 共用的目标更新核心）：
+  //  - 越界判定（f_center ≥ 0.95×(fs/2)）按当前 mode 表 + sampleRate_ 每次重算
+  //    （mode/采样率变化后重算安全；configure 期一次判定语义不变）；
+  //  - 目标 = 启用且未越界 → sanitize 配置增益；否则 0dB（未用/越界/关闭统一
+  //    直通目标）；目标变化从当前点重规划线性斜坡段（不跳变、不重走旧段）；
+  //  - mode 切换 = 中心/Q 表语义变化 → 系数参数失效，处理前强制 reinit。
+  const double nyquistHz = 0.5 * static_cast<double>(sampleRate_);
+  std::size_t bypassCount = 0;
+  for (std::size_t bandIndex = 0; bandIndex < kBandCount; ++bandIndex) {
+    auto& band = bands_[bandIndex];
+    const bool inUse = enabled_ && bandIndex < activeBandCount_;
+    const double centerHz = bandCenterHz(bandIndex);
+    band.rangeBypass = inUse && centerHz >= kNyquistBypassRatio * nyquistHz;
+    if (band.rangeBypass) {
+      ++bypassCount;
+    }
+    const double newTargetDb =
+        inUse && !band.rangeBypass ? sanitizeDb(config.bandGainsDb[bandIndex]) : 0.0;
+    if (newTargetDb != band.targetDb) {
+      band.segmentDeltaDb = newTargetDb - band.currentDb;
+      band.targetDb = newTargetDb;
+    }
+    if (modeChanged) {
+      band.coeffStale = true;
+    }
+  }
+  const double newPreGainTargetDb = enabled_ ? sanitizeDb(config.preGainDb) : 0.0;
+  if (newPreGainTargetDb != preGainTargetDb_) {
+    preGainSegmentDeltaDb_ = newPreGainTargetDb - preGainCurrentDb_;
+    preGainTargetDb_ = newPreGainTargetDb;
+  }
+  return bypassCount;
+}
+
+void EqualizerDspProcessor::recomputeSmoothingAndFastBypass() noexcept {
+  // 平滑激活态重算（全收敛扫描）+ fastBypass 快路径判定（configure/applyTargets
+  // 共用的收尾核心）。smoothingActive_/fastBypass_ 是 process 入口的唯一依赖面。
   smoothingActive_ = false;
   for (const auto& band : bands_) {
     if (band.currentDb != band.targetDb) {
@@ -126,11 +166,6 @@ EqualizerDspProcessor::ConfigReport EqualizerDspProcessor::configure(const Equal
     smoothingActive_ = true;
   }
   updateFastBypass();
-
-  report.accepted = true;
-  report.activeBandCount = activeBandCount_;
-  report.nyquistBypassBandCount = bypassCount;
-  return report;
 }
 
 void EqualizerDspProcessor::rebuildFilters() {

@@ -69,6 +69,10 @@ enum class BackendEventType {
   // advance 提交（不重发 LoadTrack）。无预载的普通自然结束仍走 PlaybackEnded。
   // 发射序 = 提交事件先于新曲的 TrackChanged/状态事件（控制器提交需先于状态漂移）。
   AdvanceCompleted,
+  // R2：频谱快照发布（服务→控制器，频谱显示链路）。载荷=SpectrumUpdated{snapshot}；
+  // 仅开关开且 Playing 时按分析产出节流（~50ms 轮询 × 分析窗消耗，≤20Hz）发射。
+  // 追加末尾保持序数兼容。
+  SpectrumUpdated,
 };
 
 struct TrackPlaybackRequest {
@@ -225,6 +229,23 @@ struct AdvanceCompleted {
   std::string trackId;
 };
 
+// R2：频谱实时快照（服务→控制器，频谱显示链路）。定义位置说明：PlaybackEvent
+// variant（下方）按值持有本类型，故本定义必须位于 variant 之前；原定义区（均衡器
+// 契约块内）已随 R2 一并上移，符号/字段序零变化（纯物理搬移）。
+struct SpectrumSnapshot {
+  std::uint64_t generation = 0;   // 单调代数：每次频谱更新递增（0 = 空快照）
+  std::uint32_t sampleRate = 0;   // 快照对应的输出采样率
+  std::array<float, 60> binsDb{}; // 60 段频带电平（dB）
+  std::uint64_t timestampMs = 0;  // 快照生成时刻（毫秒时间戳）
+};
+
+// R2：频谱更新事件载荷（服务→控制器）。snapshot = 一次新分析完成后的完整驻留
+// 快照副本（generation 单调 +1，0 = 空）。发射频率 = 分析产出节流（~50ms 轮询 ×
+// 分析窗消耗，≤20Hz），走既有 BackendEvent 通道，monotonicVersion 由 dispatcher 递增。
+struct SpectrumUpdated {
+  SpectrumSnapshot snapshot{};
+};
+
 // T8：控制器在 EndApproaching 时选定的预解码交接方式（PrepareNext 元数据）。
 // 字段声明顺序即跨端契约，追加字段只能放末尾。
 enum class PrepareNextKind : std::uint8_t {
@@ -248,7 +269,8 @@ using PlaybackEvent = std::variant<
     OutputModeFallback,
     PlaybackError,
     EndApproaching,
-    AdvanceCompleted>;
+    AdvanceCompleted,
+    SpectrumUpdated>;
 
 struct BackendEvent {
   BackendEventType type{BackendEventType::PlaybackStateChanged};
@@ -290,14 +312,6 @@ struct EqualizerStateSnapshot {
   std::uint32_t sampleRate = 0;                // 快照对应的输出采样率
   std::array<float, 181> curvePointsDb{};      // 增益曲线采样点（dB）
   std::array<float, 181> curveFrequenciesHz{}; // 与 curvePointsDb 逐点对应的频率轴（Hz）
-};
-
-// 频谱快照（实时分析输出，60 段频带电平，供前端频谱可视化；默认全 0 = 空快照）。
-struct SpectrumSnapshot {
-  std::uint64_t generation = 0;   // 单调代数：每次频谱更新递增（0 = 空快照）
-  std::uint32_t sampleRate = 0;   // 快照对应的输出采样率
-  std::array<float, 60> binsDb{}; // 60 段频带电平（dB）
-  std::uint64_t timestampMs = 0;  // 快照生成时刻（毫秒时间戳）
 };
 
 class AudioPlaybackService {

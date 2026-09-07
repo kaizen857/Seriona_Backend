@@ -548,3 +548,192 @@ TEST_CASE("controller equalizer subscription after a later commit first receives
 
   subscription.unsubscribe();
 }
+
+// ============================================================
+// R2 频谱显示链路（事件契约 + 开关命令 + 订阅推送）：
+//   - reducer 级：SetSpectrumEnabled = 单意图直转（true/false），载荷缺失拒绝；
+//   - controller 命令级：命令 → 意图 → 音频服务 setSpectrumEnabled（fake 记账）；
+//   - controller 事件级：SpectrumUpdated 事件 → spectrumSnapshot 更新 + 订阅推送
+//     （60 桶内容逐位一致 + generation/timestamp 透传）；事件不触碰播放/均衡器面。
+// ============================================================
+
+namespace {
+
+MediaControlCommand spectrumCommand(std::optional<bool> enabled) {
+  return MediaControlCommand{.kind = MediaControlCommandKind::SetSpectrumEnabled, .spectrumEnabled = enabled};
+}
+
+audio::SpectrumSnapshot makeSpectrumSnapshot(std::uint64_t generation, float fillValue) {
+  audio::SpectrumSnapshot snapshot{};
+  snapshot.generation = generation;
+  snapshot.sampleRate = 48000U;
+  snapshot.binsDb.fill(fillValue);
+  snapshot.binsDb[26] = -6.0F;  // 特征峰值（440 Hz 对数桶），供逐桶比对
+  snapshot.timestampMs = 1000U + generation;
+  return snapshot;
+}
+
+audio::BackendEvent spectrumUpdatedEvent(audio::SpectrumSnapshot snapshot, std::uint64_t version) {
+  return audio::BackendEvent{.type = audio::BackendEventType::SpectrumUpdated,
+                             .sourceModule = audio::BackendSourceModule::AudioPlaybackService,
+                             .monotonicVersion = version,
+                             .timestamp = {},
+                             .payload = audio::SpectrumUpdated{.snapshot = std::move(snapshot)}};
+}
+
+}  // namespace
+
+TEST_CASE("reducer forwards SetSpectrumEnabled with a single gate intent and no state change") {
+  ReducerFixture fixture{};
+
+  const auto enabled = fixture.submit(spectrumCommand(true));
+  REQUIRE(enabled.result.accepted);
+  REQUIRE(enabled.intents.size() == 1U);
+  CHECK(enabled.intents[0].kind == ControlIntentKind::SetSpectrumEnabled);
+  REQUIRE(enabled.intents[0].spectrumEnabled.has_value());
+  CHECK(*enabled.intents[0].spectrumEnabled);
+  CHECK_FALSE(enabled.playerStateChanged);
+  CHECK_FALSE(enabled.equalizerStateChanged);
+  CHECK(enabled.notifications.empty());
+
+  const auto disabled = fixture.submit(spectrumCommand(false));
+  REQUIRE(disabled.result.accepted);
+  REQUIRE(disabled.intents.size() == 1U);
+  CHECK(disabled.intents[0].kind == ControlIntentKind::SetSpectrumEnabled);
+  REQUIRE(disabled.intents[0].spectrumEnabled.has_value());
+  CHECK_FALSE(*disabled.intents[0].spectrumEnabled);
+  CHECK_FALSE(disabled.playerStateChanged);
+  CHECK_FALSE(disabled.equalizerStateChanged);
+}
+
+TEST_CASE("reducer rejects SetSpectrumEnabled without payload leaving zero intents and state untouched") {
+  ReducerFixture fixture{};
+
+  const auto before = fixture.submit(eqCommand(makeConfig(audio::EqualizerBandMode::Band10, 0.0F, 0.0F)));
+  REQUIRE(before.result.accepted);
+  REQUIRE(fixture.reducer.equalizerState().generation == 1U);
+
+  const auto rejected = fixture.submit(spectrumCommand(std::nullopt));
+  CHECK_FALSE(rejected.result.accepted);
+  CHECK(rejected.result.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(rejected.intents.empty());
+  CHECK_FALSE(rejected.playerStateChanged);
+  CHECK_FALSE(rejected.equalizerStateChanged);
+  CHECK(rejected.notifications.size() == 1U);  // CommandRejected 通知
+  CHECK(fixture.reducer.equalizerState().generation == 1U);
+}
+
+TEST_CASE("controller SetSpectrumEnabled command reaches the audio service gate") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  CHECK(fixture.fakeAudio->setSpectrumEnabledCalls() == 0U);
+  CHECK_FALSE(fixture.fakeAudio->spectrumEnabled());  // 默认关 = 接口默认语义
+
+  REQUIRE(fixture.controller->submitCommand(spectrumCommand(true)).accepted);
+  CHECK(fixture.fakeAudio->setSpectrumEnabledCalls() == 1U);
+  REQUIRE(fixture.fakeAudio->lastSpectrumEnabled().has_value());
+  CHECK(*fixture.fakeAudio->lastSpectrumEnabled());
+  CHECK(fixture.fakeAudio->spectrumEnabled());  // fake 回映原子位语义
+
+  REQUIRE(fixture.controller->submitCommand(spectrumCommand(false)).accepted);
+  CHECK(fixture.fakeAudio->setSpectrumEnabledCalls() == 2U);
+  REQUIRE(fixture.fakeAudio->lastSpectrumEnabled().has_value());
+  CHECK_FALSE(*fixture.fakeAudio->lastSpectrumEnabled());
+  CHECK_FALSE(fixture.fakeAudio->spectrumEnabled());
+}
+
+TEST_CASE("controller rejects SetSpectrumEnabled without payload without reaching the audio service") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  const auto rejected = fixture.controller->submitCommand(spectrumCommand(std::nullopt));
+  CHECK_FALSE(rejected.accepted);
+  CHECK(rejected.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.fakeAudio->setSpectrumEnabledCalls() == 0U);
+}
+
+TEST_CASE("controller spectrum subscription receives SpectrumUpdated events with identical payload") {
+  ControllerFixture fixture{};
+  control_test::ValueCollector<audio::SpectrumSnapshot> spectrum{};
+  auto subscription = fixture.controller->subscribeSpectrum([&](audio::SpectrumSnapshot snapshot) {
+    spectrum.push(std::move(snapshot));
+  });
+  fixture.controller->start();
+
+  REQUIRE(spectrum.count() == 1U);  // 订阅即推当前（gen0 空）
+  CHECK(spectrum.last().generation == 0U);
+
+  const auto first = makeSpectrumSnapshot(1U, -80.0F);
+  fixture.fakeAudio->emit(spectrumUpdatedEvent(first, 100U));
+  fixture.controller->drainForTests();
+  REQUIRE(spectrum.count() == 2U);
+  CHECK(spectrum.last().generation == first.generation);
+  CHECK(spectrum.last().sampleRate == first.sampleRate);
+  CHECK(spectrum.last().timestampMs == first.timestampMs);
+  CHECK(spectrum.last().binsDb == first.binsDb);
+
+  const auto second = makeSpectrumSnapshot(2U, -90.0F);
+  fixture.fakeAudio->emit(spectrumUpdatedEvent(second, 101U));
+  fixture.controller->drainForTests();
+  REQUIRE(spectrum.count() == 3U);
+  CHECK(spectrum.last().generation == 2U);
+  CHECK(spectrum.last().binsDb == second.binsDb);
+
+  subscription.unsubscribe();
+}
+
+TEST_CASE("controller SpectrumUpdated events do not perturb player or equalizer subscriptions") {
+  ControllerFixture fixture{};
+  control_test::ValueCollector<audio::SpectrumSnapshot> spectrum{};
+  auto spectrumSubscription = fixture.controller->subscribeSpectrum([&](audio::SpectrumSnapshot snapshot) {
+    spectrum.push(std::move(snapshot));
+  });
+  control_test::ValueCollector<PlayerStateSnapshot> playerSnapshots{};
+  auto playerSubscription = fixture.controller->subscribePlayerState([&](PlayerStateSnapshot snapshot) {
+    playerSnapshots.push(std::move(snapshot));
+  });
+  control_test::ValueCollector<audio::EqualizerStateSnapshot> eqSnapshots{};
+  auto eqSubscription = fixture.controller->subscribeEqualizerState([&](audio::EqualizerStateSnapshot snapshot) {
+    eqSnapshots.push(std::move(snapshot));
+  });
+  fixture.controller->start();
+  REQUIRE(playerSnapshots.count() == 1U);
+  REQUIRE(eqSnapshots.count() == 1U);
+
+  fixture.fakeAudio->emit(spectrumUpdatedEvent(makeSpectrumSnapshot(7U, -70.0F), 200U));
+  fixture.controller->drainForTests();
+  CHECK(spectrum.count() == 2U);
+  CHECK(spectrum.last().generation == 7U);
+  CHECK(playerSnapshots.count() == 1U);  // 播放快照面零扰动
+  CHECK(eqSnapshots.count() == 1U);      // 均衡器快照面零扰动
+
+  spectrumSubscription.unsubscribe();
+  playerSubscription.unsubscribe();
+  eqSubscription.unsubscribe();
+}
+
+TEST_CASE("controller spectrum subscriber after events first receives the current snapshot") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+
+  // 先落一个事件（无订阅者时也应更新驻留槽——订阅初始投递的数据源）。
+  fixture.fakeAudio->emit(spectrumUpdatedEvent(makeSpectrumSnapshot(3U, -60.0F), 300U));
+  fixture.controller->drainForTests();
+
+  control_test::ValueCollector<audio::SpectrumSnapshot> spectrum{};
+  auto subscription = fixture.controller->subscribeSpectrum([&](audio::SpectrumSnapshot snapshot) {
+    spectrum.push(std::move(snapshot));
+  });
+  REQUIRE(spectrum.count() == 1U);
+  CHECK(spectrum.last().generation == 3U);
+  CHECK(spectrum.last().binsDb == makeSpectrumSnapshot(3U, -60.0F).binsDb);
+
+  // 订阅后的增量推送继续。
+  fixture.fakeAudio->emit(spectrumUpdatedEvent(makeSpectrumSnapshot(4U, -55.0F), 301U));
+  fixture.controller->drainForTests();
+  REQUIRE(spectrum.count() == 2U);
+  CHECK(spectrum.last().generation == 4U);
+
+  subscription.unsubscribe();
+}

@@ -325,6 +325,10 @@ enum class MediaControlCommandKind {
   // ConfigureOutput/SetTransitionConfig 语义隔离：仅更新均衡处理参数，绝不触发输
   // 出重载/设备生命周期操作。追加末尾保持序列化兼容。
   SetEqualizerConfig,
+  // 频谱开关命令（R2 频谱显示链路）：SetSpectrumEnabled=实时频谱分析开关（bool
+  // 载荷=spectrumEnabled 字段）。纯门控转发至音频服务原子位（无 reducer 镜像、
+  // 不触碰播放/均衡器状态，同 SetMuted/SetVolume 直转先例）。追加末尾保持兼容。
+  SetSpectrumEnabled,
 };
 
 struct MediaControlCommand {
@@ -351,6 +355,8 @@ struct MediaControlCommand {
   // SetEqualizerConfig 载荷（任务16）：均衡器参数（默认构造 = 关闭直通，与旧行为等
   // 价）。追加末尾保持序列化兼容。
   std::optional<audio::EqualizerConfig> equalizerConfig;
+  // SetSpectrumEnabled 载荷（R2）：频谱分析开关目标值。追加末尾保持序列化兼容。
+  std::optional<bool> spectrumEnabled;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;

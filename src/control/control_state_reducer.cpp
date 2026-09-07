@@ -249,6 +249,12 @@ constexpr std::size_t kRecentNotificationLimit = 32;
   return intent;
 }
 
+[[nodiscard]] ControlIntent makeSpectrumEnabledIntent(bool enabled) {
+  auto intent = makeIntent(ControlIntentKind::SetSpectrumEnabled);
+  intent.spectrumEnabled = enabled;
+  return intent;
+}
+
 [[nodiscard]] ControlIntent makeConfigureOutputIntent(const audio::AudioOutputConfig& config) {
   auto intent = makeIntent(ControlIntentKind::ConfigureOutput);
   intent.outputConfig = config;
@@ -733,6 +739,8 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     return handleSetTransitionConfig(reduction, command);
   case MediaControlCommandKind::SetEqualizerConfig:
     return handleSetEqualizerConfig(reduction, command);
+  case MediaControlCommandKind::SetSpectrumEnabled:
+    return handleSetSpectrumEnabled(reduction, command);
   case MediaControlCommandKind::DeleteTrack:
   case MediaControlCommandKind::DeleteFolder:
     // 删除涉及文件系统与 scanner 缓存，必须经 MediaController（service 层）执行；
@@ -873,6 +881,17 @@ ControlReduction ControlStateReducer::handleSetEqualizerConfig(ControlReduction&
   equalizer_ = makeEqualizerStateSnapshot(config, 0U);
   equalizer_.generation = previousGeneration + 1U;
   reduction.equalizerStateChanged = true;
+  return reduction;
+}
+
+ControlReduction ControlStateReducer::handleSetSpectrumEnabled(ControlReduction& reduction, const MediaControlCommand& command) {
+  if (!command.spectrumEnabled.has_value()) {
+    return reject(MediaControllerErrorCode::InvalidCommand, "SetSpectrumEnabled requires a spectrum enabled value");
+  }
+  // 纯门控直转（同 SetMuted/SetVolume 先例，区别于 SetEqualizerConfig 的镜像面）：
+  // 服务原子位为最终态（worker 2ms 轮询读、任意线程可写），事件通道只承载分析快照
+  // 不承载开关状态；reducer 镜像无人消费即死状态——本命令不触碰播放/均衡器快照。
+  reduction.intents.push_back(makeSpectrumEnabledIntent(*command.spectrumEnabled));
   return reduction;
 }
 

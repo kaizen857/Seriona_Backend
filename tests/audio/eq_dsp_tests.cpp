@@ -838,3 +838,181 @@ TEST_CASE("eq dsp: 低率平滑钳制（22.05k）——3×blockMs>20ms 大块每
   CHECK(settledAt >= 400U);  // 平滑真实跨 ~20ms（而非一步到位）
   CHECK(settledAt <= 450U);
 }
+
+// ==================== applyTargets（播放中实时目标更新） ====================
+
+TEST_CASE("eq dsp: applyTargets 前置——未 configure 返回 false 无操作、configure 后生效") {
+  audio::EqualizerDspProcessor fresh;
+  const auto config = singleBandConfig(17U, 6.0F, true);
+  CHECK_FALSE(fresh.applyTargets(config));  // 未 accepted：无操作（不得全量 configure）
+  CHECK_FALSE(fresh.configured());
+  CHECK_FALSE(fresh.enabled());
+  CHECK(fresh.fastBypassActive());
+
+  static_cast<void>(fresh.configure(config, 48000U, 1U));
+  CHECK(fresh.applyTargets(config));  // accepted：受理成功
+  CHECK(fresh.configured());
+  CHECK(fresh.enabled());
+}
+
+TEST_CASE("eq dsp: applyTargets 目标更新——同 configure 收敛语义（爬坡逐块、精确到位、无跳变）") {
+  audio::EqualizerDspProcessor dsp;
+  static_cast<void>(dsp.configure(singleBandConfig(17U, 6.0F, true), 48000U, 1U));
+  // configure 后同 configure 语义 settle：快进到稳态（4096 帧块 ×3 = ramp 3×块长收敛）。
+  settleEq(dsp, 48000U, 1U);
+  REQUIRE(dsp.fullySettled());
+  REQUIRE(dsp.currentBandGainDb(17U) == doctest::Approx(6.0).epsilon(1e-9));
+  REQUIRE(dsp.fastBypassActive() == false);
+
+  // 运行中把目标改到 +3dB（applyTargets——模拟播放中调低一个 band）。
+  auto moved = singleBandConfig(17U, 3.0F, true);
+  CHECK(dsp.applyTargets(moved));
+  // 平滑从当前点（+6）规划新段：512 帧块 @48k stepRatio=1/3 → 每块 −1dB。
+  std::vector<float> block(512U, 0.0F);
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(5.0).epsilon(1e-9));
+  CHECK(!dsp.fullySettled());
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(4.0).epsilon(1e-9));
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(3.0).epsilon(1e-9));  // clamp 精确到位
+  CHECK(dsp.fullySettled());
+  // 稳态频响随目标成形（1kHz = idx17 中心）：幅值 0.25 → ×1.413。
+  std::vector<float> tone;
+  fillSineMono(tone, 48000.0, 1000.0, 0.25, 4096U);
+  dsp.process(tone.data(), 4096U);
+  const double amp = estimateAmplitudeMono(tone.data(), 512U, 3584U, 48000.0, 1000.0);
+  CHECK(std::fabs(linToDb(amp / 0.25) - 3.0) <= 0.1);
+}
+
+TEST_CASE("eq dsp: applyTargets 运行中开关——关闭平滑退出收敛后 fastBypass 回归、再开实时爬坡") {
+  audio::EqualizerDspProcessor dsp;
+  static_cast<void>(dsp.configure(singleBandConfig(17U, 6.0F, true), 48000U, 1U));
+  settleEq(dsp, 48000U, 1U);
+  REQUIRE(dsp.fastBypassActive() == false);
+
+  // 运行中关闭（enabled false→目标全 0）：先平滑退出（期间非 fastBypass、band 按
+  // 残余增益处理）→ 收敛后 fastBypass 快路径（process 零触碰样本）。
+  CHECK(dsp.applyTargets(flatConfig(audio::EqualizerBandMode::Band31, false)));
+  CHECK_FALSE(dsp.fastBypassActive());  // 平滑退出期需要处理
+  std::vector<float> block(512U, 0.0F);
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(4.0).epsilon(1e-9));  // 6→4 退出中
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(2.0).epsilon(1e-9));
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == 0.0);
+  CHECK(dsp.fullySettled());
+  CHECK(dsp.fastBypassActive());  // 关闭收敛：整链旁路
+  CHECK_FALSE(dsp.enabled());
+
+  // 旁路态下样本域逐位直通（process 常量级返回）。
+  std::vector<float> pattern;
+  fillSineMono(pattern, 48000.0, 1000.0, 0.25, 1024U);
+  const auto original = pattern;
+  dsp.process(pattern.data(), 1024U);
+  CHECK(pattern == original);
+
+  // 运行中再开（同曲线）：从当前（0）实时爬坡回 +6——无跳变（首块 +2dB）。
+  CHECK(dsp.applyTargets(singleBandConfig(17U, 6.0F, true)));
+  CHECK_FALSE(dsp.fastBypassActive());
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(2.0).epsilon(1e-9));
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(4.0).epsilon(1e-9));
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentBandGainDb(17U) == 6.0);
+  CHECK(dsp.fullySettled());
+}
+
+TEST_CASE("eq dsp: applyTargets 模式切换——前缀外 band 排空不触碰 biquad（越前缀硬切有界）") {
+  // 31→10 模式切换回归点：review 实测 44.98× 爆炸 = 未用 band（idx ≥ 前缀）在排空期
+  // 被喂进 centerHz=0 的退化系数。applyTargets 切换 mode 必须同 configure 语义：
+  // 未用 band 只走平滑状态（绝不触碰 biquad——process 内 activeBandCount_ 前缀守卫）。
+  audio::EqualizerDspProcessor dsp;
+  // Band31 下 10、17、20 三段有增益 → 全 settle。
+  auto wide = flatConfig(audio::EqualizerBandMode::Band31, true);
+  wide.bandGainsDb[10U] = 5.0F;
+  wide.bandGainsDb[17U] = 6.0F;
+  wide.bandGainsDb[20U] = 4.0F;
+  static_cast<void>(dsp.configure(wide, 48000U, 1U));
+  settleEq(dsp, 48000U, 1U);
+  REQUIRE(dsp.fullySettled());
+  REQUIRE(dsp.currentBandGainDb(17U) == doctest::Approx(6.0).epsilon(1e-9));
+
+  // 运行中切到 Band10（10 段表：idx10/17/20 全在 10-band 前缀之外 → 目标 0）。
+  auto ten = flatConfig(audio::EqualizerBandMode::Band10, true);
+  CHECK(dsp.applyTargets(ten));
+  // 排空期：前缀外 band currentDb 仍非 0，但 process 绝不触碰其 biquad（越前缀守卫）——
+  // 输出有界（10-band 表 idx5 中心 ~1kHz 无增益；残余排空只走平滑状态对样本无贡献）。
+  double peak = 0.0;
+  for (int block = 0; block < 3; ++block) {  // ramp 收敛期（6→0：每块 1/3）
+    std::vector<float> tone;
+    fillSineMono(tone, 48000.0, 1000.0, 0.25, 4096U);
+    dsp.process(tone.data(), 4096U);
+    for (const float v : tone) {
+      peak = std::max(peak, std::fabs(static_cast<double>(v)));
+    }
+  }
+  CHECK(peak <= 0.55);  // 无爆炸/无超界（44.98× 爆炸会 >1e3）
+  CHECK(dsp.currentBandGainDb(10U) == 0.0);   // 前缀外已排空到 0（band10 恰为 10-band 表内）
+  CHECK(dsp.currentBandGainDb(17U) == 0.0);
+  CHECK(dsp.currentBandGainDb(20U) == 0.0);
+  CHECK(dsp.fullySettled());
+  // 全 0 目标收敛 = fastBypass（设备门控的 enabled() 项负责 EQ 开 0dB 的链语义，
+  // 见 audio_output_device renderCallback 注释——此处 DSP 级直通零成本）。
+  CHECK(dsp.fastBypassActive());
+  CHECK(dsp.enabled());
+  // 前缀外 band 的 biquad 从未被触碰（bandBypassed = 越前缀硬直通）。
+  CHECK(dsp.bandBypassed(20U));
+  CHECK(dsp.bandBypassed(17U));
+
+  // 运行中切回 Band31 + 原曲线：跨排空/再爬坡，无旧状态爆炸（每块重新填充内容——
+  // process 原地处理，重复处理同一缓冲会错误地级联复合增益）。
+  CHECK(dsp.applyTargets(wide));
+  double reentryPeak = 0.0;
+  for (int block = 0; block < 4; ++block) {  // 收敛期内逐块有界
+    std::vector<float> tone;
+    fillSineMono(tone, 48000.0, 1000.0, 0.25, 4096U);
+    dsp.process(tone.data(), 4096U);
+    for (const float v : tone) {
+      reentryPeak = std::max(reentryPeak, std::fabs(static_cast<double>(v)));
+    }
+  }
+  CHECK(reentryPeak <= 0.55);
+  // 再 3 块后完全收敛到 +6@1kHz（10-band 表在 1kHz 处已无增益 → 重爬升从 0 起）。
+  settleEq(dsp, 48000U, 1U);
+  CHECK(dsp.currentBandGainDb(17U) == doctest::Approx(6.0).epsilon(1e-9));
+  CHECK(dsp.currentBandGainDb(10U) == doctest::Approx(5.0).epsilon(1e-9));
+}
+
+TEST_CASE("eq dsp: applyTargets 运行中 preGain/NaN 防御——sanitize 同 configure、平滑域无污染") {
+  audio::EqualizerDspProcessor dsp;
+  static_cast<void>(dsp.configure(preGainConfig(0.0, true), 48000U, 1U));
+  settleEq(dsp, 48000U, 1U);
+
+  // preGain 目标 +9dB + 一个带 NaN 的 band（上游防御同 configure：NaN → 0）。
+  auto config = flatConfig(audio::EqualizerBandMode::Band31, true);
+  config.preGainDb = 9.0F;
+  config.bandGainsDb[5U] = std::numeric_limits<float>::quiet_NaN();
+  config.bandGainsDb[17U] = std::numeric_limits<float>::infinity();  // 非有限 → 0
+  CHECK(dsp.applyTargets(config));
+  CHECK(dsp.currentPreGainDb() == 0.0);  // 段从当前点起（收敛态 → 0 起点）
+  std::vector<float> block(512U, 0.0F);
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentPreGainDb() == doctest::Approx(3.0).epsilon(1e-9));  // 9/3 每块
+  dsp.process(block.data(), 512U);
+  dsp.process(block.data(), 512U);
+  CHECK(dsp.currentPreGainDb() == 9.0);
+  CHECK(dsp.fullySettled());
+  // 污染 band 被 sanitize 成 0dB 目标：收敛后无 NaN 渗入（band 直通、频响平直）。
+  CHECK(dsp.currentBandGainDb(5U) == 0.0);
+  CHECK(dsp.currentBandGainDb(17U) == 0.0);
+  CHECK_FALSE(dsp.fastBypassActive());  // preGain +9 稳态 = 需要处理
+  std::vector<float> tone;
+  fillSineMono(tone, 48000.0, 1000.0, 0.25, 2048U);
+  dsp.process(tone.data(), 2048U);
+  for (const float v : tone) {
+    CHECK(std::isfinite(v));
+  }
+}

@@ -363,3 +363,59 @@ TEST_CASE("eq limiter: >192k 封顶分支——384k lookahead=960 帧 = 实际 2
   CHECK(std::fabs(lim.currentGainDb() - targetDb) <= 1e-6);
   CHECK(std::fabs(static_cast<double>(dc[9000]) - thresholdLin()) <= 1e-3);
 }
+
+// ==================== applyTargets（播放中实时开关目标更新） ====================
+
+TEST_CASE("eq limiter: applyTargets 前置——未 configure 返回 false、configure 后目标态即时生效") {
+  audio::LimiterDspProcessor fresh;
+  CHECK_FALSE(fresh.applyTargets(limiterConfig(true)));  // 未 accepted：无操作
+  CHECK_FALSE(fresh.configured());
+  CHECK(fresh.bypassActive());
+  CHECK_FALSE(fresh.enabled());
+
+  static_cast<void>(fresh.configure(limiterConfig(false), 48000U, 1U));
+  CHECK(fresh.applyTargets(limiterConfig(true)));  // accepted：目标态更新
+  CHECK(fresh.enabled());
+  CHECK(fresh.bypassActive());  // 迁移未开始（process 未调用——状态机在 process 内执行）
+}
+
+TEST_CASE("eq limiter: applyTargets 关→开→关——WarmUp/Active/FadingOut/Bypass 状态机迁移") {
+  constexpr std::uint32_t fs = 48000U;
+  constexpr std::uint32_t delay = 240U;  // lround(48000×0.005)
+  audio::LimiterDspProcessor lim;
+  static_cast<void>(lim.configure(limiterConfig(false), fs, 1U));
+  REQUIRE(lim.bypassActive());
+
+  // 播放中开（applyTargets limiterEnabled true）→ process 入口 WarmUp（首 D 帧直通
+  // 填延迟线）→ 满 D 帧后 Active。与 configure 开机的既有状态机语义一致（无差异路径）。
+  CHECK(lim.applyTargets(limiterConfig(true)));
+  CHECK(lim.enabled());
+  std::vector<float> dc(static_cast<std::size_t>(delay) + 8U, 0.9F);
+  processFrames(lim, dc, static_cast<std::uint32_t>(delay) + 8U);  // 单次调用跨过 D 帧 → Active
+  CHECK(lim.activity() == audio::LimiterDspProcessor::Activity::Active);
+  // WarmUp 期输出 == 输入（首 D 帧直通逐位）。
+  std::vector<float> warm(static_cast<std::size_t>(delay), 0.9F);
+  auto warmCopy = warm;
+  processFrames(lim, warm, delay);
+  CHECK(warm == warmCopy);
+
+  // 播放中关（applyTargets false）→ process 入口 FadingOut（3ms = 144 帧 @48k）→ Bypass。
+  CHECK(lim.applyTargets(limiterConfig(false)));
+  CHECK_FALSE(lim.enabled());
+  CHECK(lim.activity() == audio::LimiterDspProcessor::Activity::Active);  // 迁移未执行
+  std::vector<float> fade(static_cast<std::size_t>(144U) + 16U, 0.9F);
+  processFrames(lim, fade, static_cast<std::uint32_t>(144U) + 16U);  // 淡化 + 余量单次调用
+  CHECK(lim.activity() == audio::LimiterDspProcessor::Activity::Bypass);
+  CHECK(lim.bypassActive());
+  CHECK(lim.fullySettled());
+
+  // 旁路态 process 零触碰（逐位直通）；再开一律重新 WarmUp（Bypass 中再启用）。
+  std::vector<float> pattern(512U, 0.5F);
+  const auto original = pattern;
+  processFrames(lim, pattern, 512U);
+  CHECK(pattern == original);
+  CHECK(lim.applyTargets(limiterConfig(true)));
+  std::vector<float> probe(4U, 0.5F);
+  processFrames(lim, probe, 4U);
+  CHECK(lim.activity() == audio::LimiterDspProcessor::Activity::WarmUp);
+}

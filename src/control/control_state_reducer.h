@@ -54,6 +54,8 @@ enum class ControlIntentKind : std::uint8_t {
   AbortTransition,
   // 均衡器参数配置意图（B1.4）：转发 EqualizerConfig 至音频服务，不触发重载。
   SetEqualizerConfig,
+  // 频谱开关配置意图（R2 频谱显示链路）：转发开关目标值至音频服务原子位。
+  SetSpectrumEnabled,
 };
 
 struct ControlIntent {
@@ -73,6 +75,8 @@ struct ControlIntent {
   std::optional<audio::PrepareNextMeta> prepareNextMeta;
   // SetEqualizerConfig 载荷（B1.4）：均衡器参数副本。追加末尾保持序列化兼容。
   std::optional<audio::EqualizerConfig> equalizerConfig;
+  // SetSpectrumEnabled 载荷（R2）：频谱开关目标值副本。追加末尾保持序列化兼容。
+  std::optional<bool> spectrumEnabled;
 };
 
 struct ControlReduction {
@@ -171,6 +175,8 @@ private:
   ControlReduction handleSetTransitionConfig(ControlReduction& reduction, const MediaControlCommand& command);
   // B1.4 SetEqualizerConfig：校验均衡器参数 → 单意图（不重载）→ 快照入状态。
   ControlReduction handleSetEqualizerConfig(ControlReduction& reduction, const MediaControlCommand& command);
+  // R2 SetSpectrumEnabled：校验载荷 → 单意图转发（纯门控，无 reducer 镜像）。
+  ControlReduction handleSetSpectrumEnabled(ControlReduction& reduction, const MediaControlCommand& command);
 
   // —— T8 预解码（EndApproaching → PrepareNext，Metis 缺口 1a 选曲侧）——
   struct NaturalEndPeek {

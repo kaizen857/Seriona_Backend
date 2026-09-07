@@ -1906,6 +1906,8 @@ add_test(NAME seriona.audio.eq_spectrum COMMAND seriona_audio_eq_spectrum_tests)
 add_test(NAME seriona.audio.eq_service_forward.stopped_applies COMMAND seriona_audio_eq_service_forward_tests --test-case=*stopped_window*)
 add_test(NAME seriona.audio.eq_service_forward.running_rebuild COMMAND seriona_audio_eq_service_forward_tests --test-case=*running*rebuild*)
 add_test(NAME seriona.audio.eq_service_forward.fresh_initialize COMMAND seriona_audio_eq_service_forward_tests --test-case=*fresh*initialize*)
+# R2 频谱外发（服务侧）：开关门控 + SpectrumUpdated 事件流（真实服务 + 真实 device）。
+add_test(NAME seriona.audio.eq_service_forward.spectrum_events COMMAND seriona_audio_eq_service_forward_tests --test-case=*spectrum_events*)
 add_test(NAME seriona.scanner_test_harness COMMAND seriona_scanner_test_harness_tests)
 add_test(NAME seriona.scanner_contract COMMAND seriona_scanner_contract_tests)
 add_test(NAME seriona.scanner.internal_types COMMAND seriona_scanner_internal_types_tests)

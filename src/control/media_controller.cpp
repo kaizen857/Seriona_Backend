@@ -648,9 +648,32 @@ private:
   }
 
   void handleAudioEvent(const audio::BackendEvent& event) {
+    // R2 频谱显示链路：SpectrumUpdated 不进入 reducer 状态面——reducer 无频谱镜像
+    // （服务原子位为开关最终态、事件载荷即完整快照），控制器 impl 层独立槽直写
+    // 后发布（同订阅初始投递面 spectrumSnapshot()）。其余事件照旧经 reducer。
+    if (event.type == audio::BackendEventType::SpectrumUpdated) {
+      handleSpectrumUpdated(event);
+      return;
+    }
     auto reduction = reducer_.reduceAudioEvent(event);
     commitReduction(reduction);
     executeIntents(reduction.intents);
+  }
+
+  // 频谱快照事件落槽 + 订阅推送（事件循环线程；mutex_ 仅护成员写，publish 在锁外，
+  // 同 commitReduction 的锁纪律）。载荷非法（type/payload 失配）时静默丢弃。
+  void handleSpectrumUpdated(const audio::BackendEvent& event) {
+    const auto* payload = std::get_if<audio::SpectrumUpdated>(&event.payload);
+    if (payload == nullptr) {
+      return;
+    }
+    audio::SpectrumSnapshot snapshot;
+    {
+      std::lock_guard lock{mutex_};
+      spectrumSnapshot_ = payload->snapshot;
+      snapshot = spectrumSnapshot_;
+    }
+    spectrumSubscriptions_.publish(snapshot);
   }
 
   void handleScannerEvent(const scanner::ScannerEvent& event) {
@@ -765,6 +788,12 @@ private:
       case ControlIntentKind::SetEqualizerConfig:
         if (intent.equalizerConfig.has_value()) {
           dependencies_.audio->setEqualizer(*intent.equalizerConfig);
+        }
+        break;
+      // R2 频谱显示链路：开关命令落地服务原子位（Noop/Fake 走接口默认空实现）。
+      case ControlIntentKind::SetSpectrumEnabled:
+        if (intent.spectrumEnabled.has_value()) {
+          dependencies_.audio->setSpectrumEnabled(*intent.spectrumEnabled);
         }
         break;
       }

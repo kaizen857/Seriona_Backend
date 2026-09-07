@@ -291,6 +291,39 @@ void publishEqAppliedLayer(AudioOutputDeviceEqLayer& layer,
   layer.version.store(version, std::memory_order_release);
 }
 
+// 生效快照「config 系字段」发布（运行期回调受理专用，不写 sampleRate/channelCount）：
+// 受理发生在设备运行中——输出格式不变，采样率/声道数字段保持停态真实应用的回填值恒
+// 正确（格式变化必须经停态 initialize 重建，回调受理永不触碰格式）。回调红线：
+// 零分配/零锁/零日志；逐字段 relaxed + version release 最后写同 publishEqAppliedLayer。
+void publishEqAppliedConfigLayer(AudioOutputDeviceEqLayer& layer,
+                                 const EqualizerConfig& config,
+                                 std::uint32_t version) noexcept {
+  layer.enabled.store(config.enabled, std::memory_order_relaxed);
+  layer.mode.store(config.mode, std::memory_order_relaxed);
+  layer.preGainDb.store(config.preGainDb, std::memory_order_relaxed);
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    layer.bandGainsDb[band].store(config.bandGainsDb[band], std::memory_order_relaxed);
+  }
+  layer.limiterEnabled.store(config.limiterEnabled, std::memory_order_relaxed);
+  layer.version.store(version, std::memory_order_release);
+}
+
+// EQ 运行期目标 PENDING 发布（worker；setEqualizerConfig 无条件调用——含停态与未
+// initialize）：目标配置逐字段 relaxed 写，version release 最后写（回调读到 version
+// 变化时字段必然已就位；发布序同 publishEnvelopeLayer/publishEqAppliedLayer）。
+void publishEqTargetLayer(AudioOutputDeviceEqTargetLayer& layer,
+                          const EqualizerConfig& config) noexcept {
+  layer.enabled.store(config.enabled, std::memory_order_relaxed);
+  layer.mode.store(config.mode, std::memory_order_relaxed);
+  layer.preGainDb.store(config.preGainDb, std::memory_order_relaxed);
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    layer.bandGainsDb[band].store(config.bandGainsDb[band], std::memory_order_relaxed);
+  }
+  layer.limiterEnabled.store(config.limiterEnabled, std::memory_order_relaxed);
+  const auto nextVersion = layer.version.load(std::memory_order_relaxed) + 1U;
+  layer.version.store(nextVersion, std::memory_order_release);
+}
+
 // 单层全字段复位（resetEnvelopes 与 resetSourceEnvelope 共用）：清 PENDING 与 EXEC
 // （含 currentGain→1.0、latchedVersion→0、exec* 锁存）——设备已停时无竞争；设备运行中
 // 的槽级复位与回调并发窗口见 resetSourceEnvelope 头注释（块首快照已锁存，下块自愈）。
@@ -969,32 +1002,40 @@ void AudioOutputDevice::setMuted(bool muted) noexcept {
 }
 
 void AudioOutputDevice::setEqualizerConfig(const EqualizerConfig& config) noexcept {
-  // EQ 配置存储 + 应用入口（任务 25 B2.4a；头注释为线程契约）。存储恒执行；
-  // DSP configure（允许分配/重建）只在停态窗口执行——started_ 即视为可能活跃
-  // 回调，防御性退回「仅存储」：运行期参数变更由任务 26 快照链接管，本方法在
-  // 停态窗口的语义 = 立即生效（含下次 initialize() 的幂等重放）。
+  // EQ 配置存储 + 实时投递入口（任务 25 B2.4a；头注释为线程契约）。语义：
+  //  - eqConfig_ 存储恒执行（停态应用/幂等重放读它，兼容/回读面）；
+  //  - PENDING 目标层无条件发布（publishEqTargetLayer，version 递增）——运行中
+  //    （started_，回调可能活跃）由 renderCallback 块首受理投递到 DSP（applyTargets
+  //    零分配，播放中调节实时生效——用户实测缺陷修复点；不再 started_ 门控仅存储）；
+  //  - 停态窗口（未 started_：无活跃回调）仍即时真实应用 applyEqualizerDspConfig
+  //    （configure 允许分配；暂停中调整 = 立即生效 + 生效快照发布，同现状零回归）。
   eqConfig_ = config;
+  publishEqTargetLayer(eqTargetLayer_, config);
   if (!started_) {
     applyEqualizerDspConfig();
   }
 }
 
 void AudioOutputDevice::applyEqualizerDspConfig() noexcept {
-  // 停态应用：按当前设备格式 configure 两 DSP 单元并发布链进入条件。格式未定
+  // 停态应用：按当前设备格式 configure 两 DSP 单元并发布生效快照。格式未定
   // （未 initialize，sampleRate==0）时仅存储语义成立（initialize() 在格式确定后
-  // 调用本方法补应用——幂等）。发布序：先 configure 后置 eqChainActive_（release）
-  // ——回调读到激活标志时 DSP 必然已按同配置 + 设备格式就绪（同 publishCallbackQueue
-  // 的「内容先就绪、激活标志殿后」纪律）；随后发布 EQ 生效快照（任务 26：version 在
-  // 原子镜像层 release 最后写，读侧一致取用——含实际输出率 sampleRate 回填点）。
+  // 调用本方法补应用——幂等）。发布序：先 configure 后发布 EQ 生效快照（任务 26：
+  // version 在原子镜像层 release 最后写，读侧一致取用——含实际输出率 sampleRate
+  // 回填点）。DSP 链进入条件不再由本方法发布独立标志——renderCallback 按 DSP
+  // 目标/平滑状态实时判定（见 renderCallback 区注释）；本方法同步把目标受理账本
+  // 消费到当前 PENDING version：停态真实应用已把目标 configure 进 DSP，回调无需
+  // 再受理重放（受理对同目标本无操作，消费仅为避免生效快照重复发布——测试装置
+  // 停态直渲与重启首块均不发重复发布）。
   const auto rate = currentFormat_.sampleRate;
   if (rate == 0U || currentFormat_.channelCount == 0U) {
     return;
   }
   static_cast<void>(eqDsp_->configure(eqConfig_, rate, currentFormat_.channelCount));
   static_cast<void>(limiter_->configure(eqConfig_, rate, currentFormat_.channelCount));
-  eqChainActive_.store(eqConfig_.enabled, std::memory_order_release);
   const auto nextVersion = eqAppliedLayer_.version.load(std::memory_order_relaxed) + 1U;
   publishEqAppliedLayer(eqAppliedLayer_, eqConfig_, currentFormat_, nextVersion);
+  latchedEqTargetVersion_.store(eqTargetLayer_.version.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
 }
 
 void AudioOutputDevice::clearDspState() noexcept {
@@ -1011,8 +1052,9 @@ void AudioOutputDevice::clearDspState() noexcept {
 AudioOutputDeviceEqSnapshot AudioOutputDevice::eqAppliedSnapshot() const noexcept {
   // 一致读（跨线程安全）：version acquire 取代 → 逐字段 relaxed 读 → version 复核。
   // 发布可发生于读取期间：原子镜像字段无撕裂；版本变更仅表示读到相邻两代混合，
-  // 重读一次自愈（发布 = 停态窗口低频单写者，实际重读几乎不发生——同 planEnvelopeLayer
-  // 「读侧受理/自愈」语义；不循环等待，避免读侧饥饿）。
+  // 重读一次自愈（发布 = 停态应用（worker）与回调受理（运行期）双写侧低频发布，
+  // 两写者不并发；实际重读几乎不发生——同 planEnvelopeLayer「读侧受理/自愈」
+  // 语义；不循环等待，避免读侧饥饿）。
   AudioOutputDeviceEqSnapshot snapshot;
   std::uint32_t version = eqAppliedLayer_.version.load(std::memory_order_acquire);
   for (std::uint32_t attempt = 0; attempt < 3U; ++attempt) {
@@ -1151,13 +1193,56 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
   }
   const bool dualMix = secondQueue != nullptr &&
                        static_cast<std::size_t>(frameCount) * bytesPerFrame <= device->mixScratch_.size();
-  // ---- EQ 激活处理链（任务 25 B2.4a）----
-  // 进入条件 = eqChainActive_（worker 经 setEqualizerConfig()/initialize() 于无活跃
-  // 回调窗口发布；= 最近一次应用配置的 enabled 镜像，先 configure 后置位——回调读到
-  // true 时 eqDsp_/limiter_ 必然已按同配置 + 当前设备格式就绪）。EQ 未激活时本块
-  // 不进入：下方既有三分支原样执行，逐位不变（既有测试锁定；本分支为纯新增）。
+  // ---- EQ 运行期目标受理（播放中实时调节的投递点；每块一次，零分配/零锁/零日志）----
+  // worker 在 setEqualizerConfig（无条件发布 PENDING，见发布面注释）写目标层；本块首
+  // 把未受理的新目标经 applyTargets 投递到 DSP（eq_dsp/limiter 的实时目标更新——
+  // 平滑/开关过渡在各自 process 内执行，无咔哒）。受理前置：
+  //  - 设备处于活跃回调态（state.active）：停态直渲（stop 后测试/异常直渲）不投递
+  //    ——停态窗口的真实应用走 worker 侧 applyEqualizerDspConfig，不经本路径；且
+  //    停态应用已把账本消费到当前 version（见 applyEqualizerDspConfig），此处不重放；
+  //  - DSP 已 configure（accepted_）：initialize() 停态窗口无条件预配置（含出厂默认
+  //    配置）→ 活跃态恒成立；applyTargets 返回 false（防御分支，不可达）→ 跳过
+  //    受理与生效发布（音频走既有原路径逐位不变，下块重试自愈）。
+  // 受理后发布生效快照（config 系字段 + version 递增——服务读回曲线 = 用户目标，
+  // 受理即发布；sampleRate/channelCount 不回写：运行中格式不变，停态回填值恒正确）。
+  // 已受理账本 latchedEqTargetVersion_：回调线程写 + 停态应用消费（worker）——两写者
+  // 不并发（停态应用时无活跃回调；受理仅活跃回调态），原子化仅为跨线程读写模型卫生。
+  const std::uint32_t eqTargetVersion = device->eqTargetLayer_.version.load(std::memory_order_acquire);
+  if (state.active.load(std::memory_order_acquire) &&
+      eqTargetVersion != device->latchedEqTargetVersion_.load(std::memory_order_relaxed)) {
+    // 从 PENDING 原子层逐字段 relaxed 读组包（version 已 acquire 确认就位）。
+    EqualizerConfig pending;
+    pending.enabled = device->eqTargetLayer_.enabled.load(std::memory_order_relaxed);
+    pending.mode = device->eqTargetLayer_.mode.load(std::memory_order_relaxed);
+    pending.preGainDb = device->eqTargetLayer_.preGainDb.load(std::memory_order_relaxed);
+    for (std::size_t band = 0; band < pending.bandGainsDb.size(); ++band) {
+      pending.bandGainsDb[band] =
+          device->eqTargetLayer_.bandGainsDb[band].load(std::memory_order_relaxed);
+    }
+    pending.limiterEnabled = device->eqTargetLayer_.limiterEnabled.load(std::memory_order_relaxed);
+    if (device->eqDsp_->applyTargets(pending)) {
+      static_cast<void>(device->limiter_->applyTargets(pending));
+      device->latchedEqTargetVersion_.store(eqTargetVersion, std::memory_order_relaxed);
+      const auto nextVersion = device->eqAppliedLayer_.version.load(std::memory_order_relaxed) + 1U;
+      publishEqAppliedConfigLayer(device->eqAppliedLayer_, pending, nextVersion);
+    }
+  }
+  // ---- EQ 激活处理链（任务 25 B2.4a + 播放中实时调节）----
+  // 进入条件 = DSP 链「需要处理本块」（无独立发布标志——运行期受理与停态真实应用
+  // 统一收敛到 DSP 目标/平滑状态，本块首受理后同线程直读 DSP 可观测态）：
+  //   · eqDsp_ enabled 目标 = true（EQ 开——含全 0dB 曲线的真实 f32 链语义，
+  //     既有 render 测试锁定「EQ 开 0dB ≠ 逐位直通」）；或
+  //   · eqDsp_ 平滑/收敛态需要处理（!fastBypassActive：非零曲线稳态、开→爬坡、
+  //     enabled=false 的平滑退出期——收敛后自动回落原路径）；或
+  //   · limiter_ 需要处理（enabled 目标 = true = 待 WarmUp，或非 Bypass =
+  //     WarmUp/Active/FadingOut 进行中）。
+  // 出厂全零稳态（从未开 EQ/已关且收敛、限幅关）三条件恒 false → 本块不进入：
+  // 下方既有三分支原样执行，逐位不变（既有测试锁定；本分支为纯新增）。
   // int 设备额外要求 f32Scratch_ 容量守卫（同 dualMix 守卫语义：装不下退回既有
   // 路径，生产不可达——EQ 处理帧数 ≤ 后端 period ≤ 主队列容量）。
+  // 读取 = 回调线程对 DSP 成员的同线程读：运行中 DSP 成员仅本线程写（applyTargets/
+  // process）；worker configure/重建只在停态窗口（设备已停，无活跃回调——同下方
+  // EQ 分支内 process 读取 DSP 成员的既有信任边界）。
   //
   // 链序（f32 域，见 534-548 区注释；EQ 级联 = eqDsp_ 单实例 = 任务 22 单元：
   // 块级平滑推进 + preGain（在单元内）+ 逐 band ma_peak2，非 band×ch 实例）：
@@ -1180,9 +1265,11 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
   // 欠载块也按实际喂入帧数照常推进（步进随帧长比例缩小）= 设计意图——平滑沿
   // 真实出声时间走，不因欠载冻结；唯 copiedFrames==0 的纯静音块无帧可喂，与
   // muted 跳过块同列原位保持（同包络 finalize 的 0 帧冻结纪律，恢复后续跑）。
-  const bool eqChainEnter = device->eqChainActive_.load(std::memory_order_acquire) &&
-                            (sampleFormat == AudioSampleFormat::Float32 ||
-                             device->f32ScratchFits(frameCount, channelCount));
+  // 进入判定（本块首受理已执行——若存在新目标，DSP 目标/平滑态已按新目标更新）。
+  const bool eqChainEnter =
+      (device->eqDsp_->enabled() || !device->eqDsp_->fastBypassActive() ||
+       device->limiter_->enabled() || !device->limiter_->bypassActive()) &&
+      (sampleFormat == AudioSampleFormat::Float32 || device->f32ScratchFits(frameCount, channelCount));
   if (eqChainEnter) {
     const bool chainDual = dualMix;
     // B3.1 摘录（链激活态）：EQ process 后发布有效帧；未处理块（muted/纯静音）

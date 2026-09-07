@@ -62,7 +62,10 @@
 //
 // 线程契约：configure 允许分配（首次/fs/声道数变化时重建全部数组；平滑系数
 // 按新 fs 重算），只允许在与 process 不并发的时刻调用（任务 25 在音频 worker
-// 侧、设备未活动期调用，同 eq_dsp 先例）；开关过渡**在 process 内**完成（配置
+// 侧、设备未活动期调用，同 eq_dsp 先例）；applyTargets = configure 的「仅开关
+// 变化无重建」分支语义（更新 limiterEnabled 目标态 + config_ 快照；零分配）——
+// 与 process 同线程串行即可（回调受理路径：accepted 后、同线程 process 前调用
+// 合法；停态窗口调用亦无碍）；开关过渡**在 process 内**完成（配置
 // 变化只置目标/触发状态迁移，淡化与预热逐样本执行）。process 实时安全：
 // 不分配、不加锁、不日志、不抛异常（noexcept）。fs/声道数变化 = 全状态重建
 // （延迟线/检测/增益清零——设备重建语境下任务 26 语义同 eq_dsp 的滤波历史
@@ -110,6 +113,14 @@ public:
   [[nodiscard]] ConfigReport configure(const EqualizerConfig& config,
                                        std::uint32_t sampleRate,
                                        std::uint32_t channelCount);
+
+  // 实时目标更新（播放中限幅开关调节的 DSP 侧投递点；回调受理路径调用）。
+  // configure 的「仅开关变化无重建」分支语义：只更新 limiterEnabled 目标态
+  // （enabled_）+ config_ 快照；迁移由 process 内逐样本状态机执行（WarmUp/
+  // FadingOut——零分配同 configure 无 rebuild 路径）。零分配、零锁、零日志。
+  // 前提：已 configure（accepted_）——未 accepted 返回 false 无操作（调用方
+  // 保证设备 initialize 后必然 configure 过）。
+  [[nodiscard]] bool applyTargets(const EqualizerConfig& config) noexcept;
 
   // 处理一个 interleaved f32 块（原地，in-place）。frameCount==0、未配置/不可用
   // 态、或旁路收敛态（关闭且过渡完成）为无害空操作（快速路径不触碰样本）。

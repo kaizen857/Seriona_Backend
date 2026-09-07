@@ -107,16 +107,21 @@ struct AudioOutputDeviceEqSnapshot {
   std::uint32_t version = 0;       // 单调发布代数（每次真实应用 +1；0 = 从未应用）
 };
 
-// EQ 生效快照原子镜像层（任务 26 B2.4b；结构仿 GainEnvelopeLayerState / publishEnvelopeLayer
-// 发布序）：字段按角色分两套——
-//  - 写侧（worker，停态窗口 apply/clearDspState）：enabled/mode/preGainDb/bandGainsDb/
-//    limiterEnabled/sampleRate/channelCount 逐字段 relaxed 写，version release 最后写
-//    （发布序同 publishEnvelopeLayer：回调/读侧读到 version 变化时字段必然已就位）；
+// EQ 生效快照原子镜像层（任务 26 B2.4b + 本任务实时受理；结构仿 GainEnvelopeLayerState
+// / publishEnvelopeLayer 发布序）：字段按角色分两套——
+//  - 写侧两处（低频互斥，不并发）：
+//     · worker 停态窗口（applyEqualizerDspConfig/clearDspState 真实应用后）；
+//     · renderCallback 块首受理（本任务：运行期目标经 applyTargets 投递 DSP 后发布
+//       config 系字段；sampleRate/channelCount 不回写——运行中格式不变，停态应用
+//       已回填，恒正确）。
+//   均逐字段 relaxed 写、version release 最后写（发布序同 publishEnvelopeLayer：
+//   回调/读侧读到 version 变化时字段必然已就位）；
 //  - 读侧（eqAppliedSnapshot()，可为 worker 或控制线程）：version acquire 读后取一致
 //    字段视图，再复核 version——发布可发生于读取期间，字段为原子镜像无撕裂；版本变更
-//    仅表示读到相邻两代混合，低频读 + 停态写下重读一次自愈（同 planEnvelopeLayer 语义）。
-// 与包络层差异：EQ 应用只发生在停态窗口（无活跃回调），镜像层不是为了回调并发，而是
-// 为 worker 与未来控制线程（service.equalizerState 回读）提供无锁一致读。
+//    仅表示读到相邻两代混合，低频读 + 低频写下重读一次自愈（同 planEnvelopeLayer 语义）。
+// 与包络层差异：EQ 停态应用只发生在停态窗口（无活跃回调），运行期受理发生在回调线程
+// （此时 worker 不应用）——镜像层同时服务 worker 与未来控制线程
+// （service.equalizerState 回读）的无锁一致读，并容忍双写侧低频交错。
 struct AudioOutputDeviceEqLayer {
   std::atomic<std::uint32_t> version{0};
   std::atomic<bool> enabled{false};
@@ -126,6 +131,26 @@ struct AudioOutputDeviceEqLayer {
   std::atomic<bool> limiterEnabled{false};
   std::atomic<std::uint32_t> sampleRate{0};
   std::atomic<std::uint16_t> channelCount{0};
+};
+
+// EQ 运行期目标 PENDING 层（播放中实时调节的 worker→回调 发布面；仿
+// GainEnvelopeLayerState 的 PENDING 角色）。字段 = setEqualizerConfig 收到的目标
+// 配置快照（enabled/mode/preGainDb/31 段 bandGainsDb/limiterEnabled）：
+//  - 写侧 = worker（setEqualizerConfig 无条件发布，含停态与未 initialize）；
+//    逐字段 relaxed 写、version release 最后写（回调读到 version 变化时字段必然
+//    已就位；回调以 version 与受理账本 latchedEqTargetVersion_ 比较判定新目标）；
+//  - 读侧 = renderCallback 块首受理（device 活跃回调态）：逐字段 relaxed 读组包
+//    EqualizerConfig → eqDsp_/limiter_ applyTargets（零分配投递）→ 发布生效快照。
+// version 每次发布 +1（0 = 从未发布）。停态真实应用（applyEqualizerDspConfig）
+// 不依赖本层，但会在应用后把账本消费到当前 version（防停态应用 + 停态直渲/重启
+// 首块重复受理重放——受理对同目标无操作，仅避免生效快照重复发布）。
+struct AudioOutputDeviceEqTargetLayer {
+  std::atomic<std::uint32_t> version{0};
+  std::atomic<bool> enabled{false};
+  std::atomic<EqualizerBandMode> mode{EqualizerBandMode::Band10};
+  std::atomic<float> preGainDb{0.0F};
+  std::array<std::atomic<float>, 31> bandGainsDb{};
+  std::atomic<bool> limiterEnabled{false};
 };
 
 // 频谱摘录帧电平语义标注（任务 29 B3.1）——两态电平语义不同、显示须按相对电平注明：
@@ -234,15 +259,19 @@ public:
   // 当前激活的源包络槽数（任务 9：槽 1 随第二源激活参与执行）。
   static constexpr std::size_t kActiveSourceEnvelopeSlots = 2;
 
-  // ---- EQ 处理链发布面（任务 25 B2.4a + 任务 26 B2.4b）----
+  // ---- EQ 处理链发布面（任务 25 B2.4a + 任务 26 B2.4b + 播放中实时调节）----
   // 均衡器配置存储 + 应用入口（worker 线程调用）。语义：
-  //   · 已 initialize（设备格式确定）：按 currentFormat_（sampleRate/channelCount）
-  //     配置 DSP 单元（eqDsp_/limiter_，configure 允许分配——不得与活跃回调并发）；
-  //   · 未 initialize：仅存储 eqConfig_，待 initialize() 按生效格式应用（幂等）。
-  // 调用点必须是设备未启动/已停止窗口（eq_dsp.h/limiter.h 线程契约：configure 只在
-  // 与 process 不并发的时刻调用）。运行期（started_）调用按契约不得发生——防御性
-  // 仅存储（下个 initialize/内容边界生效）；生效路径与运行期参数变更由任务 26 快照链
-  // 接管的设备侧承载（applyEqualizerDspConfig 于每次真实应用后发布 eqAppliedSnapshot）。
+  //   · eqConfig_ 存储恒执行（停态应用/幂等重放读它）+ PENDING 目标层无条件发布
+  //     （eqTargetLayer_，见结构注释）——**运行中（started_）仅发布 PENDING，
+  //     由 renderCallback 块首受理**（本任务：受理把目标经 eqDsp_/limiter_ 的
+  //     applyTargets 零分配投递到 DSP 平滑，播放中调节实时生效）；
+  //   · 停态窗口（未 started_，无活跃回调）：仍即时真实应用
+  //     applyEqualizerDspConfig（configure 允许分配——不得与活跃回调并发），
+  //     暂停中调整 = 立即生效 + 生效快照发布（既有语义零回归）；
+  //   · 未 initialize（设备格式未定）：仅存储 + PENDING 照发，待 initialize() 按
+  //     生效格式应用（幂等）。
+  // 运行期参数变更不再「仅存储等下次内容边界」——用户实测缺陷（播放中调 EQ 无
+  // 声音变化）的根因（started_ 门控仅存储）由 PENDING + 回调受理链修复。
   void setEqualizerConfig(const EqualizerConfig& config) noexcept;
   // 内容边界清理（任务 26 B2.4b）：重建 EQ/限幅 DSP 单元实例（滤波历史/limiter 延迟线/
   // 检测/平滑全清零）并按当前设备格式重新应用存储配置（幂等）。eq_dsp/limiter 无公开
@@ -303,19 +332,34 @@ private:
   // 保留（pause/resume 冻结续接纪律）；内容边界经 clearDspState() 显式清零。
   std::unique_ptr<EqualizerDspProcessor> eqDsp_;
   std::unique_ptr<LimiterDspProcessor> limiter_;
-  // renderCallback EQ 链进入条件（= eqConfig_.enabled 镜像；release 发布）。先
-  // configure 后置位：回调读到 true 时 DSP 必然已按同配置 + 当前设备格式就绪。
-  std::atomic<bool> eqChainActive_{false};
-  // worker 侧存储的均衡器配置（默认出厂直通）；无回调窗口写，render 不读（只读
-  // eqChainActive_）。setEqualizerConfig 在 started_ 时仅存储——下个 initialize/
-  // 内容边界（clearDspState 重配置）生效。
+  // renderCallback EQ 链进入条件 = DSP 链「需要处理本块」态（无独立发布标志——
+  // 运行期目标受理与停态真实应用统一收敛到 DSP 目标/平滑状态，见 .cpp renderCallback
+  // 区注释）：eqDsp_ enabled 目标为 true（EQ 开，含全 0dB 曲线的真实 f32 链语义）
+  // 或 !fastBypassActive（平滑中/收敛于非零——含 enabled=false 的平滑退出期）或
+  // limiter_ enabled 目标为 true / 非旁路（限幅开关/淡化/压限进行中）。出厂全零
+  // 稳态（从未开 EQ）三条件恒 false → 回调走既有原路径逐位不变（既有测试锁定）。
+  // 读取 = 回调线程对 DSP 成员的同线程读（运行中 DSP 成员仅回调线程写：
+  // applyTargets/process；worker configure 只在停态窗口——设备已停无活跃回调）。
+  // worker 侧存储的均衡器配置（默认出厂直通）；无回调窗口写，render 不读（只经
+  // PENDING 目标层受理）。setEqualizerConfig 恒存储本值——下个 initialize/
+  // 内容边界（clearDspState 重配置）与停态即时应用读它。
   EqualizerConfig eqConfig_{};
-  // EQ 生效快照原子镜像层（任务 26 B2.4b）：实际应用后发布（applyEqualizerDspConfig
-  // 每次 configure 两单元成功 + eqChainActive_ 置位后调用 publishEqAppliedLayer）；
-  // 停态窗口写（无活跃回调），eqAppliedSnapshot() 跨线程一致读（结构注释为契约）。
+  // EQ 运行期目标 PENDING 层（本任务）：setEqualizerConfig 无条件发布
+  // （publishEqTargetLayer，发布序见结构注释）；renderCallback 块首受理
+  // （活跃回调态 + version ≠ 账本 → applyTargets 投递 + 发布生效快照）。
+  AudioOutputDeviceEqTargetLayer eqTargetLayer_{};
+  // 目标受理账本（已受理/已停态消费的 PENDING version；0 = 从未受理）。写者 =
+  // renderCallback 受理（回调线程）+ applyEqualizerDspConfig 停态应用后消费
+  // （worker）——两写者不并发（停态应用时无活跃回调；受理仅活跃回调态发生），
+  // 原子化仅为跨线程读写的模型卫生。回调侧每块一次 relaxed 读，无额外成本。
+  std::atomic<std::uint32_t> latchedEqTargetVersion_{0};
+  // EQ 生效快照原子镜像层（任务 26 B2.4b + 实时受理）：停态真实应用
+  // （applyEqualizerDspConfig，每次 configure 两单元成功后 publishEqAppliedLayer）
+  // 与回调受理（运行期，见 renderCallback 受理注释）双写侧；eqAppliedSnapshot()
+  // 跨线程一致读（结构注释为契约）。
   AudioOutputDeviceEqLayer eqAppliedLayer_{};
-  // 停态应用辅助：按 currentFormat_ configure 两单元并发布 eqChainActive_ 与生效快照
-  // （格式未定 = 仅存储语义，initialize() 在格式确定后调用本方法幂等应用）。
+  // 停态应用辅助：按 currentFormat_ configure 两单元 + 发布生效快照 + 消费目标受理
+  // 账本（格式未定 = 仅存储语义，initialize() 在格式确定后调用本方法幂等应用）。
   void applyEqualizerDspConfig() noexcept;
   // ---- 频谱摘录状态（任务 29 B3.1；写 = renderCallback，读 = latestCaptureFrame）----
   // 双缓冲 + 纪元：写侧（设备线程）每回调至多一帧——把最新可听信号均值下混为

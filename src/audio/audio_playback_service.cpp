@@ -349,8 +349,9 @@ public:
   // 存储 = worker 成员 equalizerTarget_（同 transitionConfig_ 存储先例；重建/交接
   // 不清它——device 侧 eqConfig_ 幂等重放已保证重建不丢，本成员供 worker 侧取用
   // 与未来 B2.6 加载后重发布通道回读）。生效语义全部委托设备：
-  // setEqualizerConfig = 配置存储恒执行 + 已 initialize 未启动窗口即时真实应用 +
-  // 运行中到达仅存储（下个 initialize/内容边界 applyEqualizerDspConfig 幂等重放）。
+  // setEqualizerConfig = 配置存储恒执行 + PENDING 目标层无条件发布（运行中由设备
+  // 回调块首受理投递 DSP——播放中调节实时生效）+ 已 initialize 未启动窗口即时真实
+  // 应用 + initialize/内容边界幂等重放。
   void setEqualizer(const EqualizerConfig& config) override {
     enqueueCommand([this, config] {
       equalizerTarget_ = config;
@@ -364,8 +365,9 @@ public:
   // 不走 queryPlaybackClock 的 promise 屏障（此处无状态迁移，镜像层即真值）。
   // 组装语义（契约头注释：生效配置 + 单调代数 + 输出采样率）：
   //  - generation = 设备单调代数（eqAppliedLayer.version：每次真实应用 +1，含
-  //    initialize/内容边界幂等重放；0 = 从未生效 = 契约空快照——本地仅存储的
-  //    未生效目标不回填，同设备「读侧不被告知未生效的新目标」纪律）；
+  //    initialize/内容边界幂等重放与运行期回调受理；0 = 从未生效 = 契约空快照——
+  //    本地仅存储、尚未受理/应用的目标不回填，同设备「读侧不被告知未生效的新
+  //    目标」纪律）；
   //  - config/sampleRate = 设备生效面真值（实际生效配置 + 实际输出率）；
   //  - 181 点增益曲线：设备生效面不产曲线（只有参数/率/代数），曲线由控制层
   //    reducer 先行解析并经订阅发布——本读回侧重配置/代数/采样率真值，曲线字段
@@ -1740,8 +1742,9 @@ private:
       return;
     }
     // 驻留快照：generation = 契约语义的独立单调计数（每次频谱更新 +1，0 = 空）；
-    // 设备 generation 仅驱动组件跨代失效，两代数域隔离。推送接线由后续任务经
-    // 契约虚表完成（spectrumSnapshot_ 现无写者/读者之外的角色）。
+    // 设备 generation 仅驱动组件跨代失效，两代数域隔离。R2 频谱外发：驻留快照
+    // 更新后即派发 SpectrumUpdated（同 dispatchPosition 通道/版本计数；事件按
+    // 分析产出节流——analysis 有值才发，天然 ≤20Hz，无需额外时间闸）。
     ++spectrumSnapshotGeneration_;
     spectrumSnapshot_.generation = spectrumSnapshotGeneration_;
     spectrumSnapshot_.sampleRate = analysis->sampleRate;
@@ -1750,6 +1753,7 @@ private:
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
+    dispatcher_.dispatch(BackendEventType::SpectrumUpdated, SpectrumUpdated{spectrumSnapshot_});
   }
 
   void startProgressWorker() {

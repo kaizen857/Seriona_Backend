@@ -28,9 +28,14 @@
 //      帧无阶跃）、EQ 曲线在交接两侧保持（停态快照不变 + 提升后实测 +6dB±0.15）。
 //
 // 判据纪律（来自冻结实现，勿改实现只约束行为）：
-//   - EQ 链进入条件 = eqChainActive_（= 最近一次真实应用的 config.enabled 镜像）；
-//     setEqualizerConfig 只允许停态窗口真实应用（started_ 时仅存储，快照不发布）；
-//     initialize() 经 clearDspState 重建实例 + 幂等重放存储配置（快照 version++）。
+//   - EQ 链进入条件 = DSP 链需要处理本块（无独立发布标志）：eqDsp_ enabled 目标
+//     = true（EQ 开，含全 0dB 曲线的真实 f32 链语义）或 !fastBypassActive（平滑/
+//     非零收敛/关闭平滑退出期）或 limiter 需要处理（enabled 目标 = true 或非
+//     Bypass）；出厂全零稳态不进链（原路径逐位不变）。setEqualizerConfig：
+//     停态窗口真实应用（立即生效 + 生效快照发布 + 目标账本消费）；运行中 = 存储 +
+//     PENDING 目标层发布，回调块首受理（活跃回调态）投递 DSP（applyTargets）并
+//     发布生效快照——播放中调节实时生效；initialize() 经 clearDspState 重建实例 +
+//     幂等重放存储配置（快照 version++）。
 //   - 格式换算读侧 s16/s24 精确（≤24 位有效位 /2 幂）、s32 有 f32 舍入；写侧
 //     double llround+clamp 末端单次量化（s16/s24 逐位、s32 ≤1LSB/≤64LSB 只在此
 //     断言——EQ 开 0dB + 限幅关走 fastBypass，链本身不触碰样本；等功率淡入淡出
@@ -561,31 +566,149 @@ TEST_CASE("eq render: EQ 配置经设备公共面下达后 render 频响成形�
   }
 }
 
-TEST_CASE("eq render: started 窗口内 setEqualizerConfig 仅存储、停态窗口再应用生效") {
+TEST_CASE("eq render: started 窗口内 setEqualizerConfig 实时受理——下块回调即生效、停态再应用幂等") {
   EqRenderRig rig(AudioSampleFormat::Float32, 48000);
   const auto versionAtInit = rig.device.eqAppliedSnapshot().version; // initialize 已重放出厂配置
   REQUIRE(rig.device.start()); // 模拟运行中（回调可能活跃）
 
-  // 运行期下达 EQ：防御性仅存储——快照保持上次真实生效（出厂直通），render 逐位直通。
+  // 运行期下达 EQ：存储 + PENDING 目标层发布——受理前生效快照保持上次真实生效
+  // （出厂直通，version 冻结）；首个 render 块首受理投递 DSP 后版本前进并真实生效。
   const auto config = oneBandConfig(kSettleDb, true);
   rig.device.setEqualizerConfig(config);
   auto snap = rig.device.eqAppliedSnapshot();
-  CHECK(snap.version == versionAtInit);     // 从未真实应用
-  CHECK(snap.config.enabled == false);      // 快照 = 上次真实生效（出厂）
-  const auto passthrough = rig.renderSine(1000.0, kMeasureAmplitude);
-  CHECK(std::fabs(passthrough[0][100]) <= kMeasureAmplitude * 1.001);
+  CHECK(snap.version == versionAtInit);   // 未受理：快照仍 = 上次真实生效（出厂）
+  CHECK(snap.config.enabled == false);
 
-  // 停态窗口（stop）再应用：同一配置立即生效 → 快照发布（version 前进一代）。
+  // 首块 render（受理点）：块首 applyTargets → 平滑起点 0dB——第 1 帧尚未爬坡
+  // （advanceSmoothing 在本块内推进；首块首帧 ≈ 0dB，尾帧 ≈ +2dB）。对比出厂直通
+  // 断言：本块内增益已开始爬坡（0→+2dB），末 128 帧幅值 ≈ +2dB（0.25×1.259≈0.315
+  // > 1.001×0.25——若仍仅存储/直通则 ≤0.2503）。快照在受理后发布（config 前进）。
+  const auto first = rig.renderSine(1000.0, kMeasureAmplitude);
+  snap = rig.device.eqAppliedSnapshot();
+  CHECK(snap.version == versionAtInit + 1U); // 回调受理 = 真实应用一代
+  CHECK(snap.config.enabled == true);
+  CHECK(snap.sampleRate == 48000U);         // 运行期受理不回写率/声道（停态值恒正确）
+  CHECK(snap.channelCount == 2U);
+  const double tailAmp =
+      estimateAmplitude(first[0], kBlockFrames - 128U, 128U, 48000, 1000.0);
+  CHECK(std::fabs(linToDb(tailAmp / kMeasureAmplitude) - 2.0) <= 0.5); // 首块爬坡 ~+2dB
+
+  // 平滑收敛 + 稳态：运行期调节的曲线成形 +6dB（不依赖任何停态窗口/内容边界）。
+  const auto amps = settleAndMeasure(rig, 90U, 12U, 1000.0, kMeasureAmplitude);
+  for (const double amp : amps) {
+    CHECK(std::fabs(linToDb(amp / kMeasureAmplitude) - kSettleDb) <= 0.1);
+  }
+
+  // 停态窗口（stop）同配置再应用：真实应用一代（幂等，生效面 config 不变）。
+  const auto versionWhileRunning = rig.device.eqAppliedSnapshot().version;
   CHECK(rig.device.stop());
   rig.device.setEqualizerConfig(config);
   snap = rig.device.eqAppliedSnapshot();
   requireSnapshotEq(snap, config, 48000, 2);
-  CHECK(snap.version == versionAtInit + 1U);
+  CHECK(snap.version == versionWhileRunning + 1U);
   CHECK(rig.device.start());
 
-  // 生效后 render：频响成形 +6dB。
+  // 生效后 render：频响成形 +6dB（停态应用后 DSP 已在目标态，无重爬坡）。
+  const auto ampsAfter = settleAndMeasure(rig, 90U, 12U, 1000.0, kMeasureAmplitude);
+  for (const double amp : ampsAfter) {
+    CHECK(std::fabs(linToDb(amp / kMeasureAmplitude) - kSettleDb) <= 0.1);
+  }
+}
+
+TEST_CASE("eq render: 出厂关 → 运行中开总开关——回调从原路径切入链并实时成形") {
+  EqRenderRig rig(AudioSampleFormat::Float32, 48000);
+  REQUIRE(rig.device.start());
+
+  // 出厂态（从未配置 EQ，DSP 已被 initialize 预配置为全零目标）：render 直通。
+  const auto passthrough = rig.renderSine(1000.0, kMeasureAmplitude);
+  CHECK(std::fabs(passthrough[0][100]) <= kMeasureAmplitude * 1.001);
+
+  // 运行中开启（enabled false→true +6dB@1kHz）：PENDING → 下块受理激活链。
+  rig.device.setEqualizerConfig(oneBandConfig(kSettleDb, true));
+  // 受理块尾帧已爬坡（非直通）——链从「出厂不进链」实时切入。
+  const auto activating = rig.renderSine(1000.0, kMeasureAmplitude);
+  double maxAbs = 0.0;
+  for (const double sample : activating[0]) {
+    maxAbs = std::max(maxAbs, std::fabs(sample));
+  }
+  CHECK(maxAbs > kMeasureAmplitude * 1.001); // 本块已处理（直通会恒 ≤1.001×）
+  // 稳态成形 +6dB。
   const auto amps = settleAndMeasure(rig, 90U, 12U, 1000.0, kMeasureAmplitude);
   for (const double amp : amps) {
+    CHECK(std::fabs(linToDb(amp / kMeasureAmplitude) - kSettleDb) <= 0.1);
+  }
+
+  // 运行中关闭（enabled true→false）：平滑退出（fade 期仍进链，≤ramp 时长 = 512
+  // 帧块下 3 块收敛）→ 收敛后整链旁路 → 回调回落原路径——f32 出厂直通逐位回归。
+  rig.device.setEqualizerConfig(flatEq());
+  for (int block = 0; block < 4; ++block) { // 退出期块（含受理块）：余块直通断言
+    const auto out = rig.renderSine(1000.0, kMeasureAmplitude);
+    if (block >= 3) {
+      for (const double sample : out[0]) {
+        CHECK(std::fabs(sample) <= kMeasureAmplitude * 1.001);
+      }
+    }
+  }
+  for (int block = 0; block < 3; ++block) { // 收敛后稳态直通
+    const auto out = rig.renderSine(1000.0, kMeasureAmplitude);
+    for (const double sample : out[0]) {
+      CHECK(std::fabs(sample) <= kMeasureAmplitude * 1.001);
+    }
+  }
+  CHECK(rig.device.eqAppliedSnapshot().config.enabled == false);
+}
+
+TEST_CASE("eq render: 运行中调参（band 迁移）无咔哒实时成形、停启冻结保持") {
+  EqRenderRig rig(AudioSampleFormat::Float32, 48000);
+  REQUIRE(rig.device.start());
+  rig.device.setEqualizerConfig(oneBandConfig(kSettleDb, true));
+  static_cast<void>(settleAndMeasure(rig, 90U, 6U, 1000.0, kMeasureAmplitude)); // +6@1k 稳态
+  const auto versionBefore = rig.device.eqAppliedSnapshot().version;
+
+  // 运行中迁移到 idx20（2kHz）：受理后 1kHz 平滑排空、2kHz 成形；全程无爆音
+  // （逐帧跳变有界——实时受理若跳变目标会端点阶跃 >0.25）。
+  EqualizerConfig moved = flatEq();
+  moved.enabled = true;
+  moved.bandGainsDb[20U] = kSettleDb;
+  rig.device.setEqualizerConfig(moved);
+  std::vector<std::vector<double>> stream(2U);
+  double maxDelta = 0.0;
+  for (int block = 0; block < 6; ++block) {
+    const auto decoded = rig.renderSine(1000.0, kMeasureAmplitude); // 旧频段观察面
+    for (std::size_t ch = 0U; ch < 2U; ++ch) {
+      for (std::size_t i = 0U; i < decoded[ch].size(); ++i) {
+        stream[ch].push_back(decoded[ch][i]);
+        if (stream[ch].size() > 1U) {
+          maxDelta = std::max(maxDelta,
+                              std::fabs(stream[ch][stream[ch].size() - 1U] - stream[ch][stream[ch].size() - 2U]));
+        }
+      }
+    }
+  }
+  CHECK(maxDelta <= 0.25); // 无爆音/无端点阶跃（1kHz 0.25 内容斜率上界 ~0.065）
+  static_cast<void>(settleAndMeasure(rig, 60U, 6U, 2000.0, kMeasureAmplitude));
+  const auto amps2k = settleAndMeasure(rig, 10U, 12U, 2000.0, kMeasureAmplitude);
+  for (const double amp : amps2k) {
+    CHECK(std::fabs(linToDb(amp / kMeasureAmplitude) - kSettleDb) <= 0.1);
+  }
+  const auto amps1k = settleAndMeasure(rig, 10U, 12U, 1000.0, kMeasureAmplitude);
+  for (const double amp : amps1k) {
+    CHECK(std::fabs(linToDb(amp / kMeasureAmplitude)) <= 0.3); // 旧 band 已排空（仅裙边）
+  }
+  CHECK(rig.device.eqAppliedSnapshot().version > versionBefore); // 运行期受理已发布
+
+  // 运行中调参后 stop/start：冻结续接（曲线跨停启保持——运行期目标已在 DSP，
+  // 无重爬坡无重放；停态无新 set 不重发快照）。首块全增益（同 895 用例首块判据
+  // 0.44–0.56 域），稳态 ±0.15。
+  CHECK(rig.device.stop());
+  CHECK(rig.device.start());
+  const auto resumed = rig.renderSine(2000.0, kMeasureAmplitude);
+  const double ampResumed = estimateAmplitude(resumed[0], 0, kBlockFrames, 48000, 2000.0);
+  CAPTURE(ampResumed);
+  CHECK(ampResumed > 0.44);
+  CHECK(ampResumed < 0.56);
+  const auto settled = settleAndMeasure(rig, 6U, 12U, 2000.0, kMeasureAmplitude);
+  for (const double amp : settled) {
     CHECK(std::fabs(linToDb(amp / kMeasureAmplitude) - kSettleDb) <= 0.1);
   }
 }

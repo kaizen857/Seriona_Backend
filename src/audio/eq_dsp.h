@@ -41,8 +41,11 @@
 //
 // 线程契约：configure 允许分配（首次/声道或采样率变化时重建 ma_peak2 组），
 // 只允许在与 process 不并发的时刻调用（任务 25 在音频 worker 侧、设备未活动期
-// 调用，同 GainEnvelopeController 的 worker 侧账本先例）；process 实时安全：
-// 不分配、不加锁、不日志、不抛异常（noexcept）。
+// 调用，同 GainEnvelopeController 的 worker 侧账本先例）；applyTargets = configure
+// 的「目标更新子集」（零分配/零锁/零日志，语义见方法注释）——与 process 同线程
+// 串行即可（回调受理路径：accepted 后、同线程 process 前调用合法；停态窗口调用
+// 亦无碍，同 configure 约束）；process 实时安全：不分配、不加锁、不日志、不抛
+// 异常（noexcept）。
 //
 // 依赖单点：band 中心频率与 Q 常量引用 inc/seriona/audio/equalizer_tables.h
 // （任务 18 公共单点，禁拷贝）；配置形状引用 audio_contracts.h 契约类型
@@ -92,6 +95,16 @@ public:
   [[nodiscard]] ConfigReport configure(const EqualizerConfig& config,
                                        std::uint32_t sampleRate,
                                        std::uint32_t channelCount);
+
+  // 实时目标更新（播放中 EQ 调节的 DSP 侧投递点；回调受理路径调用）。configure
+  // 的目标更新子集语义：sanitize/clamp（±15dB/NaN→0 同 configure）→ 更新 config_/
+  // enabled_/mode_/activeBandCount_ → 逐 band 更新目标（未用 band/越界 band 目标 0）
+  // + 系数失效置位（mode/中心频率变化需 process 内 reinit）→ 平滑段从当前点重规划
+  // → preGain 目标/段 → smoothingActive_/fastBypass_ 重算。零分配、零锁、零日志。
+  // 前提：已 configure（accepted_）且格式已定——未 accepted 返回 false 无操作
+  // （调用方保证设备 initialize 后必然 configure 过：出厂默认配置也 configure）；
+  // 本方法不改格式/声道/滤波器组（格式变化必须经停态 configure 重建）。
+  [[nodiscard]] bool applyTargets(const EqualizerConfig& config) noexcept;
 
   // 处理一个 interleaved f32 块（原地，in-place——miniaudio biquad 显式支持）。
   // frameCount==0 或未配置/不可用态为无害空操作。实时安全，noexcept。
@@ -147,6 +160,14 @@ private:
   [[nodiscard]] static double sanitizeDb(float db) noexcept;
 
   void rebuildFilters();
+  // 目标更新共用核心（configure/applyTargets 两入口共享，防双份逻辑漂移）：
+  // 调用前提 = 本对象 config_/enabled_/mode_/activeBandCount_/sampleRate_ 已按
+  // 新配置就位；逐 band 越界判定（rangeBypass 按当前 mode 表 + sampleRate_ 重算）、
+  // 目标/平滑段规划、mode 切换系数失效置位；返回越界硬直通 band 数（告警面）。
+  [[nodiscard]] std::size_t applyTargetValues(const EqualizerConfig& config,
+                                              bool modeChanged) noexcept;
+  // 平滑激活态重算（smoothingActive_ 全收敛扫描）+ fastBypass 快路径判定。
+  void recomputeSmoothingAndFastBypass() noexcept;
   void advanceSmoothing(double stepRatio) noexcept;
   [[nodiscard]] static bool advanceOne(double& current,
                                        double target,

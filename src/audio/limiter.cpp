@@ -92,6 +92,18 @@ LimiterDspProcessor::ConfigReport LimiterDspProcessor::configure(
   return report;
 }
 
+bool LimiterDspProcessor::applyTargets(const EqualizerConfig& config) noexcept {
+  // 实时目标更新（回调受理路径；方法注释为契约）：configure 无 rebuild 分支的
+  // 语义子集——只更新 limiterEnabled 目标态与 config_ 快照；关→开/开→关迁移
+  // 由 process 内逐样本状态机执行（WarmUp/FadingOut）。未 accepted = 无操作。
+  if (!accepted_) {
+    return false;
+  }
+  config_ = config;
+  enabled_ = config.limiterEnabled;
+  return true;
+}
+
 void LimiterDspProcessor::resetEngaged() {
   for (auto& ch : channels_) {
     std::fill(ch.ring.begin(), ch.ring.end(), 0.0f);
