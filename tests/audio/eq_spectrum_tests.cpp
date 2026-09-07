@@ -1,31 +1,41 @@
 // 频谱分析纯核心 + 摘录下混联测（任务 31，B3.3 组 seriona.audio.eq_spectrum）。
 //
 // 被测面：src/audio/spectrum_analyzer.{h,cpp}（任务 30 纯组件：feed(SpectrumFeedFrame)
-// → optional<SpectrumAnalysis>，60 对数桶 binsDb；头注释即行为契约）+ 任务 29 设备摘录
+// → optional<SpectrumAnalysis>，120 对数桶 binsDb；头注释即行为契约）+ 任务 29 设备摘录
 // 下混（captureDownmix* 位于 audio_output_device.cpp 匿名空间，经 renderCallback 真实
 // 路径 + latestCaptureFrame 断言单声道均值——本文件自带最小 fake backend 装置，独立
 // 编写，不依赖 eq_render_integration_tests.cpp 内部符号；两态中链关闭态输出域逐格式
 // int→f32 冻结尺度下混覆盖 captureDownmixIntToMono（s16/s32）/captureDownmixS24ToMono/
 // captureDownmixFloatToMono（f32）三分支 × N=1 直取 / N>1 均值）。
 //
-// 覆盖（计划书 B3.3 五项 + dB 标定数值锚）：
-//   1. 已知正弦 bin 命中（review 实测锁定锚点，勿用旧笔误锚）：22050 3kHz→bin43、
-//      5kHz→bin47；44.1k 1kHz→跨 33/34 桶界（edge(34)=1002.4Hz）合计 ≈0dB；
-//      192k 10kHz→53/54 合计 ≈0dB。判据：落桶邻域功率合计 ≈ 10log10(1.5A²)；
-//      主瓣整落单桶时取桶读数 ≈0dB±0.2（A=1）。
-//   2. 采样率标定：windowSizeForRate 分档全边界；同频正弦不同 fs 落相同几何桶
-//      （桶轴按实际 fs 生成，20Hz–20kHz 对数轴率无关）；跨率 feed 重建后输出
-//      与全新实例逐桶一致（位等）。
-//   3. 60 桶边界：binEdgeHz(0)=20/binEdgeHz(60)=20000 精确、边界单调；
+// 覆盖（计划书 B3.3 五项 + dB 标定数值锚，120 桶/比例分摊语义，2026-09 重锚）：
+//   1. 已知正弦落桶（对数轴率无关：logidx(i) = 120·log10(f/20)/3）：
+//      - 22050 3kHz（logidx 87.04，主瓣尾越 87/88 桶界）→ 87 主体 + 86 分片按范围
+//        重叠比例分摊（实测 b86≈−7.49 / b87≈−0.85，合计 ≈0dB）——比例分摊回归锁；
+//      - 192k 10kHz（logidx 107.96，主瓣整落桶 107）→ 单桶读数 ≈0dB（实测 −0.004），
+//        邻桶 108 仅主瓣外泄漏（−29.9dB 级）；
+//      - 44.1k 1kHz 跨 67/68 桶界（edge(68)=1002.4Hz，logidx 67.96）→ 邻桶合计 ≈0dB。
+//      判据：落桶邻域功率合计 ≈ 10log10(1.5A²)；主瓣整落单桶时取桶读数 ≈0dB±0.2
+//      （A=1）；跨桶界按新几何单桶值重锚（分摊后各桶读数非 0）。
+//   2. 采样率标定：windowSizeForRate 分档全边界（2048/4096/8192/16384 四档 + 0 守卫）；
+//      同频正弦不同 fs 落相同几何桶（桶轴按实际 fs 生成，20Hz–20kHz 对数轴率无关）；
+//      跨率 feed 重建后输出与全新实例逐桶一致（位等）。
+//   3. 120 桶边界：binEdgeHz(0)=20/binEdgeHz(120)=20000 精确、边界单调；
 //      binCenterHz 几何中心；binMeasurable/lastMeasurableBin 纯函数面；
-//      fs<40k 截断行为：22050 → 桶 55+ 输出 kFloorDb、32000 → 桶 59 静音、
-//      44100 → 全 60 桶可测。
+//      fs<40k 截断行为：22050 → 桶 110..119 输出 kFloorDb（last=109）、
+//      32000 → 桶 117..119 静音（last=116）、40000 → 仅桶 119 下界恰在奈氏内
+//      （last=119）、44100 → 全 120 桶可测。
 //   4. 下混：见头注释（device 真实路径）。
 //   5. 重建 generation 弃帧：同纪元喂部分窗→换 generation→新纪元首窗不含旧纪元
 //      样本（逐桶与全新实例一致，位等）；域变化弃未满窗（构造会混窗的序列验证
 //      不混——丢弃实例全桶 floor，同域对照有能量）。
-//   dB 标定数值锚：满刻度正弦（A=1.0）主瓣整桶 ≈0dB；A=0.5 → −6.02dB；A=0.1 →
-//      −20dB（±0.2dB）；静音输入全桶 −120。
+//   dB 标定数值锚：满刻度正弦主瓣整桶 ≈0dB（5kHz@22050 → 桶 95）；A=0.5 → −6.02dB；
+//      A=0.1 → −20dB（±0.2dB）；静音输入全桶 −120。
+//   不变量（新增，比例分摊语义锁）：
+//      - energy-preservation：Σ可测桶 10^(binsDb/10) ≈ Σ参与 FFT bin 功率/1.5
+//        （Parseval 独立复算，白噪/多音，44.1k 与 48k，±0.1dB）；
+//      - no-dead-bin：白噪下可测桶无恒地板（窄对数桶由相邻 bin 比例共享）；
+//      - 静音/截断尾恒 kFloorDb 语义不变。
 //
 // 正弦构造：相位 double 递推（仿既有 eq_dsp/eq_render 测试 fillSine）；喂帧按
 // analyzer 期望（windowSizeForRate(fs) 帧整窗即产一份，无首窗延迟）；整窗倍数 +
@@ -45,6 +55,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <vector>
 
 namespace seriona::audio {
@@ -52,7 +63,7 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-// —— 正弦 / 窗口生成（测试侧独立实现，相位 double 递推）——
+// —— 正弦 / 噪声 / 窗口生成（测试侧独立实现，相位 double 递推）——
 
 void fillSineMono(std::vector<float>& out, double fs, double f0Hz, double amplitude,
                   std::size_t frames) {
@@ -76,6 +87,18 @@ std::vector<float> makeTone(double fs, double f0Hz, double amplitude, std::uint3
 }
 
 std::vector<float> makeSilence(std::uint32_t frames) { return std::vector<float>(frames, 0.0F); }
+
+// 白噪声（σ=0.5，确定性种子；测试只依赖统计语义——无死桶断言带 20dB 以上裕量、
+// 能量守恒对任意输入成立，跨 stdlib 分布实现差异不敏感）。
+std::vector<float> makeWhiteNoise(std::uint32_t frames, std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<double> gauss(0.0, 0.5);
+  std::vector<float> noise(frames);
+  for (float& sample : noise) {
+    sample = static_cast<float>(gauss(rng));
+  }
+  return noise;
+}
 
 // 桶功率线性域（dB 已相对 1.5 参考；同参考求和后转回 dB）。
 double binsPowerDb(const SpectrumAnalysis& a, std::size_t from, std::size_t toInclusive) {
@@ -134,31 +157,107 @@ void requireBinsFloor(const SpectrumAnalysis& a, std::size_t from, std::size_t t
   }
 }
 
-// 对数桶轴公式（测试侧独立参考）：edge(i) = 20×10^(3i/60)，center = 20×10^(3(i+0.5)/60)。
-double edgeHzDouble(std::size_t i) { return 20.0 * std::pow(10.0, 3.0 * static_cast<double>(i) / 60.0); }
+// 对数桶轴公式（测试侧独立参考）：edge(i) = 20×10^(3i/120)，center = 20×10^(3(i+0.5)/120)。
+double edgeHzDouble(std::size_t i) { return 20.0 * std::pow(10.0, 3.0 * static_cast<double>(i) / 120.0); }
 double centerHzDouble(std::size_t i) {
-  return 20.0 * std::pow(10.0, 3.0 * (static_cast<double>(i) + 0.5) / 60.0);
+  return 20.0 * std::pow(10.0, 3.0 * (static_cast<double>(i) + 0.5) / 120.0);
+}
+
+// —— 能量守恒测试侧独立复算（Parseval 路径）——
+// 参与 bin 集 = k=1..n/2−1 且 f_k = k·fs/n ∈ [20, 20000)。恒等式
+//   Σ_{k=0..n/2} |X_k|² = n·Σ_j (w_j·x_j)² （非归一 RDFT Parseval）
+// ⇒ 参与功率 = n·Σ(wx)² − |X_0|² − |X_{n/2}|² − Σ_{k≥k_hi} |X_k|²
+// （k_hi = 首个 f_k ≥ 20000 的 bin；f_k 全 < 20000 时该项为空）。
+// X'_k = 4·X_k/n（Σw = n/2 → 2/Σw = 4/n），故 Σ参与 P_k = (16/n²)·参与 |X_k|² 和。
+
+// 直接 DFT 求单个 bin |X_k|²（x 为已加窗样本；相位旋转递推，避免逐点三角函数）。
+double dftBinPowerSq(const std::vector<float>& windowed, std::size_t k) {
+  const auto n = windowed.size();
+  double real = 0.0;
+  double imag = 0.0;
+  double phase = 0.0;
+  const double step = 2.0 * kPi * static_cast<double>(k) / static_cast<double>(n);
+  for (std::size_t j = 0; j < n; ++j) {
+    real += static_cast<double>(windowed[j]) * std::cos(phase);
+    imag -= static_cast<double>(windowed[j]) * std::sin(phase);
+    phase += step;
+    if (phase >= 2.0 * kPi) {
+      phase -= 2.0 * kPi;
+    }
+  }
+  return real * real + imag * imag;
+}
+
+// 参与 FFT bin 总功率 P = Σ|X'_k|²，转 dB（相对 1.5 参考）。
+double participatingPowerDb(const std::vector<float>& samples, std::uint32_t sampleRate) {
+  REQUIRE(!samples.empty());
+  const auto n = static_cast<std::size_t>(SpectrumAnalyzer::windowSizeForRate(sampleRate));
+  REQUIRE(samples.size() == n);  // 本辅助按单窗输入设计
+  const double fs = static_cast<double>(sampleRate);
+  // Hann 周期窗（与 analyzer 同式，测试侧独立展开）
+  std::vector<float> windowed(n);
+  double sumWx2 = 0.0;
+  for (std::size_t j = 0; j < n; ++j) {
+    const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * static_cast<double>(j) / static_cast<double>(n));
+    const double y = w * static_cast<double>(samples[j]);
+    windowed[j] = static_cast<float>(y);
+    sumWx2 += y * y;
+  }
+  const double totalRdfPower = static_cast<double>(n) * sumWx2;  // Σ_{k=0..n−1}|X_k|²（Parseval）
+  // 实输入 RDFT 全谱 = |X_0|² + |X_{n/2}|² + 2·Σ_{k=1..n/2−1}|X_k|²（±k 共轭对称）→
+  // 先取正频率半边，再扣参与集外 bin。
+  double excluded = (dftBinPowerSq(windowed, 0U) + dftBinPowerSq(windowed, n / 2U)) * 0.5;
+  double half = totalRdfPower * 0.5 - excluded;  // Σ_{k=1..n/2−1} |X_k|²
+  // 低段排除：f_k = k·fs/n < 20 Hz 的 bin（中心不在对数轴内，不参与）
+  const double kLo = 20.0 * static_cast<double>(n) / fs;
+  const std::size_t lastLow = static_cast<std::size_t>(std::ceil(kLo - 1e-9)) - 1U;
+  for (std::size_t k = 1U; k <= lastLow && k < n / 2U; ++k) {
+    half -= dftBinPowerSq(windowed, k);
+  }
+  // 高段排除：f_k = k·fs/n ≥ 20000 的 k（仅 fs ≥ 40k 时非空）
+  const double kHi = 20000.0 * static_cast<double>(n) / fs;
+  const std::size_t firstExcluded = static_cast<std::size_t>(std::ceil(kHi - 1e-9));
+  for (std::size_t k = firstExcluded; k < n / 2U; ++k) {
+    half -= dftBinPowerSq(windowed, k);
+  }
+  const double participatingSum = half;
+  REQUIRE(participatingSum > 0.0);
+  // X'_k = 4·X_k/n → P_k = (16/n²)·|X_k|²
+  const double pTotal = participatingSum * 16.0 / (static_cast<double>(n) * static_cast<double>(n));
+  return 10.0 * std::log10(pTotal / 1.5);
+}
+
+// 输出侧：Σ可测桶 10^(binsDb/10) 转 dB（不可测/静音桶 = kFloorDb 不贡献能量）。
+double measurablePowerDb(const SpectrumAnalysis& a, std::uint32_t sampleRate) {
+  double power = 0.0;
+  for (std::size_t i = 0; i < SpectrumAnalyzer::kBinCount; ++i) {
+    if (!SpectrumAnalyzer::binMeasurable(i, sampleRate)) {
+      continue;
+    }
+    power += std::pow(10.0, static_cast<double>(a.binsDb[i]) / 10.0);
+  }
+  return 10.0 * std::log10(power);
 }
 
 }  // namespace
 
 TEST_CASE("eq spectrum: 窗长分档全边界——windowSizeForRate 档位与 0 率守卫") {
-  // 头契约：fs ≤ 24k→1024；24k<fs≤48k→2048；48k<fs≤96k→4096；fs>96k→8192。
+  // 头契约：fs ≤ 24k→2048；24k<fs≤48k→4096；48k<fs≤96k→8192；fs>96k→16384。
   CHECK(SpectrumAnalyzer::windowSizeForRate(0U) == 0U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(22050U) == 1024U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(24000U) == 1024U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(24001U) == 2048U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(32000U) == 2048U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(44100U) == 2048U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(48000U) == 2048U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(48001U) == 4096U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(96000U) == 4096U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(96001U) == 8192U);
-  CHECK(SpectrumAnalyzer::windowSizeForRate(192000U) == 8192U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(22050U) == 2048U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(24000U) == 2048U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(24001U) == 4096U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(32000U) == 4096U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(44100U) == 4096U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(48000U) == 4096U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(48001U) == 8192U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(96000U) == 8192U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(96001U) == 16384U);
+  CHECK(SpectrumAnalyzer::windowSizeForRate(192000U) == 16384U);
 }
 
 TEST_CASE("eq spectrum: 对数桶轴纯函数——端点/单调/几何中心/可测面（binMeasurable/lastMeasurableBin）") {
-  // 端点精确：edge(0)=20、edge(60)=20000。
+  // 端点精确：edge(0)=20、edge(120)=20000。
   CHECK(SpectrumAnalyzer::binEdgeHz(0U) == 20.0F);
   CHECK(SpectrumAnalyzer::binEdgeHz(SpectrumAnalyzer::kBinCount) == 20000.0F);
   CHECK(SpectrumAnalyzer::kMinLogHz == 20.0F);
@@ -172,10 +271,10 @@ TEST_CASE("eq spectrum: 对数桶轴纯函数——端点/单调/几何中心/�
   for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
     CHECK(SpectrumAnalyzer::binEdgeHz(i) < SpectrumAnalyzer::binEdgeHz(i + 1U));
   }
-  // 超界入参钳制到 60（edge(61) == edge(60)）。
-  CHECK(SpectrumAnalyzer::binEdgeHz(100U) == SpectrumAnalyzer::binEdgeHz(SpectrumAnalyzer::kBinCount));
+  // 超界入参钳制到 120（edge(150) == edge(120)）。
+  CHECK(SpectrumAnalyzer::binEdgeHz(150U) == SpectrumAnalyzer::binEdgeHz(SpectrumAnalyzer::kBinCount));
 
-  // 几何中心：位于 (edge(i), edge(i+1)) 且 ≈ 20×10^(3(i+0.5)/60)。
+  // 几何中心：位于 (edge(i), edge(i+1)) 且 ≈ 20×10^(3(i+0.5)/120)。
   for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
     const float center = SpectrumAnalyzer::binCenterHz(i);
     CHECK(center > SpectrumAnalyzer::binEdgeHz(i));
@@ -183,15 +282,18 @@ TEST_CASE("eq spectrum: 对数桶轴纯函数——端点/单调/几何中心/�
     CHECK(std::fabs(static_cast<double>(center) - centerHzDouble(i)) <= 0.01);
   }
 
-  // 可测面：binMeasurable = lower edge < fs/2−0.01；截断几何率无关桶轴（review 实测锚）。
+  // 可测面：binMeasurable = lower edge < fs/2−0.01；截断几何率无关桶轴（120 桶推导锚）。
+  // lastMeasurableBin：22050 → 109（edge(110)=11246.9 > 11025）、32000 → 116
+  // （edge(117)=16826 > 16000）、40000 → 119（edge(120)=20000 ≥ 19999.99，仅最后桶
+  // 下界 18881 < 19999.99 可测）、≥44100 → 120（全 120 桶可测，哨兵 = kBinCount）。
   const std::array<std::pair<std::uint32_t, std::size_t>, 7> rateToLast = {{
-      {22050U, 54U},  // edge(55)=11423 > 11025 → 桶 55+ 不可测
-      {32000U, 58U},  // edge(59)=17825 > 16000 → 仅桶 59 不可测
-      {40000U, 59U},  // edge(60)=20000 ≥ 20000−0.01 → 桶 59 可测、无 60 号桶
-      {44100U, 60U},  // 全 60 桶可测（last= kBinCount 语义）
-      {48000U, 60U},
-      {96000U, 60U},
-      {192000U, 60U},
+      {22050U, 109U},
+      {32000U, 116U},
+      {40000U, 119U},
+      {44100U, 120U},
+      {48000U, 120U},
+      {96000U, 120U},
+      {192000U, 120U},
   }};
   for (const auto& [rate, expectedLast] : rateToLast) {
     CAPTURE(rate);
@@ -203,91 +305,96 @@ TEST_CASE("eq spectrum: 对数桶轴纯函数——端点/单调/几何中心/�
     }
     CHECK(SpectrumAnalyzer::binMeasurable(SpectrumAnalyzer::kBinCount, rate) == false);  // 越界恒 false
   }
+  // 截断桶界精确复核：22050 桶 109 可测/110 不可测；32000 桶 116 可测/117 不可测。
+  CHECK(SpectrumAnalyzer::binMeasurable(109U, 22050U));
+  CHECK_FALSE(SpectrumAnalyzer::binMeasurable(110U, 22050U));
+  CHECK(SpectrumAnalyzer::binMeasurable(116U, 32000U));
+  CHECK_FALSE(SpectrumAnalyzer::binMeasurable(117U, 32000U));
+  CHECK(SpectrumAnalyzer::binMeasurable(119U, 40000U));
   // 0 率守卫：binMeasurable false、lastMeasurableBin 返回 kBinCount（全不可测语义）。
   CHECK(SpectrumAnalyzer::binMeasurable(0U, 0U) == false);
   CHECK(SpectrumAnalyzer::lastMeasurableBin(0U) == SpectrumAnalyzer::kBinCount);
 }
 
-TEST_CASE("eq spectrum: 已知正弦落桶——22050 3kHz→bin43 主瓣整落 ≈0dB、5kHz→bin47+48 邻桶合计") {
-  constexpr std::uint32_t fs = 22050U;
-  constexpr std::uint32_t n = 1024U;
-  REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
-
-  // 3kHz：对数轴 index = 60·log10(3000/20)/3 ≈ 43.5 → bin43（edge(43)=2825..edge(44)=3170）。
-  // 窗内 k0 = 3000×1024/22050 ≈ 139.3，Hann 主瓣 ±2 bin 整落 bin43（131.2..147.3）→
-  // 桶读数 ≈ 0 dB（A=1，review 实测 bin43 = 0.000 dB）。
+TEST_CASE("eq spectrum: 正弦落桶与比例分摊——22050 3kHz 跨 86/87 邻桶合计 ≈0dB、5kHz 整落 95 桶") {
+  // 3kHz：对数轴 index = 120·log10(3000/20)/3 ≈ 87.04 → 主瓣尾越桶 87 上界
+  // （edge(88)=3169.8Hz；k0 = 3000×2048/22050 ≈ 278.6，Hann 主瓣 ±2 bin ≈ ±21.5Hz）
+  // → 功率按范围重叠比例分摊到 86/87：实测 b87≈−0.85、b86≈−7.49、合计 ≈0dB（A=1）。
+  // 此锚锁比例分摊本身：若回退中心点整落，b87 将 ≈0dB 且 b86 = kFloorDb（双 FAIL）。
   {
     SpectrumAnalyzer analyzer;
-    const auto samples = makeTone(fs, 3000.0, 1.0, n);
-    const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    // 邻域 42..44 合计 ≈ 0 dB（判定建议口径），主瓣整落时桶读数本身 ≈0dB。
-    CHECK(std::fabs(binsPowerDb(analysis, 42U, 44U)) <= 0.3);
-    CHECK(std::fabs(static_cast<double>(analysis.binsDb[43U])) <= 0.2);
+    const auto samples = makeTone(22050.0, 3000.0, 1.0, 2048U);
+    REQUIRE(SpectrumAnalyzer::windowSizeForRate(22050U) == 2048U);
+    const auto analysis = analyzeWindow(analyzer, samples, 0U, 22050U);
+    CHECK(std::fabs(binsPowerDb(analysis, 86U, 87U)) <= 0.3);  // 两片合计 = 总功率
+    CHECK(analysis.binsDb[87U] > -1.5F);                       // 主体桶（实测 −0.85）
+    CHECK(analysis.binsDb[87U] < -0.3F);
+    CHECK(analysis.binsDb[86U] > -8.5F);  // 越界残片桶（实测 −7.49）
+    CHECK(analysis.binsDb[86U] < -6.5F);
+    CHECK(analysis.binsDb[85U] <= -40.0F);  // 主瓣外泄漏低（−80dB 级）
+    CHECK(analysis.binsDb[88U] <= -40.0F);
   }
 
-  // 5kHz：index ≈ 47.96 → bin47（edge(47)=4477..edge(48)=5024）；k0 ≈ 232.2 主瓣尾
-  // 越 bin48 上界（233.3）→ bin47 承载主体 + bin48 少量，47+48 合计 ≈ −6.02（A=0.5，
-  // review 实测 bin47=−6.03、邻桶合计 −6.021）。
+  // 5kHz：index ≈ 95.92 → 主瓣整落桶 95（edge(95)=4742.9..edge(96)=5023.8；
+  // k0 ≈ 464.4，主瓣 ±21.5Hz ⊂ 桶内）→ 单桶读数 ≈ 0 dB（A=1，实测 −0.0012）。
   {
     SpectrumAnalyzer analyzer;
-    const auto samples = makeTone(fs, 5000.0, 0.5, n);
-    const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    CHECK(std::fabs(binsPowerDb(analysis, 47U, 48U) - toneDb(0.5)) <= 0.3);
-    CHECK(analysis.binsDb[47U] > -6.5F);
-    CHECK(analysis.binsDb[47U] < -5.5F);
+    const auto samples = makeTone(22050.0, 5000.0, 1.0, 2048U);
+    const auto analysis = analyzeWindow(analyzer, samples, 0U, 22050U);
+    CHECK(std::fabs(static_cast<double>(analysis.binsDb[95U])) <= 0.2);
+    CHECK(std::fabs(binsPowerDb(analysis, 94U, 96U)) <= 0.3);
+    CHECK(analysis.binsDb[96U] <= -20.0F);  // 仅主瓣外泄漏（实测 −35dB 级）
   }
 }
 
-TEST_CASE("eq spectrum: 跨桶界纯音——44.1k 1kHz 跨 33/34 合计 ≈0dB、192k 10kHz 跨 53/54 合计 ≈0dB") {
-  // 1kHz 恰近桶界 edge(34)=1002.4Hz（index≈33.98）：主瓣按泄漏分跨 33/34，两边
-  // 合计 = 总功率 ≈ 0 dB（A=1，review 实测 bin33=−2.63/bin34=−3.43、合计 −0.000）。
+TEST_CASE("eq spectrum: 跨桶界纯音——44.1k 1kHz 跨 67/68 合计 ≈0dB、192k 10kHz 整落 107 ≈0dB") {
+  // 1kHz 恰近桶界 edge(68)=1002.4Hz（index≈67.96）：主瓣按泄漏分跨 67/68，两边
+  // 合计 = 总功率 ≈ 0 dB（A=1；实测 b67=−2.04/b68=−4.27、合计 −0.000）。
   {
     constexpr std::uint32_t fs = 44100U;
-    constexpr std::uint32_t n = 2048U;
+    constexpr std::uint32_t n = 4096U;
     REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
-    CHECK(SpectrumAnalyzer::binEdgeHz(34U) > 1000.0F);
-    CHECK(SpectrumAnalyzer::binEdgeHz(34U) < 1010.0F);  // edge(34)=1002.4 锚
+    CHECK(SpectrumAnalyzer::binEdgeHz(68U) > 1000.0F);
+    CHECK(SpectrumAnalyzer::binEdgeHz(68U) < 1010.0F);  // edge(68)=1002.4 锚
     SpectrumAnalyzer analyzer;
     const auto samples = makeTone(fs, 1000.0, 1.0, n);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    CHECK(std::fabs(binsPowerDb(analysis, 33U, 34U)) <= 0.3);
-    CHECK(analysis.binsDb[33U] < 0.0F);   // 分跨：单桶读数不足 0dB
-    CHECK(analysis.binsDb[33U] > -5.0F);
-    CHECK(analysis.binsDb[34U] < 0.0F);
-    CHECK(analysis.binsDb[34U] > -6.0F);
+    CHECK(std::fabs(binsPowerDb(analysis, 67U, 68U)) <= 0.3);
+    CHECK(analysis.binsDb[67U] < 0.0F);  // 分跨：单桶读数不足 0dB
+    CHECK(analysis.binsDb[67U] > -5.0F);
+    CHECK(analysis.binsDb[68U] < 0.0F);
+    CHECK(analysis.binsDb[68U] > -6.0F);
   }
 
-  // 10kHz：index≈53.98 → bin53 上缘（edge(54)=10023.7），主瓣尾少量落 bin54 →
-  // 53+54 合计 ≈ 0 dB（A=1，review 实测 bin53=−0.21、邻桶合计 ≈0）。
+  // 10kHz：index≈107.96 → 主瓣整落桶 107（edge(108)=10023.7Hz；k0 ≈ 853.3，
+  // 主瓣 ±23.4Hz ⊂ 桶内）→ 单桶 ≈ 0 dB（实测 −0.004）；桶 108 仅主瓣外泄漏。
   {
     constexpr std::uint32_t fs = 192000U;
-    constexpr std::uint32_t n = 8192U;
+    constexpr std::uint32_t n = 16384U;
     REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
     SpectrumAnalyzer analyzer;
     const auto samples = makeTone(fs, 10000.0, 1.0, n);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    CHECK(std::fabs(binsPowerDb(analysis, 53U, 54U)) <= 0.5);
-    CHECK(analysis.binsDb[53U] > -2.0F);  // 主体桶贴近 0dB（review −0.21）
-    CHECK(analysis.binsDb[53U] <= 0.5F);
-    CHECK(analysis.binsDb[54U] < -5.0F);  // 少量跨桶泄漏（≈−13dB 量级）
-    CHECK(analysis.binsDb[54U] > -20.0F);
+    CHECK(std::fabs(static_cast<double>(analysis.binsDb[107U])) <= 0.5);
+    CHECK(std::fabs(binsPowerDb(analysis, 107U, 108U)) <= 0.3);
+    CHECK(analysis.binsDb[108U] <= -15.0F);  // 泄漏宽容（实测 −29.9dB）
   }
 }
 
 TEST_CASE("eq spectrum: dB 标定数值锚——A=1→0dB / A=0.5→−6.02dB / A=0.1→−20dB（±0.2）与静音全桶 −120") {
-  // 满刻度正弦（3kHz@22050，主瓣整落 bin43）：桶读数 = 10log10(功率/1.5)。
+  // 满刻度正弦（5kHz@22050，主瓣整落桶 95）：桶读数 = 10log10(功率/1.5)。
   for (const double amplitude : {1.0, 0.5, 0.1}) {
     CAPTURE(amplitude);
     SpectrumAnalyzer analyzer;
-    const auto samples = makeTone(22050.0, 3000.0, amplitude, 1024U);
+    const auto samples = makeTone(22050.0, 5000.0, amplitude, 2048U);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, 22050U);
-    CHECK(std::fabs(static_cast<double>(analysis.binsDb[43U]) - toneDb(amplitude)) <= 0.2);
-    CHECK(std::fabs(binsPowerDb(analysis, 42U, 44U) - toneDb(amplitude)) <= 0.3);
+    CHECK(std::fabs(static_cast<double>(analysis.binsDb[95U]) - toneDb(amplitude)) <= 0.2);
+    CHECK(std::fabs(binsPowerDb(analysis, 94U, 96U) - toneDb(amplitude)) <= 0.3);
   }
 
-  // 静音输入：全 60 桶 == kFloorDb（−120.0F 逐桶精确）。
+  // 静音输入：全 120 桶 == kFloorDb（−120.0F 逐桶精确）。
   SpectrumAnalyzer analyzer;
-  const auto silence = makeSilence(1024U);
+  const auto silence = makeSilence(2048U);
   const auto analysis = analyzeWindow(analyzer, silence, 0U, 22050U);
   for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
     if (analysis.binsDb[i] != SpectrumAnalyzer::kFloorDb) {
@@ -296,10 +403,10 @@ TEST_CASE("eq spectrum: dB 标定数值锚——A=1→0dB / A=0.5→−6.02dB / 
   }
 }
 
-TEST_CASE("eq spectrum: 采样率标定——同频正弦跨 fs 落相同几何桶对（1kHz 恒跨 33/34 桶界）") {
-  // 桶轴按实际 fs 生成：1kHz 在对数轴上恒为 index≈33.98（edge(34)=1002.4Hz 率无关），
-  // 五档采样率各自按真实 Δf 解算 FFT bin → 能量恒落 {33,34} 几何桶对，合计 ≈0dB。
-  // （若轴误按他率解析，例如把 22050 帧当 44100，1kHz 会落到 bin46 级——本用例即
+TEST_CASE("eq spectrum: 采样率标定——同频正弦跨 fs 落相同几何桶对（1kHz 恒跨 67/68 桶界）") {
+  // 桶轴按实际 fs 生成：1kHz 在对数轴上恒为 index≈67.96（edge(68)=1002.4Hz 率无关），
+  // 五档采样率各自按真实 Δf 解算 FFT bin → 能量恒落 {67,68} 几何桶对，合计 ≈0dB。
+  // （若轴误按他率解析，例如把 22050 帧当 44100，1kHz 会落到 bin 90 级——本用例即
   // 率标定失效判别。）
   const std::array<std::uint32_t, 5> rates{22050U, 44100U, 48000U, 96000U, 192000U};
   for (const std::uint32_t fs : rates) {
@@ -308,15 +415,15 @@ TEST_CASE("eq spectrum: 采样率标定——同频正弦跨 fs 落相同几何�
     SpectrumAnalyzer analyzer;
     const auto samples = makeTone(static_cast<double>(fs), 1000.0, 1.0, n);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    // 跨桶界对 {33,34} 承载全部能量（其余桶 ≤ 旁瓣 −18dB）。
-    CHECK(binsPowerDb(analysis, 33U, 34U) > -0.7);
-    CHECK(binsPowerDb(analysis, 33U, 34U) < 0.7);
-    CHECK(analysis.binsDb[33U] < 0.0F);
-    CHECK(analysis.binsDb[33U] > -5.0F);
-    CHECK(analysis.binsDb[34U] < 0.0F);
-    CHECK(analysis.binsDb[34U] > -6.0F);
-    CHECK(analysis.binsDb[32U] <= -18.0F);
-    CHECK(analysis.binsDb[35U] <= -18.0F);
+    // 跨桶界对 {67,68} 承载全部能量（其余桶 ≤ 旁瓣 −18dB）。
+    CHECK(binsPowerDb(analysis, 67U, 68U) > -0.7);
+    CHECK(binsPowerDb(analysis, 67U, 68U) < 0.7);
+    CHECK(analysis.binsDb[67U] < 0.0F);
+    CHECK(analysis.binsDb[67U] > -5.0F);
+    CHECK(analysis.binsDb[68U] < 0.0F);
+    CHECK(analysis.binsDb[68U] > -6.0F);
+    CHECK(analysis.binsDb[66U] <= -18.0F);
+    CHECK(analysis.binsDb[69U] <= -18.0F);
   }
 }
 
@@ -325,13 +432,13 @@ TEST_CASE("eq spectrum: 跨率/跨代重建弃帧——新纪元首窗与全新�
   //     整窗静音 → 全桶 floor。若旧纪元半窗样本未被丢弃，将与静音混窗产生能量。
   {
     SpectrumAnalyzer analyzer;
-    const auto loudHalf = makeTone(44100.0, 3000.0, 1.0, 1024U);  // n/2 = 1024（n=2048）
+    const auto loudHalf = makeTone(44100.0, 3000.0, 1.0, 2048U);  // n/2 = 2048（n=4096）
     REQUIRE(analyzer.feed(SpectrumFeedFrame{.generation = 1U,
                                             .sampleRate = 44100U,
-                                            .frameCount = 1024U,
+                                            .frameCount = 2048U,
                                             .domain = SpectrumDomainTag::ChainInactiveOutput,
                                             .samples = loudHalf.data()}) == std::nullopt);
-    const auto silence = makeSilence(2048U);
+    const auto silence = makeSilence(4096U);
     const auto analysis = analyzeWindow(analyzer, silence, 2U, 44100U);
     REQUIRE(analysis.generation == 2U);
     for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
@@ -344,43 +451,44 @@ TEST_CASE("eq spectrum: 跨率/跨代重建弃帧——新纪元首窗与全新�
   // (b) 换采样率（44.1k→48k）：gen2 首窗 = 仅新纪元样本 → 与全新 48k 实例逐桶位等。
   {
     SpectrumAnalyzer analyzer;
-    const auto oldHalf = makeTone(44100.0, 3000.0, 1.0, 1024U);
+    const auto oldHalf = makeTone(44100.0, 3000.0, 1.0, 2048U);
     REQUIRE(analyzer.feed(SpectrumFeedFrame{.generation = 1U,
                                             .sampleRate = 44100U,
-                                            .frameCount = 1024U,
+                                            .frameCount = 2048U,
                                             .domain = SpectrumDomainTag::ChainInactiveOutput,
                                             .samples = oldHalf.data()}) == std::nullopt);
-    const auto newWindow = makeTone(48000.0, 1000.0, 1.0, 2048U);
+    const auto newWindow = makeTone(48000.0, 1000.0, 1.0, 4096U);
     const auto analysis = analyzeWindow(analyzer, newWindow, 2U, 48000U);
     REQUIRE(analysis.generation == 2U);
     REQUIRE(analysis.sampleRate == 48000U);
     const auto reference = freshAnalysis(newWindow, 2U, 48000U);
     requireBinsAllEqual(analysis, reference);
-    // 语义锚：新纪元确以 48k 解析（1kHz 跨 33/34 而非按 44.1k 落到别桶）。
-    CHECK(std::fabs(binsPowerDb(analysis, 33U, 34U)) <= 0.3);
+    // 语义锚：新纪元确以 48k 解析（1kHz 跨 67/68 而非按 44.1k 落到别桶）。
+    CHECK(std::fabs(binsPowerDb(analysis, 67U, 68U)) <= 0.3);
   }
 
   // (c) 换代后新纪元首窗为强音：与全新实例逐桶位等（覆盖"非静音"路径的弃帧证明）。
   {
     SpectrumAnalyzer analyzer;
-    const auto oldHalf = makeTone(44100.0, 5000.0, 1.0, 1024U);
+    const auto oldHalf = makeTone(44100.0, 5000.0, 1.0, 2048U);
     REQUIRE(analyzer.feed(SpectrumFeedFrame{.generation = 1U,
                                             .sampleRate = 44100U,
-                                            .frameCount = 1024U,
+                                            .frameCount = 2048U,
                                             .domain = SpectrumDomainTag::ChainInactiveOutput,
                                             .samples = oldHalf.data()}) == std::nullopt);
-    const auto newWindow = makeTone(44100.0, 3000.0, 0.5, 2048U);
+    const auto newWindow = makeTone(44100.0, 3000.0, 0.5, 4096U);
     const auto analysis = analyzeWindow(analyzer, newWindow, 2U, 44100U);
     const auto reference = freshAnalysis(newWindow, 2U, 44100U);
     requireBinsAllEqual(analysis, reference);
-    CHECK(std::fabs(static_cast<double>(analysis.binsDb[43U]) - toneDb(0.5)) <= 0.2);
+    CHECK(std::fabs(binsPowerDb(analysis, 86U, 87U) - toneDb(0.5)) <= 0.3);
   }
 }
 
 TEST_CASE("eq spectrum: 域变化弃未满窗——构造会混窗的序列验证不混（丢弃实例全桶 floor + 同域对照）") {
   // 契约：domain 变化仅弃未满窗累积（率/FFT 保留），单窗内样本恒同域。
   constexpr std::uint32_t fs = 44100U;
-  constexpr std::uint32_t n = 2048U;
+  constexpr std::uint32_t n = 4096U;
+  REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
 
   // 同域对照：1/4 窗强音 + 同域 3/4 窗静音 → 混窗（窗内含强音能量，非全 floor）——
   // 证明"若域切换实例不弃窗，该序列必检出能量"。
@@ -396,10 +504,10 @@ TEST_CASE("eq spectrum: 域变化弃未满窗——构造会混窗的序列验�
     const auto silenceTail = makeSilence(n - n / 4U);
     const auto analysis = analyzeWindow(control, silenceTail, 0U, fs);
     double peak = -1e18;
-    for (std::size_t i = 30U; i <= 45U; ++i) {
+    for (std::size_t i = 75U; i <= 100U; ++i) {  // 3kHz → logidx 87（桶 84..90 邻域）
       peak = std::max(peak, static_cast<double>(analysis.binsDb[i]));
     }
-    CHECK(peak > -30.0);  // 强音混入窗 → 300Hz 邻域有能量
+    CHECK(peak > -30.0);  // 强音混入窗 → 3kHz 邻域有能量
   }
 
   // 域切换实例：dom0 喂同款 1/4 窗强音 → 换 dom1 喂整窗静音 → 全桶 floor（未满窗已弃）。
@@ -424,13 +532,14 @@ TEST_CASE("eq spectrum: 域变化弃未满窗——构造会混窗的序列验�
     // 率/FFT 状态保留：域切换后再喂整窗强音 → 正常分析（标定语义不变）。
     const auto tone = makeTone(static_cast<double>(fs), 3000.0, 0.5, n);
     const auto after = analyzeWindow(analyzer, tone, 0U, fs, SpectrumDomainTag::ChainActiveF32);
-    CHECK(std::fabs(static_cast<double>(after.binsDb[43U]) - toneDb(0.5)) <= 0.2);
+    CHECK(std::fabs(binsPowerDb(after, 86U, 87U) - toneDb(0.5)) <= 0.3);
   }
 }
 
 TEST_CASE("eq spectrum: feed 语义——空帧无害 nullopt、整窗首产、大块多窗只回最近一份、meta 透传、reset 如新") {
   constexpr std::uint32_t fs = 48000U;
-  constexpr std::uint32_t n = 2048U;
+  constexpr std::uint32_t n = 4096U;
+  REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
 
   // (a) 空帧守卫：nullptr / 0 帧 / 0 率 → nullopt 无害；随后合法喂帧正常产出。
   SpectrumAnalyzer analyzer;
@@ -470,7 +579,7 @@ TEST_CASE("eq spectrum: feed 语义——空帧无害 nullopt、整窗首产、�
     requireBinsAllEqual(incAnalysis, oneAnalysis);
   }
 
-  // (c) 大块多窗只回最近一份：一次喂 1.5n 帧 → 产 2 窗、返回第 2 窗（覆盖
+  // (c) 大块多窗只回最近一份：一次喂 1.5n 帧 → 产 3 窗、返回第 3 窗（覆盖
   //     [n/2, 3n/2) 样本）；逐桶 == 全新实例直接喂该切片（位等证明窗口对准）。
   {
     SpectrumAnalyzer bulk;
@@ -484,8 +593,8 @@ TEST_CASE("eq spectrum: feed 语义——空帧无害 nullopt、整窗首产、�
                                    tone.begin() + static_cast<std::ptrdiff_t>(n / 2U + n));
     const auto reference = freshAnalysis(slice, 0U, fs);
     requireBinsAllEqual(latest, reference);
-    // 语义锚：第 2 窗 = 纯 1kHz（跨 33/34 合计 ≈0dB，与首窗同为整窗音）。
-    CHECK(std::fabs(binsPowerDb(latest, 33U, 34U)) <= 0.3);
+    // 语义锚：第 3 窗 = 纯 1kHz（跨 67/68 合计 ≈0dB，与首窗同为整窗音）。
+    CHECK(std::fabs(binsPowerDb(latest, 67U, 68U)) <= 0.3);
   }
 
   // (d) reset 全清：累积半窗强音后 reset → 再喂静音整窗全桶 floor（无旧状态残留）。
@@ -508,29 +617,99 @@ TEST_CASE("eq spectrum: feed 语义——空帧无害 nullopt、整窗首产、�
   }
 }
 
-TEST_CASE("eq spectrum: fs<40k 奈奎斯特截断——22050 桶 55+ 静音 / 32000 桶 59 静音（内容可测桶对照）") {
-  // 22050：可测桶 0..54（edge(55)=11423 > 11025）。5kHz 强音落 bin47 正常显示，
-  // 55..59 输出 kFloorDb。
+TEST_CASE("eq spectrum: fs<40k 奈奎斯特截断——22050 桶 110+ 静音 / 32000 桶 117+ 静音（内容可测桶对照）") {
+  // 22050：可测桶 0..109（edge(110)=11246.9 > 11025）。5kHz 强音整落桶 95 正常显示，
+  // 110..119 输出 kFloorDb。
   {
     constexpr std::uint32_t fs = 22050U;
-    constexpr std::uint32_t n = 1024U;
+    constexpr std::uint32_t n = 2048U;
+    REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
     SpectrumAnalyzer analyzer;
     const auto samples = makeTone(static_cast<double>(fs), 5000.0, 1.0, n);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    CHECK(std::fabs(binsPowerDb(analysis, 47U, 48U)) <= 0.3);  // 可测区正常
-    requireBinsFloor(analysis, 55U, 59U);                        // 奈奎斯特外恒静音标记
+    CHECK(std::fabs(static_cast<double>(analysis.binsDb[95U])) <= 0.5);  // 可测区正常
+    requireBinsFloor(analysis, 110U, 119U);                              // 奈奎斯特外恒静音标记
   }
-  // 32000：可测桶 0..58（edge(59)=17825 > 16000）。12kHz 强音落 bin55 正常显示
-  // （k0=768 主瓣整落），桶 59 输出 kFloorDb。
+  // 32000：可测桶 0..116（edge(117)=16826 > 16000）。12kHz 强音整落桶 111 正常显示
+  // （k0=1536 主瓣整落，实测 −0.000），桶 117..119 输出 kFloorDb。
   {
     constexpr std::uint32_t fs = 32000U;
-    constexpr std::uint32_t n = 2048U;
+    constexpr std::uint32_t n = 4096U;
     REQUIRE(SpectrumAnalyzer::windowSizeForRate(fs) == n);
     SpectrumAnalyzer analyzer;
     const auto samples = makeTone(static_cast<double>(fs), 12000.0, 1.0, n);
     const auto analysis = analyzeWindow(analyzer, samples, 0U, fs);
-    CHECK(std::fabs(static_cast<double>(analysis.binsDb[55U])) <= 0.5);  // bin55 可测有能量
-    requireBinsFloor(analysis, 59U, 59U);                                 // 奈奎斯特外恒静音标记
+    CHECK(std::fabs(static_cast<double>(analysis.binsDb[111U])) <= 0.5);  // bin111 可测有能量
+    requireBinsFloor(analysis, 117U, 119U);                               // 奈奎斯特外恒静音标记
+  }
+}
+
+TEST_CASE("eq spectrum: energy-preservation 不变量——白噪/多音 Σ可测桶功率 ≈ Σ参与 FFT bin 功率（44.1k/48k）") {
+  // 范围重叠比例分摊的守恒锁：Σ_i 10^(binsDb[i]/10)（可测桶）= Σ_{参与 k} |X'_k|² / 1.5。
+  // 期望侧由 Parseval 独立复算（见 participatingPowerDb，测试侧自带 DFT，不经 analyzer
+  // FFT）——能抓分摊实现吞/造能量类回归；±0.1dB（f32 binsDb 量化下实测差 <0.01dB）。
+  const std::array<std::uint32_t, 2> rates{44100U, 48000U};
+  for (const std::uint32_t fs : rates) {
+    CAPTURE(fs);
+    const auto n = SpectrumAnalyzer::windowSizeForRate(fs);
+    // 白噪窗（σ=0.5）两粒种子 + 多音窗（55/440/1000/8000Hz × 0.3）——覆盖宽带与
+    // 离散混合输入。
+    std::vector<float> multi(n, 0.0F);
+    for (const double f0 : {55.0, 440.0, 1000.0, 8000.0}) {
+      const auto part = makeTone(static_cast<double>(fs), f0, 0.3, n);
+      for (std::size_t j = 0U; j < n; ++j) {
+        multi[j] += part[j];
+      }
+    }
+    const std::vector<std::vector<float>> windows = {makeWhiteNoise(n, 0xA11CEU),
+                                                     makeWhiteNoise(n, 0xB0B5U), multi};
+    for (const auto& window : windows) {
+      SpectrumAnalyzer analyzer;
+      const auto analysis = analyzeWindow(analyzer, window, 0U, fs);
+      const double measured = measurablePowerDb(analysis, fs);
+      const double expected = participatingPowerDb(window, fs);
+      CAPTURE(measured);
+      CAPTURE(expected);
+      CHECK(std::fabs(measured - expected) <= 0.1);
+    }
+  }
+}
+
+TEST_CASE("eq spectrum: no-dead-bin 不变量——白噪可测桶无恒地板（44.1k/48k）；真静音全桶地板不变") {
+  // 窄对数桶（20Hz 处宽 ~1.19Hz < bin 宽 Δf~10.8Hz）在比例分摊下由相邻 bin 按
+  // 重叠比例共享 → 白噪下无桶恒地板。回退中心点整落会让 20-30Hz 多 bin 全落桶
+  // 1/2、桶 0 恒死 → 本断言必 FAIL。判据用 −70dB 门限（实测最低桶 ≈ −53dB，
+  // 17dB 以上裕量），地板 = −120 精确判据只留给真静音/截断尾。
+  const std::array<std::uint32_t, 2> rates{44100U, 48000U};
+  for (const std::uint32_t fs : rates) {
+    CAPTURE(fs);
+    const auto n = SpectrumAnalyzer::windowSizeForRate(fs);
+    for (const std::uint32_t seed : {1U, 2U}) {
+      const auto noise = makeWhiteNoise(n, seed);
+      SpectrumAnalyzer analyzer;
+      const auto analysis = analyzeWindow(analyzer, noise, 0U, fs);
+      for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
+        if (!SpectrumAnalyzer::binMeasurable(i, fs)) {
+          CHECK(analysis.binsDb[i] == SpectrumAnalyzer::kFloorDb);  // 截断尾恒地板
+          continue;
+        }
+        if (analysis.binsDb[i] <= -70.0F) {
+          FAIL("白噪下可测桶不应接近地板 @ bin " << i << "，实读 " << analysis.binsDb[i]);
+        }
+      }
+    }
+  }
+  // 真静音语义不变：可测桶同样 = kFloorDb（静音标记与"不可测"同值但语义区分在
+  // 注释契约；此处锁定全 120 桶地板，含可测区）。
+  {
+    SpectrumAnalyzer analyzer;
+    const auto silence = makeSilence(4096U);
+    const auto analysis = analyzeWindow(analyzer, silence, 0U, 48000U);
+    for (std::size_t i = 0U; i < SpectrumAnalyzer::kBinCount; ++i) {
+      if (analysis.binsDb[i] != SpectrumAnalyzer::kFloorDb) {
+        FAIL("静音窗期望全桶 kFloorDb @ bin " << i << "，实读 " << analysis.binsDb[i]);
+      }
+    }
   }
 }
 

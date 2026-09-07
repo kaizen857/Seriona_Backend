@@ -371,7 +371,7 @@ using ControlDomainNotificationSubscriptionCallback = ControlDomainNotificationC
 // 当前采样率解析的增益曲线，经 setEqualizer 生效后递增 generation）。
 using EqualizerStateSnapshotCallback = std::function<void(audio::EqualizerStateSnapshot)>;
 using EqualizerStateSubscriptionCallback = EqualizerStateSnapshotCallback;
-// 频谱订阅回调（任务16）：快照=audio::SpectrumSnapshot（60 段频带电平，实时分析输出）。
+// 频谱订阅回调（任务16）：快照=audio::SpectrumSnapshot（120 段频带电平，实时分析输出）。
 using SpectrumSnapshotCallback = std::function<void(audio::SpectrumSnapshot)>;
 using SpectrumSubscriptionCallback = SpectrumSnapshotCallback;
 

@@ -38,8 +38,12 @@ namespace {
 constexpr auto kProgressPublishInterval = std::chrono::milliseconds{100};
 
 // 频谱节流：2ms tick 计数 % kSpectrumPollEveryTicks == 0 时轮询一次摘录帧
-// （25 × 2ms ≈ 50ms；见任务 30 notes）。tick 仅在频谱开 + Playing 时计数。
-constexpr std::uint32_t kSpectrumPollEveryTicks = 25U;
+// （5 × 2ms ≈ 10ms 轮询；校准依据 .omo/evidence/task-1-spike-cadence.md §3：
+// 回调块 512 帧 < hop 1024，12 tick/24ms 每 2 轮才耗 1 hop 仅 ~21Hz；K=5 轮询
+// 10ms < 块周期 11.61ms@44.1k → 无块丢失，44.1/48k 发布上界 ~43/45Hz ≥ 40Hz
+// 目标）。率依赖限制：96k ~25Hz / 192k ~12.5Hz（单一常量无法全率保 ~40Hz）。
+// tick 仅在频谱开 + Playing 时计数。
+constexpr std::uint32_t kSpectrumPollEveryTicks = 5U;
 
 // T6 归零判定阈值：包络读回为回调块末写回（粒度 ≈ 1/淡出帧数，块恰好止于轨迹终点
 // 时读回 1/duration≈0，其后一块读回精确 0.0）；阈值 0.02 吸收该粒度且远小于淡出中段
@@ -223,7 +227,7 @@ public:
 
   // 频谱分析开关（任务 30 B3.2）：默认关 = worker 零取帧/零分析/零快照更新。
   // 原子位 + notify：任意线程可安全调用（无命令队列需要——纯门控位，无 worker
-  // 状态迁移语义）；worker 在 2ms 轮询内读到新位，开启后下个 ~50ms 节流点生效。
+  // 状态迁移语义）；worker 在 2ms 轮询内读到新位，开启后下个 ~10ms 节流点生效。
   void setSpectrumEnabled(bool enabled) override {
     spectrumEnabled_.store(enabled, std::memory_order_release);
     commandAvailable_.notify_one();
@@ -1695,7 +1699,7 @@ private:
   }
 
   // 频谱分析（任务 30 B3.2）：仅 Playing 逻辑态 + 开关开时工作（非 Playing 与
-  // 关闭 = 常数级判断零成本返回，不取帧不推）。~50ms 节流以 2ms tick 计数近似
+  // 关闭 = 常数级判断零成本返回，不取帧不推）。~10ms 轮询以 2ms tick 计数近似
   // （tick 仅在 Playing + 开时递增）；节流点取最新摘录帧喂纯分析组件。
   void serviceSpectrumIfDue() {
     if (!spectrumEnabled_.load(std::memory_order_acquire)) {
@@ -1744,7 +1748,8 @@ private:
     // 驻留快照：generation = 契约语义的独立单调计数（每次频谱更新 +1，0 = 空）；
     // 设备 generation 仅驱动组件跨代失效，两代数域隔离。R2 频谱外发：驻留快照
     // 更新后即派发 SpectrumUpdated（同 dispatchPosition 通道/版本计数；事件按
-    // 分析产出节流——analysis 有值才发，天然 ≤20Hz，无需额外时间闸）。
+    // 分析产出节流——analysis 有值才发，天然受 ~10ms 轮询上界约束（44.1/48k
+    // ~43/45Hz；96k ~25Hz / 192k ~12.5Hz 率依赖递减），无需额外时间闸）。
     ++spectrumSnapshotGeneration_;
     spectrumSnapshot_.generation = spectrumSnapshotGeneration_;
     spectrumSnapshot_.sampleRate = analysis->sampleRate;
@@ -2600,7 +2605,7 @@ private:
   bool spectrumFrameSeen_ = false;             // 已记录首帧元数据（同帧判定前提）
   std::uint32_t spectrumFrameGeneration_ = 0;  // 最近摘录帧纪元（同帧判定）
   std::uint32_t spectrumFrameSequence_ = 0;    // 最近摘录帧序（同帧判定）
-  std::uint32_t spectrumTickCounter_ = 0;      // 2ms tick 计数（%25 → ~50ms 节流）
+  std::uint32_t spectrumTickCounter_ = 0;      // 2ms tick 计数（%5 → ~10ms 轮询）
   std::uint64_t spectrumSnapshotGeneration_ = 0;  // 驻留快照单调代数（契约语义）
   SpectrumSnapshot spectrumSnapshot_{};        // 驻留快照（后续 control 接线取用）
 

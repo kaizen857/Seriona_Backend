@@ -22,7 +22,7 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kLogLower = 20.0;    // 对数轴下界（Hz）
 constexpr double kLogUpper = 20000.0; // 对数轴上界（Hz）
-constexpr double kLogDecades = 3.0;   // log10(1000)：桶边界 = 20×10^(3i/60)
+constexpr double kLogDecades = 3.0;   // log10(1000)：桶边界 = 20×10^(3i/120)
 
 // 满刻度正弦参考功率（dB 0 基准）：纯正弦实谱（正频率半边）总功率 =
 // Σ_k∈1..n/2−1 |X'_k|² = 1.5×A² —— 当主瓣整落单个对数桶时该桶读数 ≈ 0 dB。
@@ -45,7 +45,7 @@ struct SpectrumAnalyzer::Impl {
 
   // —— FFT / 窗状态（按 sampleRate 档重建）——
   std::uint32_t n = 0;             // FFT 点数（2 的幂）
-  std::uint32_t hop = 0;           // 重叠推进（= n/2，50% 重叠）
+  std::uint32_t hop = 0;           // 重叠推进（= n/4，25% 重叠）
   std::vector<float> hann{};       // 周期 Hann 窗（长度 n，预计算）
   double windowSum = 0.0;          // Σw（周期 Hann = n/2）
   AVTXContext* fftContext = nullptr;
@@ -84,7 +84,7 @@ struct SpectrumAnalyzer::Impl {
       return;
     }
     n = size;
-    hop = n / 2U;
+    hop = n / 4U;
 
     hann.resize(n);
     for (std::uint32_t j = 0; j < n; ++j) {
@@ -131,19 +131,19 @@ std::uint32_t SpectrumAnalyzer::windowSizeForRate(std::uint32_t sampleRate) noex
     return 0U;
   }
   if (sampleRate <= 24000U) {
-    return 1024U;  // 22050 → Δf = 21.5 Hz
+    return 2048U;  // 22050 → Δf = 10.8 Hz
   }
   if (sampleRate <= 48000U) {
-    return 2048U;  // 44100 → 21.5 Hz；48000 → 23.4 Hz
+    return 4096U;  // 44100 → 10.8 Hz；48000 → 11.7 Hz
   }
   if (sampleRate <= 96000U) {
-    return 4096U;  // 96000 → 23.4 Hz
+    return 8192U;  // 96000 → 11.7 Hz
   }
-  return 8192U;    // 192000 → 23.4 Hz（长窗档：低频分辨率与 44.1k 族一致）
+  return 16384U;   // 192000 → 11.7 Hz（长窗档：低频分辨率与 44.1k 族一致）
 }
 
 float SpectrumAnalyzer::binEdgeHz(std::size_t binIndex) noexcept {
-  // 桶 i 边界 f_i = 20×1000^(i/60) = 20×10^(3i/60)，i = 0..60（f_60 = 20000）。
+  // 桶 i 边界 f_i = 20×1000^(i/120) = 20×10^(3i/120)，i = 0..120（f_120 = 20000）。
   if (binIndex > kBinCount) {
     binIndex = kBinCount;
   }
@@ -152,7 +152,7 @@ float SpectrumAnalyzer::binEdgeHz(std::size_t binIndex) noexcept {
 }
 
 float SpectrumAnalyzer::binCenterHz(std::size_t binIndex) noexcept {
-  // 桶几何中心 = 20×1000^((i+0.5)/60)（对数等分桶的中点，测试正弦落桶判定面）。
+  // 桶几何中心 = 20×1000^((i+0.5)/120)（对数等分桶的中点，测试正弦落桶判定面）。
   const double edgeExponent =
       kLogDecades * (static_cast<double>(binIndex) + 0.5) / static_cast<double>(kBinCount);
   return static_cast<float>(kLogLower * std::pow(10.0, edgeExponent));
@@ -175,8 +175,8 @@ std::size_t SpectrumAnalyzer::lastMeasurableBin(std::uint32_t sampleRate) noexce
   if (nyquist <= kLogLower) {
     return kBinCount;  // 防御：fs ≤ 40 Hz 全桶不可测
   }
-  // 理论值：最大的 i 使 20×10^(3i/60) < nyquist → 3i/60 < log10(nyquist/20)
-  double index = 60.0 * std::log10(nyquist / kLogLower) / kLogDecades;
+  // 理论值：最大的 i 使 20×10^(3i/kBinCount) < nyquist → 3i/kBinCount < log10(nyquist/20)
+  double index = static_cast<double>(kBinCount) * std::log10(nyquist / kLogLower) / kLogDecades;
   std::size_t i = static_cast<std::size_t>(std::clamp(index, 0.0, static_cast<double>(kBinCount)));
   // 浮点边界复核：从理论值逐桶向下找第一个 edge < nyquist 的桶
   while (i > 0U && binEdgeHz(i) >= static_cast<float>(nyquist)) {
@@ -218,7 +218,7 @@ std::optional<SpectrumAnalysis> SpectrumAnalyzer::feed(const SpectrumFeedFrame& 
 
   impl_->append(frame.samples, frame.frameCount);
 
-  // 每消耗 hop（= n/2，50% 重叠）帧产出一份分析；feed 内可能命中多窗
+  // 每消耗 hop（= n/4，25% 重叠）帧产出一份分析；feed 内可能命中多窗
   // （大块喂入），只返回最近一份（内部状态照常推进）。
   std::optional<SpectrumAnalysis> latest;
   while (impl_->windowReady()) {
@@ -240,36 +240,47 @@ std::optional<SpectrumAnalysis> SpectrumAnalyzer::feed(const SpectrumFeedFrame& 
     // 相干增益归一：X'_k = 2·X_k/Σw（Σw = n/2）→ 窗内满刻度正弦峰值幅度 ≈ A。
     const double norm = 2.0 / windowSum;
 
-    // 桶能量求和：k×fs/n ∈ [f_i, f_{i+1}) 的全部正频率 FFT bin（k = 1..n/2−1；
-    // DC 与奈奎斯特点不参与——f = 0 与 f = fs/2 不在轴内；fs < 40k 时天然只对
-    // fs/2 截断轴内的部分求和）。
+    // 桶能量归属（范围重叠比例分摊）：参与 FFT bin（k = 1..n/2−1，中心频率
+    // f_k = k×fs/n ∈ [20, 20000)；DC 与奈奎斯特点不参与——f = 0 与 f = fs/2
+    // 不在轴内）。bin 功率 |X'_k|² 视为均匀分布于其频谱跨度 [f_k−Δf/2,
+    // f_k+Δf/2]（Δf = fs/n），按该跨度与各对数桶区间 [edge(i), edge(i+1)) 的
+    // 交集长度比例分入桶；每 bin 功率按其轴内跨度（clippedHigh−clippedLow，中心
+    // 在轴内 ⇒ > 0）归一 → Σ桶功率 = Σ参与 bin 功率（能量守恒，T3 测试不变式；
+    // 轴外残片摊回相邻轴内桶）。fs < 40k 时高于 fs/2 的桶由下方 dB 转换按
+    // binMeasurable 置 kFloorDb（能量不守恒例外，属"不可测"语义）。
     const double fs = static_cast<double>(impl_->sampleRate);
+    const double binHalfWidth = 0.5 * fs / static_cast<double>(n);  // Δf/2
     std::array<double, kBinCount> powers{};
     for (std::uint32_t k = 1; k < n / 2U; ++k) {
       const double freq = fs * static_cast<double>(k) / static_cast<double>(n);
       if (freq < kLogLower || freq >= kLogUpper) {
-        continue;  // 对数轴外（20 Hz 以下 / 20 kHz 及以上）
+        continue;  // bin 中心在对数轴外（<20 Hz / ≥20 kHz）：不参与（与旧中心点判定同集）
       }
-      // i(f) = floor(60·log10(f/20)/3)；双精度索引计算 + 边界复核
-      const double index = 60.0 * std::log10(freq / kLogLower) / kLogDecades;
-      if (index < 0.0) {
-        continue;
-      }
-      std::size_t i = static_cast<std::size_t>(index);
-      if (i >= kBinCount) {
-        continue;  // ≥ 20 kHz（f_60 = 20000，双精度边界已含）
-      }
-      // 浮点边界：index 恰为整数的极窄情形归入下桶（freq ≥ edge(i+1) 时落 i+1，
-      // 由下一轮自然处理——floor 语义即 [edge_i, edge_{i+1}) 左闭右开）
-      if (freq >= static_cast<double>(binEdgeHz(i + 1U))) {
-        ++i;
-        if (i >= kBinCount) {
-          continue;
-        }
-      }
+      const double bandLow = freq - binHalfWidth;
+      const double bandHigh = freq + binHalfWidth;
+      const double clippedLow = std::max(bandLow, kLogLower);
+      const double clippedHigh = std::min(bandHigh, kLogUpper);
+      const double inAxisSpan = clippedHigh - clippedLow;
       const double re = static_cast<double>(impl_->fftOut[2U * k]) * norm;
       const double im = static_cast<double>(impl_->fftOut[2U * k + 1U]) * norm;
-      powers[i] += re * re + im * im;
+      const double binPower = re * re + im * im;
+      // 首桶：clippedLow 所在桶（floor 语义即 [edge_i, edge_{i+1}) 左闭右开）。
+      // 双精度索引计算；clippedLow < 20000 ⇒ i ≤ kBinCount−1。
+      const double index =
+          static_cast<double>(kBinCount) * std::log10(clippedLow / kLogLower) / kLogDecades;
+      std::size_t i = static_cast<std::size_t>(std::floor(index));
+      if (i >= kBinCount) {
+        continue;  // 防御：浮点边界（轴内首桶必 < kBinCount）
+      }
+      double segmentStart = clippedLow;
+      while (i < kBinCount && segmentStart < clippedHigh) {
+        const double edgeHi = std::min(static_cast<double>(binEdgeHz(i + 1U)), clippedHigh);
+        if (edgeHi > segmentStart) {
+          powers[i] += binPower * ((edgeHi - segmentStart) / inAxisSpan);
+        }
+        ++i;
+        segmentStart = edgeHi;
+      }
     }
 
     for (std::size_t i = 0; i < kBinCount; ++i) {

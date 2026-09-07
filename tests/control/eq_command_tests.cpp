@@ -504,7 +504,7 @@ TEST_CASE("controller spectrum subscription starts empty at generation 0 and is 
   });
   fixture.controller->start();
 
-  // 频谱分析未接入（FFT 未生效）：订阅即推空快照 gen0，60 bin 全 0。
+  // 频谱分析未接入（FFT 未生效）：订阅即推空快照 gen0，全 120 bin 0。
   REQUIRE(spectrum.count() == 1U);
   CHECK(spectrum.last().generation == 0U);
   CHECK(spectrum.last().sampleRate == 0U);
@@ -554,7 +554,7 @@ TEST_CASE("controller equalizer subscription after a later commit first receives
 //   - reducer 级：SetSpectrumEnabled = 单意图直转（true/false），载荷缺失拒绝；
 //   - controller 命令级：命令 → 意图 → 音频服务 setSpectrumEnabled（fake 记账）；
 //   - controller 事件级：SpectrumUpdated 事件 → spectrumSnapshot 更新 + 订阅推送
-//     （60 桶内容逐位一致 + generation/timestamp 透传）；事件不触碰播放/均衡器面。
+//     （120 桶内容逐位一致 + generation/timestamp 透传）；事件不触碰播放/均衡器面。
 // ============================================================
 
 namespace {
@@ -568,7 +568,7 @@ audio::SpectrumSnapshot makeSpectrumSnapshot(std::uint64_t generation, float fil
   snapshot.generation = generation;
   snapshot.sampleRate = 48000U;
   snapshot.binsDb.fill(fillValue);
-  snapshot.binsDb[26] = -6.0F;  // 特征峰值（440 Hz 对数桶），供逐桶比对
+  snapshot.binsDb[53] = -6.0F;  // 特征峰值（440 Hz 在 120 桶的 logidx≈53.7 → 53），供逐桶比对
   snapshot.timestampMs = 1000U + generation;
   return snapshot;
 }

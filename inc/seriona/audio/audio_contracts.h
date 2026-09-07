@@ -70,7 +70,7 @@ enum class BackendEventType {
   // 发射序 = 提交事件先于新曲的 TrackChanged/状态事件（控制器提交需先于状态漂移）。
   AdvanceCompleted,
   // R2：频谱快照发布（服务→控制器，频谱显示链路）。载荷=SpectrumUpdated{snapshot}；
-  // 仅开关开且 Playing 时按分析产出节流（~50ms 轮询 × 分析窗消耗，≤20Hz）发射。
+  // 仅开关开且 Playing 时按分析产出节流（轮询 × hop 消耗，上界 ~40Hz）发射。
   // 追加末尾保持序数兼容。
   SpectrumUpdated,
 };
@@ -235,13 +235,13 @@ struct AdvanceCompleted {
 struct SpectrumSnapshot {
   std::uint64_t generation = 0;   // 单调代数：每次频谱更新递增（0 = 空快照）
   std::uint32_t sampleRate = 0;   // 快照对应的输出采样率
-  std::array<float, 60> binsDb{}; // 60 段频带电平（dB）
+  std::array<float, 120> binsDb{}; // 120 段频带电平（dB）
   std::uint64_t timestampMs = 0;  // 快照生成时刻（毫秒时间戳）
 };
 
 // R2：频谱更新事件载荷（服务→控制器）。snapshot = 一次新分析完成后的完整驻留
-// 快照副本（generation 单调 +1，0 = 空）。发射频率 = 分析产出节流（~50ms 轮询 ×
-// 分析窗消耗，≤20Hz），走既有 BackendEvent 通道，monotonicVersion 由 dispatcher 递增。
+// 快照副本（generation 单调 +1，0 = 空）。发射频率 = 分析产出节流（轮询节流 ×
+// hop 消耗，上界 ~40Hz），走既有 BackendEvent 通道，monotonicVersion 由 dispatcher 递增。
 struct SpectrumUpdated {
   SpectrumSnapshot snapshot{};
 };
@@ -363,10 +363,10 @@ public:
   // 同 setEqualizer / enumeratePlaybackDevices 先例。
   virtual EqualizerStateSnapshot equalizerState() const { return {}; }
   // 频谱：实时频谱分析开关（任务 30 B3.2）。默认关——worker 不取摘录帧/不分析/
-  // 零成本；开启且逻辑态 Playing 时以 ~50ms 节流产出频谱快照。非纯虚 + 默认空
-  // 实现：实现者共 4 个（SingleTrack 业务实现、Noop、后端 Fake、前端 Fake），
-  // 纯虚会同时打破两仓库编译；no-op 也是 Noop/Fake 的既有机制（同 setEqualizer
-  // / configureTransition 先例）。
+  // 零成本；开启且逻辑态 Playing 时以轮询节流产出频谱快照（上界 ~40Hz）。非纯虚
+  // + 默认空实现：实现者共 4 个（SingleTrack 业务实现、Noop、后端 Fake、前端
+  // Fake），纯虚会同时打破两仓库编译；no-op 也是 Noop/Fake 的既有机制（同
+  // setEqualizer / configureTransition 先例）。
   virtual void setSpectrumEnabled(bool enabled) { (void)enabled; }
   [[nodiscard]] virtual bool spectrumEnabled() const { return false; }
 };

@@ -434,7 +434,7 @@ AudioOutputConfig spectrumOutputConfigForTest() {
 }
 
 // 以 ~4.17× 实时持续驱动设备回调（800 帧/4ms）：使 PCM 消费快于频谱分析的
-// 50ms 轮询栅（喂帧节奏由轮询主导，音频时间轴推进约 4×）。
+// ~10ms 轮询栅（喂帧节奏由轮询主导，音频时间轴推进约 4×）。
 void driveFor(std::shared_ptr<AudioPlaybackService>& service, SpectrumServiceBackend& backend,
               std::chrono::milliseconds wallMs) {
   const auto deadline = std::chrono::steady_clock::now() + wallMs;
@@ -444,8 +444,9 @@ void driveFor(std::shared_ptr<AudioPlaybackService>& service, SpectrumServiceBac
   }
 }
 
-// 440 Hz、0.5 满刻度正弦在 48k 下应把能量集中到对数桶 26（[399,448)Hz），
-// 邻桶 24-28 搜索峰——泄漏宽容，避免逐 bin 过约束。
+// 440 Hz、0.5 满刻度正弦在 48k 下的对数桶位置 ≈ 53.7（120 桶：120·log10(440/20)/3），
+// 主瓣加轮询丢块杂散把峰摊到 52..55；全局搜峰后由调用方限定在 51..56 带内——
+// 泄漏宽容，避免逐 bin 过约束。
 [[nodiscard]] std::size_t strongestBinIndex(const SpectrumSnapshot& snapshot) {
   std::size_t best = 0;
   for (std::size_t index = 1; index < snapshot.binsDb.size(); ++index) {
@@ -481,7 +482,8 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
   CHECK(sink.spectrumSnapshots().empty());
   CHECK_FALSE(service->spectrumEnabled());
 
-  // ② 开：~50ms 节流 × 2048 窗 → 首个事件应在数百 ms 内；限 4s 预算收集 ≥3 份。
+  // ② 开：~10ms 轮询节流（K=5）× 4096 窗（hop 1024）→ 首个事件应在数百 ms 内；
+  // 限 4s 预算收集 ≥3 份。
   service->setSpectrumEnabled(true);
   REQUIRE(service->spectrumEnabled());
   std::vector<SpectrumSnapshot> snapshots;
@@ -493,29 +495,30 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
   }
   REQUIRE(snapshots.size() >= 3U);
 
-  // 逐份断言：generation 从 1 严格递增、率/时间戳已填、440 Hz 峰在 24-28 桶、
-  // 峰强 ≈ −6dB（0.5 满刻度正弦，±3.5dB 宽容）。尾部（峰邻域外）不做绝对静音
-  // 断言：轮询节流丢弃中间摘录块 → 分析窗样本时间不连续 → 正弦相位跳变产生宽带
-  // 杂散（实测 ~−35dB 级地板，真实部署同语义）——断言峰显著高于杂散地板即可。
+  // 逐份断言：generation 从 1 严格递增、率/时间戳已填、440 Hz 峰在 51..56 桶
+  // （120 桶 logidx≈53.7；实测 52..54 峰 ≈ −11.5dB，±3dB 宽容）、峰显著高于
+  // 杂散地板。尾部（桶 46..58 邻域外）不做绝对静音断言：轮询节流丢弃中间摘录块
+  // → 分析窗样本时间不连续 → 正弦相位跳变产生宽带杂散（实测 ~−22dB 级局部峰、
+  // ~−28dB 级外围地板，真实部署同语义）——断言峰显著高于杂散地板即可。
   for (std::size_t index = 0; index < snapshots.size(); ++index) {
     CAPTURE(index);
     CHECK(snapshots[index].generation == index + 1U);
     CHECK(snapshots[index].sampleRate == kSampleRate);
     CHECK(snapshots[index].timestampMs > 0U);
     const auto peak = strongestBinIndex(snapshots[index]);
-    CHECK(peak >= 24U);
-    CHECK(peak <= 28U);
-    CHECK(snapshots[index].binsDb[peak] > -10.0F);
-    CHECK(snapshots[index].binsDb[peak] < -3.0F);
+    CHECK(peak >= 51U);
+    CHECK(peak <= 56U);
+    CHECK(snapshots[index].binsDb[peak] > -15.0F);
+    CHECK(snapshots[index].binsDb[peak] < -8.0F);
     float tailMax = -120.0F;
     for (std::size_t bin = 0U; bin < snapshots[index].binsDb.size(); ++bin) {
-      if (bin >= 20U && bin <= 34U) {
+      if (bin >= 46U && bin <= 58U) {
         continue;
       }
       tailMax = std::max(tailMax, snapshots[index].binsDb[bin]);
     }
-    CHECK(tailMax < -25.0F);
-    CHECK(snapshots[index].binsDb[peak] - tailMax > 15.0F);
+    CHECK(tailMax < -20.0F);
+    CHECK(snapshots[index].binsDb[peak] - tailMax > 8.0F);
   }
 
   // ③ 关：停等 ~100ms 排空在途 tick（窗口 ≤ 2ms）后计数定格，再驱动 ~300ms 零增长。
