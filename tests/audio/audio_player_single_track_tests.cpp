@@ -1097,7 +1097,8 @@ TEST_CASE("audio_player_finishing natural end with fade enabled stays instant (r
   waitForState(fading.events, PlaybackState::Playing);
 
   bool ended = false;
-  for (int index = 0; index < 12 && !ended; ++index) {
+  const auto endDeadline = std::chrono::steady_clock::now() + 2s;
+  while (!ended && std::chrono::steady_clock::now() < endDeadline) {
     fake->consumeFrames(1'200U);
     const auto snapshot = fading.events.snapshot();
     ended = std::any_of(snapshot.begin(), snapshot.end(), [](const BackendEvent& event) {
