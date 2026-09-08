@@ -1,5 +1,7 @@
 #include "seriona/audio/device/audio_output_device.h"
 
+#include "../eq_dsp.h"
+#include "../limiter.h"
 #include "spdlog/spdlog.h"
 
 #include <algorithm>
@@ -268,6 +270,60 @@ void publishEnvelopeLayer(GainEnvelopeLayerState& layer, const GainEnvelopeSnaps
   layer.version.store(snapshot.version, std::memory_order_release);
 }
 
+// EQ 生效快照发布（任务 26 B2.4b；worker，停态窗口调用）：把实际生效配置 + 实际输出率
+// 逐字段 relaxed 写入原子镜像层，version release 最后写（发布序同 publishEnvelopeLayer）。
+// 调用点 = applyEqualizerDspConfig 每次真实 configure 成功之后（含 clearDspState 重建后
+// 重配置）；eqConfig_ 仅存储未应用（未 initialize / started_ 防御存储）时不调用——快照
+// 保持上一次真实生效状态，读侧不被告知未生效的新目标。
+void publishEqAppliedLayer(AudioOutputDeviceEqLayer& layer,
+                           const EqualizerConfig& config,
+                           const AudioDeviceFormat& format,
+                           std::uint32_t version) noexcept {
+  layer.enabled.store(config.enabled, std::memory_order_relaxed);
+  layer.mode.store(config.mode, std::memory_order_relaxed);
+  layer.preGainDb.store(config.preGainDb, std::memory_order_relaxed);
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    layer.bandGainsDb[band].store(config.bandGainsDb[band], std::memory_order_relaxed);
+  }
+  layer.limiterEnabled.store(config.limiterEnabled, std::memory_order_relaxed);
+  layer.sampleRate.store(format.sampleRate, std::memory_order_relaxed);
+  layer.channelCount.store(format.channelCount, std::memory_order_relaxed);
+  layer.version.store(version, std::memory_order_release);
+}
+
+// 生效快照「config 系字段」发布（运行期回调受理专用，不写 sampleRate/channelCount）：
+// 受理发生在设备运行中——输出格式不变，采样率/声道数字段保持停态真实应用的回填值恒
+// 正确（格式变化必须经停态 initialize 重建，回调受理永不触碰格式）。回调红线：
+// 零分配/零锁/零日志；逐字段 relaxed + version release 最后写同 publishEqAppliedLayer。
+void publishEqAppliedConfigLayer(AudioOutputDeviceEqLayer& layer,
+                                 const EqualizerConfig& config,
+                                 std::uint32_t version) noexcept {
+  layer.enabled.store(config.enabled, std::memory_order_relaxed);
+  layer.mode.store(config.mode, std::memory_order_relaxed);
+  layer.preGainDb.store(config.preGainDb, std::memory_order_relaxed);
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    layer.bandGainsDb[band].store(config.bandGainsDb[band], std::memory_order_relaxed);
+  }
+  layer.limiterEnabled.store(config.limiterEnabled, std::memory_order_relaxed);
+  layer.version.store(version, std::memory_order_release);
+}
+
+// EQ 运行期目标 PENDING 发布（worker；setEqualizerConfig 无条件调用——含停态与未
+// initialize）：目标配置逐字段 relaxed 写，version release 最后写（回调读到 version
+// 变化时字段必然已就位；发布序同 publishEnvelopeLayer/publishEqAppliedLayer）。
+void publishEqTargetLayer(AudioOutputDeviceEqTargetLayer& layer,
+                          const EqualizerConfig& config) noexcept {
+  layer.enabled.store(config.enabled, std::memory_order_relaxed);
+  layer.mode.store(config.mode, std::memory_order_relaxed);
+  layer.preGainDb.store(config.preGainDb, std::memory_order_relaxed);
+  for (std::size_t band = 0; band < config.bandGainsDb.size(); ++band) {
+    layer.bandGainsDb[band].store(config.bandGainsDb[band], std::memory_order_relaxed);
+  }
+  layer.limiterEnabled.store(config.limiterEnabled, std::memory_order_relaxed);
+  const auto nextVersion = layer.version.load(std::memory_order_relaxed) + 1U;
+  layer.version.store(nextVersion, std::memory_order_release);
+}
+
 // 单层全字段复位（resetEnvelopes 与 resetSourceEnvelope 共用）：清 PENDING 与 EXEC
 // （含 currentGain→1.0、latchedVersion→0、exec* 锁存）——设备已停时无竞争；设备运行中
 // 的槽级复位与回调并发窗口见 resetSourceEnvelope 头注释（块首快照已锁存，下块自愈）。
@@ -530,6 +586,228 @@ void mixDualFrames(void* output,
   }
 }
 
+// --- EQ 格式转换辅助（任务 24 B2.3；任务 25 EQ 分支接线）------------------------------
+// EQ 激活时处理链在 f32 域进行：int 设备格式逐样本转 f32 进 f32Scratch_（读侧三函数），
+// 链尾一次量化回设备格式（写侧三函数）——末端是 EQ 链唯一 round+clamp 点（单次量化，
+// 无中间域往返）。尺度与既有打包同源防双标：s16 以 2^15 为 1.0（±32768 ↔ ±1.0）；
+// s24 按 76-95 的「左对齐 S32」中间域以 2^31 为 1.0——读用 unpackS24ToLeftAlignedS32
+// 还原后 /2^31，写先量化左对齐 S32 再 packLeftAlignedS32ToS24 落 3 字节，与打包写侧
+// （ffmpeg_filter_pipeline.cpp packS32ToS24）同尺度；s32 直接以 2^31 为 1.0。读侧
+// s16/s24 内容 ≤ 24 位有效位：int→float 精确且除数为 2 的幂 → 转换零舍入；s32 高位
+// 内容按 f32 尾数（24 位）正确舍入，误差 ≤ 该幅值浮点 ULP（f32 域固有精度）。
+// 写侧量化数学沿用 40-49（double 加宽域 llround + clamp）：有限样本先 clamp 到
+// [-1,1] 再乘尺度——与直接 round 后 clamp 输出等价（|x|>1 的量化结果经 clamp 恒收敛
+// 到同一满幅值），且使 llround 永在 long long 域内（无实现相关溢出值）；NaN/±Inf
+// 显式量化 0（40-49 输入恒 int 无此通道；llround(NaN) 结果实现相关，落满幅会放大
+// 爆音）。全零分配、零间接。[[maybe_unused]]：任务 25 接线前无调用点（抑制
+// -Wunused-function），接线后随调用点移除。
+
+// 读侧：int 设备样本 → f32（source = 设备输出缓冲 int 布局，destination = f32Scratch_）。
+[[maybe_unused]] void int16ToFloat32(const void* source, float* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto const* in = static_cast<std::int16_t const*>(source);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    destination[index] = static_cast<float>(in[index]) / 32768.0F;
+  }
+}
+
+[[maybe_unused]] void int32ToFloat32(const void* source, float* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto const* in = static_cast<std::int32_t const*>(source);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    destination[index] = static_cast<float>(in[index]) / 2147483648.0F;
+  }
+}
+
+[[maybe_unused]] void int24ToFloat32(const void* source, float* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto const* bytes = static_cast<std::uint8_t const*>(source);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    // 3 字节小端 S24 → 左对齐 S32（76-95 unpack，|值| ≤ 2^31）→ /2^31（精确，见区注释）。
+    destination[index] = static_cast<float>(unpackS24ToLeftAlignedS32(bytes + index * 3U)) / 2147483648.0F;
+  }
+}
+
+// 写侧（末端量化）：f32 → int 设备样本（source = f32 处理域，destination = 设备输出缓冲）。
+[[maybe_unused]] void float32ToInt16(const float* source, void* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto* out = static_cast<std::int16_t*>(destination);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    const double value = static_cast<double>(source[index]);
+    const auto scaled =
+        std::isfinite(value) ? std::llround(std::clamp(value, -1.0, 1.0) * 32768.0) : 0LL;
+    out[index] = static_cast<std::int16_t>(std::clamp<long long>(
+        scaled, std::numeric_limits<std::int16_t>::min(), std::numeric_limits<std::int16_t>::max()));
+  }
+}
+
+[[maybe_unused]] void float32ToInt32(const float* source, void* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto* out = static_cast<std::int32_t*>(destination);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    const double value = static_cast<double>(source[index]);
+    const auto scaled =
+        std::isfinite(value) ? std::llround(std::clamp(value, -1.0, 1.0) * 2147483648.0) : 0LL;
+    out[index] = static_cast<std::int32_t>(std::clamp<long long>(
+        scaled, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()));
+  }
+}
+
+[[maybe_unused]] void float32ToInt24(const float* source, void* destination, std::uint32_t frameCount,
+                                     std::uint16_t channelCount) noexcept {
+  auto* bytes = static_cast<std::uint8_t*>(destination);
+  const auto sampleCount = static_cast<std::size_t>(frameCount) * channelCount;
+  for (std::size_t index = 0U; index < sampleCount; ++index) {
+    const double value = static_cast<double>(source[index]);
+    const auto scaled =
+        std::isfinite(value) ? std::llround(std::clamp(value, -1.0, 1.0) * 2147483648.0) : 0LL;
+    const auto quantized = static_cast<std::int32_t>(std::clamp<long long>(
+        scaled, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max()));
+    packLeftAlignedS32ToS24(quantized, bytes + index * 3U);
+  }
+}
+
+// --- EQ 链第二腿累加辅助（任务 25 B2.4a；EQ 激活分支专用）----------------------------
+// 双源 EQ 链的读侧混合：腿 0（output）先经任务 24 读侧辅助逐样本转 f32 进
+// f32Scratch_，腿 1（mixScratch_，设备域）经本族逐样本转 f32 后**就地累加**进
+// f32Scratch_（destination += 腿1 × 腿1包络增益——仅双腿增益+求和，master×volume
+// 推迟到 EQ 后统一应用）。尺度和数学与任务 24 读侧辅助一致（s16 / 2^15；s24 经
+// unpackS24ToLeftAlignedS32 / 2^31；s32 / 2^31），单次量化仍在链尾（见 533-547
+// 区注释）。leg 增益每帧每声道相同（trajectoryGain 按帧取）；未受理层 = 恒等 1.0。
+// 零分配、零锁、零日志；Float32 设备不经过本族（就地混音，见 eqMixFloat32Dual）。
+
+template <typename IntSample>
+void eqAccumulateIntLegToFloat32(IntSample const* secondSrc,
+                                 float* destination,
+                                 std::uint32_t frameCount,
+                                 std::uint16_t channelCount,
+                                 float intScale,
+                                 const ExecutedTrajectory& legTrajectory) noexcept {
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float gain = trajectoryGain(legTrajectory, frame);
+    auto const* const frameSrc = secondSrc + static_cast<std::size_t>(frame) * channels;
+    auto* const frameDst = destination + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      frameDst[ch] += static_cast<float>(frameSrc[ch]) * intScale * gain;
+    }
+  }
+}
+
+void eqAccumulateS24LegToFloat32(const void* secondSrc,
+                                 float* destination,
+                                 std::uint32_t frameCount,
+                                 std::uint16_t channelCount,
+                                 const ExecutedTrajectory& legTrajectory) noexcept {
+  auto const* bytes = static_cast<std::uint8_t const*>(secondSrc);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float gain = trajectoryGain(legTrajectory, frame);
+    auto const* const frameSrc = bytes + static_cast<std::size_t>(frame) * channels * 3U;
+    auto* const frameDst = destination + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      // 3 字节小端 S24 → 左对齐 S32（unpackS24ToLeftAlignedS32，|值| ≤ 2^31）→
+      // /2^31（与 int24ToFloat32 同尺度；f32 域相加，链尾单次量化）。
+      frameDst[ch] +=
+          static_cast<float>(unpackS24ToLeftAlignedS32(frameSrc + ch * 3U)) / 2147483648.0F * gain;
+    }
+  }
+}
+
+// f32 设备双源 EQ 链的腿求和（就地）：output 兼腿 0 与和缓冲，secondSrc = 腿 1
+// （mixScratch_，f32 设备域字节）。逐帧：out = out×g0 + second×g1——同上方累加
+// 纪律（双腿增益+求和；master×volume 推迟 EQ 后；单源 f32 走 applyFloat32FrameGains，
+// 不经本函数）。未受理层增益恒等 1.0。
+void eqMixFloat32Dual(float* output,
+                      const float* secondSrc,
+                      std::uint32_t frameCount,
+                      std::uint16_t channelCount,
+                      const ExecutedTrajectory& source0,
+                      const ExecutedTrajectory& source1) noexcept {
+  const auto channels = static_cast<std::size_t>(channelCount);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    const float g0 = trajectoryGain(source0, frame);
+    const float g1 = trajectoryGain(source1, frame);
+    auto* const frameOut = output + static_cast<std::size_t>(frame) * channels;
+    auto const* const frameSrc = secondSrc + static_cast<std::size_t>(frame) * channels;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      frameOut[ch] = frameOut[ch] * g0 + frameSrc[ch] * g1;
+    }
+  }
+}
+
+// --- 摘录单声道均值下混辅助（任务 29 B3.1；回调线程专用）------------------------
+// 帧内按声道序 0..N-1 固定顺序累加（f32；|Σ| ≤ N×幅值，EQ 增益后幅值有界、无溢出
+// 可能；累加顺序固定 = 可复现），再乘 1/N。int 源逐样本先按任务 24 冻结读侧尺度
+// 转 f32（s16 /2^15；s24 经 unpackS24ToLeftAlignedS32 左对齐后 /2^31；s32 /2^31，
+// 与 int16ToFloat32/int24ToFloat32/int32ToFloat32 同尺度）；N=1 单声道直取（无
+// 均值运算，scale 乘/拷贝恒等）。零分配、零锁、零日志。
+template <typename IntSample>
+void captureDownmixIntToMono(IntSample const* src, float* mono, std::uint32_t frameCount,
+                             std::uint16_t channelCount, float intScale) noexcept {
+  const auto channels = static_cast<std::size_t>(channelCount);
+  if (channels == 1U) {
+    for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+      mono[frame] = static_cast<float>(src[frame]) * intScale;
+    }
+    return;
+  }
+  const float invChannels = 1.0F / static_cast<float>(channels);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    auto const* const frameSrc = src + static_cast<std::size_t>(frame) * channels;
+    float sum = 0.0F;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      sum += static_cast<float>(frameSrc[ch]) * intScale;
+    }
+    mono[frame] = sum * invChannels;
+  }
+}
+
+void captureDownmixS24ToMono(const void* src, float* mono, std::uint32_t frameCount,
+                             std::uint16_t channelCount) noexcept {
+  auto const* bytes = static_cast<std::uint8_t const*>(src);
+  const auto channels = static_cast<std::size_t>(channelCount);
+  if (channels == 1U) {
+    for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+      mono[frame] =
+          static_cast<float>(unpackS24ToLeftAlignedS32(bytes + static_cast<std::size_t>(frame) * 3U)) /
+          2147483648.0F;
+    }
+    return;
+  }
+  const float invChannels = 1.0F / static_cast<float>(channels);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    auto const* const frameSrc = bytes + static_cast<std::size_t>(frame) * channels * 3U;
+    float sum = 0.0F;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      sum += static_cast<float>(unpackS24ToLeftAlignedS32(frameSrc + ch * 3U)) / 2147483648.0F;
+    }
+    mono[frame] = sum * invChannels;
+  }
+}
+
+void captureDownmixFloatToMono(const float* src, float* mono, std::uint32_t frameCount,
+                               std::uint16_t channelCount) noexcept {
+  const auto channels = static_cast<std::size_t>(channelCount);
+  if (channels == 1U) {
+    std::memcpy(mono, src, static_cast<std::size_t>(frameCount) * sizeof(float));
+    return;
+  }
+  const float invChannels = 1.0F / static_cast<float>(channels);
+  for (std::uint32_t frame = 0U; frame < frameCount; ++frame) {
+    auto const* const frameSrc = src + static_cast<std::size_t>(frame) * channels;
+    float sum = 0.0F;
+    for (std::size_t ch = 0U; ch < channels; ++ch) {
+      sum += frameSrc[ch];
+    }
+    mono[frame] = sum * invChannels;
+  }
+}
 
 }
 
@@ -538,6 +816,12 @@ AudioOutputDevice::AudioOutputDevice(std::unique_ptr<AudioOutputDeviceBackend> b
   if (!backend_) {
     backend_ = makeMiniaudioOutputDeviceBackend();
   }
+  // EQ/限幅 DSP 实例（任务 25）：构造函数内一次性分配（非回调路径），保证首次
+  // setEqualizerConfig（未 initialize、格式未定）等停态调用永不触碰空指针；configure
+  // 在停态窗口（setEqualizerConfig/initialize），process 在 renderCallback EQ 分支。
+  // 任务 26：每次 initialize() 经 clearDspState() 重建实例（内容边界清零），此处仅兜底。
+  eqDsp_ = std::make_unique<EqualizerDspProcessor>();
+  limiter_ = std::make_unique<LimiterDspProcessor>();
 }
 
 AudioOutputDevice::~AudioOutputDevice() { uninitialize(); }
@@ -577,6 +861,22 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
   // 调整——rebind/start 的重发布在设备运行期可能发生，绝不边跑边改回调工作区。
   mixScratch_.resize(static_cast<std::size_t>(request.pcmQueue->capacityFrames()) *
                      bytesPerSample(currentFormat_.sampleFormat) * currentFormat_.channelCount);
+  // 任务 24：EQ f32 暂存容量 = 主队列容量 × 4B（float32 字节宽）× 声道数。与 mixScratch_
+  // 同纪律（仅此处调整）；按固定 4B/f32 分配，不依赖 mixScratch_ 的帧字节（后随设备
+  // 位深字节宽变化）。EQ 处理帧数 ≤ 后端 period ≤ 主队列容量 ⇒ 4×帧×声道 ≤ 容量恒成立。
+  f32Scratch_.resize(static_cast<std::size_t>(request.pcmQueue->capacityFrames()) * sizeof(float) *
+                     currentFormat_.channelCount);
+  // 任务 29 B3.1：频谱摘录双缓冲按主队列容量（= 最大回调帧数上界）重分配 + 纪元
+  // 推进（双槽内容清零防混率帧被消费；无活跃回调窗口，同 f32Scratch_ resize 纪律；
+  // rebindQueue/T10 交接与 stop() 不调用——交接不是重建，暂停冻结续接）。
+  captureReset(request.pcmQueue->capacityFrames());
+  // 任务 25/26：EQ/限幅 DSP 按生效格式（重新）应用存储配置（幂等——negotiateOutput
+  // 失败候选反复 initialize 安全；backend init 已成功 = 格式确定）。挂点 ①（任务 26
+  // 内容边界清理）：initialize() 内经 clearDspState() 重建 DSP 单元实例——滤波历史/
+  // limiter 延迟线/检测/平滑全清零后按存储配置重配置并发布 EQ 生效快照（含实际输出率
+  // sampleRate 回填）。configure 允许分配/重建，此处无活跃回调（结构性无竞态，
+  // 同 f32Scratch_ resize 纪律）；EQ 重建语义在 eq_dsp configure 内。
+  clearDspState();
   publishCallbackQueue(*request.pcmQueue, currentFormat_);
   callbackCount_.store(0U, std::memory_order_relaxed);
   requestedFrames_.store(0U, std::memory_order_relaxed);
@@ -588,6 +888,13 @@ bool AudioOutputDevice::initialize(const AudioOutputDeviceOpenRequest& request) 
                currentFormat_.channelCount,
                static_cast<int>(currentFormat_.sampleFormat));
   return true;
+}
+
+bool AudioOutputDevice::f32ScratchFits(std::uint32_t frameCount, std::uint16_t channelCount) const noexcept {
+  // EQ f32 暂存容量守卫：frameCount×4B/f32×channelCount ≤ 分配容量（f32Scratch_）。
+  // 正常路径恒成立（EQ 处理帧数 ≤ 后端 period ≤ 主队列容量，容量在 initialize 按主
+  // 队列容量分配）；装不下时调用方（任务 25 EQ 分支）退回既有路径，同 dualMix 守卫语义。
+  return static_cast<std::size_t>(frameCount) * sizeof(float) * channelCount <= f32Scratch_.size();
 }
 
 bool AudioOutputDevice::start() {
@@ -692,6 +999,83 @@ void AudioOutputDevice::setVolume(float linearGain) noexcept {
 void AudioOutputDevice::setMuted(bool muted) noexcept {
     spdlog::debug("device mute set to {}", muted);
   muted_.store(muted, std::memory_order_release);
+}
+
+void AudioOutputDevice::setEqualizerConfig(const EqualizerConfig& config) noexcept {
+  // EQ 配置存储 + 实时投递入口（任务 25 B2.4a；头注释为线程契约）。语义：
+  //  - eqConfig_ 存储恒执行（停态应用/幂等重放读它，兼容/回读面）；
+  //  - PENDING 目标层无条件发布（publishEqTargetLayer，version 递增）——运行中
+  //    （started_，回调可能活跃）由 renderCallback 块首受理投递到 DSP（applyTargets
+  //    零分配，播放中调节实时生效——用户实测缺陷修复点；不再 started_ 门控仅存储）；
+  //  - 停态窗口（未 started_：无活跃回调）仍即时真实应用 applyEqualizerDspConfig
+  //    （configure 允许分配；暂停中调整 = 立即生效 + 生效快照发布，同现状零回归）。
+  eqConfig_ = config;
+  publishEqTargetLayer(eqTargetLayer_, config);
+  if (!started_) {
+    applyEqualizerDspConfig();
+  }
+}
+
+void AudioOutputDevice::applyEqualizerDspConfig() noexcept {
+  // 停态应用：按当前设备格式 configure 两 DSP 单元并发布生效快照。格式未定
+  // （未 initialize，sampleRate==0）时仅存储语义成立（initialize() 在格式确定后
+  // 调用本方法补应用——幂等）。发布序：先 configure 后发布 EQ 生效快照（任务 26：
+  // version 在原子镜像层 release 最后写，读侧一致取用——含实际输出率 sampleRate
+  // 回填点）。DSP 链进入条件不再由本方法发布独立标志——renderCallback 按 DSP
+  // 目标/平滑状态实时判定（见 renderCallback 区注释）；本方法同步把目标受理账本
+  // 消费到当前 PENDING version：停态真实应用已把目标 configure 进 DSP，回调无需
+  // 再受理重放（受理对同目标本无操作，消费仅为避免生效快照重复发布——测试装置
+  // 停态直渲与重启首块均不发重复发布）。
+  const auto rate = currentFormat_.sampleRate;
+  if (rate == 0U || currentFormat_.channelCount == 0U) {
+    return;
+  }
+  static_cast<void>(eqDsp_->configure(eqConfig_, rate, currentFormat_.channelCount));
+  static_cast<void>(limiter_->configure(eqConfig_, rate, currentFormat_.channelCount));
+  const auto nextVersion = eqAppliedLayer_.version.load(std::memory_order_relaxed) + 1U;
+  publishEqAppliedLayer(eqAppliedLayer_, eqConfig_, currentFormat_, nextVersion);
+  latchedEqTargetVersion_.store(eqTargetLayer_.version.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+}
+
+void AudioOutputDevice::clearDspState() noexcept {
+  // 内容边界清理（任务 26 B2.4b；仅停态窗口调用，见头注释三挂点与不清零纪律）：
+  // eq_dsp/limiter 无公开复位 API 且同参数 configure 不清态（fs/声道变化才重建），
+  // 故重建实例（滤波历史/limiter 延迟线/检测/平滑全清零）+ 按当前存储配置重配置
+  // （幂等；格式未定 = 仅清空待下次应用）达成清零，零单元改动。DSP 实例不透明持有，
+  // 此处分配不在回调路径（调用点设备已停，结构性无竞态）。
+  eqDsp_ = std::make_unique<EqualizerDspProcessor>();
+  limiter_ = std::make_unique<LimiterDspProcessor>();
+  applyEqualizerDspConfig();
+}
+
+AudioOutputDeviceEqSnapshot AudioOutputDevice::eqAppliedSnapshot() const noexcept {
+  // 一致读（跨线程安全）：version acquire 取代 → 逐字段 relaxed 读 → version 复核。
+  // 发布可发生于读取期间：原子镜像字段无撕裂；版本变更仅表示读到相邻两代混合，
+  // 重读一次自愈（发布 = 停态应用（worker）与回调受理（运行期）双写侧低频发布，
+  // 两写者不并发；实际重读几乎不发生——同 planEnvelopeLayer「读侧受理/自愈」
+  // 语义；不循环等待，避免读侧饥饿）。
+  AudioOutputDeviceEqSnapshot snapshot;
+  std::uint32_t version = eqAppliedLayer_.version.load(std::memory_order_acquire);
+  for (std::uint32_t attempt = 0; attempt < 3U; ++attempt) {
+    snapshot.config.enabled = eqAppliedLayer_.enabled.load(std::memory_order_relaxed);
+    snapshot.config.mode = eqAppliedLayer_.mode.load(std::memory_order_relaxed);
+    snapshot.config.preGainDb = eqAppliedLayer_.preGainDb.load(std::memory_order_relaxed);
+    for (std::size_t band = 0; band < snapshot.config.bandGainsDb.size(); ++band) {
+      snapshot.config.bandGainsDb[band] =
+          eqAppliedLayer_.bandGainsDb[band].load(std::memory_order_relaxed);
+    }
+    snapshot.config.limiterEnabled = eqAppliedLayer_.limiterEnabled.load(std::memory_order_relaxed);
+    snapshot.sampleRate = eqAppliedLayer_.sampleRate.load(std::memory_order_relaxed);
+    snapshot.channelCount = eqAppliedLayer_.channelCount.load(std::memory_order_relaxed);
+    const auto current = eqAppliedLayer_.version.load(std::memory_order_acquire);
+    if (current == version) {
+      break;
+    }
+    version = current;  // 读取期间发布推进：用新代重读。
+  }
+  snapshot.version = version;
+  return snapshot;
 }
 
 void AudioOutputDevice::setMasterEnvelope(const GainEnvelopeSnapshot& snapshot) noexcept {
@@ -809,6 +1193,215 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
   }
   const bool dualMix = secondQueue != nullptr &&
                        static_cast<std::size_t>(frameCount) * bytesPerFrame <= device->mixScratch_.size();
+  // ---- EQ 运行期目标受理（播放中实时调节的投递点；每块一次，零分配/零锁/零日志）----
+  // worker 在 setEqualizerConfig（无条件发布 PENDING，见发布面注释）写目标层；本块首
+  // 把未受理的新目标经 applyTargets 投递到 DSP（eq_dsp/limiter 的实时目标更新——
+  // 平滑/开关过渡在各自 process 内执行，无咔哒）。受理前置：
+  //  - 设备处于活跃回调态（state.active）：停态直渲（stop 后测试/异常直渲）不投递
+  //    ——停态窗口的真实应用走 worker 侧 applyEqualizerDspConfig，不经本路径；且
+  //    停态应用已把账本消费到当前 version（见 applyEqualizerDspConfig），此处不重放；
+  //  - DSP 已 configure（accepted_）：initialize() 停态窗口无条件预配置（含出厂默认
+  //    配置）→ 活跃态恒成立；applyTargets 返回 false（防御分支，不可达）→ 跳过
+  //    受理与生效发布（音频走既有原路径逐位不变，下块重试自愈）。
+  // 受理后发布生效快照（config 系字段 + version 递增——服务读回曲线 = 用户目标，
+  // 受理即发布；sampleRate/channelCount 不回写：运行中格式不变，停态回填值恒正确）。
+  // 已受理账本 latchedEqTargetVersion_：回调线程写 + 停态应用消费（worker）——两写者
+  // 不并发（停态应用时无活跃回调；受理仅活跃回调态），原子化仅为跨线程读写模型卫生。
+  const std::uint32_t eqTargetVersion = device->eqTargetLayer_.version.load(std::memory_order_acquire);
+  if (state.active.load(std::memory_order_acquire) &&
+      eqTargetVersion != device->latchedEqTargetVersion_.load(std::memory_order_relaxed)) {
+    // 从 PENDING 原子层逐字段 relaxed 读组包（version 已 acquire 确认就位）。
+    EqualizerConfig pending;
+    pending.enabled = device->eqTargetLayer_.enabled.load(std::memory_order_relaxed);
+    pending.mode = device->eqTargetLayer_.mode.load(std::memory_order_relaxed);
+    pending.preGainDb = device->eqTargetLayer_.preGainDb.load(std::memory_order_relaxed);
+    for (std::size_t band = 0; band < pending.bandGainsDb.size(); ++band) {
+      pending.bandGainsDb[band] =
+          device->eqTargetLayer_.bandGainsDb[band].load(std::memory_order_relaxed);
+    }
+    pending.limiterEnabled = device->eqTargetLayer_.limiterEnabled.load(std::memory_order_relaxed);
+    if (device->eqDsp_->applyTargets(pending)) {
+      static_cast<void>(device->limiter_->applyTargets(pending));
+      device->latchedEqTargetVersion_.store(eqTargetVersion, std::memory_order_relaxed);
+      const auto nextVersion = device->eqAppliedLayer_.version.load(std::memory_order_relaxed) + 1U;
+      publishEqAppliedConfigLayer(device->eqAppliedLayer_, pending, nextVersion);
+    }
+  }
+  // ---- EQ 激活处理链（任务 25 B2.4a + 播放中实时调节）----
+  // 进入条件 = DSP 链「需要处理本块」（无独立发布标志——运行期受理与停态真实应用
+  // 统一收敛到 DSP 目标/平滑状态，本块首受理后同线程直读 DSP 可观测态）：
+  //   · eqDsp_ enabled 目标 = true（EQ 开——含全 0dB 曲线的真实 f32 链语义，
+  //     既有 render 测试锁定「EQ 开 0dB ≠ 逐位直通」）；或
+  //   · eqDsp_ 平滑/收敛态需要处理（!fastBypassActive：非零曲线稳态、开→爬坡、
+  //     enabled=false 的平滑退出期——收敛后自动回落原路径）；或
+  //   · limiter_ 需要处理（enabled 目标 = true = 待 WarmUp，或非 Bypass =
+  //     WarmUp/Active/FadingOut 进行中）。
+  // 出厂全零稳态（从未开 EQ/已关且收敛、限幅关）三条件恒 false → 本块不进入：
+  // 下方既有三分支原样执行，逐位不变（既有测试锁定；本分支为纯新增）。
+  // int 设备额外要求 f32Scratch_ 容量守卫（同 dualMix 守卫语义：装不下退回既有
+  // 路径，生产不可达——EQ 处理帧数 ≤ 后端 period ≤ 主队列容量）。
+  // 读取 = 回调线程对 DSP 成员的同线程读：运行中 DSP 成员仅本线程写（applyTargets/
+  // process）；worker configure/重建只在停态窗口（设备已停，无活跃回调——同下方
+  // EQ 分支内 process 读取 DSP 成员的既有信任边界）。
+  //
+  // 链序（f32 域，见 534-548 区注释；EQ 级联 = eqDsp_ 单实例 = 任务 22 单元：
+  // 块级平滑推进 + preGain（在单元内）+ 逐 band ma_peak2，非 band×ch 实例）：
+  //   读环已就位 output（设备域）→ int 设备逐样本转 f32 进 f32Scratch_（任务 24
+  //   读侧辅助；f32 设备就地，不占暂存）→ 双腿包络增益 + f32 求和（第二源经
+  //   eqAccumulate*/eqMixFloat32Dual；master×volume 推迟）→ EQ 级联 process →
+  //   master 包络 × volume（f32 乘）→ 限幅器 process（任务 23 单元；limiterEnabled
+  //   门控与开关过渡在单元内，关闭收敛态走旁路快速路径）→ 末端单次 f32→int 量化
+  //   写回（任务 24 写侧辅助；f32 设备无量化）。
+  //   [频谱摘录（任务 29 B3.1 已落地）：摘录点 = 链激活时 preGain 后/volume 前
+  //   f32，即 EQ process 之后、master×volume 之前；muted/静音帧该点不发帧、由
+  //   分支尾部补发全零帧（「muted 下摘静音帧」语义）。]
+  //
+  // 欠载语义：级联只喂 copiedFrames（补零尾不滤波——readIfGeneration 已补零的
+  // 尾部原样保留，EQ 链不触碰、量化也不写回尾部）。muted/volume==0：先 memset
+  // 输出整块再跳过链（既有语义；跳过 = 不转换/不 EQ/不限幅——EQ 平滑与限幅延迟
+  // 线原位冻结，恢复出声从当前位置续跑，无跳变；包络轨迹照常按 copiedFrames
+  // 推进，同既有活动路径 muted 块纪律，见下方 1181-1183 区注释）。
+  // current-dB 爬坡（eq_dsp 平滑）按块推进且与块长相关（eq_dsp.h 头注释）：
+  // 欠载块也按实际喂入帧数照常推进（步进随帧长比例缩小）= 设计意图——平滑沿
+  // 真实出声时间走，不因欠载冻结；唯 copiedFrames==0 的纯静音块无帧可喂，与
+  // muted 跳过块同列原位保持（同包络 finalize 的 0 帧冻结纪律，恢复后续跑）。
+  // 进入判定（本块首受理已执行——若存在新目标，DSP 目标/平滑态已按新目标更新）。
+  const bool eqChainEnter =
+      (device->eqDsp_->enabled() || !device->eqDsp_->fastBypassActive() ||
+       device->limiter_->enabled() || !device->limiter_->bypassActive()) &&
+      (sampleFormat == AudioSampleFormat::Float32 || device->f32ScratchFits(frameCount, channelCount));
+  if (eqChainEnter) {
+    const bool chainDual = dualMix;
+    // B3.1 摘录（链激活态）：EQ process 后发布有效帧；未处理块（muted/纯静音）
+    // 在分支尾部补发全零帧——两者互斥，每回调至多发布一帧。
+    bool eqCaptureDone = false;
+    if (chainDual) {
+      // 第二源读入 mixScratch_（设备域；同既有双源路径 1192-1194——muted 也读，
+      // ring 消费进度与静音无关）。代次/指针由上方门控保证非空且容量已守卫。
+      const auto secondGeneration = state.secondGeneration.load(std::memory_order_acquire);
+      static_cast<void>(
+          secondQueue->readIfGeneration(device->mixScratch_.data(), frameCount, secondGeneration));
+    }
+    const auto masterTrajectory = planEnvelopeLayer(masterLayer);
+    const auto sourceTrajectory = planEnvelopeLayer(sourceLayer);
+    const auto secondTrajectory =
+        chainDual ? planEnvelopeLayer(state.sourceEnvelopes[1]) : ExecutedTrajectory{};
+    if (muted || volume <= 0.0F) {
+      if (output != nullptr && frameCount != 0U && bytesPerFrame != 0U) {
+        std::memset(output, 0, static_cast<std::size_t>(frameCount) * bytesPerFrame);
+      }
+    } else if (copiedFrames != 0U && channelCount != 0U) {
+      float* work = nullptr;  // f32 处理缓冲：f32 设备 = output 就地；int 设备 = f32Scratch_
+      if (sampleFormat == AudioSampleFormat::Float32) {
+        work = static_cast<float*>(output);
+        if (chainDual) {
+          // 双腿增益 + f32 求和（就地；output 兼腿 0 与和缓冲）。
+          eqMixFloat32Dual(work, reinterpret_cast<const float*>(device->mixScratch_.data()), copiedFrames,
+                           channelCount, sourceTrajectory, secondTrajectory);
+        } else {
+          applyFloat32FrameGains(work, copiedFrames, channelCount,
+                                 [&](std::uint32_t frame) noexcept {
+                                   return trajectoryGain(sourceTrajectory, frame);
+                                 });
+        }
+      } else {
+        work = reinterpret_cast<float*>(device->f32Scratch_.data());
+        // 读侧转 f32（任务 24 辅助；单源即腿 0）→ 腿 0 包络增益 → 第二腿转 f32
+        // 就地累加（双腿增益+求和；均不含 master×volume——推迟到 EQ 后）。
+        switch (sampleFormat) {
+        case AudioSampleFormat::Int16:
+          int16ToFloat32(output, work, copiedFrames, channelCount);
+          applyFloat32FrameGains(work, copiedFrames, channelCount,
+                                 [&](std::uint32_t frame) noexcept {
+                                   return trajectoryGain(sourceTrajectory, frame);
+                                 });
+          if (chainDual) {
+            eqAccumulateIntLegToFloat32(reinterpret_cast<const std::int16_t*>(device->mixScratch_.data()), work,
+                                        copiedFrames, channelCount, 1.0F / 32768.0F, secondTrajectory);
+          }
+          break;
+        case AudioSampleFormat::Int24:
+          int24ToFloat32(output, work, copiedFrames, channelCount);
+          applyFloat32FrameGains(work, copiedFrames, channelCount,
+                                 [&](std::uint32_t frame) noexcept {
+                                   return trajectoryGain(sourceTrajectory, frame);
+                                 });
+          if (chainDual) {
+            eqAccumulateS24LegToFloat32(device->mixScratch_.data(), work, copiedFrames, channelCount,
+                                        secondTrajectory);
+          }
+          break;
+        case AudioSampleFormat::Int32:
+          int32ToFloat32(output, work, copiedFrames, channelCount);
+          applyFloat32FrameGains(work, copiedFrames, channelCount,
+                                 [&](std::uint32_t frame) noexcept {
+                                   return trajectoryGain(sourceTrajectory, frame);
+                                 });
+          if (chainDual) {
+            eqAccumulateIntLegToFloat32(reinterpret_cast<const std::int32_t*>(device->mixScratch_.data()), work,
+                                        copiedFrames, channelCount, 1.0F / 2147483648.0F, secondTrajectory);
+          }
+          break;
+        case AudioSampleFormat::Float32:
+          break;  // f32 设备走上方就地分支，不到达本 switch
+        case AudioSampleFormat::Unknown:
+          break;
+        }
+      }
+      if (sampleFormat != AudioSampleFormat::Unknown) {
+        device->eqDsp_->process(work, copiedFrames);
+        // ---- B3.1 摘录（链激活态）：EQ(含 preGain) 后、master×volume 前 f32 中间域 ----
+        // 帧 = 最新可听信号（不含 volume/限幅/包络淡变——电平语义由 domain 标注，
+        // 显示按相对电平）；只取 copiedFrames 有效帧，欠载尾在摘录槽内补零（work
+        // 尾部为陈旧内容，不外泄）。muted/无有效帧块由分支尾部补发全零帧。
+        device->capturePublishF32(work, copiedFrames, frameCount, channelCount,
+                                  AudioOutputDeviceCaptureDomain::ChainActiveF32);
+        eqCaptureDone = true;
+        // 音量/包络：master×volume 逐帧 f32 乘（既有音量数学照搬 f32 域；组合
+        // 增益 = master(i) × volume，与既有路径 1176-1178 的 master×volume 同构）。
+        applyFloat32FrameGains(work, copiedFrames, channelCount, [&](std::uint32_t frame) noexcept {
+          return trajectoryGain(masterTrajectory, frame) * volume;
+        });
+        device->limiter_->process(work, copiedFrames);
+        // 末端单次量化写回（int 设备；f32 设备 work == output 就地，无需写回）。
+        switch (sampleFormat) {
+        case AudioSampleFormat::Int16:
+          float32ToInt16(work, output, copiedFrames, channelCount);
+          break;
+        case AudioSampleFormat::Int24:
+          float32ToInt24(work, output, copiedFrames, channelCount);
+          break;
+        case AudioSampleFormat::Int32:
+          float32ToInt32(work, output, copiedFrames, channelCount);
+          break;
+        case AudioSampleFormat::Float32:
+          break;
+        case AudioSampleFormat::Unknown:
+          break;
+        }
+      }
+    }
+    // B3.1 摘录（链激活态静音帧）：muted/volume==0/无有效帧等跳过链的块——输出
+    // 整块静音，补发全零帧（「muted 下摘静音帧」语义）；标注仍为链激活态域
+    // （恢复出声后同域采集，显示不跳标定）。
+    if (!eqCaptureDone) {
+      device->capturePublishF32(nullptr, 0U, frameCount, channelCount,
+                                AudioOutputDeviceCaptureDomain::ChainActiveF32);
+    }
+    // 轨迹推进同既有路径纪律（muted/音量 0 块照常按 copiedFrames 推进；纯静音块
+    // 0 帧冻结）；EQ/限幅状态已在上方按「是否喂帧」推进/冻结（注释见链说明）。
+    finalizeTrajectory(masterLayer, masterTrajectory, copiedFrames);
+    finalizeTrajectory(sourceLayer, sourceTrajectory, copiedFrames);
+    if (chainDual) {
+      finalizeTrajectory(state.sourceEnvelopes[1], secondTrajectory, copiedFrames);
+    }
+    // EQ 分支提前返回：自行推进计数器（同下方既有尾部）。
+    device->callbackCount_.fetch_add(1U, std::memory_order_relaxed);
+    device->requestedFrames_.fetch_add(result.requestedFrames, std::memory_order_relaxed);
+    device->copiedFrames_.fetch_add(result.copiedFrames, std::memory_order_relaxed);
+    device->silenceFrames_.fetch_add(result.silenceFrames, std::memory_order_relaxed);
+    return;
+  }
   if (!envelopePublished && !dualMix) {
     applyGain(output, copiedFrames, channelCount, sampleFormat, volume, muted);
   } else if (!dualMix) {
@@ -856,6 +1449,13 @@ void AudioOutputDevice::renderCallback(void* userData, void* output, std::uint32
     finalizeTrajectory(sourceLayer, sourceTrajectory, copiedFrames);
     finalizeTrajectory(secondLayer, secondTrajectory, copiedFrames);
   }
+  // ---- B3.1 摘录（链关闭态）：EQ 链未激活 → 输出域样本转换拷贝 ----
+  // 帧 = 设备输出域最终可听信号（volume/muted/混音已应用；int 设备逐样本按任务
+  // 24 冻结读侧尺度 int→f32，f32 设备直取；均值下混单声道；欠载尾在摘录槽内
+  // 补零——单源路径只处理 copiedFrames（其后为读环补零静音），双源混音路径整块
+  // frameCount 有效（mixDualFrames 覆盖全块）。
+  const auto outputValidFrames = dualMix ? frameCount : copiedFrames;
+  device->capturePublishOutputDomain(output, outputValidFrames, frameCount, channelCount, sampleFormat);
   device->callbackCount_.fetch_add(1U, std::memory_order_relaxed);
   device->requestedFrames_.fetch_add(result.requestedFrames, std::memory_order_relaxed);
   device->copiedFrames_.fetch_add(result.copiedFrames, std::memory_order_relaxed);
@@ -883,6 +1483,132 @@ AudioOutputDeviceCounters AudioOutputDevice::counters() const noexcept {
                                    requestedFrames_.load(std::memory_order_relaxed),
                                    copiedFrames_.load(std::memory_order_relaxed),
                                    silenceFrames_.load(std::memory_order_relaxed)};
+}
+
+void AudioOutputDevice::captureReset(std::uint32_t capacityFrames) noexcept {
+  // 摘录纪元推进（任务 29 B3.1；initialize 停态窗口调用，无活跃回调）：按新协商
+  // 容量重分配双槽（assign 即清零内容）+ 元数据/帧序复位 + 纪元 ++（release 发布
+  // 于清零之后）——任何跨代帧（旧率/旧容量/旧内容）不可再被消费（frameCount=0
+  // 即无帧）；rebindQueue/T10 交接与 stop() 不调用本方法（交接不是重建）。
+  captureCapacityFrames_ = capacityFrames;
+  captureBuffers_.assign(static_cast<std::size_t>(capacityFrames) * 2U, 0.0F);
+  captureNextSequence_ = 0U;
+  capturePublishedSlot_.store(0U, std::memory_order_relaxed);
+  for (auto& slotMeta : captureSlotMeta_) {
+    slotMeta.sequence.store(0U, std::memory_order_relaxed);
+    slotMeta.frameCount.store(0U, std::memory_order_relaxed);
+    slotMeta.sampleRate.store(0U, std::memory_order_relaxed);
+    slotMeta.domain.store(AudioOutputDeviceCaptureDomain::ChainInactiveOutput, std::memory_order_relaxed);
+  }
+  captureGeneration_.store(captureGeneration_.load(std::memory_order_relaxed) + 1U, std::memory_order_release);
+}
+
+void AudioOutputDevice::captureCommitSlot(std::uint32_t slot, std::uint32_t frameCount,
+                                          AudioOutputDeviceCaptureDomain domain) noexcept {
+  // 发布序尾（仿 publishCallbackQueue）：样本/元数据先就绪，索引 release 翻转——
+  // 读侧 acquire 取槽后必然看到完整帧。
+  auto& slotMeta = captureSlotMeta_[slot];
+  slotMeta.sequence.store(++captureNextSequence_, std::memory_order_relaxed);
+  slotMeta.frameCount.store(frameCount, std::memory_order_relaxed);
+  slotMeta.sampleRate.store(currentFormat_.sampleRate, std::memory_order_relaxed);
+  slotMeta.domain.store(domain, std::memory_order_relaxed);
+  capturePublishedSlot_.store(slot, std::memory_order_release);
+}
+
+void AudioOutputDevice::capturePublishF32(const float* interleaved, std::uint32_t validFrames,
+                                          std::uint32_t blockFrames, std::uint16_t channelCount,
+                                          AudioOutputDeviceCaptureDomain domain) noexcept {
+  if (blockFrames == 0U || channelCount == 0U || blockFrames > captureCapacityFrames_) {
+    return;  // 无帧可发 / 容量守卫（回调帧数 ≤ 主队列容量 = 槽容量，超限生产不可达）
+  }
+  const auto slot = capturePublishedSlot_.load(std::memory_order_relaxed) ^ 1U;  // 写侧独占，写非发布槽
+  float* const dst = captureBuffers_.data() + static_cast<std::size_t>(slot) * captureCapacityFrames_;
+  const auto valid = std::min(validFrames, blockFrames);
+  if (interleaved == nullptr || valid == 0U) {
+    std::memset(dst, 0, static_cast<std::size_t>(blockFrames) * sizeof(float));
+  } else {
+    captureDownmixFloatToMono(interleaved, dst, valid, channelCount);
+    if (valid < blockFrames) {
+      std::memset(dst + valid, 0, static_cast<std::size_t>(blockFrames - valid) * sizeof(float));
+    }
+  }
+  captureCommitSlot(slot, blockFrames, domain);
+}
+
+void AudioOutputDevice::capturePublishOutputDomain(const void* output, std::uint32_t validFrames,
+                                                   std::uint32_t blockFrames, std::uint16_t channelCount,
+                                                   AudioSampleFormat sampleFormat) noexcept {
+  if (output == nullptr || blockFrames == 0U || channelCount == 0U || blockFrames > captureCapacityFrames_ ||
+      sampleFormat == AudioSampleFormat::Unknown) {
+    return;
+  }
+  const auto slot = capturePublishedSlot_.load(std::memory_order_relaxed) ^ 1U;
+  float* const dst = captureBuffers_.data() + static_cast<std::size_t>(slot) * captureCapacityFrames_;
+  const auto valid = std::min(validFrames, blockFrames);
+  switch (sampleFormat) {
+  case AudioSampleFormat::Int16:
+    captureDownmixIntToMono(reinterpret_cast<const std::int16_t*>(output), dst, valid, channelCount,
+                            1.0F / 32768.0F);
+    break;
+  case AudioSampleFormat::Int24:
+    captureDownmixS24ToMono(output, dst, valid, channelCount);
+    break;
+  case AudioSampleFormat::Int32:
+    captureDownmixIntToMono(reinterpret_cast<const std::int32_t*>(output), dst, valid, channelCount,
+                            1.0F / 2147483648.0F);
+    break;
+  case AudioSampleFormat::Float32:
+    captureDownmixFloatToMono(reinterpret_cast<const float*>(output), dst, valid, channelCount);
+    break;
+  case AudioSampleFormat::Unknown:
+    return;
+  }
+  if (valid < blockFrames) {
+    std::memset(dst + valid, 0, static_cast<std::size_t>(blockFrames - valid) * sizeof(float));
+  }
+  captureCommitSlot(slot, blockFrames, AudioOutputDeviceCaptureDomain::ChainInactiveOutput);
+}
+
+bool AudioOutputDevice::latestCaptureFrame(float* samplesOut, std::uint32_t capacityFrames,
+                                           AudioOutputDeviceCaptureMeta& meta) const noexcept {
+  if (samplesOut == nullptr || captureCapacityFrames_ == 0U) {
+    return false;
+  }
+  // 有界重试 ≤3（同 eqAppliedSnapshot 先例；不循环等待——读侧低频、写侧块率发布，
+  // 首轮即一致，重试仅覆盖「拷贝期间写者连续两轮发布回绕到本槽」的不可达窗口）。
+  for (std::uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+    const auto generation = captureGeneration_.load(std::memory_order_acquire);
+    const auto slot = capturePublishedSlot_.load(std::memory_order_acquire);
+    const auto frameCount = captureSlotMeta_[slot].frameCount.load(std::memory_order_relaxed);
+    if (frameCount == 0U) {
+      return false;  // 尚无完整帧（从未摘录 / 重建清零后）
+    }
+    if (frameCount > capacityFrames) {
+      return false;  // 调用方缓冲不足（应按 captureCapacityFrames() 分配）
+    }
+    AudioOutputDeviceCaptureMeta candidate;
+    candidate.generation = generation;
+    candidate.sequence = captureSlotMeta_[slot].sequence.load(std::memory_order_relaxed);
+    candidate.sampleRate = captureSlotMeta_[slot].sampleRate.load(std::memory_order_relaxed);
+    candidate.frameCount = frameCount;
+    candidate.domain = captureSlotMeta_[slot].domain.load(std::memory_order_relaxed);
+    std::memcpy(samplesOut,
+                captureBuffers_.data() + static_cast<std::size_t>(slot) * captureCapacityFrames_,
+                static_cast<std::size_t>(frameCount) * sizeof(float));
+    // 复核：拷贝期间写者未把本槽翻转回发布位（连续两轮发布才可能覆写本槽）。
+    if (generation == captureGeneration_.load(std::memory_order_acquire) &&
+        slot == capturePublishedSlot_.load(std::memory_order_acquire) &&
+        captureSlotMeta_[slot].sequence.load(std::memory_order_relaxed) == candidate.sequence &&
+        captureSlotMeta_[slot].frameCount.load(std::memory_order_relaxed) == frameCount) {
+      meta = candidate;
+      return true;
+    }
+  }
+  return false;  // 写者连续发布：本轮未取得一致视图，调用方稍后重试
+}
+
+std::uint32_t AudioOutputDevice::captureCapacityFrames() const noexcept {
+  return captureCapacityFrames_;
 }
 
 }

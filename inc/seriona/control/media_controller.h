@@ -32,6 +32,13 @@ public:
   SubscriptionHandle subscribePlayerState(PlayerStateSnapshotCallback callback);
   SubscriptionHandle subscribeLibraryState(LibraryStateSnapshotCallback callback);
   SubscriptionHandle subscribeDomainNotifications(ControlDomainNotificationCallback callback);
+  // 均衡器状态订阅：注册后立即以当前生效快照回调一次（订阅即回调当前生效快照，
+  // generation=0 表示从未生效的空快照），此后每次均衡器参数生效（generation 递增）
+  // 再次回调。与 subscribePlayerState 同为初始快照 + 增量通知语义。
+  SubscriptionHandle subscribeEqualizerState(EqualizerStateSnapshotCallback callback);
+  // 频谱订阅：注册后立即以当前频谱快照回调一次；无生效频谱输出时回调空快照
+  // （generation=0），此后每次频谱更新再次回调。
+  SubscriptionHandle subscribeSpectrum(SpectrumSnapshotCallback callback);
   [[nodiscard]] PlayerStateSnapshot playerStateSnapshot() const;
   [[nodiscard]] LibraryStateSnapshot libraryStateSnapshot() const;
   [[nodiscard]] std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const;

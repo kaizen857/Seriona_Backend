@@ -76,6 +76,10 @@ public:
   void seek(std::chrono::milliseconds position) override;
   void setVolume(float linearGain) override;
   void setMuted(bool muted) override;
+  // R2 频谱开关：覆写接口默认空实现——控制器全链测试需在 fake 侧观察命令落地
+  // （真实语义 = 服务原子位，fake 只记账并回映）。
+  void setSpectrumEnabled(bool enabled) override;
+  [[nodiscard]] bool spectrumEnabled() const override;
   void selectOutputDevice(const std::string& deviceId) override;
   [[nodiscard]] audio::PlaybackClockSnapshot queryPlaybackClock() const override;
   [[nodiscard]] std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const override;
@@ -93,6 +97,7 @@ public:
   [[nodiscard]] std::size_t seekCalls() const noexcept;
   [[nodiscard]] std::size_t setVolumeCalls() const noexcept;
   [[nodiscard]] std::size_t setMutedCalls() const noexcept;
+  [[nodiscard]] std::size_t setSpectrumEnabledCalls() const noexcept;
   [[nodiscard]] std::size_t selectOutputDeviceCalls() const noexcept;
   [[nodiscard]] std::size_t emitEventCalls() const noexcept;
 
@@ -105,6 +110,7 @@ public:
   [[nodiscard]] const std::optional<std::chrono::milliseconds>& lastSeekPosition() const noexcept;
   [[nodiscard]] const std::optional<float>& lastVolume() const noexcept;
   [[nodiscard]] const std::optional<bool>& lastMuted() const noexcept;
+  [[nodiscard]] const std::optional<bool>& lastSpectrumEnabled() const noexcept;
   [[nodiscard]] const std::optional<std::string>& lastSelectedOutputDevice() const noexcept;
 
   // 按调用顺序记录的命令名日志，用于断言跨方法的调用顺序（如
@@ -134,6 +140,7 @@ private:
   std::size_t seekCalls_{0};
   std::size_t setVolumeCalls_{0};
   std::size_t setMutedCalls_{0};
+  std::size_t setSpectrumEnabledCalls_{0};
   std::size_t selectOutputDeviceCalls_{0};
   std::size_t emitEventCalls_{0};
   std::optional<audio::AudioOutputConfig> lastConfiguredOutput_{};
@@ -144,6 +151,8 @@ private:
   std::optional<std::chrono::milliseconds> lastSeekPosition_{};
   std::optional<float> lastVolume_{};
   std::optional<bool> lastMuted_{};
+  std::optional<bool> lastSpectrumEnabled_{};
+  bool spectrumEnabledState_{false};
   std::optional<std::string> lastSelectedOutputDevice_{};
   std::vector<std::string> callLog_{};
   std::vector<audio::AudioDeviceFormat> playbackDevices_{};

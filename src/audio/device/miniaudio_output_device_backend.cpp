@@ -1,6 +1,7 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include <miniaudio.h>
 
+#include "miniaudio_device_id_encoding.h"
 #include "seriona/audio/device/audio_output_device.h"
 #include "spdlog/spdlog.h"
 
@@ -18,7 +19,8 @@ AudioDeviceFormat makeAudioDeviceFormat(const ma_device_info& info, std::string 
                           .deviceName = info.name,
                           .backendName = "miniaudio",
                           .sampleFormat = AudioSampleFormat::Unknown,
-                          .actualMode = AudioOutputMode::Mixed};
+                          .actualMode = AudioOutputMode::Mixed,
+                          .isDefaultDevice = info.isDefault != MA_FALSE};
 }
 
 AudioSampleFormat fromMiniaudioFormat(ma_format format) noexcept {
@@ -113,7 +115,11 @@ public:
       devices.reserve(playbackCount);
       for (ma_uint32 index = 0; index < playbackCount; ++index) {
         const auto& info = playbackInfos[index];
-        AudioDeviceFormat device = makeAudioDeviceFormat(info, std::to_string(index));
+        // deviceId = 当前后端的稳定文本 id（见 miniaudio_device_id_encoding.h），
+        // 可持久化跨枚举复用；历史版本曾用 std::to_string(index)（枚举序索引），
+        // 热插拔/排序变化即错位，已废弃，见 resolvePreferredDevice 的迁移回退。
+        AudioDeviceFormat device =
+            makeAudioDeviceFormat(info, encodeMiniaudioDeviceId(context.backend, info.id));
         // 逐设备查询详细能力（nativeDataFormats）；失败时能力留空并标记 fallbackApplied
         // （空列表=未枚举=前端按全支持显示，见 fillDeviceCapabilitiesFromQuery）。
         ma_device_info detailed{};
@@ -148,8 +154,9 @@ public:
     config.dataCallback = miniaudioDataCallback;
     config.pUserData = request.callbackUserData;
 
-    // preferredDeviceId 非空时解析（枚举索引字符串，见 enumeratePlaybackDevices）并绑定对应
-    // 播放设备；解析失败（非数字/越界/枚举失败）回退默认设备——仅记日志，不视为失败。
+    // preferredDeviceId 非空时解析（稳定文本 id，见 encodeMiniaudioDeviceId）并绑定对应
+    // 播放设备；解析失败（无法匹配/旧版索引迁移越界/枚举失败）回退默认设备——仅记日志，
+    // 不视为失败。空串 = 系统默认（ma_device_init 不指定设备），与 UI"跟随默认"语义一致。
     const bool boundToPreferredDevice =
         !request.config.preferredDeviceId.empty() && resolvePreferredDevice(request.config.preferredDeviceId, config);
 
@@ -237,30 +244,19 @@ public:
   [[nodiscard]] std::optional<AudioOutputDeviceError> lastError() const override { return lastError_; }
 
 private:
-  // 将 preferredDeviceId（枚举索引字符串，见 enumeratePlaybackDevices：deviceId =
-  // std::to_string(index)）解析回 ma_device_id 并写入 config.playback.pDeviceID。
+  // 将 preferredDeviceId（稳定文本 id，见 encodeMiniaudioDeviceId）解析回 ma_device_id
+  // 并写入 config.playback.pDeviceID。解析 = 重新枚举后按编码 id 精确匹配；匹配失败时
+  // 兼容历史版本持久化的"枚举索引"（纯十进制），按序回退索引语义（迁移）；仍失败
+  // （设备已拔出/不可用）回退默认设备——仅记日志，不视为失败。
   // miniaudio 在 ma_device_init 内部拷贝 pDeviceID（MA_COPY_MEMORY 进 pDevice->playback.id），
   // 因此 playbackInfos[index].id 只需在 init 调用期间有效；但显式 context 会被 device
   // 长期持有（pDevice->pContext），必须作为成员保存并在 ma_device_uninit 之后释放。
-  // 解析/枚举失败时释放本次 context 并返回 false——调用方回退默认设备（仅日志，不视为失败）。
+  // 枚举失败时释放本次 context 并返回 false——调用方回退默认设备（仅日志，不视为失败）。
   bool resolvePreferredDevice(const std::string& preferredDeviceId, ma_device_config& config) {
-    std::size_t index = 0;
-    {
-      const char* const begin = preferredDeviceId.data();
-      const char* const end = begin + preferredDeviceId.size();
-      const auto parsed = std::from_chars(begin, end, index);
-      if (parsed.ec != std::errc{} || parsed.ptr != end) {
-        spdlog::warn("miniaudio backend: preferredDeviceId '{}' is not a numeric device index; "
-                     "falling back to the default output device",
-                     preferredDeviceId);
-        return false;
-      }
-    }
-
     if (ma_context_init(nullptr, 0, nullptr, &context_) != MA_SUCCESS) {
-      spdlog::warn("miniaudio backend: failed to initialize context for preferred device index {}; "
+      spdlog::warn("miniaudio backend: failed to initialize context for preferred device '{}'; "
                    "falling back to the default output device",
-                   index);
+                   preferredDeviceId);
       return false;
     }
     contextInitialized_ = true;
@@ -268,21 +264,43 @@ private:
     ma_device_info* playbackInfos = nullptr;
     ma_uint32 playbackCount = 0;
     if (ma_context_get_devices(&context_, &playbackInfos, &playbackCount, nullptr, nullptr) != MA_SUCCESS) {
-      spdlog::warn("miniaudio backend: failed to enumerate playback devices for preferred device index {}; "
+      spdlog::warn("miniaudio backend: failed to enumerate playback devices for preferred device '{}'; "
                    "falling back to the default output device",
-                   index);
-      releaseContext();
-      return false;
-    }
-    if (index >= playbackCount) {
-      spdlog::warn("miniaudio backend: preferred device index {} is out of range ({} playback devices available); "
-                   "falling back to the default output device",
-                   index, playbackCount);
+                   preferredDeviceId);
       releaseContext();
       return false;
     }
 
-    config.playback.pDeviceID = &playbackInfos[index].id;
+    std::optional<ma_uint32> matchedIndex;
+    for (ma_uint32 index = 0; index < playbackCount; ++index) {
+      if (encodeMiniaudioDeviceId(context_.backend, playbackInfos[index].id) == preferredDeviceId) {
+        matchedIndex = index;
+        break;
+      }
+    }
+    if (!matchedIndex.has_value()) {
+      // 历史版本 deviceId 是枚举序索引（std::to_string(index)）；旧持久化值迁移：
+      // 纯十进制且不命中任何稳定 id 时按索引语义解析一次（命中即视为旧格式）。
+      std::size_t legacyIndex = 0;
+      const char* const begin = preferredDeviceId.data();
+      const char* const end = begin + preferredDeviceId.size();
+      const auto parsed = std::from_chars(begin, end, legacyIndex);
+      if (parsed.ec == std::errc{} && parsed.ptr == end && legacyIndex < playbackCount) {
+        spdlog::warn("miniaudio backend: preferredDeviceId '{}' matched as a legacy enumeration index; "
+                     "consider re-selecting the output device in settings",
+                     preferredDeviceId);
+        matchedIndex = static_cast<ma_uint32>(legacyIndex);
+      }
+    }
+    if (!matchedIndex.has_value()) {
+      spdlog::warn("miniaudio backend: preferred device '{}' is not available among {} playback devices; "
+                   "falling back to the default output device",
+                   preferredDeviceId, playbackCount);
+      releaseContext();
+      return false;
+    }
+
+    config.playback.pDeviceID = &playbackInfos[*matchedIndex].id;
     return true;
   }
 

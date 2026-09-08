@@ -320,6 +320,15 @@ enum class MediaControlCommandKind {
   // 加载），载荷=MediaControlCommand::transitionConfig。与 ConfigureOutput 语义隔
   // 离：仅存配置，绝不触发整轨重载/设备操作。追加末尾保持序列化兼容。
   SetTransitionConfig,
+  // 均衡器参数命令（任务16/B1.2）：SetEqualizerConfig=配置均衡器参数（总开关/频段
+  // 模式/前置增益/频段增益/限幅器），载荷=MediaControlCommand::equalizerConfig。与
+  // ConfigureOutput/SetTransitionConfig 语义隔离：仅更新均衡处理参数，绝不触发输
+  // 出重载/设备生命周期操作。追加末尾保持序列化兼容。
+  SetEqualizerConfig,
+  // 频谱开关命令（R2 频谱显示链路）：SetSpectrumEnabled=实时频谱分析开关（bool
+  // 载荷=spectrumEnabled 字段）。纯门控转发至音频服务原子位（无 reducer 镜像、
+  // 不触碰播放/均衡器状态，同 SetMuted/SetVolume 直转先例）。追加末尾保持兼容。
+  SetSpectrumEnabled,
 };
 
 struct MediaControlCommand {
@@ -343,6 +352,11 @@ struct MediaControlCommand {
   std::optional<std::size_t> queueIndex;
   // SetTransitionConfig 载荷（T1）。追加末尾保持序列化兼容。
   std::optional<audio::TransitionConfig> transitionConfig;
+  // SetEqualizerConfig 载荷（任务16）：均衡器参数（默认构造 = 关闭直通，与旧行为等
+  // 价）。追加末尾保持序列化兼容。
+  std::optional<audio::EqualizerConfig> equalizerConfig;
+  // SetSpectrumEnabled 载荷（R2）：频谱分析开关目标值。追加末尾保持序列化兼容。
+  std::optional<bool> spectrumEnabled;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;
@@ -353,6 +367,13 @@ using LibraryStateSnapshotCallback = std::function<void(LibraryStateSnapshot)>;
 using LibraryStateSubscriptionCallback = LibraryStateSnapshotCallback;
 using ControlDomainNotificationCallback = std::function<void(ControlDomainNotification)>;
 using ControlDomainNotificationSubscriptionCallback = ControlDomainNotificationCallback;
+// 均衡器状态订阅回调（任务16）：快照=audio::EqualizerStateSnapshot（生效配置 + 按
+// 当前采样率解析的增益曲线，经 setEqualizer 生效后递增 generation）。
+using EqualizerStateSnapshotCallback = std::function<void(audio::EqualizerStateSnapshot)>;
+using EqualizerStateSubscriptionCallback = EqualizerStateSnapshotCallback;
+// 频谱订阅回调（任务16）：快照=audio::SpectrumSnapshot（120 段频带电平，实时分析输出）。
+using SpectrumSnapshotCallback = std::function<void(audio::SpectrumSnapshot)>;
+using SpectrumSubscriptionCallback = SpectrumSnapshotCallback;
 
 struct SubscriptionHandle {
   std::size_t subscriptionId{0};
@@ -363,5 +384,8 @@ using PlayerStateSubscriptionFactory = std::function<SubscriptionHandle(PlayerSt
 using MediaControlCommandSinkFactory = std::function<MediaControlCommandSink()>;
 using LibraryStateSubscriptionFactory = std::function<SubscriptionHandle(LibraryStateSnapshotCallback)>;
 using ControlDomainNotificationSubscriptionFactory = std::function<SubscriptionHandle(ControlDomainNotificationCallback)>;
+// 均衡器/频谱订阅工厂（任务16）：返回带 unsubscribe 的 SubscriptionHandle。
+using EqualizerStateSubscriptionFactory = std::function<SubscriptionHandle(EqualizerStateSnapshotCallback)>;
+using SpectrumSubscriptionFactory = std::function<SubscriptionHandle(SpectrumSnapshotCallback)>;
 
 }

@@ -162,7 +162,9 @@ public:
         reducer_(options),
         playerSubscriptions_({}, deliveryModeFor(options)),
         librarySubscriptions_({}, deliveryModeFor(options)),
-        notificationSubscriptions_({}, deliveryModeFor(options)) {
+        notificationSubscriptions_({}, deliveryModeFor(options)),
+        equalizerSubscriptions_({}, deliveryModeFor(options)),
+        spectrumSubscriptions_({}, deliveryModeFor(options)) {
     normalizeMediaControllerDependencies(dependencies_);
     installSinks();
     if (dependencies_.artworkResolver) {
@@ -340,6 +342,14 @@ public:
     return notificationSubscriptions_.subscribe(std::move(callback));
   }
 
+  SubscriptionHandle subscribeEqualizerState(EqualizerStateSnapshotCallback callback) {
+    return equalizerSubscriptions_.subscribe(std::move(callback), equalizerStateSnapshot());
+  }
+
+  SubscriptionHandle subscribeSpectrum(SpectrumSnapshotCallback callback) {
+    return spectrumSubscriptions_.subscribe(std::move(callback), spectrumSnapshot());
+  }
+
   PlayerStateSnapshot playerStateSnapshot() const {
     std::lock_guard lock{mutex_};
     return playerSnapshot_;
@@ -348,6 +358,16 @@ public:
   LibraryStateSnapshot libraryStateSnapshot() const {
     std::lock_guard lock{mutex_};
     return librarySnapshot_;
+  }
+
+  audio::EqualizerStateSnapshot equalizerStateSnapshot() const {
+    std::lock_guard lock{mutex_};
+    return equalizerSnapshot_;
+  }
+
+  audio::SpectrumSnapshot spectrumSnapshot() const {
+    std::lock_guard lock{mutex_};
+    return spectrumSnapshot_;
   }
 
   std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const {
@@ -628,9 +648,32 @@ private:
   }
 
   void handleAudioEvent(const audio::BackendEvent& event) {
+    // R2 频谱显示链路：SpectrumUpdated 不进入 reducer 状态面——reducer 无频谱镜像
+    // （服务原子位为开关最终态、事件载荷即完整快照），控制器 impl 层独立槽直写
+    // 后发布（同订阅初始投递面 spectrumSnapshot()）。其余事件照旧经 reducer。
+    if (event.type == audio::BackendEventType::SpectrumUpdated) {
+      handleSpectrumUpdated(event);
+      return;
+    }
     auto reduction = reducer_.reduceAudioEvent(event);
     commitReduction(reduction);
     executeIntents(reduction.intents);
+  }
+
+  // 频谱快照事件落槽 + 订阅推送（事件循环线程；mutex_ 仅护成员写，publish 在锁外，
+  // 同 commitReduction 的锁纪律）。载荷非法（type/payload 失配）时静默丢弃。
+  void handleSpectrumUpdated(const audio::BackendEvent& event) {
+    const auto* payload = std::get_if<audio::SpectrumUpdated>(&event.payload);
+    if (payload == nullptr) {
+      return;
+    }
+    audio::SpectrumSnapshot snapshot;
+    {
+      std::lock_guard lock{mutex_};
+      spectrumSnapshot_ = payload->snapshot;
+      snapshot = spectrumSnapshot_;
+    }
+    spectrumSubscriptions_.publish(snapshot);
   }
 
   void handleScannerEvent(const scanner::ScannerEvent& event) {
@@ -642,6 +685,7 @@ private:
   void commitReduction(const ControlReduction& reduction) {
     std::optional<PlayerStateSnapshot> playerSnapshot;
     std::optional<LibraryStateSnapshot> librarySnapshot;
+    std::optional<audio::EqualizerStateSnapshot> equalizerSnapshot;
 
     {
       std::lock_guard lock{mutex_};
@@ -653,6 +697,10 @@ private:
         librarySnapshot_ = reducer_.libraryState();
         librarySnapshot = librarySnapshot_;
       }
+      if (reduction.equalizerStateChanged) {
+        equalizerSnapshot_ = reducer_.equalizerState();
+        equalizerSnapshot = equalizerSnapshot_;
+      }
     }
 
     if (playerSnapshot.has_value()) {
@@ -660,6 +708,9 @@ private:
     }
     if (librarySnapshot.has_value()) {
       librarySubscriptions_.publish(*librarySnapshot);
+    }
+    if (equalizerSnapshot.has_value()) {
+      equalizerSubscriptions_.publish(*equalizerSnapshot);
     }
     for (const auto& notification : reduction.notifications) {
       notificationSubscriptions_.publish(notification);
@@ -733,6 +784,18 @@ private:
       case ControlIntentKind::AbortTransition:
         dependencies_.audio->abortTransition();
         break;
+      // 接口默认空实现暂不生效 DSP（B2 生效路径以实际输出率重建曲线并重发布）。
+      case ControlIntentKind::SetEqualizerConfig:
+        if (intent.equalizerConfig.has_value()) {
+          dependencies_.audio->setEqualizer(*intent.equalizerConfig);
+        }
+        break;
+      // R2 频谱显示链路：开关命令落地服务原子位（Noop/Fake 走接口默认空实现）。
+      case ControlIntentKind::SetSpectrumEnabled:
+        if (intent.spectrumEnabled.has_value()) {
+          dependencies_.audio->setSpectrumEnabled(*intent.spectrumEnabled);
+        }
+        break;
       }
     }
   }
@@ -744,9 +807,13 @@ private:
   PlayerStateSubscriptionStore playerSubscriptions_;
   LibraryStateSubscriptionStore librarySubscriptions_;
   DomainNotificationSubscriptionStore notificationSubscriptions_;
+  EqualizerStateSubscriptionStore equalizerSubscriptions_;
+  SpectrumSubscriptionStore spectrumSubscriptions_;
   mutable std::mutex mutex_{};
   PlayerStateSnapshot playerSnapshot_{};
   LibraryStateSnapshot librarySnapshot_{};
+  audio::EqualizerStateSnapshot equalizerSnapshot_{};
+  audio::SpectrumSnapshot spectrumSnapshot_{};
   SubscriptionHandle metadataCommandSubscription_{};
   bool started_{false};
   bool stopping_{false};
@@ -793,6 +860,14 @@ SubscriptionHandle MediaController::subscribeLibraryState(LibraryStateSnapshotCa
 
 SubscriptionHandle MediaController::subscribeDomainNotifications(ControlDomainNotificationCallback callback) {
   return impl_->subscribeDomainNotifications(std::move(callback));
+}
+
+SubscriptionHandle MediaController::subscribeEqualizerState(EqualizerStateSnapshotCallback callback) {
+  return impl_->subscribeEqualizerState(std::move(callback));
+}
+
+SubscriptionHandle MediaController::subscribeSpectrum(SpectrumSnapshotCallback callback) {
+  return impl_->subscribeSpectrum(std::move(callback));
 }
 
 PlayerStateSnapshot MediaController::playerStateSnapshot() const { return impl_->playerStateSnapshot(); }

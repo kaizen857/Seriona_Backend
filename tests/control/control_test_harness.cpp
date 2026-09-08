@@ -125,6 +125,17 @@ void FakeAudioPlaybackService::setMuted(bool muted) {
   lastMuted_ = muted;
 }
 
+void FakeAudioPlaybackService::setSpectrumEnabled(bool enabled) {
+  ++setSpectrumEnabledCalls_;
+  callLog_.push_back("setSpectrumEnabled");
+  lastSpectrumEnabled_ = enabled;
+  spectrumEnabledState_ = enabled;
+}
+
+bool FakeAudioPlaybackService::spectrumEnabled() const {
+  return spectrumEnabledState_;
+}
+
 void FakeAudioPlaybackService::selectOutputDevice(const std::string& deviceId) {
   ++selectOutputDeviceCalls_;
   callLog_.push_back("selectOutputDevice");
@@ -191,6 +202,10 @@ std::size_t FakeAudioPlaybackService::setMutedCalls() const noexcept {
   return setMutedCalls_;
 }
 
+std::size_t FakeAudioPlaybackService::setSpectrumEnabledCalls() const noexcept {
+  return setSpectrumEnabledCalls_;
+}
+
 std::size_t FakeAudioPlaybackService::selectOutputDeviceCalls() const noexcept {
   return selectOutputDeviceCalls_;
 }
@@ -229,6 +244,10 @@ const std::optional<float>& FakeAudioPlaybackService::lastVolume() const noexcep
 
 const std::optional<bool>& FakeAudioPlaybackService::lastMuted() const noexcept {
   return lastMuted_;
+}
+
+const std::optional<bool>& FakeAudioPlaybackService::lastSpectrumEnabled() const noexcept {
+  return lastSpectrumEnabled_;
 }
 
 const std::optional<std::string>& FakeAudioPlaybackService::lastSelectedOutputDevice() const noexcept {

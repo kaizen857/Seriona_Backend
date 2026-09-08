@@ -387,5 +387,7 @@ void SubscriptionStore<Snapshot>::reportException(std::size_t subscriptionId, st
 template class SubscriptionStore<PlayerStateSnapshot>;
 template class SubscriptionStore<LibraryStateSnapshot>;
 template class SubscriptionStore<ControlDomainNotification>;
+template class SubscriptionStore<audio::EqualizerStateSnapshot>;
+template class SubscriptionStore<audio::SpectrumSnapshot>;
 
 }

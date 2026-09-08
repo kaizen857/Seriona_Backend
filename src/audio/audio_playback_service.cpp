@@ -12,6 +12,7 @@
 #include "seriona/audio/ffmpeg_audio_source.h"
 #include "seriona/audio/ffmpeg_filter_pipeline.h"
 #include "seriona/audio/playback_state_machine.h"
+#include "spectrum_analyzer.h"
 #include "transition/gain_envelope.h"
 
 #include <algorithm>
@@ -35,6 +36,14 @@ namespace seriona::audio {
 namespace {
 
 constexpr auto kProgressPublishInterval = std::chrono::milliseconds{100};
+
+// 频谱节流：2ms tick 计数 % kSpectrumPollEveryTicks == 0 时轮询一次摘录帧
+// （5 × 2ms ≈ 10ms 轮询；校准依据 .omo/evidence/task-1-spike-cadence.md §3：
+// 回调块 512 帧 < hop 1024，12 tick/24ms 每 2 轮才耗 1 hop 仅 ~21Hz；K=5 轮询
+// 10ms < 块周期 11.61ms@44.1k → 无块丢失，44.1/48k 发布上界 ~43/45Hz ≥ 40Hz
+// 目标）。率依赖限制：96k ~25Hz / 192k ~12.5Hz（单一常量无法全率保 ~40Hz）。
+// tick 在频谱开时恒递增（Playing/Paused 无差异，允许静音下查看频谱）。
+constexpr std::uint32_t kSpectrumPollEveryTicks = 5U;
 
 // T6 归零判定阈值：包络读回为回调块末写回（粒度 ≈ 1/淡出帧数，块恰好止于轨迹终点
 // 时读回 1/duration≈0，其后一块读回精确 0.0）；阈值 0.02 吸收该粒度且远小于淡出中段
@@ -216,6 +225,18 @@ public:
 
   void setEventSink(BackendEventSink sink) override { dispatcher_.setEventSink(std::move(sink)); }
 
+  // 频谱分析开关（任务 30 B3.2）：默认关 = worker 零取帧/零分析/零快照更新。
+  // 原子位 + notify：任意线程可安全调用（无命令队列需要——纯门控位，无 worker
+  // 状态迁移语义）；worker 在 2ms 轮询内读到新位，开启后下个 ~10ms 节流点生效。
+  void setSpectrumEnabled(bool enabled) override {
+    spectrumEnabled_.store(enabled, std::memory_order_release);
+    commandAvailable_.notify_one();
+  }
+
+  [[nodiscard]] bool spectrumEnabled() const override {
+    return spectrumEnabled_.load(std::memory_order_acquire);
+  }
+
   void configureOutput(const AudioOutputConfig& config) override {
     enqueueCommand([this, config] {
       config_ = config;
@@ -319,6 +340,50 @@ public:
     }
 
     return {};
+  }
+
+  // EQ：均衡器参数下发（接口默认空实现 → 覆写；任务 19 控制命令链的服务侧落点）。
+  // 线程模型与存储模式仿 configureTransition/configureOutput 覆写先例：命令进
+  // enqueueCommand worker 串行域执行——device_.setEqualizerConfig 按设备线程契约
+  // 只允许 worker 调用（停态窗口 configure 可分配，不得与活跃回调并发）。语义红线
+  // （接口注释 + 设备侧内建，转发勿破坏）：仅更新均衡器配置，绝不触发输出重载/
+  // 设备生命周期操作/事件——本覆写除转发外零设备操作（区别于 configureOutput 的
+  // 整轨重载语义）；rebindQueue/T10 交接/stop/pause/resume 非重建路径不动 EQ 状态
+  // 的既有纪律（service 停启区注释）不受本覆写影响。
+  // 存储 = worker 成员 equalizerTarget_（同 transitionConfig_ 存储先例；重建/交接
+  // 不清它——device 侧 eqConfig_ 幂等重放已保证重建不丢，本成员供 worker 侧取用
+  // 与未来 B2.6 加载后重发布通道回读）。生效语义全部委托设备：
+  // setEqualizerConfig = 配置存储恒执行 + PENDING 目标层无条件发布（运行中由设备
+  // 回调块首受理投递 DSP——播放中调节实时生效）+ 已 initialize 未启动窗口即时真实
+  // 应用 + initialize/内容边界幂等重放。
+  void setEqualizer(const EqualizerConfig& config) override {
+    enqueueCommand([this, config] {
+      equalizerTarget_ = config;
+      device_.setEqualizerConfig(config);
+    });
+  }
+
+  // EQ：同步读回（接口默认空快照 → 覆写；无调用方的读回面按接口注释语义就位）。
+  // 线程模型：直接读设备生效面原子镜像——eqAppliedSnapshot 跨线程一致读（设备层
+  // 注释明示读侧可为 worker 或控制线程/service.equalizerState 回读），无锁无往返；
+  // 不走 queryPlaybackClock 的 promise 屏障（此处无状态迁移，镜像层即真值）。
+  // 组装语义（契约头注释：生效配置 + 单调代数 + 输出采样率）：
+  //  - generation = 设备单调代数（eqAppliedLayer.version：每次真实应用 +1，含
+  //    initialize/内容边界幂等重放与运行期回调受理；0 = 从未生效 = 契约空快照——
+  //    本地仅存储、尚未受理/应用的目标不回填，同设备「读侧不被告知未生效的新
+  //    目标」纪律）；
+  //  - config/sampleRate = 设备生效面真值（实际生效配置 + 实际输出率）；
+  //  - 181 点增益曲线：设备生效面不产曲线（只有参数/率/代数），曲线由控制层
+  //    reducer 先行解析并经订阅发布——本读回侧重配置/代数/采样率真值，曲线字段
+  //    留零不编造（消费端绘制请以 reducer 快照曲线为准）。
+  [[nodiscard]] EqualizerStateSnapshot equalizerState() const override {
+    const auto applied = device_.eqAppliedSnapshot();
+    EqualizerStateSnapshot snapshot;
+    snapshot.generation = applied.version;
+    snapshot.config = applied.config;
+    snapshot.sampleRate = applied.sampleRate;
+    // curvePointsDb / curveFrequenciesHz 保持契约默认零值（见上注释，勿编造曲线）。
+    return snapshot;
   }
 
 private:
@@ -629,6 +694,12 @@ private:
     currentTarget_ = negotiation->target;
     hasCurrentTarget_ = true;
     activeDeviceConfig_ = config_;
+    // 内容边界清理（任务 26 B2.4b 挂点 ②）：新曲加载协商/rebind 成功后清 DSP 状态——
+    // EQ 滤波历史/limiter lookahead 延迟线/平滑全清零（device_.clearDspState 重建实例），
+    // 防旧曲内容尾残留造成新曲起手瞬态。两分支在此收敛：重开分支（initialize 已于挂点 ①
+    // 清理，此处幂等）；T7 免重开分支（同格式未重建设备、仅 rebindQueue）必须此处显式清理。
+    // 设备已停（函数首部 stopDevice），无活跃回调竞态；T10 运行中交接不经过本路径。
+    device_.clearDspState();
     spdlog::debug("output negotiated: {}Hz {}ch {} mode={}",
                   currentTarget_.sampleRate, currentTarget_.channelCount,
                   sampleFormatName(currentTarget_.sampleFormat),
@@ -1011,6 +1082,12 @@ private:
 
     observedQueueCounters_ = queue_->counters();
     clock_.seek(position);
+    // 内容边界清理（任务 26 B2.4b 挂点 ③）：瞬时 seek 重启点——设备已停（上方
+    // stopDevice）、队列已按新位置重填；清 DSP 状态（EQ 滤波历史/limiter lookahead
+    // 延迟线）防旧位置内容尾残留。seek = 内容边界，清零正确；pause/resume 不经本路径
+    // （保留冻结状态 = 线性精确续接）。T11 seek dip 走归零点换面（零增益窗口内自掩，
+    // 设备未停）不在此列。
+    device_.clearDspState();
     stateMachine_.completeSeek(seekGeneration);
     if (shouldResume) {
       clock_.resume();
@@ -1618,6 +1695,68 @@ private:
       return;
     }
     publishProgressIfDue();
+    serviceSpectrumIfDue();
+  }
+
+  // 频谱分析（任务 30 B3.2）：开关开时工作（与逻辑态解耦,允许 Paused/Stopped
+  // 下查看频谱——EQ 调试需求）。~10ms 轮询以 2ms tick 计数近似（tick 在频谱开时
+  // 恒递增,Playing/Paused 无差异）；节流点取最新摘录帧喂纯分析组件。
+  void serviceSpectrumIfDue() {
+    if (!spectrumEnabled_.load(std::memory_order_acquire)) {
+      return;
+    }
+    // 移除 Playing 状态检查:频谱开时任意状态均轮询（EQ 调试场景需要）
+    if ((++spectrumTickCounter_) % kSpectrumPollEveryTicks != 0U) {
+      return;
+    }
+    pullAndAnalyzeSpectrum();
+  }
+
+  // 单次节流点的摘录轮询（worker 线程；与设备生命周期同线程纪律天然满足）。
+  void pullAndAnalyzeSpectrum() {
+    const std::uint32_t capacity = device_.captureCapacityFrames();
+    if (capacity == 0U) {
+      return;  // 设备未 initialize（Playing 下不可达，防御）
+    }
+    if (spectrumCaptureScratch_.size() < capacity) {
+      spectrumCaptureScratch_.resize(capacity);
+    }
+    AudioOutputDeviceCaptureMeta meta{};
+    if (!device_.latestCaptureFrame(spectrumCaptureScratch_.data(), capacity, meta)) {
+      return;  // 尚无完整帧/未取到一致视图：下轮重试
+    }
+    // sequence/generation 双判新：同帧重读（含 stop 后冻结帧）零分析。
+    if (spectrumFrameSeen_ && meta.generation == spectrumFrameGeneration_ &&
+        meta.sequence == spectrumFrameSequence_) {
+      return;
+    }
+    spectrumFrameSeen_ = true;
+    spectrumFrameGeneration_ = meta.generation;
+    spectrumFrameSequence_ = meta.sequence;
+
+    const SpectrumFeedFrame frame{meta.generation,
+                                  meta.sampleRate,
+                                  meta.frameCount,
+                                  static_cast<SpectrumDomainTag>(meta.domain),
+                                  spectrumCaptureScratch_.data()};
+    const auto analysis = spectrumAnalyzer_.feed(frame);
+    if (!analysis.has_value()) {
+      return;
+    }
+    // 驻留快照：generation = 契约语义的独立单调计数（每次频谱更新 +1，0 = 空）；
+    // 设备 generation 仅驱动组件跨代失效，两代数域隔离。R2 频谱外发：驻留快照
+    // 更新后即派发 SpectrumUpdated（同 dispatchPosition 通道/版本计数；事件按
+    // 分析产出节流——analysis 有值才发，天然受 ~10ms 轮询上界约束（44.1/48k
+    // ~43/45Hz；96k ~25Hz / 192k ~12.5Hz 率依赖递减），无需额外时间闸）。
+    ++spectrumSnapshotGeneration_;
+    spectrumSnapshot_.generation = spectrumSnapshotGeneration_;
+    spectrumSnapshot_.sampleRate = analysis->sampleRate;
+    spectrumSnapshot_.binsDb = analysis->binsDb;
+    spectrumSnapshot_.timestampMs = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    dispatcher_.dispatch(BackendEventType::SpectrumUpdated, SpectrumUpdated{spectrumSnapshot_});
   }
 
   void startProgressWorker() {
@@ -1827,6 +1966,10 @@ private:
     if (device_.started()) {
       static_cast<void>(device_.stop());
     }
+    // 任务 26 纪律：stop()/pause/resume 路径不调用 device_.clearDspState()——EQ 滤波/
+    // limiter lookahead 延迟线状态跨 stop()/start() 保留（device_.stop 只复位包络层，
+    // 不触碰 DSP 实例），pause→resume/同曲 replay 冻结续接 = 线性精确续接。内容边界
+    // 清理只经显式 clearDspState()（initialize/加载协商成功/瞬时 seek 重启三停态挂点）。
     // T9/T10：退役 ring 的销毁点——设备已停（无活跃回调）才允许析构已发布过的队列
     // （见 retireSecondSourceOnWorker / completeOverlapHandoff / retiredQueue_）；stop
     // 失败时 device 仍 started → 不移交销毁。
@@ -2037,6 +2180,10 @@ private:
     device_.deactivateSecondSource();
     device_.resetSourceEnvelope(0);
     device_.resetSourceEnvelope(1);
+    // 任务 26 纪律：T10 运行中交接（自动前进/预解码直切/交叉在设备运行中调 rebindQueue）
+    // 不调用 device_.clearDspState()——EQ 滤波/limiter lookahead 延迟线状态在此冻结跨越
+    // 交接（清空 = 每次交接 ~5ms 空洞 + EQ 阶跃瞬态，违 F5「切换无爆音」）。内容边界清理
+    // 只挂在停态边界（initialize/加载协商成功/瞬时 seek 重启），本函数无停态边界。
     retiredQueue_ = std::move(queue_);
     device_.rebindQueue(*slot.queue);
     queue_ = std::move(slot.queue);
@@ -2403,6 +2550,9 @@ private:
   // T7：最近一次成功开启设备时的 config_ 快照（免重开短路"设备目标未变"判据）。
   std::optional<AudioOutputConfig> activeDeviceConfig_{};
   TransitionConfig transitionConfig_{};
+  // EQ：worker 侧均衡器目标存储（setEqualizer 命令写；重建/交接/stop 等非 EQ 路径
+  // 不清——设备侧 eqConfig_ 幂等重放保证重建不丢，本成员供 worker 侧取用）。
+  EqualizerConfig equalizerTarget_{};
   // T8：EndApproaching 是否已在本臂（当前曲/当前配置）发出——一次性去重；
   // 由新 loadTrack / configureTransition / handoff 重新武装（裁定复位矩阵）。
   bool endApproachEmitted_{false};
@@ -2445,6 +2595,17 @@ private:
   std::optional<std::chrono::milliseconds> pendingFrozenSeekPosition_{};
   // T5 worker 侧包络账本（版本递增/ms→帧换算/增益钳制），发布唯一入口。
   GainEnvelopeController masterEnvelope_{1.0F};
+
+  // ---- 频谱分析状态（任务 30 B3.2）----
+  std::atomic<bool> spectrumEnabled_{false};   // 开关（默认关；关闭 = 零取帧/零分析）
+  SpectrumAnalyzer spectrumAnalyzer_;          // 纯分析组件（窗/FFT/跨代状态自持）
+  std::vector<float> spectrumCaptureScratch_;  // latestCaptureFrame 输出缓冲（按容量扩容）
+  bool spectrumFrameSeen_ = false;             // 已记录首帧元数据（同帧判定前提）
+  std::uint32_t spectrumFrameGeneration_ = 0;  // 最近摘录帧纪元（同帧判定）
+  std::uint32_t spectrumFrameSequence_ = 0;    // 最近摘录帧序（同帧判定）
+  std::uint32_t spectrumTickCounter_ = 0;      // 2ms tick 计数（%5 → ~10ms 轮询）
+  std::uint64_t spectrumSnapshotGeneration_ = 0;  // 驻留快照单调代数（契约语义）
+  SpectrumSnapshot spectrumSnapshot_{};        // 驻留快照（后续 control 接线取用）
 
   AudioOutputDevice device_;
   std::unique_ptr<DeviceFormatEnumerator> formatEnumerator_{};
