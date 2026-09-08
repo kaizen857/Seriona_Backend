@@ -290,10 +290,14 @@ TEST_CASE("caching enumerator warms up in background and serves cached capabilit
   auto* rawPlatform = platform.get();
   auto caching = std::make_unique<CachingDeviceFormatEnumerator>(std::move(platform));
 
-  // 构造即后台预热；等待后台线程完成（10ms 延迟 + 调度余量）。
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
-
-  const auto result = caching->enumerate();
+  // 构造即后台预热；固定 100ms 等待在慢机上可能不够 → 谓词轮询缓存（2s 预算）。
+  // enumerate() 不会重复触发平台枚举（refreshing 门 + TTL），轮询安全。
+  const auto warmDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  auto result = caching->enumerate();
+  while (result.empty() && std::chrono::steady_clock::now() < warmDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    result = caching->enumerate();
+  }
   REQUIRE(result.size() == 1U);
   CHECK(result[0].deviceId == "dev-cached");
   CHECK(result[0].supportedSampleFormats == std::vector<AudioSampleFormat>{AudioSampleFormat::Int32});
@@ -303,16 +307,18 @@ TEST_CASE("caching enumerator warms up in background and serves cached capabilit
 }
 
 TEST_CASE("caching enumerator returns immediately before background refresh completes") {
-  auto platform = std::make_unique<DelayedFakeFormatEnumerator>(std::chrono::milliseconds{200});
+  auto platform = std::make_unique<DelayedFakeFormatEnumerator>(std::chrono::milliseconds{1000});
   auto* rawPlatform = platform.get();
   auto caching = std::make_unique<CachingDeviceFormatEnumerator>(std::move(platform));
 
   // 预热未完成时 enumerate() 立即返回空缓存，等待时间远小于平台延迟。
+  // 平台延迟取 1s（原 200ms）：慢机上测试线程若被抢占超过延迟，后台会先完成、
+  // 返回非空缓存导致假失败；1s 使抢占窗口大 5 倍，enumerate() 自身开销上限 200ms 留 5x 余量。
   const auto started = std::chrono::steady_clock::now();
   const auto result = caching->enumerate();
   const auto elapsed = std::chrono::steady_clock::now() - started;
   CHECK(result.empty());
-  CHECK(elapsed < std::chrono::milliseconds{100});
+  CHECK(elapsed < std::chrono::milliseconds{200});
   // 不检查 enumerateCalls：后台线程是否已调度到属于竞态，本用例只验证不阻塞。
 }
 
@@ -321,7 +327,11 @@ TEST_CASE("caching enumerator serves cache without re-invoking platform within t
   auto* rawPlatform = platform.get();
   auto caching = std::make_unique<CachingDeviceFormatEnumerator>(std::move(platform));
 
-  std::this_thread::sleep_for(std::chrono::milliseconds{50});  // 等预热完成
+  // 固定 50ms 等预热在慢机上可能不够 → 谓词轮询缓存（2s 预算）。
+  const auto warmDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (caching->enumerate().empty() && std::chrono::steady_clock::now() < warmDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
 
   for (int i = 0; i < 3; ++i) {
     const auto result = caching->enumerate();

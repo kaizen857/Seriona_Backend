@@ -188,9 +188,13 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
   return songs;
 }
 
+// Budget for scanner worker async completion (scan round + SQLite writes); generous for slow CI machines.
+inline constexpr auto kEventWaitBudget = std::chrono::seconds{3};
+
 template <typename Predicate>
 [[nodiscard]] PlaylistTreeSnapshot waitForSnapshot(const FileScannerService& service, Predicate predicate) {
-  for (auto attempts = 0; attempts < 2000; ++attempts) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (std::chrono::steady_clock::now() < deadline) {
     auto snapshot = service.snapshot();
     if (predicate(snapshot)) {
       return snapshot;
@@ -206,10 +210,8 @@ template <typename Predicate>
   });
 }
 
-void waitForReaderCount(const FakeServiceMetadataReader& reader, std::size_t expectedCount) {
-  for (auto attempts = 0; attempts < 100 && reader.readCount() != expectedCount; ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+void waitForReaderCount(FakeServiceMetadataReader& reader, std::size_t expectedCount) {
+  REQUIRE(reader.waitForReadCount(expectedCount, kEventWaitBudget));
 }
 
 [[nodiscard]] std::vector<ScannerError> errorsFrom(const std::vector<ScannerEvent>& events) {
@@ -528,7 +530,7 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   const LrcParseObserverGuard parseObserver{[&parseCallCount](const std::filesystem::path&) { ++parseCallCount; }};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   const auto firstSnapshot = service->snapshot();
   const auto firstSongs = songsIn(firstSnapshot);
 
@@ -547,7 +549,7 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   CHECK(sidecar.loadLyrics(firstLocation.locationId, "external").size() == 1U);
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
   const auto cachedSongs = songsIn(service->snapshot());
 
   REQUIRE(cachedSongs.size() == 2U);
@@ -577,7 +579,7 @@ TEST_CASE("scanner service runScan characterizes main database scanner schema si
   CHECK_FALSE(std::filesystem::exists(sidecarPath));
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
 
   const auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
@@ -608,7 +610,7 @@ TEST_CASE("scanner service clears stale external lrc after a cached song sees ma
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
@@ -618,7 +620,7 @@ TEST_CASE("scanner service clears stale external lrc after a cached song sees ma
 
   writeText(temp.path() / "song.lrc", "[00:99.00]malformed stale external\n");
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
   songs = songsIn(service->snapshot());
 
   CHECK(reader->readCount() == 1U);
@@ -651,7 +653,7 @@ TEST_CASE("scanner service clears stale external lrc after hash io failure") {
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
@@ -665,7 +667,7 @@ TEST_CASE("scanner service clears stale external lrc after hash io failure") {
                                                                              .path = path}}}};
   }};
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
   songs = songsIn(service->snapshot());
 
   REQUIRE(songs.size() == 1U);
@@ -692,7 +694,7 @@ TEST_CASE("scanner service delta recording deletes stale empty embedded and exte
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());
   const auto locationBefore = cachedLocationForPath(sidecar, rootPath, audio);
@@ -707,7 +709,7 @@ TEST_CASE("scanner service delta recording deletes stale empty embedded and exte
   }};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
 
   REQUIRE(cacheWrites.size() == 1U);
   REQUIRE(cacheWrites.back().changedSongs.size() == 1U);
@@ -814,7 +816,7 @@ TEST_CASE("scanner service handles new and deleted lrc without tagreader and pru
   ScannerEventLog eventLog;
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   waitForReaderCount(*reader, 3U);
   CHECK(reader->readCount() == 3U);
 
@@ -822,7 +824,7 @@ TEST_CASE("scanner service handles new and deleted lrc without tagreader and pru
   writeText(temp.path() / "plain.lrc", "[00:01.00]external plain\n");
   forceNextScanIncrementalForCurrentTree(temp);
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
   auto songs = songsIn(waitForSnapshot(*service, [&embeddedAudio, &plainAudio](const PlaylistTreeSnapshot& snapshot) {
     const auto currentSongs = songsIn(snapshot);
     return currentSongs.size() == 3U && songByPath(currentSongs, embeddedAudio).effectiveLyricsSource == LyricsSource::ExternalLrc &&
@@ -843,7 +845,7 @@ TEST_CASE("scanner service handles new and deleted lrc without tagreader and pru
     deleteWrites.push_back(write);
   }};
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 3U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 3U, kEventWaitBudget));
   waitForReaderCount(*reader, 3U);
   songs = songsIn(waitForSongs(*service, 2U));
 
@@ -886,7 +888,7 @@ TEST_CASE("scanner service treats lrc hash cancellation as typed cancellation an
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());
   REQUIRE(sidecar.loadLocationsByRoot(rootPath).size() == 2U);
@@ -908,7 +910,7 @@ TEST_CASE("scanner service treats lrc hash cancellation as typed cancellation an
                                                                              .path = path}}}};
   }};
 	  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-	  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanStopped, std::chrono::seconds{1}));
+	  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanStopped, kEventWaitBudget));
 
 	  CHECK(cancelledWrites.empty());
 	  const auto locationsAfterCancel = sidecar.loadLocationsByRoot(rootPath);
@@ -933,7 +935,7 @@ TEST_CASE("scanner service does not retain a cache hit whose content hydrate fai
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
   const auto rootPath = canonicalRootPath(temp.path());
   const auto originalLocation = cachedLocationForPath(sidecar, rootPath, audio);
@@ -946,7 +948,7 @@ TEST_CASE("scanner service does not retain a cache hit whose content hydrate fai
   }};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
 
   REQUIRE_FALSE(snapshots.empty());
   CHECK(snapshots.back().retainedLocationIds.empty());
@@ -1029,7 +1031,7 @@ TEST_CASE("scanner service records failures malformed lrc cancellation and prese
   service->stop();
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   songs = songsIn(service->snapshot());
-  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanStopped, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanStopped, kEventWaitBudget));
   errors = eventLog.errors();
 
   REQUIRE(songs.size() == 1U);
@@ -1049,7 +1051,7 @@ TEST_CASE("scanner service processes audio candidates through the worker pool") 
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  REQUIRE(reader->waitForBlockedRead(kEventWaitBudget));
   waitForReaderCount(*reader, 2U);
   CHECK(reader->readCount() == 2U);
   CHECK(service->snapshot().nodes.empty());
@@ -1080,7 +1082,7 @@ TEST_CASE("scanner service contains queued scan exceptions and keeps the worker 
   }};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanError, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEvent(ScannerEventType::ScanError, kEventWaitBudget));
 
   const auto errors = eventLog.errors();
   REQUIRE(errors.size() == 1U);
@@ -1092,7 +1094,7 @@ TEST_CASE("scanner service contains queued scan exceptions and keeps the worker 
 
   preallocationObserver.reset();
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
 
   const auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
@@ -1113,7 +1115,7 @@ TEST_CASE("scanner service honors configured worker and tagreader concurrency") 
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForReadCount(2U, std::chrono::seconds{1}));
+  REQUIRE(reader->waitForReadCount(2U, kEventWaitBudget));
   CHECK(service->snapshot().nodes.empty());
 
   reader->release();
@@ -1136,7 +1138,7 @@ TEST_CASE("scanner service can force serial fallback from scanner config") {
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForReadCount(1U, std::chrono::seconds{1}));
+  REQUIRE(reader->waitForReadCount(1U, kEventWaitBudget));
   CHECK_FALSE(reader->waitForReadCount(2U, std::chrono::milliseconds{20}));
 
   reader->release();
@@ -1161,7 +1163,7 @@ TEST_CASE("scanner service applies env worker overrides and disable concurrency 
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForReadCount(1U, std::chrono::seconds{1}));
+  REQUIRE(reader->waitForReadCount(1U, kEventWaitBudget));
   CHECK_FALSE(reader->waitForReadCount(2U, std::chrono::milliseconds{20}));
 
   reader->release();
@@ -1187,7 +1189,7 @@ TEST_CASE("scanner service ignores malformed env overrides and keeps config fall
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForReadCount(2U, std::chrono::seconds{1}));
+  REQUIRE(reader->waitForReadCount(2U, kEventWaitBudget));
 
   reader->release();
   const auto songs = songsIn(waitForSongs(*service, 2U));
@@ -1219,19 +1221,19 @@ TEST_CASE("scanner config disables incremental mode and can force full scans") {
   };
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
   CHECK(lastScanMode() == ScanMode::Incremental);
 
   service->configure(ScannerConfig{.enableIncrementalScan = false});
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 3U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 3U, kEventWaitBudget));
   CHECK(lastScanMode() == ScanMode::Full);
 
   service->configure(ScannerConfig{.forceFull = true});
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
-  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 4U, std::chrono::seconds{1}));
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 4U, kEventWaitBudget));
   CHECK(lastScanMode() == ScanMode::Full);
 }
 
@@ -1255,7 +1257,7 @@ TEST_CASE("scanner service publishes worker results in discovered file order") {
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
-  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  REQUIRE(reader->waitForBlockedRead(kEventWaitBudget));
   waitForReaderCount(*reader, 2U);
   reader->release();
   const auto snapshotSongs = songsInPublishedOrder(waitForSongs(*service, 2U));
@@ -1342,18 +1344,14 @@ TEST_CASE("scanner service returns from scan while scanner worker performs slow 
   const auto elapsed = std::chrono::steady_clock::now() - before;
 
   CHECK(elapsed < std::chrono::milliseconds{50});
-  REQUIRE(reader->waitForBlockedRead(std::chrono::seconds{1}));
+  REQUIRE(reader->waitForBlockedRead(kEventWaitBudget));
   CHECK(service->snapshot().nodes.empty());
 
   reader->release();
-  for (auto attempts = 0; attempts < 100 && service->snapshot().nodes.empty(); ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-
-  const auto songs = songsIn(service->snapshot());
+  const auto songs = songsIn(waitForSongs(*service, 1U));
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].title == "Slow");
-  CHECK(eventLog.waitForEvent(ScannerEventType::ScanCompleted, std::chrono::seconds{1}));
+  CHECK(eventLog.waitForEvent(ScannerEventType::ScanCompleted, kEventWaitBudget));
 }
 
 }

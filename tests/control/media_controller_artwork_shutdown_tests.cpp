@@ -229,13 +229,13 @@ TEST_CASE("media controller shutdown waits for in-flight artwork resolution and 
   fixture.fakeScanner->emit(scannerSnapshotEvent(
       libraryTree({songWithThumbnail("a", "music/a.flac", "/thumbs/a.png")}, 21), 21));
   REQUIRE(fixture.controller->submitCommand(command(MediaControlCommandKind::Play)).accepted);
-  REQUIRE(loader.waitForEnter(std::chrono::seconds{1}));
+  REQUIRE(loader.waitForEnter(std::chrono::seconds{2}));
 
   auto shutdownResult = std::async(std::launch::async, [&] { fixture.controller->shutdown(); });
   CHECK(shutdownResult.wait_for(std::chrono::milliseconds{50}) != std::future_status::ready);
 
   loader.release();
-  REQUIRE(shutdownResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(shutdownResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK(fixture.resolver->stopped());
 
   const auto snapshot = fixture.controller->playerStateSnapshot();

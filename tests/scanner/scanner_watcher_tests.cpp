@@ -184,6 +184,18 @@ void waitForSnapshotSongCount(const FileScannerService& service, std::size_t exp
   FAIL("timed out waiting for watcher reconciliation snapshot");
 }
 
+// 等待快照中出现指定路径（rename 类用例：song 数不变，按计数等待会被陈旧快照立刻满足）。
+void waitForSnapshotSongPath(const FileScannerService& service, const std::filesystem::path& path) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
+    const auto songs = songsIn(service.snapshot());
+    if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for watcher snapshot song path");
+}
+
 void waitForLyrics(const FileScannerService& service, LyricsSource source, std::string_view text) {
   for (auto attempt = 0; attempt != 1000; ++attempt) {
     const auto songs = songsIn(service.snapshot());
@@ -215,6 +227,22 @@ void waitForScanStartedCount(const std::vector<ScannerEvent>& events, std::mutex
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
   FAIL("timed out waiting for fallback rescan to start");
+}
+
+// 等待事件计数到达阈值（代替固定沉降窗）：发布在慢机上可能迟到 >30ms；
+// Snapshot 事件先于 ScanCompleted 推送，故该阈值满足后等值 CHECK 不再有竞态。
+void waitForScanCompletedCount(const std::vector<ScannerEvent>& events, std::mutex& mutex, std::size_t expected) {
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    {
+      std::scoped_lock lock{mutex};
+      if (static_cast<std::size_t>(std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type)) >=
+          expected) {
+        return;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for ScanCompleted event count");
 }
 
 
@@ -762,7 +790,7 @@ TEST_CASE("scanner watcher dedups same-path move-self and flush destroy within o
                                             .associated = {}});
 
   waitForSnapshotSongCount(*service, 0U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  waitForScanCompletedCount(events, eventsMutex, completedBefore + 1U);
   {
     std::scoped_lock lock{eventsMutex};
     // 双 remove 合并后仍走精准删除路径，不触发全根 ScanStarted（非回落重扫）。
@@ -812,8 +840,7 @@ TEST_CASE("scanner watcher root-internal directory rename converges without resc
   rename.associated.push_back(WatchEvent{.path = pop, .pathKind = WatchPathKind::Directory, .effectKind = WatchEffectKind::Renamed, .associated = {}});
   watchers->states[0]->callback(rename);
 
-  waitForSnapshotSongCount(*service, 1U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  waitForSnapshotSongPath(*service, pop / "01.flac");
   const auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].filePath == (pop / "01.flac"));
@@ -880,17 +907,7 @@ TEST_CASE("scanner watcher root-internal rename keeps CUE source audio hidden (n
                                          .effectKind = WatchEffectKind::Renamed, .associated = {}});
   watchers->states[0]->callback(rename);
 
-  const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
-    for (auto attempt = 0; attempt != 1000; ++attempt) {
-      const auto songs = songsIn(service->snapshot());
-      if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-    FAIL("timed out waiting for renamed snapshot path");
-  };
-  waitForSnapshotPath(pop / "album.cue");
+  waitForSnapshotSongPath(*service, pop / "album.cue");
   std::this_thread::sleep_for(std::chrono::milliseconds{30});
 
   // 根内 rename 后 CUE 源音频（album.flac）必须仍隐藏：只有 CUE 轨 + standalone 轨可见，
@@ -981,17 +998,7 @@ TEST_CASE("scanner watcher root-internal rename with overlapping sibling prefix 
                                          .effectKind = WatchEffectKind::Renamed, .associated = {}});
   watchers->states[0]->callback(rename);
 
-  const auto waitForSnapshotPath = [&service](const std::filesystem::path& path) {
-    for (auto attempt = 0; attempt != 1000; ++attempt) {
-      const auto songs = songsIn(service->snapshot());
-      if (std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == path; })) {
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds{5});
-    }
-    FAIL("timed out waiting for renamed snapshot path");
-  };
-  waitForSnapshotPath(pop / "album.cue");
+  waitForSnapshotSongPath(*service, pop / "album.cue");
   std::this_thread::sleep_for(std::chrono::milliseconds{30});
 
   // 根内 rename 只影响 music→pop：pop 内 CUE 轨/独立音频路径更新且无 music/ 残留。

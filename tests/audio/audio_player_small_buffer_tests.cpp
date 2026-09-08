@@ -3,7 +3,9 @@
 
 #include <doctest.h>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -197,7 +199,9 @@ TEST_CASE("audio_player_small_buffer refills playback without clock polling") {
   static_cast<void>(player.queryPlaybackClock());
   player.play();
   static_cast<void>(player.queryPlaybackClock());
-  for (int index = 0; index < 80; ++index) {
+  // refill 由 worker 完成：固定 80×2ms 节拍窗在慢机上不足 → 谓词驱动（总预算 2s）。
+  const auto refillDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (fake->nonSilentCallbacks <= 10 && std::chrono::steady_clock::now() < refillDeadline) {
     fake->consume(16U);
     std::this_thread::sleep_for(2ms);
   }
@@ -227,7 +231,12 @@ TEST_CASE("audio_player_small_buffer publishes progress while playing without cl
   static_cast<void>(player.queryPlaybackClock());
   player.play();
   static_cast<void>(player.queryPlaybackClock());
-  for (int index = 0; index < 120; ++index) {
+  // 进度事件由 worker ticker 派发：固定 120×2ms 节拍窗在慢机上不足 → 谓词驱动（总预算 2s）。
+  const auto progressDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < progressDeadline &&
+         std::ranges::count_if(events, [](const BackendEvent& event) {
+           return event.type == BackendEventType::PlaybackPositionUpdated;
+         }) < 3) {
     fake->consume(16U);
     std::this_thread::sleep_for(2ms);
   }

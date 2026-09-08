@@ -325,11 +325,20 @@ EquivCapture capturePlaythrough(ScenarioSession& session, const TrackPlaybackReq
   loadAndPlay(session, request);
   // 固定块数消费（600ms = 120 块 + 2 块零尾余量）：尾块内容跨树确定性来自"解码帧数
   // 相同 + 队列耗尽后渲染全零"，不以 PlaybackEnded 事件到达时刻驱动（消除事件/消费
-  // 交错竞态）。事件事后核验自然播完确实发生。
+  // 交错竞态；字节长度基线按 122 块锁定）。事件事后核验自然播完确实发生——事件派发
+  // 可能滞后于消费完成（慢机），核验用带 deadline 的等待而非即时快照。
   pacedConsume(*session.fake, 240U * 122U);
-  const auto events = session.log.snapshot();
-  const bool ended = hasEventSince(events, BackendEventType::PlaybackEnded) ||
-                     hasStateSince(events, PlaybackState::Stopped);
+  // 事件可能在消费过程中已派发（自然结束于尾块窗口内），故核验扫描完整事件日志。
+  const auto endedDeadline = std::chrono::steady_clock::now() + 5s;
+  bool ended = false;
+  while (std::chrono::steady_clock::now() < endedDeadline) {
+    const auto snapshot = session.log.snapshot();
+    if (hasEventSince(snapshot, BackendEventType::PlaybackEnded) || hasStateSince(snapshot, PlaybackState::Stopped)) {
+      ended = true;
+      break;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
   if (!ended) {
     throw std::runtime_error("playthrough: natural end not observed after fixed consumption");
   }

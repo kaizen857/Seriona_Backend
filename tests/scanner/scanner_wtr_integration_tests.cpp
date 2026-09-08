@@ -149,6 +149,26 @@ void waitForMovedOutConverged(const FileScannerService& service, const test::Tem
       std::chrono::seconds{10}));
 }
 
+// 等待 scan 计数静默（quiet 时长内无新 ScanStarted）：create/rename 等事件可能触发回落
+// 全根重扫且其启动可能延迟，固定沉降窗在慢机上会被击穿，使增量/等值计数断言假失败。
+bool waitForScanQuiescence(const RealWtrEventLog& log,
+                           std::chrono::milliseconds quiet = std::chrono::milliseconds{500}) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  auto lastCount = log.scanStartedCount();
+  auto lastChanged = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    const auto count = log.scanStartedCount();
+    if (count != lastCount) {
+      lastCount = count;
+      lastChanged = std::chrono::steady_clock::now();
+    } else if (std::chrono::steady_clock::now() - lastChanged >= quiet) {
+      return true;
+    }
+  }
+  return false;
+}
+
 TEST_CASE("real wtr integration directory moved out of root converges snapshot sqlite and disk") {
   test::TempScannerRoot temp{"scanner-wtr-move-out"};
   const auto root = temp.path();
@@ -168,8 +188,8 @@ TEST_CASE("real wtr integration directory moved out of root converges snapshot s
 
   writeMinimalWav(music / "01.wav");
   waitForSnapshotSongCount(*service, 1U);
-  // 沉降：让 create 可能触发的回落（dir/create 事件）先完成，再取基线。
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  // 静默后再取基线：create 的 dir/create 回落可能延迟启动，固定沉降会被慢机击穿。
+  CHECK(waitForScanQuiescence(log));
   const auto baseline = log.scanStartedCount();
 
   std::filesystem::rename(music, movedOut, ec);
@@ -185,6 +205,7 @@ TEST_CASE("real wtr integration directory moved out of root converges snapshot s
   CHECK(locations.empty());
 
   // mv 出根：真实 wtr 报告 file/other → 分类器回落全根重扫一次即收敛，不无限增长。
+  CHECK(waitForScanQuiescence(log));
   CHECK(log.scanStartedCount() <= baseline + 1U);
 
   service->stopWatching();
@@ -220,8 +241,8 @@ TEST_CASE("real wtr integration single file moved out converges via fae flush") 
   // 必须 .wav：destroy 门禁（orchestrator:2425 isSupportedAudioExtension）排除非音频。
   writeMinimalWav(wav);
   waitForSnapshotSongCount(*service, 1U);
-  // 沉降：create 可能触发的回落先完成，再取基线 scan 计数。
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  // 静默后再取基线：create 可能触发回落，固定沉降会被慢机击穿。
+  CHECK(waitForScanQuiescence(log));
   const auto baseline = log.scanStartedCount();
 
   std::filesystem::rename(wav, movedOut, ec);
@@ -243,6 +264,7 @@ TEST_CASE("real wtr integration single file moved out converges via fae flush") 
   CHECK(locations.empty());
 
   // 精准删除：flush-destroy 走 destroyByKey 精准移除，scan 计数不增长（非回落全根重扫）。
+  CHECK(waitForScanQuiescence(log));
   CHECK(log.scanStartedCount() == baseline);
 
   service->stopWatching();
@@ -267,7 +289,8 @@ TEST_CASE("real wtr integration root internal directory rename updates paths wit
 
   writeMinimalWav(music / "01.wav");
   waitForSnapshotSongCount(*service, 1U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  // 静默后再取基线：create 可能触发回落，固定沉降会被慢机击穿。
+  CHECK(waitForScanQuiescence(log));
   const auto baseline = log.scanStartedCount();
 
   std::error_code ec;
@@ -319,6 +342,7 @@ TEST_CASE("real wtr integration root internal directory rename updates paths wit
   }));
 
   // 根内 rename：真实 wtr 会产生 dir/rename + 后续 file/other，可能回落一次，仍收敛且不无限增长。
+  CHECK(waitForScanQuiescence(log));
   CHECK(log.scanStartedCount() <= baseline + 1U);
 
   service->stopWatching();
@@ -337,25 +361,26 @@ TEST_CASE("real wtr integration file create modify delete converge without unbou
   service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
   waitForInitialScanCompleted(log);
   service->startWatching({ScannerRoot{.path = root}});
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
-
+  // 静默后再取基线：startWatching 后可能仍有回落扫描延迟启动。
+  CHECK(waitForScanQuiescence(log));
   const auto baseline = log.scanStartedCount();
 
   writeMinimalWav(wav);
   waitForSnapshotSongCount(*service, 1U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  // 静默后再采样：create 的 dir/create 回落可能延迟启动，固定沉降会被慢机击穿。
+  CHECK(waitForScanQuiescence(log));
   const auto afterCreate = log.scanStartedCount();
 
   std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   writeMinimalWav(wav);
-  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  CHECK(waitForScanQuiescence(log));
   CHECK(songsIn(service->snapshot()).size() == 1U);
   const auto afterModify = log.scanStartedCount();
 
   std::error_code ec;
   std::filesystem::remove(wav, ec);
   waitForSnapshotSongCount(*service, 0U);
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  CHECK(waitForScanQuiescence(log));
   const auto afterDelete = log.scanStartedCount();
 
   // 精准路径：modify/delete 由分类器精准处理（File+Modified/Destroyed），scan 计数不增长；

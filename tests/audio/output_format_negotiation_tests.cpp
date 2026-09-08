@@ -536,7 +536,10 @@ TEST_CASE("mixed_output_noreopen same-format switches keep the device open and s
 
   // 4) 自然播完（naturalEnd 只停设备不拆设备，到达时设备已停）后再切同格式曲：
   //    "非 handoff 路径 LoadTrack 到达时设备已停"的既有事实——仍免重开。
-  for (int index = 0; index < 200 && !hasEvent(eventLog.snapshot(), BackendEventType::PlaybackEnded); ++index) {
+  // 手工渲染必须持续泵帧（事件由 worker 派发），故 deadline 轮询而非纯 waitUntil。
+  const auto endedDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+  while (!hasEvent(eventLog.snapshot(), BackendEventType::PlaybackEnded) &&
+         std::chrono::steady_clock::now() < endedDeadline) {
     static_cast<void>(fake->renderFrames(960U));
     std::this_thread::sleep_for(1ms);
   }

@@ -2146,15 +2146,9 @@ TEST_CASE("media controller facade does not run scanner work on the control exec
   fixture.fakeScanner->blockScansUntilReleased();
   fixture.controller->start();
   installLibrary(fixture);
-  for (auto attempts = 0; attempts < 100 && !fixture.controller->libraryStateSnapshot().libraryTree.has_value(); ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  REQUIRE(waitUntil([&] { return fixture.controller->libraryStateSnapshot().libraryTree.has_value(); }));
   fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
-  for (auto attempts = 0; attempts < 100 && fixture.fakeAudio->playCalls() == 0U; ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(fixture.fakeAudio->playCalls() == 1U);
+  REQUIRE(waitUntil([&] { return fixture.fakeAudio->playCalls() == 1U; }));
 
   const std::vector<scanner::ScannerRoot> roots{{.path = std::filesystem::path{"music"}, .recursive = true}};
   auto scanResult = std::async(std::launch::async, [&] {
@@ -2168,17 +2162,17 @@ TEST_CASE("media controller facade does not run scanner work on the control exec
   });
 
   REQUIRE(scanResult.wait_for(std::chrono::seconds{1}) == std::future_status::timeout);
-  REQUIRE(pauseResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(pauseResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK(pauseResult.get().accepted);
-  for (auto attempts = 0; attempts < 100 && fixture.controller->playerStateSnapshot().timeline.position != std::chrono::milliseconds{1250}; ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(waitUntil([&] {
+    return fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{1250};
+  }));
   CHECK(fixture.fakeAudio->pauseCalls() == 1U);
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
   CHECK(fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{1250});
 
   fixture.fakeScanner->releaseBlockedScans();
-  REQUIRE(scanResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(scanResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK(scanResult.get().accepted);
 }
 
@@ -2203,7 +2197,7 @@ TEST_CASE("media controller facade exposes first scanned track while stopped") {
   CHECK(player.playback.state == PlaybackStatus::Stopped);
   CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
   CHECK(fixture.fakeAudio->playCalls() == 0U);
-  REQUIRE(trackSnapshot.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(trackSnapshot.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   const auto publishedSnapshot = trackSnapshot.get();
   REQUIRE(publishedSnapshot.currentTrack.has_value());
   CHECK(publishedSnapshot.currentTrack->trackId == "a");
@@ -2450,15 +2444,12 @@ TEST_CASE("media controller facade completes dispatch future when queued work th
   ControllerFixture fixture{MediaControllerOptions{.runInlineForTests = false}};
   fixture.controller->start();
   fixture.fakeScanner->emit(scannerSnapshotEvent(libraryTree({song("a", "music/a.flac")}, 20), 1));
-  for (auto attempts = 0; attempts < 100 && !fixture.controller->libraryStateSnapshot().libraryTree.has_value(); ++attempts) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(fixture.controller->libraryStateSnapshot().libraryTree.has_value());
+  REQUIRE(waitUntil([&] { return fixture.controller->libraryStateSnapshot().libraryTree.has_value(); }));
   fixture.fakeAudio->loadTrackThrows(std::runtime_error{"load failed"});
 
   auto commandResult = std::async(std::launch::async, [&] { return fixture.controller->submitCommand(command(MediaControlCommandKind::Play)); });
 
-  REQUIRE(commandResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(commandResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK_THROWS_WITH_AS(static_cast<void>(commandResult.get()), "load failed", std::runtime_error);
 }
 
@@ -2483,18 +2474,18 @@ TEST_CASE("media controller facade slow snapshot subscribers do not starve contr
 
   installLibrary(fixture);
   fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
-  REQUIRE(subscriberIsBlocked.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(subscriberIsBlocked.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
 
   auto pauseResult = std::async(std::launch::async, [&] {
     return fixture.controller->submitCommand(command(MediaControlCommandKind::Pause));
   });
 
-  REQUIRE(pauseResult.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(pauseResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   CHECK(pauseResult.get().accepted);
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
 
   releaseSubscriber.set_value();
-  REQUIRE(subscriberIsReleased.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(subscriberIsReleased.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   playerSubscription.unsubscribe();
 }
 
@@ -2524,11 +2515,11 @@ TEST_CASE("media controller facade subscribers receive committed snapshots not r
   fixture.fakeAudio->emit(audioTrackChangedEvent("sink-track", "music/sink.flac", 1));
   fixture.controller->drainForTests();
 
-  REQUIRE(committedLibrary.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(committedLibrary.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   const auto librarySnapshot = committedLibrary.get();
   CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Scanning);
   CHECK_FALSE(librarySnapshot.libraryTree.has_value());
-  REQUIRE(committedPlayer.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(committedPlayer.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
   const auto playerSnapshot = committedPlayer.get();
   REQUIRE(playerSnapshot.currentTrack.has_value());
   CHECK(playerSnapshot.currentTrack->trackId == "sink-track");
