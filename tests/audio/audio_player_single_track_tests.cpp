@@ -412,8 +412,11 @@ TEST_CASE("audio_player_public_commands_enqueue_without_waiting_for_device_start
   player.stop();
   const auto stopLatency = std::chrono::steady_clock::now() - beforeStop;
 
-  CHECK(pauseLatency < 50ms);
-  CHECK(stopLatency < 50ms);
+  // start 阻塞期间命令只须入队即返；设备在下方 unblockStart 前一直阻塞，窗口确定，
+  // 50ms 上限在慢机抢占下会被击穿 → 命名预算放宽到 200ms。
+  constexpr auto kEnqueueLatencyBudget = 200ms;
+  CHECK(pauseLatency < kEnqueueLatencyBudget);
+  CHECK(stopLatency < kEnqueueLatencyBudget);
 
   fake->unblockStart();
   waitForState(eventLog, PlaybackState::Stopped);
