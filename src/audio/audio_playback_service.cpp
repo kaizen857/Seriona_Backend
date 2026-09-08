@@ -42,7 +42,7 @@ constexpr auto kProgressPublishInterval = std::chrono::milliseconds{100};
 // 回调块 512 帧 < hop 1024，12 tick/24ms 每 2 轮才耗 1 hop 仅 ~21Hz；K=5 轮询
 // 10ms < 块周期 11.61ms@44.1k → 无块丢失，44.1/48k 发布上界 ~43/45Hz ≥ 40Hz
 // 目标）。率依赖限制：96k ~25Hz / 192k ~12.5Hz（单一常量无法全率保 ~40Hz）。
-// tick 仅在频谱开 + Playing 时计数。
+// tick 在频谱开时恒递增（Playing/Paused 无差异，允许静音下查看频谱）。
 constexpr std::uint32_t kSpectrumPollEveryTicks = 5U;
 
 // T6 归零判定阈值：包络读回为回调块末写回（粒度 ≈ 1/淡出帧数，块恰好止于轨迹终点
@@ -1698,16 +1698,14 @@ private:
     serviceSpectrumIfDue();
   }
 
-  // 频谱分析（任务 30 B3.2）：仅 Playing 逻辑态 + 开关开时工作（非 Playing 与
-  // 关闭 = 常数级判断零成本返回，不取帧不推）。~10ms 轮询以 2ms tick 计数近似
-  // （tick 仅在 Playing + 开时递增）；节流点取最新摘录帧喂纯分析组件。
+  // 频谱分析（任务 30 B3.2）：开关开时工作（与逻辑态解耦,允许 Paused/Stopped
+  // 下查看频谱——EQ 调试需求）。~10ms 轮询以 2ms tick 计数近似（tick 在频谱开时
+  // 恒递增,Playing/Paused 无差异）；节流点取最新摘录帧喂纯分析组件。
   void serviceSpectrumIfDue() {
     if (!spectrumEnabled_.load(std::memory_order_acquire)) {
       return;
     }
-    if (stateMachine_.state() != PlaybackState::Playing) {
-      return;
-    }
+    // 移除 Playing 状态检查:频谱开时任意状态均轮询（EQ 调试场景需要）
     if ((++spectrumTickCounter_) % kSpectrumPollEveryTicks != 0U) {
       return;
     }
