@@ -500,6 +500,9 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
   // 杂散地板。尾部（桶 46..58 邻域外）不做绝对静音断言：轮询节流丢弃中间摘录块
   // → 分析窗样本时间不连续 → 正弦相位跳变产生宽带杂散（实测 ~−22dB 级局部峰、
   // ~−28dB 级外围地板，真实部署同语义）——断言峰显著高于杂散地板即可。
+  // 上界取 −3dB 而非 −8dB：binsDb 按满刻度纯音主瓣整落桶 ≈ 0dB 标定（kSineRefPower），
+  // 0.5 满刻度正弦的理论主瓣峰值 ≈ −6dB；泄漏分布随分析窗样本连续性摆动（实测
+  // −11.5..−7dB），−8 上界在泄漏集中帧上会误杀——−3dB 仍能排除近满刻度异常。
   for (std::size_t index = 0; index < snapshots.size(); ++index) {
     CAPTURE(index);
     CHECK(snapshots[index].generation == index + 1U);
@@ -509,7 +512,7 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
     CHECK(peak >= 51U);
     CHECK(peak <= 56U);
     CHECK(snapshots[index].binsDb[peak] > -15.0F);
-    CHECK(snapshots[index].binsDb[peak] < -8.0F);
+    CHECK(snapshots[index].binsDb[peak] < -3.0F);
     float tailMax = -120.0F;
     for (std::size_t bin = 0U; bin < snapshots[index].binsDb.size(); ++bin) {
       if (bin >= 46U && bin <= 58U) {
