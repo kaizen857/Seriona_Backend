@@ -179,7 +179,8 @@ void writeText(const fs::path& path, const std::string& text) {
 }
 
 [[nodiscard]] PlaylistTreeSnapshot waitForSongs(const FileScannerService& service, std::size_t expectedCount) {
-  for (auto attempts = 0; attempts < 2000; ++attempts) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (std::chrono::steady_clock::now() < deadline) {
     auto snapshot = service.snapshot();
     if (songsIn(snapshot).size() == expectedCount) {
       return snapshot;
