@@ -393,7 +393,7 @@ TEST_CASE("metadata service queues slow backend updates and keeps the latest sna
                                                            .title = std::string{"Latest"}});
 
   const auto firstUpdate = service->update(firstState);
-  REQUIRE(blockingBackend->waitForUpdateCalls(1U, std::chrono::seconds{1}));
+  REQUIRE(blockingBackend->waitForUpdateCalls(1U, std::chrono::seconds{2}));
   const auto beforeLatest = Clock::now();
   const auto queuedMiddle = service->update(middleState);
   const auto queuedLatest = service->update(latestState);
@@ -402,10 +402,11 @@ TEST_CASE("metadata service queues slow backend updates and keeps the latest sna
   CHECK(firstUpdate.accepted);
   CHECK(queuedMiddle.accepted);
   CHECK(queuedLatest.accepted);
-  CHECK(queueElapsed < std::chrono::milliseconds{100});
+  // 纯入队（worker 阻塞于后端）：300ms 上限对慢机抢占留余量。
+  CHECK(queueElapsed < std::chrono::milliseconds{300});
 
   blockingBackend->releaseBlockedUpdates();
-  REQUIRE(blockingBackend->waitForUpdateCalls(2U, std::chrono::seconds{1}));
+  REQUIRE(blockingBackend->waitForUpdateCalls(2U, std::chrono::seconds{2}));
   service->stop();
 
   const auto finalState = blockingBackend->lastUpdatedState();

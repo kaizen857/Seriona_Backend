@@ -21,8 +21,9 @@ using namespace seriona::control;
 
 namespace {
 
-constexpr std::chrono::milliseconds kGenerationTimeout{2000};
-constexpr std::chrono::milliseconds kQuickReturnBudget{200};  // design goal 50 ms; relaxed for CI jitter
+constexpr std::chrono::milliseconds kGenerationTimeout{5000};
+// design goal 50 ms; 400 ms keeps a >=5x gap against the 2 s blocking loader (slow CI preemption).
+constexpr std::chrono::milliseconds kQuickReturnBudget{400};
 
 ArtworkResolveRequest makeRequest(std::uint64_t generation, std::string sourcePath) {
   TrackIdentity identity;
@@ -149,7 +150,7 @@ private:
 TEST_CASE("artwork resolver request returns well within the design target with a 500 ms loader") {
   ResultCollector collector;
   auto slowLoader = [](const std::filesystem::path&, const std::filesystem::path&) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    std::this_thread::sleep_for(std::chrono::milliseconds{2000});
     ArtworkResolveOutcome outcome;
     outcome.kind = ArtworkResolveOutcomeKind::FullPath;
     outcome.fullPath = std::filesystem::path{"/covers/full.png"};

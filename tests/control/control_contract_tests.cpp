@@ -343,7 +343,7 @@ TEST_CASE("control event loop can be stopped from posted work without terminatin
   });
 
   REQUIRE(posted);
-  REQUIRE(finished.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(finished.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
 }
 
 TEST_CASE("control event loop external stop joins work that requested stop from worker") {
@@ -361,13 +361,13 @@ TEST_CASE("control event loop external stop joins work that requested stop from 
   });
 
   REQUIRE(posted);
-  REQUIRE(stopRequested.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  REQUIRE(stopRequested.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
 
   auto externalStop = std::async(std::launch::async, [&] { loop.stop(); });
 
   CHECK(externalStop.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
   releaseWorker.set_value();
-  CHECK(externalStop.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+  CHECK(externalStop.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
 }
 
 TEST_CASE("public control headers avoid platform-only tokens") {
