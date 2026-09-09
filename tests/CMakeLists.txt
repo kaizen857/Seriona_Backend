@@ -5,6 +5,26 @@ if(SERIONA_TAGREADER_INCLUDE_DIR)
   include_directories(SYSTEM "${SERIONA_TAGREADER_INCLUDE_DIR}")
 endif()
 
+set(SERIONA_TEST_FFMPEG_EXECUTABLE "" CACHE FILEPATH "FFmpeg CLI used to generate audio test fixtures")
+if(NOT SERIONA_TEST_FFMPEG_EXECUTABLE)
+  set(_seriona_vcpkg_ffmpeg
+    "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/tools/ffmpeg/ffmpeg${CMAKE_EXECUTABLE_SUFFIX}"
+  )
+  if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET AND EXISTS "${_seriona_vcpkg_ffmpeg}")
+    set(SERIONA_TEST_FFMPEG_EXECUTABLE "${_seriona_vcpkg_ffmpeg}" CACHE FILEPATH
+      "FFmpeg CLI used to generate audio test fixtures" FORCE)
+  else()
+    unset(SERIONA_TEST_FFMPEG_EXECUTABLE CACHE)
+    find_program(SERIONA_TEST_FFMPEG_EXECUTABLE NAMES ffmpeg)
+  endif()
+endif()
+if(NOT SERIONA_TEST_FFMPEG_EXECUTABLE OR NOT EXISTS "${SERIONA_TEST_FFMPEG_EXECUTABLE}")
+  message(FATAL_ERROR
+    "Seriona tests require an FFmpeg CLI. Set SERIONA_TEST_FFMPEG_EXECUTABLE or install ffmpeg; "
+    "vcpkg users must enable the ffmpeg port's ffmpeg and mp3lame features."
+  )
+endif()
+
 add_executable(seriona_tests main.cpp)
 add_executable(seriona_audio_contract_tests
   audio/audio_contract_tests.cpp
@@ -690,6 +710,7 @@ target_compile_definitions(seriona_audio_contract_tests PRIVATE DOCTEST_CONFIG_I
 target_compile_definitions(seriona_miniaudio_device_id_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_waveform_generator_tests PRIVATE
   DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+  SERIONA_TEST_FFMPEG_EXECUTABLE="${SERIONA_TEST_FFMPEG_EXECUTABLE}"
   SERIONA_WAVEFORM_FIXTURE_DIR="${CMAKE_CURRENT_BINARY_DIR}/generated_waveform_fixtures"
 )
 target_compile_definitions(seriona_ffmpeg_audio_source_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
