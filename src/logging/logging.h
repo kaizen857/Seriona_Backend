@@ -16,8 +16,11 @@ namespace logging {
   return std::string{reinterpret_cast<const char*>(utf8.data()), utf8.size()};
 }
 
+// 文件路径一律以 std::filesystem::path 传入（禁止转 UTF-8 string）：内部文件
+// sink 经 std::ofstream(path) 打开（Windows 宽字符通道），UTF-8 文本只用于
+// 日志消息本身与错误提示，不再进入任何窄字符文件 API。
 void initialize(spdlog::level::level_enum console_level,
-                const std::string& log_file_path,
+                const std::filesystem::path& log_file_path,
                 spdlog::level::level_enum logger_level = spdlog::level::trace);
 
 // 运行时设置全局日志等级（默认 logger 与全部已注册 named logger 及其 sink 同步；

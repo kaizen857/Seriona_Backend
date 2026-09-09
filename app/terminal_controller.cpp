@@ -339,7 +339,7 @@ int runTerminalController(const std::filesystem::path& musicPath) {
   const auto timestampedLogPath = seriona::logging::prepareLogFile(runtimePaths.dataRoot / "logs");
 
   try {
-    seriona::logging::initialize(spdlog::level::off, timestampedLogPath.string()
+    seriona::logging::initialize(spdlog::level::off, timestampedLogPath
 #ifdef SERIONA_RELEASE_BUILD
                                  , spdlog::level::info
 #endif
