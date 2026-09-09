@@ -250,7 +250,11 @@ TEST_CASE("cached location from song preserves thumbnail path") {
   song.metadata.artworkPath = temp.path() / "artwork" / "full.png";
   song.metadata.thumbnailPath = temp.path() / "artwork" / "thumbnails" / "thumb.png";
 
-  const auto location = cachedLocationFromSong(song, temp.path(), filePath);
+  // 传与 artwork/thumbnail 不相交的 coverExportDir，使写侧相对化不触发：
+  // 本用例聚焦 cachedLocationFromSong 的字段保真链；相对化契约见下方
+  // "cover cache paths are stored relative / resolved back" 用例（真实 orchestrator
+  // 以自身 coverExportDir_ 注入）。
+  const auto location = cachedLocationFromSong(song, temp.path(), filePath, temp.path() / "unused-export-dir");
 
   CHECK(location.artworkPath == temp.path() / "artwork" / "full.png");
   CHECK(location.thumbnailPath == temp.path() / "artwork" / "thumbnails" / "thumb.png");
@@ -269,7 +273,8 @@ TEST_CASE("thumbnail path survives tree publish and cached location apply with a
   song.metadata.artworkPath = std::nullopt;
   song.metadata.thumbnailPath = thumbnail;
 
-  const auto location = cachedLocationFromSong(song, temp.path(), filePath);
+  // 同上：传不相交的 coverExportDir，聚焦 applyCachedLocation 保真链本身。
+  const auto location = cachedLocationFromSong(song, temp.path(), filePath, temp.path() / "unused-export-dir");
 
   CHECK(location.contentId == "content-id");
   CHECK(location.sourceFilePath == filePath);
@@ -286,6 +291,101 @@ TEST_CASE("thumbnail path survives tree publish and cached location apply with a
   CHECK(restored.metadata.sourceFilePath == filePath);
   CHECK(restored.metadata.thumbnailPath == thumbnail);
   CHECK_FALSE(restored.metadata.artworkPath.has_value());
+}
+
+TEST_CASE("cover cache paths are stored relative to cover export dir when under it") {
+  test::TempScannerRoot temp{"incremental-plan-cover-relative"};
+  const auto exportDir = temp.path() / "SerionaData" / "artwork";
+
+  // 位于 coverExportDir 树下的绝对路径 → 相对（预期经 lexically_normal 统一分隔符）
+  const auto underThumb = exportDir / "thumbnails" / "90" / "a.png";
+  const auto thumbResult = coverRelativePath(std::optional{underThumb}, exportDir);
+  REQUIRE(thumbResult.has_value());
+  CHECK(thumbResult->lexically_normal() ==
+        std::filesystem::path{"thumbnails/90/a.png"}.lexically_normal());
+
+  const auto underArtwork = exportDir / "artwork" / "90" / "b.png";
+  const auto artworkResult = coverRelativePath(std::optional{underArtwork}, exportDir);
+  REQUIRE(artworkResult.has_value());
+  CHECK(artworkResult->lexically_normal() ==
+        std::filesystem::path{"artwork/90/b.png"}.lexically_normal());
+
+  // 树外绝对路径 → 原样保留（异常数据防御）
+  const auto outside = temp.path() / "elsewhere" / "c.png";
+  CHECK(coverRelativePath(std::optional{outside}, exportDir) == outside);
+
+  // 已相对 / nullopt → 原样
+  CHECK(coverRelativePath(std::optional<std::filesystem::path>{"rel/d.png"}, exportDir) ==
+        std::filesystem::path{"rel/d.png"});
+  CHECK_FALSE(coverRelativePath(std::nullopt, exportDir).has_value());
+}
+
+TEST_CASE("cached cover paths resolve back to absolute on read") {
+  test::TempScannerRoot temp{"incremental-plan-cover-resolve"};
+  const auto oldRoot = temp.path() / "old-app" / "SerionaData" / "artwork";
+  const auto newRoot = temp.path() / "new-app" / "SerionaData" / "artwork";
+
+  // 新格式相对路径 → 拼当前 coverExportDir
+  CHECK(resolveCoverPath(std::optional<std::filesystem::path>{"thumbnails/ab/x.png"}, newRoot) ==
+        (newRoot / "thumbnails" / "ab" / "x.png"));
+
+  // 旧绝对路径（应用整体移动，前缀失效）→ 按结构锚重建到新目录
+  const auto staleThumb = oldRoot / "thumbnails" / "90" / "a.png";
+  const auto rebuiltThumb = resolveCoverPath(std::optional{staleThumb}, newRoot);
+  REQUIRE(rebuiltThumb.has_value());
+  CHECK(*rebuiltThumb == newRoot / "thumbnails" / "90" / "a.png");
+
+  // artwork 大图旧绝对路径（含 "artwork/artwork/…" 两段）→ 锚取内部段
+  const auto staleArtwork = oldRoot / "artwork" / "90" / "b.png";
+  const auto rebuiltArtwork = resolveCoverPath(std::optional{staleArtwork}, newRoot);
+  REQUIRE(rebuiltArtwork.has_value());
+  CHECK(*rebuiltArtwork == newRoot / "artwork" / "90" / "b.png");
+
+  // 仍位于当前 coverExportDir 下的旧绝对路径 → 原样可用
+  const auto stillValid = newRoot / "thumbnails" / "11" / "c.png";
+  CHECK(resolveCoverPath(std::optional{stillValid}, newRoot) == stillValid);
+
+  // 无结构锚（不在 coverExportDir 下且无 artwork/thumbnails 段）→ 原样
+  const auto noAnchor = temp.path() / "misc" / "cover.png";
+  CHECK(resolveCoverPath(std::optional{noAnchor}, newRoot) == noAnchor);
+
+  // nullopt → 原样
+  CHECK_FALSE(resolveCoverPath(std::nullopt, newRoot).has_value());
+}
+
+TEST_CASE("cached location stores relative artwork and resolves back under real export dir") {
+  test::TempScannerRoot temp{"incremental-plan-cover-roundtrip"};
+  const auto exportDir = temp.path() / "SerionaData" / "artwork";
+  const auto filePath = test::writeAudioFixture(temp.path(), "song.flac");
+
+  cache::CachedSong song{};
+  song.metadata.contentHash = "content-id";
+  song.metadata.fileSizeBytes = fileSizeBytes(filePath);
+  song.metadata.fileMtime = fileMtime(filePath);
+  song.metadata.sourceFilePath = filePath;
+  song.metadata.artworkPath = exportDir / "artwork" / "ab" / "full.png";
+  song.metadata.thumbnailPath = exportDir / "thumbnails" / "ab" / "thumb.png";
+
+  // 写侧：真实 coverExportDir 注入 → DB 落盘形态为相对路径
+  const auto location = cachedLocationFromSong(song, temp.path(), filePath, exportDir);
+  REQUIRE(location.artworkPath.has_value());
+  REQUIRE(location.thumbnailPath.has_value());
+  CHECK(location.artworkPath->is_relative());
+  CHECK(location.thumbnailPath->is_relative());
+
+  // 读侧：同一 coverExportDir 下 resolve 回绝对路径（等价于移动后目录名未变的场景）
+  const auto resolvedArtwork = resolveCoverPath(location.artworkPath, exportDir);
+  const auto resolvedThumbnail = resolveCoverPath(location.thumbnailPath, exportDir);
+  REQUIRE(resolvedArtwork.has_value());
+  REQUIRE(resolvedThumbnail.has_value());
+  CHECK(*resolvedArtwork == exportDir / "artwork" / "ab" / "full.png");
+  CHECK(*resolvedThumbnail == exportDir / "thumbnails" / "ab" / "thumb.png");
+
+  // 读侧：目录整体移动后（新 coverExportDir），相对路径直接拼接到新目录
+  const auto movedDir = temp.path() / "moved-app" / "SerionaData" / "artwork";
+  const auto movedThumbnail = resolveCoverPath(location.thumbnailPath, movedDir);
+  REQUIRE(movedThumbnail.has_value());
+  CHECK(*movedThumbnail == movedDir / "thumbnails" / "ab" / "thumb.png");
 }
 
 }

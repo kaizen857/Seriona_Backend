@@ -644,9 +644,82 @@ void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
   g_workerTaskObserver(snapshots);
 }
 
+// ---------------------------------------------------------------------------
+// 封面/缩略图缓存路径的持久化形态：SQLite 只存相对 coverExportDir 的路径，
+// 内存/快照保持绝对路径。此前 DB 存绝对路径，应用目录整体移动后全部失效且
+// 目录树哈希未变（增量扫描永不触发重导出），缩略图永久丢失；相对存储可移植。
+// 旧库绝对路径由 resolveCoverPath 在读取时兼容。
+// ---------------------------------------------------------------------------
+
+// 写侧：绝对路径若位于 coverExportDir 树下 → 相对；否则（异常数据）原样保留。
+[[nodiscard]] std::optional<std::filesystem::path> coverRelativePath(
+    const std::optional<std::filesystem::path>& path,
+    const std::filesystem::path& coverExportDir) {
+  if (!path.has_value() || path->empty() || path->is_relative()) {
+    return path;
+  }
+  const auto relative = path->lexically_normal().lexically_relative(coverExportDir.lexically_normal());
+  if (relative.empty() || relative.is_absolute() ||
+      (relative.begin() != relative.end() && *relative.begin() == std::filesystem::path{".."})) {
+    return path;
+  }
+  return relative;
+}
+
+// 读侧逆变换：相对路径 → coverExportDir 拼接；仍位于当前 coverExportDir 下的
+// 旧绝对路径直接可用；已失效（目录移动）的旧绝对路径按其结构锚重建：
+// 取最后一个 "/artwork/" 或 "/thumbnails/" 之后的内容作为 coverExportDir 的
+// 相对尾段。thumbnail 绝对路径含 "/artwork/thumbnails/"（取更靠后的 thumbnails
+// 锚），artwork 大图绝对路径含两个 "/artwork/"（rfind 命中内部段），均成立；
+// 锚缺失则原样返回（维持旧行为，不更糟）。
+[[nodiscard]] std::optional<std::filesystem::path> resolveCoverPath(
+    const std::optional<std::filesystem::path>& path,
+    const std::filesystem::path& coverExportDir) {
+  if (!path.has_value() || path->empty()) {
+    return path;
+  }
+  const auto normalized = path->lexically_normal();
+  if (normalized.is_relative()) {
+    if (normalized.begin() != normalized.end() &&
+        *normalized.begin() == std::filesystem::path{".."}) {
+      return path;
+    }
+    return coverExportDir / normalized;
+  }
+  // 文本通道走 pathToUtf8（Windows 窄 string 按代码页转换，非 ASCII 路径会
+  // 抛异常/乱码，禁止直接 generic_string()）。generic_u8string 恒为 UTF-8 且
+  // 分隔符统一为 '/'，逐字节比较安全（UTF-8 多字节续字节不含 0x5C/0x2F）。
+  const auto text = pathToUtf8(normalized);
+  const auto dirText = pathToUtf8(coverExportDir.lexically_normal());
+  // 仍位于当前 coverExportDir 树下（前缀 + 分隔符边界）→ 原样可用。
+  const auto underDir = text.size() > dirText.size() &&
+                        text.compare(0, dirText.size(), dirText) == 0 &&
+                        text[dirText.size()] == '/';
+  if (underDir) {
+    return path;
+  }
+  auto anchor = std::string::npos;
+  for (const char* marker : {"/artwork/", "/thumbnails/"}) {
+    const auto pos = text.rfind(marker);
+    if (pos != std::string::npos && (anchor == std::string::npos || pos > anchor)) {
+      anchor = pos;
+    }
+  }
+  if (anchor == std::string::npos) {
+    return path;
+  }
+  const auto tail = pathFromUtf8(text.substr(anchor + 1));
+  if (tail.empty() || tail.is_absolute() ||
+      (tail.begin() != tail.end() && *tail.begin() == std::filesystem::path{".."})) {
+    return path;
+  }
+  return coverExportDir / tail;
+}
+
 [[nodiscard]] cache::CachedLocation cachedLocationFromSong(const cache::CachedSong& song,
                                                            const std::filesystem::path& rootPath,
-                                                           const std::filesystem::path& filePath) {
+                                                           const std::filesystem::path& filePath,
+                                                           const std::filesystem::path& coverExportDir) {
   const auto filesystemMtime = fileMtime(filePath);
   const auto stableMtime = filesystemMtime.has_value() ? filesystemMtime : song.metadata.fileMtime;
   const auto mtime = fileTimeNanoseconds(stableMtime).value_or(0);
@@ -676,8 +749,8 @@ void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
           .cueFileMtimeNs = isCueTrack ? std::optional<std::int64_t>{mtime} : std::optional<std::int64_t>{},
           .sourceFileSizeBytes = sourceFileSize,
           .sourceFileMtimeNs = sourceFileMtime,
-          .artworkPath = song.metadata.artworkPath,
-          .thumbnailPath = song.metadata.thumbnailPath,
+          .artworkPath = coverRelativePath(song.metadata.artworkPath, coverExportDir),
+          .thumbnailPath = coverRelativePath(song.metadata.thumbnailPath, coverExportDir),
           .lyricsSource = song.metadata.effectiveLyricsSource,
           .externalLrcPath = song.metadata.externalLyricsPath,
           .externalLrcMtimeNs = fileTimeNanoseconds(song.metadata.externalLyricsMtime),
@@ -1681,6 +1754,10 @@ private:
         const auto cachedScanRoot = scanRootCache.loadScanRoot(rootPath);
         if (cachedScanRoot.has_value()) {
           cachedLocations = scanRootCache.loadLocationsByRoot(rootPath);
+          for (auto& location : cachedLocations) {
+            location.artworkPath = resolveCoverPath(location.artworkPath, coverExportDir_);
+            location.thumbnailPath = resolveCoverPath(location.thumbnailPath, coverExportDir_);
+          }
           if (decision.directoryTreeHash.has_value() && 
               cachedScanRoot->directoryTreeHash == *decision.directoryTreeHash) {
             treeHashMatches = true;
@@ -1859,8 +1936,10 @@ private:
           const auto fileSize = fileSizeBytes(entry.path);
           const auto fileMtimeValue = fileMtime(entry.path);
           const auto locationId = fileSize.has_value() ? computeLocationId(entry.path, *fileSize, fileMtimeValue) : std::string{};
-          const auto cachedLocation = locationId.empty() ? std::optional<cache::CachedLocation>{} : scanRootCache.loadLocation(locationId);
+          auto cachedLocation = locationId.empty() ? std::optional<cache::CachedLocation>{} : scanRootCache.loadLocation(locationId);
           if (cachedLocation.has_value()) {
+            cachedLocation->artworkPath = resolveCoverPath(cachedLocation->artworkPath, coverExportDir_);
+            cachedLocation->thumbnailPath = resolveCoverPath(cachedLocation->thumbnailPath, coverExportDir_);
             const auto cachedSong = scanRootCache.loadContent(cachedLocation->contentId);
             if (cachedSong.has_value()) {
               ++skipped;
@@ -2093,7 +2172,7 @@ private:
 	        if (!publishedSong.song.metadata.duration.has_value() || publishedSong.song.metadata.contentHash.empty()) {
 	          continue;
 	        }
-	        const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath);
+	        const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath, coverExportDir_);
 	        write.retainedLocationIds.push_back(location.locationId);
 	        if (publishedSong.origin == ScanItemOrigin::CacheHit &&
 	            publishedSong.externalLyricsCacheAction != ExternalLyricsCacheAction::None) {
@@ -2680,7 +2759,7 @@ private:
           continue;
         }
         auto song = readClassifierSong(upsert.abs);
-        const auto location = cachedLocationFromSong(song, upsert.root, upsert.abs);
+        const auto location = cachedLocationFromSong(song, upsert.root, upsert.abs, coverExportDir_);
         RootResult::PublishedSong entry{.song = std::move(song),
                                         .treeRelativePath = upsert.rel,
                                         .origin = upsert.created ? ScanItemOrigin::ScannedNew : ScanItemOrigin::RescannedChanged,
