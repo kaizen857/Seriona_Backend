@@ -27,10 +27,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(_WIN32)
-#include <windows.h>
-#endif
-
 namespace seriona::scanner {
 namespace {
 
@@ -111,6 +107,18 @@ private:
   std::filesystem::path blockPath_{};
   bool blocked_{false};
   bool released_{false};
+};
+
+class BlockedReaderReleaseGuard {
+public:
+  explicit BlockedReaderReleaseGuard(FakeServiceMetadataReader& reader) : reader_{reader} {}
+  ~BlockedReaderReleaseGuard() { reader_.release(); }
+
+  BlockedReaderReleaseGuard(const BlockedReaderReleaseGuard&) = delete;
+  BlockedReaderReleaseGuard& operator=(const BlockedReaderReleaseGuard&) = delete;
+
+private:
+  FakeServiceMetadataReader& reader_;
 };
 
 [[nodiscard]] RawTagMetadata rawMetadata(std::string title, std::vector<RawTagLyricLine> lyrics = {}) {
@@ -427,7 +435,7 @@ public:
       return;
     }
 #if defined(_WIN32)
-    SetEnvironmentVariableA(name_.c_str(), nullptr);
+    _putenv_s(name_.c_str(), "");
 #else
     unsetenv(name_.c_str());
 #endif
@@ -1048,6 +1056,7 @@ TEST_CASE("scanner service processes audio candidates through the worker pool") 
   reader->put(parallel, rawMetadata("Parallel"));
   reader->blockPathUntilReleased(blocked);
   auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
@@ -1111,6 +1120,7 @@ TEST_CASE("scanner service honors configured worker and tagreader concurrency") 
   reader->put(parallel, rawMetadata("Parallel"));
   reader->blockUntilReleased();
   auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
   service->configure(ScannerConfig{.workerCount = 2U, .tagReaderConcurrency = 2});
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
@@ -1134,6 +1144,7 @@ TEST_CASE("scanner service can force serial fallback from scanner config") {
   reader->put(second, rawMetadata("Second"));
   reader->blockUntilReleased();
   auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
   service->configure(ScannerConfig{.workerCount = 1U, .tagReaderConcurrency = 1});
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
@@ -1160,6 +1171,7 @@ TEST_CASE("scanner service applies env worker overrides and disable concurrency 
   reader->put(second, rawMetadata("Second"));
   reader->blockUntilReleased();
   auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
 
@@ -1185,6 +1197,7 @@ TEST_CASE("scanner service ignores malformed env overrides and keeps config fall
   reader->put(second, rawMetadata("Second"));
   reader->blockUntilReleased();
   auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
   service->configure(ScannerConfig{.workerCount = 2U, .tagReaderConcurrency = 2});
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
@@ -1245,9 +1258,10 @@ TEST_CASE("scanner service publishes worker results in discovered file order") {
   reader->put(first, rawMetadata("First"));
   reader->put(second, rawMetadata("Second"));
   reader->blockPathUntilReleased(first);
-  auto service = makeService(temp, reader);
   std::vector<SongMetadata> publishedSongs;
   std::mutex publishedMutex;
+  auto service = makeService(temp, reader);
+  BlockedReaderReleaseGuard releaseGuard{*reader};
   service->setEventSink([&publishedSongs, &publishedMutex](ScannerEvent event) {
     if (event.type == ScannerEventType::FileScanned && std::holds_alternative<SongMetadata>(event.payload)) {
       std::lock_guard lock{publishedMutex};
