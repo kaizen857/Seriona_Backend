@@ -674,6 +674,10 @@ add_executable(seriona_scanner_wtr_integration_tests
   scanner/scanner_wtr_integration_tests.cpp
   scanner/scanner_test_harness.cpp
 )
+add_executable(seriona_scanner_efsw_integration_tests
+  scanner/scanner_efsw_integration_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
 if(WIN32 AND MSVC)
   add_executable(seriona_wtr_unicode_path_probe
     scanner/wtr_unicode_path_probe.cpp
@@ -817,6 +821,7 @@ target_compile_definitions(seriona_scanner_tagreader_concurrency_stress_tests PR
 target_compile_definitions(seriona_scanner_service_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_watcher_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_wtr_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_efsw_integration_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_lazy_cover_gateway_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_error_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_runtime_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -1276,6 +1281,11 @@ target_include_directories(seriona_scanner_wtr_integration_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src/scanner
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_scanner_efsw_integration_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_scanner_lazy_cover_gateway_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src/scanner
@@ -1709,6 +1719,7 @@ seriona_enable_warnings(seriona_scanner_tagreader_tests)
 seriona_enable_warnings(seriona_scanner_service_tests)
 seriona_enable_warnings(seriona_scanner_watcher_tests)
 seriona_enable_warnings(seriona_scanner_wtr_integration_tests)
+seriona_enable_warnings(seriona_scanner_efsw_integration_tests)
 seriona_enable_warnings(seriona_scanner_lazy_cover_gateway_tests)
 seriona_enable_warnings(seriona_scanner_error_logging_tests)
 seriona_enable_warnings(seriona_runtime_paths_tests)
@@ -1798,6 +1809,7 @@ target_link_libraries(seriona_scanner_phase2_tsan_stress_tests PRIVATE
 )
 target_link_libraries(seriona_scanner_scan_mode_decision_tests PRIVATE
   seriona_watcher_headers
+  efsw-static
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
   ${SERIONA_TAGREADER_TARGET}
@@ -1806,6 +1818,7 @@ target_link_libraries(seriona_scanner_scan_mode_decision_tests PRIVATE
 )
 target_link_libraries(seriona_scanner_incremental_plan_tests PRIVATE
   seriona_watcher_headers
+  efsw-static
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
   ${SERIONA_TAGREADER_TARGET}
@@ -1840,6 +1853,11 @@ target_link_libraries(seriona_scanner_watcher_tests PRIVATE
 target_link_libraries(seriona_scanner_wtr_integration_tests PRIVATE
   seriona_scanner
   seriona_watcher_headers
+  SQLite3::SQLite3
+)
+target_link_libraries(seriona_scanner_efsw_integration_tests PRIVATE
+  seriona_scanner
+  efsw-static
   SQLite3::SQLite3
 )
 target_link_libraries(seriona_scanner_lazy_cover_gateway_tests PRIVATE
@@ -2015,6 +2033,8 @@ add_test(NAME seriona.scanner.config_scan_mode COMMAND seriona_scanner_service_t
 add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
 add_test(NAME seriona.scanner.wtr_integration COMMAND seriona_scanner_wtr_integration_tests)
 set_tests_properties(seriona.scanner.wtr_integration PROPERTIES TIMEOUT 900)
+add_test(NAME seriona.scanner.efsw_integration COMMAND seriona_scanner_efsw_integration_tests)
+set_tests_properties(seriona.scanner.efsw_integration PROPERTIES TIMEOUT 900)
 if(WIN32 AND MSVC)
   add_test(NAME seriona.scanner.wtr_unicode_path_probe.ascii_root
     COMMAND seriona_wtr_unicode_path_probe --mode ascii-root)

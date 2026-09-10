@@ -37,18 +37,29 @@
 
 #include "scanner/file_scanner_service_internal.h"
 
+#include <efsw/efsw.hpp>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/wait.h>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -365,10 +376,1540 @@ void reportMoveOutScene(int index, std::string_view title,
 }
 
 // ============================================================================
-// 主流程
+// Gate 0：efsw 语义实测矩阵（efsw-migration 计划任务 4 / Wave 2）
+//
+// 目的：绕过 seriona 编排层，直接用 efsw::FileWatcher（Linux 默认 inotify 后端）
+// 驱动文件系统操作矩阵，逐场景记录原始事件流（相对时间戳、watchid、dir、
+// filename、action、oldFilename），为迁移决策（D4：ReportCrossDirectoryMoves
+// 默认值）与整体 GO/NO-GO 提供一手证据。
+//
+// 场景（每个场景独立 fork 子进程 + 独立临时目录）：
+//   S1 目录移入（含既有子文件）          S2 文件移入
+//   S3 文件/目录移出（Delete/级联）      S4 根内 rename（文件/目录）
+//   S5 跨目录移动 OFF/ON（D4 依据）      S6 create/modify/delete
+//   S7 UTF-8 路径（非 ASCII 根/文件名）  S8 尖峰风暴（批量/合并/竞态/溢出）
+//   S9 停止/析构竞态
+//
+// 用法：
+//   seriona_watch_root_move_audit                     原有 wtr 移出审计（无参数，行为不变）
+//   seriona_watch_root_move_audit --efsw-matrix DIR   efsw 矩阵，日志写 DIR/scenario-*.log
+//   seriona_watch_root_move_audit --efsw-negative     无效路径负向用例（预期非 0 退出）
+//
+// 预期事件语义（源码核实：efsw-src/src/efsw/FileWatcherInotify.cpp）：
+//   - IN_MOVED_TO 且无旧路径（从根外移入）→ Add + Modified（:552-566）
+//   - IN_MOVED_FROM 配不到批内 IN_MOVED_TO → Delete（:453）
+//   - 同目录 rename → 单条 Moved，oldFilename=相对旧名（:467-471）
+//   - 跨目录 rename（同递归根）且 ReportCrossDirectoryMoves=ON → 单条 Moved，
+//     oldFilename=绝对源路径（:525-535）；OFF → Delete(源)+Add/Modified(目标)
+//   - 目录移入仅上报目录本身，不逐事件上报既有子文件（:560, :193-215）
+//   - handleMissedFileActions 仅在 IN_Q_OVERFLOW 时触发（:547-548）
 // ============================================================================
 
-int main() {
+namespace gate0 {
+
+// ---- 文本/时间辅助 ----------------------------------------------------------
+
+// UTF-8 字节转换（Linux 原生路径即字节；与 src/scanner/path_utf8.h 同规则）
+std::string toUtf8(const fs::path& path) {
+  const std::u8string encoded = path.u8string();
+  return std::string(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+}
+
+const char* actionName(efsw::Action action) {
+  switch (action) {
+    case efsw::Actions::Add:
+      return "Add";
+    case efsw::Actions::Delete:
+      return "Delete";
+    case efsw::Actions::Modified:
+      return "Modified";
+    case efsw::Actions::Moved:
+      return "Moved";
+  }
+  return "Unknown";
+}
+
+std::string actionLabel(efsw::Action action) {
+  std::string label = actionName(action);
+  label.resize(8, ' ');
+  return label;
+}
+
+std::string elapsedText(const std::chrono::steady_clock::time_point& origin,
+                        const std::chrono::steady_clock::time_point& now) {
+  const double value = std::chrono::duration<double, std::milli>(now - origin).count();
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(3) << value;
+  return os.str();
+}
+
+std::string wallClockText() {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+  localtime_r(&seconds, &tm);
+  char buffer[32]{};
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm);
+  return buffer;
+}
+
+// ---- 原始事件记录器（efsw 在自有线程回调，必须加锁） -----------------------
+
+struct EfswEvent {
+  std::chrono::steady_clock::time_point t;
+  efsw::WatchID watchid{0};
+  std::string dir;
+  std::string filename;
+  efsw::Action action{efsw::Actions::Add};
+  std::string oldFilename;
+};
+
+class EventRecorder final : public efsw::FileWatchListener {
+ public:
+  void handleFileAction(efsw::WatchID watchid, const std::string& dir,
+                        const std::string& filename, efsw::Action action,
+                        const std::string& oldFilename) override {
+    if (destroyStarted_.load(std::memory_order_relaxed)) {
+      ++afterDestroyStarted_;
+    }
+    if (watcherDestroyed_.load(std::memory_order_relaxed)) {
+      ++afterWatcherDestroyed_;
+    }
+    std::scoped_lock lock{mutex_};
+    events_.push_back(EfswEvent{std::chrono::steady_clock::now(), watchid, dir, filename, action,
+                                oldFilename});
+  }
+
+  void handleMissedFileActions(efsw::WatchID watchid, const std::string& dir) override {
+    std::scoped_lock lock{mutex_};
+    (void)watchid;
+    missedDirs_.push_back(dir);
+  }
+
+  std::vector<EfswEvent> events() const {
+    std::scoped_lock lock{mutex_};
+    return events_;
+  }
+
+  std::size_t eventCount() const {
+    std::scoped_lock lock{mutex_};
+    return events_.size();
+  }
+
+  std::vector<std::string> missedDirs() const {
+    std::scoped_lock lock{mutex_};
+    return missedDirs_;
+  }
+
+  // S9：停止/析构开始后到达的回调计数（允许发生，仅记录）
+  void noteDestroyStarted() { destroyStarted_.store(true, std::memory_order_relaxed); }
+  std::uint64_t callbacksAfterDestroyStarted() const {
+    return afterDestroyStarted_.load(std::memory_order_relaxed);
+  }
+  // S9：watcher 析构返回后到达的回调（必须为 0；>0 = use-after-free 风险）
+  void noteWatcherDestroyed() { watcherDestroyed_.store(true, std::memory_order_relaxed); }
+  std::uint64_t callbacksAfterWatcherDestroyed() const {
+    return afterWatcherDestroyed_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<EfswEvent> events_;
+  std::vector<std::string> missedDirs_;
+  std::atomic<bool> destroyStarted_{false};
+  std::atomic<bool> watcherDestroyed_{false};
+  std::atomic<std::uint64_t> afterDestroyStarted_{0};
+  std::atomic<std::uint64_t> afterWatcherDestroyed_{0};
+};
+
+// ---- 事件查询辅助 -----------------------------------------------------------
+
+std::size_t countIf(const std::vector<EfswEvent>& events,
+                    const std::function<bool(const EfswEvent&)>& predicate) {
+  return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), predicate));
+}
+
+bool anyIf(const std::vector<EfswEvent>& events,
+           const std::function<bool(const EfswEvent&)>& predicate) {
+  return countIf(events, predicate) > 0;
+}
+
+constexpr std::size_t kNoIndex = static_cast<std::size_t>(-1);
+
+std::size_t firstIndex(const std::vector<EfswEvent>& events,
+                       const std::function<bool(const EfswEvent&)>& predicate) {
+  for (std::size_t i = 0; i < events.size(); ++i) {
+    if (predicate(events[i])) {
+      return i;
+    }
+  }
+  return kNoIndex;
+}
+
+std::string sequenceOf(const std::vector<EfswEvent>& events, const std::string& filename) {
+  std::string sequence;
+  for (const auto& event : events) {
+    if (event.filename != filename) {
+      continue;
+    }
+    if (!sequence.empty()) {
+      sequence += ",";
+    }
+    sequence += actionName(event.action);
+  }
+  return sequence.empty() ? "（无）" : sequence;
+}
+
+// ---- 场景上下文（每场景独立临时目录 + 每场景独立日志） ----------------------
+
+struct ScenarioCtx {
+  std::string id;
+  std::string title;
+  fs::path base;
+  fs::path root;
+  fs::path outside;
+  std::ostream* log{nullptr};
+  std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+  int failures{0};
+  int unknowns{0};
+
+  void line(const std::string& text) {
+    if (log != nullptr) {
+      (*log) << text << "\n";
+      log->flush();
+    }
+  }
+  void expect(const std::string& text) { line("  [expect] " + text); }
+  void note(const std::string& text) { line("  [note] " + text); }
+  void check(const std::string& label, bool ok, const std::string& observed) {
+    if (!ok) {
+      ++failures;
+    }
+    line(std::string("  [") + (ok ? "PASS" : "FAIL") + "] " + label + " | 观察: " + observed);
+  }
+  void unknown(const std::string& label, const std::string& observed) {
+    ++unknowns;
+    line("  [UNKNOWN] " + label + " | 观察: " + observed);
+  }
+};
+
+ScenarioCtx makeScenarioCtx(const std::string& id, const std::string& title) {
+  ScenarioCtx ctx;
+  ctx.id = id;
+  ctx.title = title;
+  ctx.base = fs::temp_directory_path() / ("seriona-gate0-" + id + "-" + std::to_string(::getpid()));
+  std::error_code ec;
+  fs::remove_all(ctx.base, ec);
+  ctx.root = ctx.base / "root";
+  ctx.outside = ctx.base / "outside";
+  fs::create_directories(ctx.root, ec);
+  fs::create_directories(ctx.outside, ec);
+  return ctx;
+}
+
+void cleanupScenario(const ScenarioCtx& ctx) {
+  if (::getenv("SERIONA_GATE0_KEEP") != nullptr) {
+    return;
+  }
+  std::error_code ec;
+  fs::remove_all(ctx.base, ec);
+}
+
+void writeText(const fs::path& path, const std::string& content) {
+  fs::create_directories(path.parent_path());
+  std::ofstream out{path, std::ios::binary | std::ios::trunc};
+  out << content;
+}
+
+// ---- efsw 会话（真实 FileWatcher + 选项矩阵） -------------------------------
+
+struct EfswSession {
+  std::unique_ptr<efsw::FileWatcher> watcher;
+  std::unique_ptr<EventRecorder> recorder;
+  efsw::WatchID watchid{-1};
+  std::chrono::steady_clock::time_point t0;
+  bool started{false};
+};
+
+EfswSession startEfswSession(ScenarioCtx& ctx, const fs::path& root, bool crossDirectoryMoves) {
+  EfswSession session;
+  session.recorder = std::make_unique<EventRecorder>();
+  session.watcher = std::make_unique<efsw::FileWatcher>();
+  std::vector<efsw::WatcherOption> options;
+  if (crossDirectoryMoves) {
+    options.emplace_back(efsw::Options::ReportCrossDirectoryMoves, 1);
+  }
+  const std::string rootUtf8 = toUtf8(root);
+  session.t0 = std::chrono::steady_clock::now();
+  session.watchid = session.watcher->addWatch(rootUtf8, session.recorder.get(), true, options);
+  if (session.watchid < 0) {
+    // 经 ctx.check 上报失败（failures++ → 子进程 exit 1 → 场景 FAIL），而非仅打印一行。
+    ctx.check("addWatch 成功", false,
+              "watchid=" + std::to_string(session.watchid) +
+                  " lastError=" + efsw::Errors::Log::getLastErrorLog());
+    return session;
+  }
+  efsw::Errors::Log::clearLastError();
+  session.watcher->watch();
+  session.started = true;
+  std::this_thread::sleep_for(60ms);  // 让 reader 线程进入 select 循环
+  return session;
+}
+
+// ---- 等待/沉降/导出 ---------------------------------------------------------
+
+bool waitForEvents(EventRecorder& recorder, std::size_t from,
+                   const std::function<bool(const std::vector<EfswEvent>&)>& predicate,
+                   std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    {
+      const auto events = recorder.events();
+      const auto begin = std::min(from, events.size());
+      const std::vector<EfswEvent> slice(events.begin() + static_cast<std::ptrdiff_t>(begin),
+                                         events.end());
+      if (predicate(slice)) {
+        return true;
+      }
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(5ms);
+  }
+}
+
+void settleQuiet(EventRecorder& recorder, std::chrono::milliseconds quiet,
+                 std::chrono::milliseconds maxWait) {
+  auto lastCount = recorder.eventCount();
+  auto lastChange = std::chrono::steady_clock::now();
+  const auto deadline = lastChange + maxWait;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(10ms);
+    const auto count = recorder.eventCount();
+    if (count != lastCount) {
+      lastCount = count;
+      lastChange = std::chrono::steady_clock::now();
+      continue;
+    }
+    if (std::chrono::steady_clock::now() - lastChange >= quiet) {
+      return;
+    }
+  }
+}
+
+std::vector<EfswEvent> eventsSince(const EventRecorder& recorder, std::size_t from) {
+  const auto events = recorder.events();
+  const auto begin = std::min(from, events.size());
+  return std::vector<EfswEvent>(events.begin() + static_cast<std::ptrdiff_t>(begin), events.end());
+}
+
+void dumpEvents(ScenarioCtx& ctx, const EfswSession& session, std::size_t from,
+                const std::string& label) {
+  const auto events = session.recorder->events();
+  const auto begin = std::min(from, events.size());
+  ctx.line("  --- 原始事件流（" + label + "；新增 " + std::to_string(events.size() - begin) +
+           " 条）---");
+  for (std::size_t i = begin; i < events.size(); ++i) {
+    const auto& event = events[i];
+    std::ostringstream os;
+    os << "  [+" << elapsedText(session.t0, event.t) << "]"
+       << " watchid=" << event.watchid << " action=" << actionLabel(event.action)
+       << " dir=" << event.dir << " filename=" << event.filename;
+    if (!event.oldFilename.empty()) {
+      os << " oldFilename=" << event.oldFilename;
+    }
+    ctx.line(os.str());
+  }
+}
+
+// ---- S1：目录移入（含既有子文件） ------------------------------------------
+
+void scenarioS1(ScenarioCtx& ctx) {
+  ctx.expect("目录移入：父 watch 收到 Add(incoming)（IN_MOVED_TO 无旧路径时伴随 Modified）");
+  ctx.expect("既有子文件（含子目录内文件）不逐事件上报 → 迁移需要子树枚举");
+  ctx.expect("移入目录的递归 watch 在 Add 回调前已注册 → 之后写入可被捕获");
+
+  const fs::path incoming = ctx.outside / "incoming";
+  writeText(incoming / "child1.wav", "c1");
+  writeText(incoming / "child2.wav", "c2");
+  writeText(incoming / "sub" / "deep.wav", "d");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+  const std::size_t base = session.recorder->eventCount();
+
+  std::error_code ec;
+  fs::rename(incoming, ctx.root / "incoming", ec);
+  ctx.line("  [op] rename(outside/incoming -> root/incoming) ec=" + ec.message());
+  waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+    return anyIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "incoming";
+    });
+  }, 3s);
+  settleQuiet(*session.recorder, 200ms, 2s);
+
+  const auto events = eventsSince(*session.recorder, base);
+  dumpEvents(ctx, session, base, "目录移入后");
+
+  const auto dirAdds = countIf(events, [](const EfswEvent& event) {
+    return event.action == efsw::Actions::Add && event.filename == "incoming";
+  });
+  const auto dirModified = countIf(events, [](const EfswEvent& event) {
+    return event.action == efsw::Actions::Modified && event.filename == "incoming";
+  });
+  const auto childEvents = countIf(events, [](const EfswEvent& event) {
+    return event.filename == "child1.wav" || event.filename == "child2.wav" ||
+           event.filename == "deep.wav";
+  });
+  ctx.check("目录 Add 事件已产生", dirAdds >= 1, "Add(incoming)=" + std::to_string(dirAdds));
+  ctx.check("子文件未被逐事件上报（证明需子树枚举）", childEvents == 0,
+            "子文件事件数=" + std::to_string(childEvents));
+  ctx.note("incoming 事件序列=" + sequenceOf(events, "incoming") +
+           "；Modified(incoming)=" + std::to_string(dirModified));
+
+  const std::size_t lateBase = session.recorder->eventCount();
+  writeText(ctx.root / "incoming" / "late.wav", "late");
+  waitForEvents(*session.recorder, lateBase, [](const std::vector<EfswEvent>& events) {
+    return anyIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "late.wav";
+    });
+  }, 3s);
+  settleQuiet(*session.recorder, 150ms, 1500ms);
+  const auto lateEvents = eventsSince(*session.recorder, lateBase);
+  dumpEvents(ctx, session, lateBase, "移入目录内后续写入");
+
+  const std::string expectedDir = toUtf8(ctx.root / "incoming") + "/";
+  const bool lateAddWithNewDir = anyIf(lateEvents, [&](const EfswEvent& event) {
+    return event.action == efsw::Actions::Add && event.filename == "late.wav" &&
+           event.dir == expectedDir;
+  });
+  ctx.check("递归 watch 生效：late.wav Add 且 dir=移入目录", lateAddWithNewDir,
+            "期望 dir=" + expectedDir);
+}
+
+// ---- S2：文件移入 -----------------------------------------------------------
+
+void scenarioS2(ScenarioCtx& ctx) {
+  ctx.expect("文件移入：Add(file_in.wav) 后紧跟 Modified(file_in.wav)（IN_MOVED_TO 无旧路径）");
+  ctx.expect("dir+filename 拼出完整目标路径");
+
+  const fs::path source = ctx.outside / "file_in.wav";
+  writeText(source, "x");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+  const std::size_t base = session.recorder->eventCount();
+
+  std::error_code ec;
+  fs::rename(source, ctx.root / "file_in.wav", ec);
+  ctx.line("  [op] rename(outside/file_in.wav -> root/file_in.wav) ec=" + ec.message());
+  waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+    return anyIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "file_in.wav";
+    });
+  }, 3s);
+  settleQuiet(*session.recorder, 200ms, 2s);
+
+  const auto events = eventsSince(*session.recorder, base);
+  dumpEvents(ctx, session, base, "文件移入后");
+
+  const std::string expectedPath = toUtf8(ctx.root / "file_in.wav");
+  const bool pathComplete = anyIf(events, [&](const EfswEvent& event) {
+    return event.action == efsw::Actions::Add && event.filename == "file_in.wav" &&
+           (event.dir + event.filename) == expectedPath;
+  });
+  const auto addIndex = firstIndex(events, [](const EfswEvent& event) {
+    return event.action == efsw::Actions::Add && event.filename == "file_in.wav";
+  });
+  const auto modifiedIndex = firstIndex(events, [](const EfswEvent& event) {
+    return event.action == efsw::Actions::Modified && event.filename == "file_in.wav";
+  });
+  ctx.check("Add 事件存在且 dir+filename=完整目标路径", pathComplete,
+            "期望=" + expectedPath + "；序列=" + sequenceOf(events, "file_in.wav"));
+  ctx.check("Add 之后有 Modified（成对语义）",
+            addIndex != kNoIndex && modifiedIndex != kNoIndex && addIndex < modifiedIndex,
+            "序列=" + sequenceOf(events, "file_in.wav"));
+}
+
+// ---- S3：文件/目录移出（Delete/级联） --------------------------------------
+
+void scenarioS3(ScenarioCtx& ctx) {
+  ctx.expect("文件移出：Delete(file_out.wav)，无 Add/Moved 回落");
+  ctx.expect("目录移出：Delete 级联（被监视子目录与目录本身均产生 Delete），无 Add/Moved");
+  ctx.expect("移出后 watch 已清理：向移出目录内写入不产生幽灵事件");
+
+  writeText(ctx.root / "file_out.wav", "x");
+  writeText(ctx.root / "dir_out" / "deep" / "inner.wav", "x");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+
+  // Phase A：文件移出
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(ctx.root / "file_out.wav", ctx.outside / "file_out.wav", ec);
+    ctx.line("  [op] rename(root/file_out.wav -> outside/file_out.wav) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "file_out.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件移出");
+    const auto deletes = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "file_out.wav";
+    });
+    const auto others = countIf(events, [](const EfswEvent& event) {
+      return event.action != efsw::Actions::Delete && event.filename == "file_out.wav";
+    });
+    ctx.check("文件移出产生 Delete", deletes >= 1, "Delete(file_out.wav)=" + std::to_string(deletes));
+    ctx.check("无 Add/Moved 回落", others == 0, "非 Delete 事件=" + std::to_string(others));
+  }
+
+  // Phase B：目录移出（含已注册的子目录 watch）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(ctx.root / "dir_out", ctx.outside / "dir_out", ec);
+    ctx.line("  [op] rename(root/dir_out -> outside/dir_out) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "dir_out";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 250ms, 2000ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "目录移出");
+    const auto dirDelete = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "dir_out";
+    });
+    const auto deepDelete = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "deep";
+    });
+    const auto movedOrAdd = countIf(events, [](const EfswEvent& event) {
+      return (event.action == efsw::Actions::Add || event.action == efsw::Actions::Moved) &&
+             (event.filename == "dir_out" || event.filename == "deep");
+    });
+    ctx.check("目录移出产生 Delete(dir_out)", dirDelete >= 1,
+              "Delete(dir_out)=" + std::to_string(dirDelete));
+    ctx.check("被监视子目录级联 Delete(deep)", deepDelete >= 1,
+              "Delete(deep)=" + std::to_string(deepDelete));
+    ctx.check("无 Add/Moved 回落", movedOrAdd == 0, "Add/Moved=" + std::to_string(movedOrAdd));
+    ctx.note("dir_out 序列=" + sequenceOf(events, "dir_out") + "；deep 序列=" +
+             sequenceOf(events, "deep") +
+             "；级联顺序判定仅记录（源码为最深目录优先）");
+  }
+
+  // Phase C：移出目录内写入，确认 watch 已清理（无幽灵事件）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    writeText(ctx.outside / "dir_out" / "newfile.wav", "x");
+    settleQuiet(*session.recorder, 300ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "移出目录内写入（幽灵事件检查）");
+    ctx.check("移出目录内写入无幽灵事件（watch 已清理）", events.empty(),
+              "新增事件=" + std::to_string(events.size()));
+  }
+}
+
+// ---- S4：根内 rename（文件/目录） ------------------------------------------
+
+void scenarioS4(ScenarioCtx& ctx) {
+  ctx.expect("文件根内 rename：单条 Moved(new.wav, oldFilename=old.wav)，无 Delete/Add");
+  ctx.expect("目录根内 rename：单条 Moved(dirB, oldFilename=dirA)");
+  ctx.expect("目录 rename 后 watch 路径已更新：目录内写入事件的 dir 为新路径");
+
+  writeText(ctx.root / "old.wav", "x");
+  writeText(ctx.root / "dirA" / "inside.wav", "x");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+
+  // Phase A：文件 rename
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(ctx.root / "old.wav", ctx.root / "new.wav", ec);
+    ctx.line("  [op] rename(root/old.wav -> root/new.wav) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "new.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件根内 rename");
+    const auto moved = countIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Moved && event.filename == "new.wav" &&
+             event.oldFilename == "old.wav" && event.dir == toUtf8(ctx.root) + "/";
+    });
+    const auto addDelete = countIf(events, [](const EfswEvent& event) {
+      return (event.action == efsw::Actions::Add || event.action == efsw::Actions::Delete) &&
+             (event.filename == "old.wav" || event.filename == "new.wav");
+    });
+    ctx.check("单条 Moved(new.wav, oldFilename=old.wav)", moved == 1,
+              "Moved 匹配数=" + std::to_string(moved) + "；序列=" + sequenceOf(events, "new.wav"));
+    ctx.check("无 Delete/Add 回落", addDelete == 0, "Add/Delete=" + std::to_string(addDelete));
+  }
+
+  // Phase B：目录 rename
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(ctx.root / "dirA", ctx.root / "dirB", ec);
+    ctx.line("  [op] rename(root/dirA -> root/dirB) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "dirB";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 250ms, 2000ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "目录根内 rename");
+    const auto moved = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Moved && event.filename == "dirB" &&
+             event.oldFilename == "dirA";
+    });
+    const auto addDelete = countIf(events, [](const EfswEvent& event) {
+      return (event.action == efsw::Actions::Add || event.action == efsw::Actions::Delete) &&
+             (event.filename == "dirA" || event.filename == "dirB");
+    });
+    ctx.check("单条 Moved(dirB, oldFilename=dirA)", moved == 1,
+              "Moved 匹配数=" + std::to_string(moved));
+    ctx.check("目录 rename 无 Delete/Add 回落", addDelete == 0,
+              "Add/Delete=" + std::to_string(addDelete));
+  }
+
+  // Phase C：watch 路径更新验证
+  {
+    const std::size_t base = session.recorder->eventCount();
+    writeText(ctx.root / "dirB" / "late2.wav", "x");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "late2.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "rename 后目录内写入");
+    const std::string expectedDir = toUtf8(ctx.root / "dirB") + "/";
+    const bool updated = anyIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "late2.wav" &&
+             event.dir == expectedDir;
+    });
+    ctx.check("rename 后事件 dir=新目录路径", updated, "期望 dir=" + expectedDir);
+  }
+}
+
+// ---- S5：跨目录移动（ReportCrossDirectoryMoves OFF/ON；D4 决策依据） --------
+
+void scenarioS5(ScenarioCtx& ctx, bool crossDirectoryMoves) {
+  const std::string mode = crossDirectoryMoves ? "ON" : "OFF";
+  ctx.expect("模式=" + mode + "：" +
+             (crossDirectoryMoves
+                  ? "跨目录移动 → 单条 Moved（dir=目标目录，oldFilename=绝对源路径），无 Delete/Add"
+                  : "跨目录移动 → Delete(源) + Add/Modified(目标) 回落，无 Moved"));
+
+  const fs::path dirA = ctx.root / "dirA";
+  const fs::path dirB = ctx.root / "dirB";
+  const fs::path srcDir = ctx.root / "srcDir";
+  writeText(dirA / "file.wav", "x");
+  fs::create_directories(dirB);
+  writeText(srcDir / "subdir" / "leaf.bin", "x");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, crossDirectoryMoves);
+  if (!session.started) {
+    return;
+  }
+  const std::string dirAUtf8 = toUtf8(dirA) + "/";
+  const std::string dirBUtf8 = toUtf8(dirB) + "/";
+  const std::string srcDirUtf8 = toUtf8(srcDir) + "/";
+
+  // Phase A：文件跨目录移动（dirA/file.wav -> dirB/file.wav）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(dirA / "file.wav", dirB / "file.wav", ec);
+    ctx.line("  [op] rename(root/dirA/file.wav -> root/dirB/file.wav) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [&](const std::vector<EfswEvent>& events) {
+      if (crossDirectoryMoves) {
+        return anyIf(events, [](const EfswEvent& event) {
+          return event.action == efsw::Actions::Moved && event.filename == "file.wav";
+        });
+      }
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "file.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 250ms, 2000ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件跨目录移动（" + mode + "）");
+
+    if (crossDirectoryMoves) {
+      const auto moved = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "file.wav" &&
+               event.dir == dirBUtf8 && event.oldFilename == toUtf8(dirA / "file.wav");
+      });
+      const auto fallback = countIf(events, [](const EfswEvent& event) {
+        return (event.action == efsw::Actions::Add || event.action == efsw::Actions::Delete) &&
+               event.filename == "file.wav";
+      });
+      ctx.check("ON：单条 Moved(file.wav, oldFilename=绝对源路径)", moved == 1,
+                "Moved 匹配数=" + std::to_string(moved) + "；序列=" +
+                    sequenceOf(events, "file.wav"));
+      ctx.check("ON：无 Delete/Add 回落", fallback == 0,
+                "Delete/Add=" + std::to_string(fallback));
+    } else {
+      const auto deleted = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "file.wav" &&
+               event.dir == dirAUtf8;
+      });
+      const auto added = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "file.wav" &&
+               event.dir == dirBUtf8;
+      });
+      const auto moved = countIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "file.wav";
+      });
+      ctx.check("OFF：Delete(源 dirA/file.wav) + Add(目标 dirB/file.wav)",
+                deleted >= 1 && added >= 1,
+                "Delete=" + std::to_string(deleted) + " Add=" + std::to_string(added) +
+                    "；序列=" + sequenceOf(events, "file.wav"));
+      ctx.check("OFF：无 Moved 事件", moved == 0, "Moved=" + std::to_string(moved));
+    }
+  }
+
+  // Phase B：目录跨目录移动（srcDir/subdir -> dirB/subdir）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::rename(srcDir / "subdir", dirB / "subdir", ec);
+    ctx.line("  [op] rename(root/srcDir/subdir -> root/dirB/subdir) ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [&](const std::vector<EfswEvent>& events) {
+      if (crossDirectoryMoves) {
+        return anyIf(events, [](const EfswEvent& event) {
+          return event.action == efsw::Actions::Moved && event.filename == "subdir";
+        });
+      }
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "subdir";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 300ms, 2500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "目录跨目录移动（" + mode + "）");
+    const std::string expectedOld = toUtf8(srcDir / "subdir");
+
+    if (crossDirectoryMoves) {
+      const auto moved = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "subdir" &&
+               event.dir == dirBUtf8 && event.oldFilename == expectedOld;
+      });
+      const auto fallback = countIf(events, [](const EfswEvent& event) {
+        return (event.action == efsw::Actions::Add || event.action == efsw::Actions::Delete) &&
+               event.filename == "subdir";
+      });
+      ctx.check("ON：单条 Moved(subdir, oldFilename=绝对源路径)", moved == 1,
+                "Moved 匹配数=" + std::to_string(moved));
+      ctx.check("ON：目录移动无 Delete/Add 回落", fallback == 0,
+                "Delete/Add=" + std::to_string(fallback));
+    } else {
+      const auto deleted = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "subdir" &&
+               event.dir == srcDirUtf8;
+      });
+      const auto added = countIf(events, [&](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "subdir" &&
+               event.dir == dirBUtf8;
+      });
+      const auto moved = countIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "subdir";
+      });
+      ctx.check("OFF：Delete(源) + Add(目标)", deleted >= 1 && added >= 1,
+                "Delete=" + std::to_string(deleted) + " Add=" + std::to_string(added));
+      ctx.check("OFF：目录移动无 Moved 事件", moved == 0, "Moved=" + std::to_string(moved));
+    }
+  }
+
+  // Phase C（仅 ON）：目录移动后 watch 路径已迁移到新位置
+  if (crossDirectoryMoves) {
+    const std::size_t base = session.recorder->eventCount();
+    writeText(dirB / "subdir" / "late3.bin", "x");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "late3.bin";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "移动后目录内写入");
+    const std::string expectedDir = toUtf8(dirB / "subdir") + "/";
+    const bool updated = anyIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "late3.bin" &&
+             event.dir == expectedDir;
+    });
+    ctx.check("目录移动后事件 dir=新路径", updated, "期望 dir=" + expectedDir);
+  }
+}
+
+// ---- S6：create/modify/delete 常规序列 -------------------------------------
+
+void scenarioS6(ScenarioCtx& ctx) {
+  ctx.expect("mkdir → Add；文件创建（含写入）→ Add + ≥1 Modified；改写 → ≥1 Modified；"
+             "删除文件 → Delete；rmdir → Delete");
+
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+
+  // mkdir
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::create_directories(ctx.root / "newdir", ec);
+    ctx.line("  [op] mkdir root/newdir ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "newdir";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "mkdir");
+    const auto adds = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "newdir";
+    });
+    ctx.check("mkdir → Add(newdir)", adds >= 1, "Add=" + std::to_string(adds));
+  }
+
+  // create file (write content)
+  {
+    const std::size_t base = session.recorder->eventCount();
+    writeText(ctx.root / "newdir" / "song.txt", "hello");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "song.txt";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 200ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件创建（含写入）");
+    const auto adds = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "song.txt";
+    });
+    const auto modified = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Modified && event.filename == "song.txt";
+    });
+    ctx.check("文件创建 → Add(song.txt)", adds >= 1, "Add=" + std::to_string(adds));
+    ctx.check("创建时写入 → ≥1 Modified", modified >= 1,
+              "Modified=" + std::to_string(modified) + "；序列=" + sequenceOf(events, "song.txt"));
+  }
+
+  // modify
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::this_thread::sleep_for(5ms);
+    writeText(ctx.root / "newdir" / "song.txt", "hello world");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Modified && event.filename == "song.txt";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 200ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件改写");
+    const auto modified = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Modified && event.filename == "song.txt";
+    });
+    ctx.check("改写 → ≥1 Modified", modified >= 1, "Modified=" + std::to_string(modified));
+  }
+
+  // delete file
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::remove(ctx.root / "newdir" / "song.txt", ec);
+    ctx.line("  [op] rm root/newdir/song.txt ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "song.txt";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 200ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "文件删除");
+    const auto deletes = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "song.txt";
+    });
+    ctx.check("删除文件 → Delete(song.txt)", deletes >= 1, "Delete=" + std::to_string(deletes));
+  }
+
+  // rmdir
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::error_code ec;
+    fs::remove(ctx.root / "newdir", ec);
+    ctx.line("  [op] rmdir root/newdir ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "newdir";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 200ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "rmdir");
+    const auto deletes = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "newdir";
+    });
+    ctx.check("rmdir → Delete(newdir)", deletes >= 1, "Delete=" + std::to_string(deletes));
+  }
+}
+
+// ---- S7：UTF-8 路径（非 ASCII 根/目录/文件名） -----------------------------
+
+void scenarioS7(ScenarioCtx& ctx) {
+  ctx.expect("非 ASCII 根/目录/文件名：dir、filename、oldFilename 保持原 UTF-8 字节，无乱码/截断");
+
+  const fs::path utfRoot = ctx.base / "音乐根-🎵";
+  std::error_code ec;
+  fs::create_directories(utfRoot, ec);
+  EfswSession session = startEfswSession(ctx, utfRoot, false);
+  if (!session.started) {
+    return;
+  }
+  const std::string utfRootSlash = toUtf8(utfRoot) + "/";
+  const std::string album = "專輯-音楽";
+  const std::string song = "歌曲-café-Ω.wav";
+  const std::string renamed = "改名-ñ.mp3";
+  const fs::path albumDir = utfRoot / fs::path{album};
+  const fs::path songPath = albumDir / fs::path{song};
+  const fs::path renamedPath = albumDir / fs::path{renamed};
+
+  // mkdir 非 ASCII 目录
+  {
+    const std::size_t base = session.recorder->eventCount();
+    fs::create_directories(albumDir, ec);
+    ctx.line("  [op] mkdir " + toUtf8(albumDir) + " ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "專輯-音楽";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "非 ASCII mkdir");
+    const bool ok = anyIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == album &&
+             event.dir == utfRootSlash;
+    });
+    ctx.check("非 ASCII 目录 Add 字节保真", ok, "期望 filename=" + album + " dir=" + utfRootSlash);
+  }
+
+  // create 非 ASCII 文件
+  {
+    const std::size_t base = session.recorder->eventCount();
+    writeText(songPath, "x");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "歌曲-café-Ω.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "非 ASCII 文件创建");
+    const std::string expectedFull = toUtf8(songPath);
+    const bool ok = anyIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == song &&
+             (event.dir + event.filename) == expectedFull;
+    });
+    ctx.check("非 ASCII 文件 Add 且 dir+filename=完整路径", ok, "期望=" + expectedFull);
+  }
+
+  // modify
+  {
+    const std::size_t base = session.recorder->eventCount();
+    std::this_thread::sleep_for(5ms);
+    writeText(songPath, "y");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Modified && event.filename == "歌曲-café-Ω.wav";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    const auto modified = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Modified && event.filename == "歌曲-café-Ω.wav";
+    });
+    ctx.check("非 ASCII 文件 Modified", modified >= 1, "Modified=" + std::to_string(modified));
+  }
+
+  // rename（同目录）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    fs::rename(songPath, renamedPath, ec);
+    ctx.line("  [op] rename(" + song + " -> " + renamed + ") ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Moved && event.filename == "改名-ñ.mp3";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "非 ASCII 文件 rename");
+    const bool ok = anyIf(events, [&](const EfswEvent& event) {
+      return event.action == efsw::Actions::Moved && event.filename == renamed &&
+             event.oldFilename == song;
+    });
+    ctx.check("非 ASCII rename：Moved(new, oldFilename=旧字节)", ok,
+              "序列=" + sequenceOf(events, renamed));
+  }
+
+  // delete
+  {
+    const std::size_t base = session.recorder->eventCount();
+    fs::remove(renamedPath, ec);
+    ctx.line("  [op] rm " + renamed + " ec=" + ec.message());
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Delete && event.filename == "改名-ñ.mp3";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 150ms, 1500ms);
+    const auto events = eventsSince(*session.recorder, base);
+    const auto deletes = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Delete && event.filename == "改名-ñ.mp3";
+    });
+    ctx.check("非 ASCII 文件 Delete", deletes >= 1, "Delete=" + std::to_string(deletes));
+  }
+}
+
+// ---- S8：尖峰风暴（批量创建/合并/竞态/溢出） -------------------------------
+
+void scenarioS8(ScenarioCtx& ctx) {
+  ctx.expect("批量创建 500 个文件：内核队列未溢出时事件全覆盖（Add 名单 == 创建名单）");
+  ctx.expect("同一文件描述符连续写：相同 IN_MODIFY 可被内核合并（Modified 数可 << 写入次数）");
+  ctx.expect("mkdir 后立即写入（递归 watch 注册前）：目录 Add 可见，内部文件事件可能缺失"
+             "（LinuxProduceSyntheticEvents=OFF）");
+  ctx.expect("handleMissedFileActions 仅在 IN_Q_OVERFLOW 时触发；本场景记录是否触发");
+
+  const fs::path burstDir = ctx.root / "burst";
+  fs::create_directories(burstDir);
+  EfswSession session = startEfswSession(ctx, ctx.root, false);
+  if (!session.started) {
+    return;
+  }
+
+  {
+    std::ifstream proc{"/proc/sys/fs/inotify/max_queued_events"};
+    std::string value;
+    std::getline(proc, value);
+    ctx.note("内核 fs.inotify.max_queued_events=" +
+             (value.empty() ? std::string("（读取失败）") : value));
+  }
+
+  constexpr int kFiles = 500;
+  std::vector<std::string> created;
+  created.reserve(kFiles);
+
+  // Phase 1：批量创建（覆盖度）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    for (int i = 0; i < kFiles; ++i) {
+      std::ostringstream name;
+      name << "f" << std::setw(4) << std::setfill('0') << i << ".txt";
+      created.push_back(name.str());
+      writeText(burstDir / name.str(), "x");
+    }
+    ctx.line("  [op] 紧循环创建 " + std::to_string(kFiles) + " 个文件于 root/burst/");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      const auto adds = countIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename.size() > 4 &&
+               event.filename.rfind("f", 0) == 0 && event.filename.ends_with(".txt");
+      });
+      return adds >= static_cast<std::size_t>(kFiles);
+    }, 20s);
+    settleQuiet(*session.recorder, 400ms, 4s);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "批量创建 500 文件");
+
+    std::set<std::string> observedAdds;
+    for (const auto& event : events) {
+      if (event.action == efsw::Actions::Add) {
+        observedAdds.insert(event.filename);
+      }
+    }
+    std::vector<std::string> missing;
+    for (const auto& name : created) {
+      if (observedAdds.count(name) == 0U) {
+        missing.push_back(name);
+      }
+    }
+    const auto modifiedCount = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Modified;
+    });
+    ctx.check("批量创建事件全覆盖（Add 名单 == 500 个创建名）", missing.empty(),
+              "缺失=" + std::to_string(missing.size()) +
+                  (missing.empty() ? "" : ("（示例 " + missing.front() + "）")) +
+                  "；Modified=" + std::to_string(modifiedCount));
+    ctx.note("handleMissedFileActions 触发次数=" +
+             std::to_string(session.recorder->missedDirs().size()) + "（0 = 内核队列未溢出）");
+  }
+
+  // Phase 2：单 fd 连续写同一文件（合并行为）
+  {
+    const fs::path hot = burstDir / "hot.txt";
+    writeText(hot, "0");
+    const std::size_t baseHot = session.recorder->eventCount();
+    waitForEvents(*session.recorder, baseHot, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "hot.txt";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 250ms, 1500ms);
+
+    const std::size_t baseWrites = session.recorder->eventCount();
+    {
+      std::ofstream out{hot, std::ios::binary | std::ios::trunc};
+      for (int i = 0; i < 200; ++i) {
+        out << "write-" << i << "\n";
+        out.flush();
+      }
+    }
+    settleQuiet(*session.recorder, 300ms, 2000ms);
+    const auto events = eventsSince(*session.recorder, baseWrites);
+    dumpEvents(ctx, session, baseWrites, "hot.txt 连续 200 次写入");
+    const auto modified = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Modified;
+    });
+    ctx.check("连续写同一文件产生 Modified", modified >= 1,
+              "Modified=" + std::to_string(modified));
+    ctx.note("200 次连续写入 → Modified=" + std::to_string(modified) +
+             "（< 200 即相同 IN_MODIFY 被内核合并的实测证据；IN_CLOSE_WRITE 另计）");
+  }
+
+  // Phase 3：mkdir + 立即写入（递归 watch 注册竞态）
+  {
+    const std::size_t base = session.recorder->eventCount();
+    const fs::path raced = ctx.root / "racedir";
+    fs::create_directories(raced);
+    for (int i = 0; i < 100; ++i) {
+      std::ostringstream name;
+      name << "r" << std::setw(3) << std::setfill('0') << i << ".txt";
+      writeText(raced / name.str(), "x");
+    }
+    ctx.line("  [op] mkdir root/racedir 后立即写入 100 个文件（无等待）");
+    waitForEvents(*session.recorder, base, [](const std::vector<EfswEvent>& events) {
+      return anyIf(events, [](const EfswEvent& event) {
+        return event.action == efsw::Actions::Add && event.filename == "racedir";
+      });
+    }, 3s);
+    settleQuiet(*session.recorder, 400ms, 3000ms);
+    const auto events = eventsSince(*session.recorder, base);
+    dumpEvents(ctx, session, base, "mkdir+立即写入竞态");
+    const auto dirAdd = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename == "racedir";
+    });
+    const auto fileAdds = countIf(events, [](const EfswEvent& event) {
+      return event.action == efsw::Actions::Add && event.filename.size() > 4 &&
+             event.filename.rfind("r", 0) == 0 && event.filename.ends_with(".txt");
+    });
+    ctx.check("racedir 目录 Add 可见", dirAdd >= 1, "Add(racedir)=" + std::to_string(dirAdd));
+    ctx.note("racedir 内文件 Add=" + std::to_string(fileAdds) +
+             "/100（<100 属预期：watch 注册竞态 + LinuxProduceSyntheticEvents=OFF 时"
+             "既有文件不补报；迁移设计需在目录 Add 上做子树枚举）");
+  }
+}
+
+// ---- S9：停止/析构竞态 ------------------------------------------------------
+
+void scenarioS9(ScenarioCtx& ctx) {
+  ctx.expect("事件流中析构：析构有限时间返回，析构返回后无回调（无 use-after-free）");
+  ctx.expect("removeWatch 生效后不再投递新回调");
+
+  const fs::path live = ctx.root / "live";
+  fs::create_directories(live);
+
+  // Phase A：事件流中析构 FileWatcher
+  {
+    auto recorder = std::make_unique<EventRecorder>();
+    auto watcher = std::make_unique<efsw::FileWatcher>();
+    const std::string rootUtf8 = toUtf8(ctx.root);
+    const efsw::WatchID watchid =
+        watcher->addWatch(rootUtf8, recorder.get(), true, std::vector<efsw::WatcherOption>{});
+    if (watchid < 0) {
+      ctx.check("addWatch 成功（Phase A）", false, "watchid=" + std::to_string(watchid));
+      return;
+    }
+    watcher->watch();
+    std::this_thread::sleep_for(50ms);
+
+    std::atomic<bool> stopProducer{false};
+    std::atomic<int> produced{0};
+    std::thread producer([&] {
+      for (int i = 0; i < 500 && !stopProducer.load(); ++i) {
+        std::ostringstream name;
+        name << "a" << std::setw(4) << std::setfill('0') << i << ".txt";
+        writeText(live / name.str(), "x");
+        ++produced;
+        if (i % 25 == 0) {
+          std::this_thread::sleep_for(1ms);
+        }
+      }
+    });
+
+    std::this_thread::sleep_for(80ms);
+    recorder->noteDestroyStarted();
+    const std::size_t beforeDestroy = recorder->eventCount();
+    const auto destroyStart = std::chrono::steady_clock::now();
+    watcher.reset();  // 析构：join 读线程并清理 watches
+    const auto destroyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - destroyStart)
+                               .count();
+    recorder->noteWatcherDestroyed();
+    const int producedAtDestroy = produced.load();
+    std::this_thread::sleep_for(250ms);
+    stopProducer.store(true);
+    producer.join();
+
+    ctx.check("析构在 2000ms 内返回（无挂起）", destroyMs < 2000,
+              "destructor=" + std::to_string(destroyMs) + "ms");
+    ctx.check("析构返回后无回调（无 use-after-free）",
+              recorder->callbacksAfterWatcherDestroyed() == 0,
+              "post-destroy callbacks=" +
+                  std::to_string(recorder->callbacksAfterWatcherDestroyed()));
+    ctx.note("析构前事件=" + std::to_string(beforeDestroy) + "；析构时已创建文件=" +
+             std::to_string(producedAtDestroy) + "；析构开始后到达回调=" +
+             std::to_string(recorder->callbacksAfterDestroyStarted()) +
+             "（析构开始后的事件允许部分投递，仅记录）");
+  }
+
+  // Phase B：removeWatch 停止投递
+  {
+    auto recorder = std::make_unique<EventRecorder>();
+    auto watcher = std::make_unique<efsw::FileWatcher>();
+    const std::string rootUtf8 = toUtf8(ctx.root);
+    const efsw::WatchID watchid =
+        watcher->addWatch(rootUtf8, recorder.get(), true, std::vector<efsw::WatcherOption>{});
+    if (watchid < 0) {
+      ctx.check("addWatch 成功（Phase B）", false, "watchid=" + std::to_string(watchid));
+      return;
+    }
+    watcher->watch();
+    std::this_thread::sleep_for(50ms);
+
+    const fs::path live2 = ctx.root / "live2";
+    fs::create_directories(live2);
+    std::atomic<bool> stopProducer{false};
+    std::atomic<int> produced{0};
+    std::thread producer([&] {
+      for (int i = 0; i < 400 && !stopProducer.load(); ++i) {
+        std::ostringstream name;
+        name << "b" << std::setw(4) << std::setfill('0') << i << ".txt";
+        writeText(live2 / name.str(), "x");
+        ++produced;
+        if (i % 20 == 0) {
+          std::this_thread::sleep_for(1ms);
+        }
+      }
+    });
+
+    waitForEvents(*recorder, 0, [](const std::vector<EfswEvent>& events) {
+      return countIf(events, [](const EfswEvent& event) {
+               return event.action == efsw::Actions::Add;
+             }) >= 5;
+    }, 3s);
+    watcher->removeWatch(rootUtf8);
+    settleQuiet(*recorder, 300ms, 1200ms);
+    const std::size_t afterRemoval = recorder->eventCount();
+    std::this_thread::sleep_for(300ms);
+    stopProducer.store(true);
+    producer.join();
+    settleQuiet(*recorder, 300ms, 1200ms);
+    const std::size_t finalCount = recorder->eventCount();
+    const int producedCount = produced.load();
+    watcher.reset();
+
+    ctx.check("removeWatch 后无新回调（producer 继续写入被忽略）", finalCount == afterRemoval,
+              "removeWatch+沉降后=" + std::to_string(afterRemoval) + "；最终=" +
+                  std::to_string(finalCount) + "；producer 产生=" + std::to_string(producedCount));
+  }
+}
+
+// ---- 矩阵编排（fork 子进程 + 看门狗） ---------------------------------------
+
+using ScenarioFn = std::function<void(ScenarioCtx&)>;
+
+struct MatrixSpec {
+  std::string id;
+  std::string title;
+  ScenarioFn fn;
+  int timeoutSeconds;
+};
+
+void runScenarioInChild(const MatrixSpec& spec, const std::string& logPath) {
+  std::ofstream log{logPath, std::ios::trunc};
+  ScenarioCtx ctx = makeScenarioCtx(spec.id, spec.title);
+  ctx.log = &log;
+  ctx.line("===== Gate 0：efsw 语义实测（efsw-migration 任务 4 / Wave 2）=====");
+  ctx.line("scenario: " + spec.id);
+  ctx.line("title   : " + spec.title);
+  ctx.line("pid     : " + std::to_string(::getpid()));
+  ctx.line("wall    : " + wallClockText());
+  ctx.line("backend : efsw::FileWatcher 默认构造（Linux 构建为 inotify 后端）");
+  ctx.line("temp    : " + toUtf8(ctx.base));
+
+  spec.fn(ctx);
+
+  cleanupScenario(ctx);
+  ctx.line("");
+  ctx.line("===== 场景结论 =====");
+  ctx.line("checks: FAIL=" + std::to_string(ctx.failures) + " UNKNOWN=" +
+           std::to_string(ctx.unknowns));
+  const std::string verdict =
+      ctx.failures > 0 ? "FAIL" : (ctx.unknowns > 0 ? "UNKNOWN" : "PASS");
+  ctx.line("VERDICT: " + verdict);
+  log.flush();
+  const int code = ctx.failures > 0 ? 1 : (ctx.unknowns > 0 ? 2 : 0);
+  std::_Exit(code);
+}
+
+std::vector<MatrixSpec> buildMatrix() {
+  return {
+      {"s1-dir-move-in", "目录移入（含既有子文件）",
+       [](ScenarioCtx& ctx) { scenarioS1(ctx); }, 60},
+      {"s2-file-move-in", "文件移入",
+       [](ScenarioCtx& ctx) { scenarioS2(ctx); }, 60},
+      {"s3-move-out", "文件/目录移出（Delete/级联/清理）",
+       [](ScenarioCtx& ctx) { scenarioS3(ctx); }, 60},
+      {"s4-in-root-rename", "根内 rename（文件/目录）",
+       [](ScenarioCtx& ctx) { scenarioS4(ctx); }, 60},
+      {"s5a-crossdir-move-off", "跨目录移动：ReportCrossDirectoryMoves=OFF",
+       [](ScenarioCtx& ctx) { scenarioS5(ctx, false); }, 60},
+      {"s5b-crossdir-move-on", "跨目录移动：ReportCrossDirectoryMoves=ON",
+       [](ScenarioCtx& ctx) { scenarioS5(ctx, true); }, 60},
+      {"s6-create-modify-delete", "create/modify/delete 常规",
+       [](ScenarioCtx& ctx) { scenarioS6(ctx); }, 60},
+      {"s7-utf8-paths", "UTF-8 路径（非 ASCII 根/文件名）",
+       [](ScenarioCtx& ctx) { scenarioS7(ctx); }, 60},
+      {"s8-burst-storm", "尖峰风暴（批量创建/合并/竞态/溢出）",
+       [](ScenarioCtx& ctx) { scenarioS8(ctx); }, 120},
+      {"s9-stop-race", "停止/析构竞态",
+       [](ScenarioCtx& ctx) { scenarioS9(ctx); }, 90},
+  };
+}
+
+struct HarnessResult {
+  std::string id;
+  std::string title;
+  std::string logPath;
+  std::string verdict;
+  std::string exitDetail;
+  long long durationMs{0};
+};
+
+HarnessResult runScenarioHarness(const MatrixSpec& spec, const fs::path& outDir) {
+  HarnessResult result;
+  result.id = spec.id;
+  result.title = spec.title;
+  result.logPath = toUtf8(outDir / ("scenario-" + spec.id + ".log"));
+
+  const auto started = std::chrono::steady_clock::now();
+  const pid_t pid = fork();
+  if (pid == 0) {
+    runScenarioInChild(spec, result.logPath);
+    std::_Exit(127);
+  }
+  if (pid < 0) {
+    result.verdict = "FORK_FAILED";
+    result.exitDetail = "fork failed";
+    return result;
+  }
+
+  int status = 0;
+  bool timedOut = false;
+  bool waitFailed = false;
+  const auto deadline = started + std::chrono::seconds(spec.timeoutSeconds);
+  for (;;) {
+    const pid_t waited = waitpid(pid, &status, WNOHANG);
+    if (waited == pid) {
+      break;
+    }
+    if (waited < 0) {
+      waitFailed = true;
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      timedOut = true;
+      break;
+    }
+    std::this_thread::sleep_for(20ms);
+  }
+  result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count();
+
+  if (waitFailed) {
+    result.verdict = "WAIT_FAILED";
+    result.exitDetail = "waitpid failed";
+  } else if (timedOut) {
+    result.verdict = "HANG";
+    result.exitDetail = "watchdog kill after " + std::to_string(spec.timeoutSeconds) + "s";
+  } else if (WIFSIGNALED(status)) {
+    result.verdict = "CRASH";
+    result.exitDetail = "signal=" + std::to_string(WTERMSIG(status));
+  } else if (WIFEXITED(status)) {
+    const int code = WEXITSTATUS(status);
+    result.exitDetail = "exit=" + std::to_string(code);
+    if (code == 0) {
+      result.verdict = "PASS";
+    } else if (code == 1) {
+      result.verdict = "FAIL";
+    } else if (code == 2) {
+      result.verdict = "UNKNOWN";
+    } else {
+      result.verdict = "EXIT_" + std::to_string(code);
+    }
+  } else {
+    result.verdict = "UNKNOWN_STATUS";
+  }
+
+  {
+    std::ofstream note{result.logPath, std::ios::app};
+    if (note) {
+      note << "\n[harness] verdict=" << result.verdict << " " << result.exitDetail
+           << " duration=" << result.durationMs << "ms\n";
+    }
+  }
+  std::cout << "  " << std::setw(28) << std::left << result.id << " " << std::setw(8)
+            << result.verdict << " " << std::setw(7) << std::right << result.durationMs
+            << "ms (" << result.exitDetail << ")\n";
+  return result;
+}
+
+void writeD4Comparison(const fs::path& outDir, const std::vector<HarnessResult>& results) {
+  std::ofstream out{outDir / "d4-crossdir-move.txt", std::ios::trunc};
+  if (!out) {
+    return;
+  }
+  out << "===== D4 决策证据：跨目录移动 ReportCrossDirectoryMoves OFF vs ON =====\n";
+  out << "生成时间: " << wallClockText() << "\n";
+  out << "说明：以下为两次独立运行的完整原始日志（含事件流与场景结论），未做删改。\n";
+  out << "构建: cmake -S . -B build/w2-t4 -DSERIONA_BUILD_TESTS=ON -DSERIONA_BUILD_TOOLS=ON;"
+         " cmake --build build/w2-t4 -j8\n\n";
+  const auto appendLog = [&](const std::string& label, const fs::path& path) {
+    out << "----- " << label << "（" << toUtf8(path.filename()) << "）-----\n";
+    std::ifstream in{path, std::ios::binary};
+    if (in) {
+      out << in.rdbuf();
+    } else {
+      out << "（日志缺失）\n";
+    }
+    out << "\n";
+  };
+  appendLog("S5a ReportCrossDirectoryMoves=OFF", outDir / "scenario-s5a-crossdir-move-off.log");
+  appendLog("S5b ReportCrossDirectoryMoves=ON", outDir / "scenario-s5b-crossdir-move-on.log");
+  out << "----- harness 判定 -----\n";
+  for (const auto& result : results) {
+    if (result.id.rfind("s5", 0) == 0) {
+      out << result.id << ": " << result.verdict << " (" << result.exitDetail << ", "
+          << result.durationMs << "ms)\n";
+    }
+  }
+}
+
+int runEfswMatrix(const fs::path& outDir) {
+  std::error_code ec;
+  fs::create_directories(outDir, ec);
+  if (ec) {
+    std::cerr << "无法创建输出目录 " << toUtf8(outDir) << ": " << ec.message() << "\n";
+    return 2;
+  }
+  std::cout << "===== Gate 0：efsw 语义实测矩阵 =====\n";
+  std::cout << "输出目录: " << toUtf8(outDir) << "\n";
+
+  const auto specs = buildMatrix();
+  std::vector<HarnessResult> results;
+  results.reserve(specs.size());
+  for (const auto& spec : specs) {
+    results.push_back(runScenarioHarness(spec, outDir));
+  }
+  writeD4Comparison(outDir, results);
+
+  std::cout << "\n===== 矩阵汇总 =====\n";
+  std::size_t passCount = 0;
+  for (const auto& result : results) {
+    const bool pass = result.verdict == "PASS";
+    passCount += pass ? 1 : 0;
+    std::cout << "  " << std::setw(28) << std::left << result.id << " " << std::setw(8)
+              << result.verdict << " " << std::setw(7) << std::right << result.durationMs
+              << "ms " << result.exitDetail << "\n";
+  }
+  std::cout << "overall: " << passCount << "/" << results.size()
+            << (passCount == results.size() ? " PASS" : " 存在 FAIL/HANG/CRASH") << "\n";
+  std::cout << "d4: " << toUtf8(outDir / "d4-crossdir-move.txt") << "\n";
+  return passCount == results.size() ? 0 : 1;
+}
+
+int runEfswNegative() {
+  std::cout << "===== Gate 0 负向用例：不存在路径上的监视请求 =====\n";
+  const fs::path missing = fs::temp_directory_path() /
+                           ("seriona-gate0-negative-" + std::to_string(::getpid()) +
+                            "/does-not-exist");
+  std::error_code ec;
+  fs::remove_all(missing.parent_path(), ec);
+  const std::string missingUtf8 = toUtf8(missing);
+  std::cout << "path: " << missingUtf8 << "\n";
+  std::cout << "exists: " << (fs::exists(missing) ? "yes" : "no") << "\n";
+
+  EventRecorder recorder;
+  efsw::FileWatcher watcher;
+  efsw::Errors::Log::clearLastError();
+  std::cout << "call: addWatch(path, listener, recursive=true)\n";
+  const efsw::WatchID watchid = watcher.addWatch(missingUtf8, &recorder, true);
+  const efsw::Error errorCode = efsw::Errors::Log::getLastErrorCode();
+  const std::string errorLog = efsw::Errors::Log::getLastErrorLog();
+  const auto dirs = watcher.directories();
+  std::cout << "return: watchid=" << watchid << "\n";
+  std::cout << "efsw error code=" << static_cast<int>(errorCode)
+            << " (FileNotFound=-1)\n";
+  std::cout << "efsw error log=" << errorLog << "\n";
+  std::cout << "registered watches after failure=" << dirs.size() << "\n";
+
+  // efsw 1.7.2 的 Log::createLastError 只写文案、不更新 LastErrorCode（Log.cpp:22-60），
+  // getLastErrorCode() 恒为 NoError；权威信号是 addWatch 的返回值（错误枚举取负）。
+  const bool rejected = watchid < 0 && !errorLog.empty() && dirs.empty();
+  if (!rejected) {
+    std::cout << "VERDICT: FAIL（无效路径未被明确拒绝）\n";
+    return 4;
+  }
+  std::cout << "VERDICT: PASS（watchid<0 + 明确错误文案 + 未注册 watch；无崩溃/无挂起）\n";
+  std::cout << "note: getLastErrorCode()=0 为 efsw 1.7.2 API 缺陷（LastErrorCode 永不更新），"
+               "迁移实现必须以 addWatch 返回值为准\n";
+  std::cout << "note: 本用例按设计以非 0 退出码 3 结束（负向信号即预期结果）\n";
+  return 3;
+}
+
+}  // namespace gate0
+
+// ============================================================================
+// 主流程（原有 wtr 移出审计；无参数模式行为保持不变）
+// ============================================================================
+
+int runWtrAudit() {
   std::cout << "===== Seriona Watch Root Move Audit =====\n";
   std::cout << "验证假设（方案 B）：目录 mv 出监视根 -> IN_MOVE_SELF 精准删除（快照收敛、scan 不增长）；\n";
   std::cout << "                文件 create/modify/delete、根内 rename -> 精准更新（scan 不增长）；\n";
@@ -690,10 +2231,30 @@ int main() {
     service->startWatching({sc::ScannerRoot{musicRoot, true}, sc::ScannerRoot{musicB, true}});
     const auto beforeG = log.baseline();
     writeMinimalWav(musicB / "g.wav");
-    const bool rescanned =
-        waitUntil([&log, &beforeG] { return log.scanStartedCount() > beforeG.scanStarted; },
+    // 竞态修复：不能只等"扫描开始"就立刻取快照——扫描开始 -> 完成入库之间存在窗口，
+    // 快照可能读到 0 首而假 FAIL（C1 收尾验证复现 1 次）。改为循环等待直到判定条件
+    // 实际成立：扫描确被触发（scanStartedCount 增量）且当前快照内 musicB 歌曲 >= 2；
+    // 超时则以实际值判定 FAIL，真实回归不会被掩盖。
+    const bool controlReady =
+        waitUntil([&] {
+                    if (log.scanStartedCount() <= beforeG.scanStarted) {
+                      return false;
+                    }
+                    std::size_t musicBCount = 0;
+                    for (const auto& node : service->snapshot().nodes) {
+                      if (!node.song.has_value()) {
+                        continue;
+                      }
+                      if (node.song->filePath.generic_string().find("musicB") !=
+                          std::string::npos) {
+                        ++musicBCount;
+                      }
+                    }
+                    return musicBCount >= 2U;
+                  },
                   kSceneTimeout);
     const auto afterG = log.baseline();
+    const bool rescanned = log.scanStartedCount() > beforeG.scanStarted;
     std::cout << "  操作    : 建 musicB，写 f.wav；startWatching({musicRoot, musicB})；写 g.wav\n";
     std::cout << "  结果    : 重扫=" << (rescanned ? "触发" : "未触发（超时）")
               << " 歌曲数=" << afterG.tracks << "\n";
@@ -713,7 +2274,7 @@ int main() {
     }
     std::cout << "  验证    : 快照内 musicRoot 歌曲=" << musicRootInSnapshot
               << " musicB 歌曲=" << musicBInSnapshot << "\n";
-    std::cout << "  判定    : " << ((rescanned && musicBInSnapshot >= 2U)
+    std::cout << "  判定    : " << ((controlReady && rescanned && musicBInSnapshot >= 2U)
                                         ? "PASS（对照组：第二根内 create 触发重扫，两个根歌曲并入快照）"
                                         : "FAIL（对照组异常）")
               << "\n";
@@ -964,4 +2525,43 @@ int main() {
 
   std::cout << "\n===== 审计结束 =====\n";
   return 0;
+}
+
+// ============================================================================
+// 入口分发
+//   无参数                      → 原有 wtr 移出审计（11 场景）
+//   --efsw-matrix <输出目录>    → Gate 0 efsw 语义矩阵（scenario-*.log + d4）
+//   --efsw-negative             → 无效路径负向用例（明确报错 + 非 0 退出）
+// ============================================================================
+
+int main(int argc, char** argv) {
+  if (argc <= 1) {
+    return runWtrAudit();
+  }
+  const std::string first = argv[1];
+  if (first == "--efsw-matrix") {
+    if (argc != 3) {
+      std::cerr << "用法: seriona_watch_root_move_audit --efsw-matrix <输出目录>\n";
+      return 2;
+    }
+    return gate0::runEfswMatrix(fs::path{argv[2]});
+  }
+  if (first == "--efsw-negative") {
+    if (argc != 2) {
+      std::cerr << "用法: seriona_watch_root_move_audit --efsw-negative\n";
+      return 2;
+    }
+    return gate0::runEfswNegative();
+  }
+  if (first == "--help" || first == "-h") {
+    std::cout << "用法:\n"
+              << "  seriona_watch_root_move_audit                     原有 wtr 移出审计（11 场景）\n"
+              << "  seriona_watch_root_move_audit --efsw-matrix DIR   Gate 0 efsw 矩阵"
+                 "（日志写 DIR/scenario-*.log）\n"
+              << "  seriona_watch_root_move_audit --efsw-negative     无效路径负向用例"
+                 "（明确报错 + 非 0 退出）\n";
+    return 0;
+  }
+  std::cerr << "未知参数: " << first << "（--help 查看用法）\n";
+  return 2;
 }

@@ -34,8 +34,11 @@ target_include_directories(seriona_watch_root_move_audit PRIVATE
   ${PROJECT_SOURCE_DIR}/src/scanner
 )
 
+# Gate 0（任务 4）：矩阵模式直接驱动 efsw::FileWatcher，需要 efsw 头与静态库。
+# seriona_scanner 以 PRIVATE 链接 efsw-static，include 不会传递，故这里显式链接。
 target_link_libraries(seriona_watch_root_move_audit PRIVATE
   seriona_scanner
+  efsw-static
 )
 
 seriona_enable_warnings(seriona_watch_root_move_audit)

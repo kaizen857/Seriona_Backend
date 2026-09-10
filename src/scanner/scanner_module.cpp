@@ -1,11 +1,11 @@
 #include "seriona/scanner/scanner_module.h"
 
-#include "wtr/watcher.hpp"
+#include <efsw/efsw.hpp>
 
 namespace seriona::scanner {
 
 bool scannerModuleLinked() noexcept {
-  [[maybe_unused]] constexpr auto watcherPathType = wtr::event::path_type::watcher;
+  [[maybe_unused]] constexpr auto watchedAction = efsw::Actions::Modified;
   return true;
 }
 

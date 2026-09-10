@@ -1,7 +1,7 @@
 @PACKAGE_INIT@
 
 # SerionaBackend 消费方配置：重建后端库构建时的外部依赖 target
-#（pkg-config 的 SERIONA_*、SQLite3、spdlog、TagReaderCore），
+#（pkg-config 的 SERIONA_*、SQLite3、spdlog、Threads、TagReaderCore），
 # 导出文件（SerionaBackendTargets.cmake）里的接口/链接引用才会可解析。
 include(CMakeFindDependencyMacro)
 
@@ -16,6 +16,10 @@ pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
 pkg_check_modules(SERIONA_XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 find_dependency(SQLite3)
 find_dependency(spdlog)
+# 按计划保留 find_dependency(Threads)：为潜在 -pthread 平台/消费方兜底；上游 Threads 只链到
+# efsw 目标（本仓未链接/未导出，efsw-static 的导出接口为空；CMake 不会裁剪 $<LINK_ONLY:…>）。
+# Apple 平台的 CoreFoundation/CoreServices 以 "-framework" 链接选项形式随导出接口传递，无需 find_dependency。
+find_dependency(Threads)
 find_dependency(TagReaderCore CONFIG)
 
 # 平台分支依赖：与构建时条件一致（UNIX AND NOT APPLE 才需要 pipewire/sdbus）

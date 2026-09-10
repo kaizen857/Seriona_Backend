@@ -16,7 +16,7 @@
 #include "seriona/scanner/tag_reader_metadata_adapter.h"
 #include "seriona/scanner/worker_pool.h"
 
-#include "wtr/watcher.hpp"
+#include <efsw/efsw.hpp>
 
 #include <algorithm>
 #include <array>
@@ -900,56 +900,69 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
   sink(ScannerEvent{.type = type, .monotonicVersion = version, .timestamp = std::chrono::steady_clock::now(), .payload = std::move(payload)});
 }
 
-[[nodiscard]] WatchEffectKind watchEffectFrom(enum wtr::event::effect_type effect) {
-  switch (effect) {
-  case wtr::event::effect_type::create:
+[[nodiscard]] WatchEffectKind watchEffectFrom(efsw::Action action) {
+  switch (action) {
+  case efsw::Actions::Add:
     return WatchEffectKind::Created;
-  case wtr::event::effect_type::modify:
-    return WatchEffectKind::Modified;
-  case wtr::event::effect_type::destroy:
+  case efsw::Actions::Delete:
     return WatchEffectKind::Destroyed;
-  case wtr::event::effect_type::rename:
+  case efsw::Actions::Modified:
+    return WatchEffectKind::Modified;
+  case efsw::Actions::Moved:
     return WatchEffectKind::Renamed;
-  case wtr::event::effect_type::owner:
-    return WatchEffectKind::OwnerChanged;
-  case wtr::event::effect_type::other:
-    return WatchEffectKind::Other;
   }
   return WatchEffectKind::Other;
 }
 
-[[nodiscard]] WatchPathKind watchPathKindFrom(enum wtr::event::path_type pathType) {
-  switch (pathType) {
-  case wtr::event::path_type::file:
-  case wtr::event::path_type::hard_link:
-  case wtr::event::path_type::sym_link:
-    return WatchPathKind::File;
-  case wtr::event::path_type::dir:
+// efsw 事件不带文件/目录类型字段，按事件到达时的磁盘状态判定。路径已不存在（Delete，
+// 以及 Moved 的旧路径）时判为 File：删除路径的扩展名门禁与"无法分类即回落"由分类器
+// 按既有规则处理；目录 delete 若已无 stat 依据则走有界回落，与移出根语义一致。
+[[nodiscard]] WatchPathKind watchPathKindFrom(const std::filesystem::path& absolutePath) {
+  std::error_code error;
+  const auto status = std::filesystem::status(absolutePath, error);
+  if (!error && std::filesystem::is_directory(status)) {
     return WatchPathKind::Directory;
-  case wtr::event::path_type::watcher:
-    return WatchPathKind::Watcher;
-  case wtr::event::path_type::other:
-    return WatchPathKind::Other;
   }
-  return WatchPathKind::Other;
+  return WatchPathKind::File;
 }
 
-[[nodiscard]] WatchEvent watchEventFrom(const wtr::event& event) {
-  WatchEvent mapped{.path = event.path_name,
-                    .pathKind = watchPathKindFrom(event.path_type),
-                    .effectKind = watchEffectFrom(event.effect_type),
-                    .associated = {}};
-  if (event.associated) {
-    mapped.associated.push_back(watchEventFrom(*event.associated));
+// efsw 的 dir 为事件所在目录（含尾斜杠），filename 为该目录下的条目名；两者拼接并
+// 经 path_utf8 通道构造绝对路径（禁止裸 string()/generic_string()）。
+[[nodiscard]] std::filesystem::path absolutePathFrom(const std::string& dir, const std::string& filename) {
+  return (pathFromUtf8(dir) / pathFromUtf8(filename)).lexically_normal();
+}
+
+[[nodiscard]] WatchEvent watchEventFrom(const std::string& dir, const std::string& filename,
+                                        efsw::Action action, const std::string& oldFilename) {
+  const auto newPath = absolutePathFrom(dir, filename);
+  if (action != efsw::Actions::Moved) {
+    return WatchEvent{.path = newPath,
+                      .pathKind = watchPathKindFrom(newPath),
+                      .effectKind = watchEffectFrom(action),
+                      .associated = {}};
   }
-  return mapped;
+  // Moved 的 oldFilename 有两种形状：同目录 rename 为相对旧名；跨目录移动（根 watch 带
+  // ReportCrossDirectoryMoves 选项）为绝对源路径。两种都落到内部 Renamed 对约定：
+  // primary = 旧路径、associated = 新路径，分类器据此走 renameSubtree 精准更新。
+  const auto reportedOld = pathFromUtf8(oldFilename);
+  const auto oldPath =
+      reportedOld.is_absolute() ? reportedOld.lexically_normal() : (pathFromUtf8(dir) / reportedOld).lexically_normal();
+  WatchEvent renamed{.path = oldPath,
+                     .pathKind = watchPathKindFrom(oldPath),
+                     .effectKind = WatchEffectKind::Renamed,
+                     .associated = {}};
+  renamed.associated.push_back(WatchEvent{
+      .path = newPath, .pathKind = watchPathKindFrom(newPath), .effectKind = WatchEffectKind::Renamed, .associated = {}});
+  return renamed;
 }
 
 [[nodiscard]] bool watcherMessageRequestsRootReconciliation(const std::filesystem::path& messagePath) {
   const auto message = pathToUtf8(messagePath);
-  // s/self/live@、s/self/die@ 是 watch 生命周期消息（startWatching/stopWatching 内部），不应触发对账；
-  // e@ 是 wtr result::e 的独立完成标记（无路径后缀），必须精确 == "e@" 而不能 contains("e@")——
-  // 后者会误命中 s/self/live@（"live@" 含子串 "e@"）与 e/self/live@（同样含 "e@"）。
+  // 监视消息由适配层合成，走 Watcher 通道（不携带文件路径语义）：
+  //   - "e/sys/missed@<dir>"：efsw handleMissedFileActions（内核事件队列溢出）→ 必须根调和。
+  // "s/" 前缀是 watch 生命周期消息的历史约定，必须显式排除：s/self/live@ 不得触发对账。
+  // "e@" 是无路径后缀的独立完成标记，必须精确 == "e@" 而不能 contains("e@")——后者会误命中
+  // s/self/live@（"live@" 含子串 "e@"）与 e/self/live@（同样含 "e@"）。
   if (message.starts_with("s/")) {
     return false;
   }
@@ -975,7 +988,8 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
   case WatchEffectKind::OwnerChanged:
     return true;
   case WatchEffectKind::Other:
-    // IN_MOVE_SELF 由 wtr 映射为 Other（波1.1 补丁后放行），由波 4.1 分类器细分；无法分类的 Other 将回落全根重扫
+    // 适配层不产出 Other；fake 注入与未来后端兜底场景仍按"无法分类的目录自移动"放行，
+    // 由分类器细分，无法分类时回落全根重扫。
     return true;
   }
   return false;
@@ -1008,31 +1022,125 @@ void collectActionableWatcherEvent(const WatchEvent& event, std::vector<std::str
   return false;
 }
 
-class WtrFolderWatcher final : public FolderWatcher {
-public:
-  WtrFolderWatcher(const std::filesystem::path& root, WatchEventCallback callback)
-      : watcher_(std::make_unique<wtr::watch>(root, [callback = std::move(callback)](const wtr::event& event) {
-          callback(watchEventFrom(event));
-        })) {}
+// 内核事件队列溢出消息（Watcher 通道）：前缀须通过 watcherMessageRequestsRootReconciliation
+// 的匹配规则（"e/" 开头），内容含 dir 便于诊断。
+constexpr std::string_view kMissedEventsMessagePrefix = "e/sys/missed@";
 
-  ~WtrFolderWatcher() override { close(); }
+class EfswFolderWatcher final : public FolderWatcher, private efsw::FileWatchListener {
+public:
+  EfswFolderWatcher(const std::filesystem::path& root, WatchEventCallback callback)
+      : root_(root), callback_(std::move(callback)), watcher_(std::make_unique<efsw::FileWatcher>()) {
+    std::vector<efsw::WatcherOption> options;
+    // Gate 0 D4：启用跨目录移动单条 Moved 上报（oldFilename 为绝对源路径）；配对失败时
+    // 上游回落到 Delete(源) + Add/Modified(目标)，适配层两种形状都映射。
+    options.emplace_back(efsw::Options::ReportCrossDirectoryMoves, 1);
+
+    std::error_code typeError;
+    const auto rootStatus = std::filesystem::status(root_, typeError);
+    const bool directoryRoot = !typeError && std::filesystem::is_directory(rootStatus);
+    rootPathKind_ = directoryRoot ? WatchPathKind::Directory : WatchPathKind::File;
+    // efsw addWatch 只接受目录（单文件根实测返回 -1 + FileNotFound）。非目录根改为监视其
+    // 父目录（非递归）并在回调层按根文件名过滤，保持单文件根（CLI 单文件入口）可被监视。
+    const auto watchTarget = directoryRoot ? root_ : root_.parent_path();
+    fileRoot_ = !directoryRoot;
+    if (fileRoot_) {
+      rootFilenameUtf8_ = pathToUtf8(root_.filename());
+    }
+
+    watchId_ = watcher_->addWatch(pathToUtf8(watchTarget), this, directoryRoot, options);
+    if (watchId_ < 0) {
+      // efsw 1.7.2 的 Log::getLastErrorCode() 恒返回 NoError（只写文案、不更新错误码），
+      // 失败判定必须以 addWatch 返回值为准（负值 = 错误枚举）。
+      throw std::runtime_error("efsw addWatch failed for '" + pathToUtf8(watchTarget) +
+                               "' (watchid=" + std::to_string(watchId_) + ")");
+    }
+    watcher_->watch();
+    // efsw inotify 后端不投递 IN_MOVE_SELF/IN_DELETE_SELF：被监视根自身被移走/删除时没有
+    // 任何回调，残留 watch 之后只在旧路径上产生幽灵事件。轮询根存在性并在消失时以自移动
+    // 事件触发根调和（既有事件队列/去抖通道），保持"根移出 → 有界全根重扫"的既有语义。
+    livenessThread_ = std::thread([this] { rootLivenessLoop(); });
+  }
+
+  ~EfswFolderWatcher() override { close(); }
 
   void close() noexcept override {
-    if (watcher_) {
-      watcher_->close();
-      watcher_.reset();
+    livenessStopping_.store(true);
+    if (livenessThread_.joinable()) {
+      livenessThread_.join();
     }
+    if (!watcher_) {
+      return;  // 二次 close（含析构再次调用）：读线程已 join、watch 已摘除
+    }
+    if (watchId_ >= 0) {
+      watcher_->removeWatch(watchId_);
+      watchId_ = -1;
+    }
+    // watcher_.reset() 触发 ~FileWatcher → 后端析构（先等待派发中的 handleAction 完成，再
+    // delete 读线程对象 → ~Thread join 读线程）。removeWatch 只能摘除 watch，无法撤销"已解析
+    // 但尚未派发"的事件；只有 join 读线程后，才保证不会再有回调触碰本对象成员。这样 close()
+    // 即"完整停止"（与被替换的旧监视器 close 语义一致），消除 callback_ 先于读线程 join 被析构的
+    // use-after-free 竞态（P1，task-6-review.md §一）。
+    watcher_.reset();
   }
 
 private:
-  std::unique_ptr<wtr::watch> watcher_;
+  static constexpr auto kRootLivenessProbeInterval = std::chrono::milliseconds{50};
+
+  void handleFileAction(efsw::WatchID, const std::string& dir, const std::string& filename,
+                        efsw::Action action, const std::string& oldFilename) override {
+    if (fileRoot_ && filename != rootFilenameUtf8_) {
+      return;  // 单文件根：父目录 watch 的兄弟条目事件一律过滤
+    }
+    callback_(watchEventFrom(dir, filename, action, oldFilename));
+  }
+
+  void handleMissedFileActions(efsw::WatchID, const std::string& dir) override {
+    callback_(WatchEvent{.path = pathFromUtf8(std::string{kMissedEventsMessagePrefix} + dir),
+                         .pathKind = WatchPathKind::Watcher,
+                         .effectKind = WatchEffectKind::Other,
+                         .associated = {}});
+  }
+
+  void rootLivenessLoop() {
+    while (!livenessStopping_.load()) {
+      std::this_thread::sleep_for(kRootLivenessProbeInterval);
+      if (livenessStopping_.load()) {
+        return;
+      }
+      std::error_code error;
+      if (std::filesystem::exists(root_, error) || error) {
+        continue;  // 仍存在或状态不可判定：继续监视
+      }
+      // 根已消失：以"目录/文件自移动、无法分类"的形状上报（分类器对根自身一律回落全根
+      // 重扫，与移出根的既有兜底一致，且不占用消息通道）。只发一次。
+      callback_(WatchEvent{.path = root_,
+                           .pathKind = rootPathKind_,
+                           .effectKind = WatchEffectKind::Other,
+                           .associated = {}});
+      return;
+    }
+  }
+
+  std::filesystem::path root_;
+  WatchEventCallback callback_;
+  std::string rootFilenameUtf8_;
+  WatchPathKind rootPathKind_{WatchPathKind::File};
+  efsw::WatchID watchId_{-1};
+  bool fileRoot_{false};
+  std::atomic_bool livenessStopping_{false};
+  std::thread livenessThread_;
+  // 末位声明（最先析构）：构造期若在 watch() 启动读线程之后再抛错（构造体内仅 liveness 线程
+  // 创建可能抛），对象未完整构造、close() 不会被调用，此时成员逆序析构由本成员先触发
+  // ~FileWatcher join 读线程，早于 callback_ 等成员被销毁；正常路径由 close() 显式 reset
+  // 完成同一保证（见 close 注释）。
+  std::unique_ptr<efsw::FileWatcher> watcher_;
 };
 
-class WtrFolderWatcherFactory final : public FolderWatcherFactory {
+class EfswFolderWatcherFactory final : public FolderWatcherFactory {
 public:
   [[nodiscard]] std::unique_ptr<FolderWatcher> watch(const std::filesystem::path& root,
                                                      WatchEventCallback callback) override {
-    return std::make_unique<WtrFolderWatcher>(root, std::move(callback));
+    return std::make_unique<EfswFolderWatcher>(root, std::move(callback));
   }
 };
 
@@ -1094,7 +1202,7 @@ public:
       metadataReader_ = std::make_shared<ProductionTagMetadataReader>();
     }
     if (!watcherFactory_) {
-      watcherFactory_ = std::make_shared<WtrFolderWatcherFactory>();
+      watcherFactory_ = std::make_shared<EfswFolderWatcherFactory>();
     }
     if (databasePath_.empty()) {
       databasePath_ = defaultDatabasePath();
@@ -2658,12 +2766,10 @@ private:
       return false;
     }
 
-    // Seriona patch (wtr-fae-flush): 批内防御性去重——目录 mv 出根可能同时产生
-    // IN_MOVE_SELF（上方 moveSelfByRaw 循环 push）+ flush destroy（destroyByKey 循环 push）
-    // 的同路径双 remove。watcherDebounce（50ms）聚合与 fae flush（100ms）跨批次，跨批去重
-    // 无效且双 remove 幂等无害（removeSubtree/deleteLocationsByPathPrefix 重复执行结果一致），
-    // 本段只消除同批内的冗余：按 pathKey(abs) 去重、保留首个（push 顺序即 moveSelfByRaw 在前），
-    // 不引入任何跨批去重状态。
+    // 批内防御性去重：同一路径可能经不同事件形状（moveSelf 或重复 destroy）在同一批内
+    // 进入 removes。跨批冗余无需处理（重复 remove 幂等：removeSubtree/
+    // deleteLocationsByPathPrefix 重复执行结果一致，也不引入跨批去重状态）；本段只按
+    // pathKey(abs) 消除同批内重复，保留首个。
     {
       std::unordered_set<std::string> seenRemoveKeys;
       seenRemoveKeys.reserve(removes.size());
