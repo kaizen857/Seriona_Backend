@@ -1333,36 +1333,13 @@ public:
     const auto phaseEnumTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(phaseEnumEnd - phaseEnumStart).count();
 
     const auto phaseAggregationStart = std::chrono::steady_clock::now();
-    auto builder = std::make_unique<PlaylistTreeBuilder>("Library");
-    const auto cueSourcePaths = cueReferencedAudioPaths(allSongs);
-    for (const auto& publishedSong : allSongs) {
-      if (hiddenByCueSourceVisibility(publishedSong, cueSourcePaths)) {
-        continue;
-      }
-      builder->addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
-    }
-    auto published = builder->publish();
-    // 文件夹缩略图解析：publish 之后、快照锁之外 —— seam（TagReader 导出写缓存）的 I/O 不持锁；
-    // 单文件夹失败在 resolver 内隔离（回退树内兜底/空），不阻断扫描、不新增 error 事件。
-    resolveFolderThumbnails(published, allSongs);
-    TreeBuilderSeededSnapshot treeBuilderReport;
     {
       std::scoped_lock lock{mutex_};
-      // 波 3a：长生命周期 builder 成员（生命周期=watch 会话）。首次 runScan 种子化接管，
-      // 回落全根重扫重建并原子替换成员（不累积、不产生重复树）；精准更新路径（波 3b/3c/3d、4.1）复用成员。
-      treeBuilder_ = std::move(builder);
-      ++treeBuilderGeneration_;
       // 波 4.1：长期存活的 allSongs 成员（随精准 upsert/remove/rename 同步增删改；回落重扫随 builder 一并重建）。
       // 快照无 relativePath 无法反推，补丁路径 publish 后 resolveFolderThumbnails 必须取自此成员。
-      allSongs_ = allSongs;
-      snapshot_ = published;
-      treeBuilderReport.seeded = true;
-      treeBuilderReport.generation = treeBuilderGeneration_;
-      treeBuilderReport.songCount = treeBuilder_->stats().songCount;
+      allSongs_ = std::move(allSongs);
     }
-    if (g_treeBuilderObserver) {
-      g_treeBuilderObserver(treeBuilderReport);
-    }
+    const auto published = rebuildTreeFromAllSongsAndPublish();
     const auto phaseAggregationEnd = std::chrono::steady_clock::now();
     const auto phaseAggregationTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(phaseAggregationEnd - phaseAggregationStart).count();
 
@@ -1451,8 +1428,7 @@ public:
     spdlog::info("===============================================");
 
     publishEvent(sink, ScannerEventType::ProgressUpdated, ++eventVersion_, progress);
-    publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
-    publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
+    publishSnapshotEvents(published, /*publishCompletion=*/true);
   }
 
   void startWatching(const std::vector<ScannerRoot>& roots) override {
@@ -1837,7 +1813,8 @@ private:
                                          [[maybe_unused]] cache::SQLiteCache& cache,
                                          std::uint64_t& discovered, std::uint64_t& skipped, std::uint64_t& scanned,
                                          std::uint64_t& completedFiles, std::uint64_t& totalTagReaderTimeMs,
-                                         const ScannerEventSink& sink) {
+                                         const ScannerEventSink& sink,
+                                         const std::optional<std::filesystem::path>& walkScope = std::nullopt) {
     // Phase timing
     const auto phaseStart = std::chrono::steady_clock::now();
     auto phase1End = phaseStart;
@@ -1876,7 +1853,11 @@ private:
       }
     }
     
-    entries = discoverScannerPaths(ScannerRoot{.path = rootPath, .recursive = root.recursive}, pathConfig);
+    // walk root 与 classify root 分离（任务 7）：scoped 对账只枚举 scope 子树，但相对路径、
+    // 缓存键与发布身份仍以扫描根 rootPath 为基准，因此并入 allSongs_/locations 的形态与
+    // 全根扫描完全一致。
+    const auto walkPath = walkScope.has_value() ? walkScope->lexically_normal() : rootPath;
+    entries = discoverScannerPaths(ScannerRoot{.path = walkPath, .recursive = root.recursive}, pathConfig);
     phase1End = std::chrono::steady_clock::now();
 
 	    auto incrementalPlan = decision.mode == ScanMode::Incremental
@@ -2469,6 +2450,154 @@ private:
     WatchPathKind pathKind{WatchPathKind::Other};
   };
 
+  struct ScopedScanTarget {
+    ScannerRoot root;
+    std::filesystem::path scopeAbs;
+  };
+
+  [[nodiscard]] static bool pathWithinScope(const std::filesystem::path& path, const std::filesystem::path& scope) {
+    const auto pathText = pathToUtf8(path.lexically_normal());
+    const auto scopeText = pathToUtf8(scope.lexically_normal());
+    return pathText == scopeText || pathText.rfind(scopeText + "/", 0) == 0;
+  }
+
+  [[nodiscard]] static std::optional<ScannerRoot> findRootForPath(const std::vector<ScannerRoot>& roots,
+                                                                  const std::filesystem::path& path) {
+    std::optional<ScannerRoot> best;
+    std::size_t bestLength = 0;
+    const auto normalized = pathToUtf8(path.lexically_normal());
+    for (const auto& root : roots) {
+      const auto rootPath = rootPathFor(root);
+      const auto rootText = pathToUtf8(rootPath);
+      if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
+        if (rootText.size() >= bestLength) {
+          bestLength = rootText.size();
+          best = ScannerRoot{.path = rootPath, .recursive = root.recursive};
+        }
+      }
+    }
+    return best;
+  }
+
+  // 事件是否由某个 scope 的子树枚举接管：普通事件按路径是否落在任一 scope 内判定；
+  // Renamed 对仅当新旧两端都在 scope 内才交给枚举（跨边界 rename 仍走精准分类器，
+  // 否则新落点的文件会丢失更新）。
+  [[nodiscard]] static bool eventCoveredByScopes(const WatchEvent& event, const std::vector<ScopedScanTarget>& scopes) {
+    const auto withinAny = [&scopes](const std::filesystem::path& path) {
+      return std::ranges::any_of(scopes, [&path](const ScopedScanTarget& scope) {
+        return pathWithinScope(path, scope.scopeAbs);
+      });
+    };
+    if (event.effectKind == WatchEffectKind::Renamed) {
+      if (!withinAny(event.path)) {
+        return false;
+      }
+      for (const auto& associated : event.associated) {
+        if (associated.effectKind == WatchEffectKind::Renamed && !withinAny(associated.path)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return withinAny(event.path);
+  }
+
+  // 从事件批提取最外层 Created + Directory 作为 scoped 目标：嵌套 scope 并入外层、重复路径
+  // 去重；路径不在任何监视根内（或等于根自身）的事件不构成 scope，留给既有分类器按
+  // "无法分类 → 兜底回落"处理。祖先路径恒短于后代，按文本长度升序即可保证外层先入列。
+  [[nodiscard]] static std::vector<ScopedScanTarget> extractScopedScanTargets(const std::vector<ScannerRoot>& roots,
+                                                                              const std::vector<WatchEvent>& batch) {
+    std::vector<std::filesystem::path> candidates;
+    const std::function<void(const WatchEvent&)> collect = [&candidates, &collect](const WatchEvent& event) {
+      if (event.effectKind == WatchEffectKind::Created && event.pathKind == WatchPathKind::Directory) {
+        candidates.push_back(event.path.lexically_normal());
+      }
+      for (const auto& associated : event.associated) {
+        collect(associated);
+      }
+    };
+    for (const auto& event : batch) {
+      collect(event);
+    }
+    if (candidates.empty()) {
+      return {};
+    }
+    std::ranges::sort(candidates, {}, [](const std::filesystem::path& path) { return pathToUtf8(path).size(); });
+    std::vector<ScopedScanTarget> scopes;
+    for (const auto& candidate : candidates) {
+      const auto root = findRootForPath(roots, candidate);
+      if (!root.has_value() || pathKey(root->path) == pathKey(candidate)) {
+        continue;
+      }
+      const bool nested = std::ranges::any_of(scopes, [&candidate](const ScopedScanTarget& scope) {
+        return pathWithinScope(candidate, scope.scopeAbs);
+      });
+      if (!nested) {
+        scopes.push_back(ScopedScanTarget{.root = *root, .scopeAbs = candidate});
+      }
+    }
+    return scopes;
+  }
+
+  // 仅枚举 scope 子树（walk root），classify root 仍是扫描根，因此 treeRelativePath/缓存键
+  // 可直接并入 allSongs_/locations。scope 内路径相对根是全新路径：计划置空即"整子树按新增
+  // 处理"，不做根级增量计划比对。
+  [[nodiscard]] RootResult runScopedScan(const ScopedScanTarget& target) {
+    ScannerConfig config;
+    ScannerEventSink sink;
+    {
+      std::scoped_lock lock{mutex_};
+      config = config_;
+      sink = sink_;
+    }
+    std::error_code error;
+    // 非递归根：子树内容不在曲库内，scope 结果恒为空（仍经 mergeScopedResult 清理残留行）。
+    // scope 在去抖窗口内消失（移入后又被移出/替换）同样返回空结果：merge 仍会清理该子树残留。
+    if (!target.root.recursive || !std::filesystem::is_directory(target.scopeAbs, error) || error) {
+      return {};
+    }
+    const auto effectiveConfig = effectiveScannerConfig(config);
+    std::uint64_t discovered = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t scanned = 0;
+    std::uint64_t completedFiles = 0;
+    std::uint64_t totalTagReaderTimeMs = 0;
+    const ScanModeDecision scopedDecision{.mode = ScanMode::Full, .directoryTreeHash = std::nullopt};
+    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    return reconcileRoot(target.root, scopedDecision, effectiveConfig, cache, discovered, skipped, scanned,
+                         completedFiles, totalTagReaderTimeMs, sink, target.scopeAbs);
+  }
+
+  // scoped 结果并入长期成员 allSongs_，并以既有精确写 API 收敛缓存：先按 scope 前缀清理
+  // 树/缓存，再写入扫描结果（disk truth）。重复/嵌套 scope 合并后仍幂等，且能清理"移入后
+  // 又被移出"留下的残留行。
+  void mergeScopedResult(const ScopedScanTarget& target, RootResult& result) {
+    const auto rootPath = rootPathFor(target.root);
+    const auto scopeRel = relativePathFor(rootPath, target.scopeAbs);
+    const auto scopeRelText = pathToUtf8(scopeRel);
+    std::erase_if(allSongs_, [&scopeRelText](const RootResult::PublishedSong& entry) {
+      const auto relative = pathToUtf8(entry.treeRelativePath);
+      return relative == scopeRelText || relative.rfind(scopeRelText + "/", 0) == 0;
+    });
+    const auto scopeAbs = (rootPath / scopeRel).lexically_normal();
+    cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    cache.deleteLocationsByPathPrefix(pathKey(rootPath), pathKey(scopeAbs));
+    for (auto& publishedSong : result.songs) {
+      if (!shouldRetainLocationForOrigin(publishedSong.origin)) {
+        allSongs_.push_back(std::move(publishedSong));
+        continue;
+      }
+      const auto location = cachedLocationFromSong(publishedSong.song, rootPath, publishedSong.song.metadata.filePath,
+                                                   coverExportDir_);
+      cache.upsertContent(location.contentId, publishedSong.song.metadata);
+      cache.upsertLocation(location);
+      cache.replaceLyrics(location.locationId, "embedded", publishedSong.song.embeddedLyrics);
+      cache.replaceLyrics(location.locationId, "external", publishedSong.song.externalLyrics);
+      publishedSong.locationId = location.locationId;
+      allSongs_.push_back(std::move(publishedSong));
+    }
+  }
+
   [[nodiscard]] cache::CachedSong readClassifierSong(const std::filesystem::path& path) {
     auto raw = metadataReader_->read(thumbnailOnlyRequest(path, coverExportDir_));
     raw.filePath = path;
@@ -2550,20 +2679,73 @@ private:
     }
   }
 
+  // 从 allSongs_ 整树重建并原子接管成员（treeBuilder_/snapshot_）：runScan 全量聚合与 scoped
+  // 子树合并两条路径共用（任务 7）。scoped 歌曲只并入 allSongs_、不逐条 upsert 既有成员
+  // builder，发布前必须整树重建，保证快照与 allSongs_ 一致（补丁结果 == 全量重建）。
+  [[nodiscard]] PlaylistTreeSnapshot rebuildTreeFromAllSongsAndPublish() {
+    auto builder = std::make_unique<PlaylistTreeBuilder>("Library");
+    const auto cueSourcePaths = cueReferencedAudioPaths(allSongs_);
+    for (const auto& publishedSong : allSongs_) {
+      if (hiddenByCueSourceVisibility(publishedSong, cueSourcePaths)) {
+        continue;
+      }
+      builder->addSong({.relativePath = publishedSong.treeRelativePath, .metadata = publishedSong.song.metadata});
+    }
+    auto published = builder->publish();
+    // 文件夹缩略图解析：publish 之后、快照锁之外 —— seam（TagReader 导出写缓存）的 I/O 不持锁；
+    // 单文件夹失败在 resolver 内隔离（回退树内兜底/空），不阻断扫描、不新增 error 事件。
+    resolveFolderThumbnails(published, allSongs_);
+    TreeBuilderSeededSnapshot treeBuilderReport;
+    {
+      std::scoped_lock lock{mutex_};
+      // 波 3a：长生命周期 builder 成员（生命周期=watch 会话）。整树重建并原子替换成员
+      // （不累积、不产生重复树）；精准更新路径（波 3b/3c/3d、4.1）继续复用成员。
+      treeBuilder_ = std::move(builder);
+      ++treeBuilderGeneration_;
+      snapshot_ = published;
+      treeBuilderReport.seeded = true;
+      treeBuilderReport.generation = treeBuilderGeneration_;
+      treeBuilderReport.songCount = treeBuilder_->stats().songCount;
+    }
+    if (g_treeBuilderObserver) {
+      g_treeBuilderObserver(treeBuilderReport);
+    }
+    return published;
+  }
+
+  // 发布契约（唯一事实来源；任务 7 建立、任务 8 明文固化，审查建议见 task-7-review §二.5）：
+  //   1) 全量/增量扫描（runScan）：ScanStarted → ProgressUpdated(≥0) → PlaylistSnapshotUpdated
+  //      → ScanCompleted（任一阶段错误时另有 ScanError）——即"一次扫描"的完整生命周期。
+  //   2) 文件级精准批次（applyClassifierBatch 无 scope → publishClassifierSnapshot）：
+  //      PlaylistSnapshotUpdated + ScanCompleted。commit 24186ef 起的既有设计，既有测试
+  //      （waitForScanCompletedCount）与前端 LibraryScanCompleted 通知均依赖，不得压制。
+  //   3) scoped 子树对账（含"精准+scope"混合批次）：只发 PlaylistSnapshotUpdated（+ 错误时
+  //      ScanError）；不发 ScanStarted，也不发 ScanCompleted——子树对账不是一次扫描，其完成
+  //      只以最新快照表达。计划所述"不发 ScanStarted/ScanCompleted"仅指本路径。
+  // 参数 publishCompletion 即第 2/1 类与第 3 类的分界：全量扫描与文件级精准批次为 true。
+  void publishSnapshotEvents(const PlaylistTreeSnapshot& published, bool publishCompletion) {
+    ScannerEventSink sink;
+    {
+      std::scoped_lock lock{mutex_};
+      sink = sink_;
+    }
+    publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
+    if (publishCompletion) {
+      publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
+    }
+  }
+
   void publishClassifierSnapshot() {
     if (!treeBuilder_) {
       return;
     }
     auto published = treeBuilder_->publish();
     resolveFolderThumbnails(published, allSongs_);
-    ScannerEventSink sink;
     {
       std::scoped_lock lock{mutex_};
-      sink = sink_;
       snapshot_ = published;
     }
-    publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
-    publishEvent(sink, ScannerEventType::ScanCompleted, ++eventVersion_, published);
+    publishSnapshotEvents(published, /*publishCompletion=*/true);
   }
 
   bool applyClassifierBatch(const std::vector<ScannerRoot>& roots, const std::vector<WatchEvent>& batch) {
@@ -2579,6 +2761,9 @@ private:
       config = config_;
     }
     const auto effective = effectiveScannerConfig(config);
+    // 任务 7：从事件批提取最外层 Created + Directory 作为 scoped 子树对账目标；被 scope
+    // 覆盖的事件由子树枚举接管（嵌套/重复 scope 在提取内合并），不再进入逐事件分类。
+    const auto scopes = extractScopedScanTargets(roots, batch);
 
     std::vector<ClassifierRename> renames;
     std::vector<ClassifierRemove> removes;
@@ -2590,22 +2775,6 @@ private:
     std::unordered_set<std::string> createdInBatch;
     bool unclassifiable = false;
 
-    const auto findRootFor = [&roots](const std::filesystem::path& path) -> std::optional<std::filesystem::path> {
-      std::optional<std::filesystem::path> best;
-      std::size_t bestLength = 0;
-      const auto normalized = pathToUtf8(path.lexically_normal());
-      for (const auto& root : roots) {
-        const auto rootPath = rootPathFor(root);
-        const auto rootText = pathToUtf8(rootPath);
-        if (normalized == rootText || normalized.rfind(rootText + "/", 0) == 0) {
-          if (rootText.size() >= bestLength) {
-            bestLength = rootText.size();
-            best = rootPath;
-          }
-        }
-      }
-      return best;
-    };
     const auto isRootSelf = [](const std::filesystem::path& path, const std::filesystem::path& root) {
       return pathKey(path) == pathKey(root);
     };
@@ -2621,15 +2790,15 @@ private:
           }
           const auto oldPath = event.path;
           const auto newPath = associated.path;
-          const auto root = findRootFor(oldPath);
-          if (!root.has_value() || isRootSelf(oldPath, *root)) {
+          const auto root = findRootForPath(roots, oldPath);
+          if (!root.has_value() || isRootSelf(oldPath, root->path)) {
             return;
           }
-          const auto oldRel = relativePathFor(*root, oldPath);
-          const auto newRel = relativePathFor(*root, newPath);
-          const auto oldAbs = (*root / oldRel).lexically_normal();
-          const auto newAbs = (*root / newRel).lexically_normal();
-          renames.push_back(ClassifierRename{.root = *root,
+          const auto oldRel = relativePathFor(root->path, oldPath);
+          const auto newRel = relativePathFor(root->path, newPath);
+          const auto oldAbs = (root->path / oldRel).lexically_normal();
+          const auto newAbs = (root->path / newRel).lexically_normal();
+          renames.push_back(ClassifierRename{.root = root->path,
                                              .oldAbs = oldAbs,
                                              .newAbs = newAbs,
                                              .oldRel = oldRel,
@@ -2686,6 +2855,9 @@ private:
     };
 
     for (const auto& event : batch) {
+      if (eventCoveredByScopes(event, scopes)) {
+        continue;
+      }
       walk(event);
     }
     if (unclassifiable) {
@@ -2725,42 +2897,42 @@ private:
       if (renameOldToNew.contains(key)) {
         continue;
       }
-      const auto root = findRootFor(raw);
+      const auto root = findRootForPath(roots, raw);
       if (!root.has_value()) {
         continue;
       }
-      if (isRootSelf(raw, *root)) {
+      if (isRootSelf(raw, root->path)) {
         unclassifiable = true;
         break;
       }
-      const auto rel = relativePathFor(*root, raw);
-      const auto abs = (*root / rel).lexically_normal();
+      const auto rel = relativePathFor(root->path, raw);
+      const auto abs = (root->path / rel).lexically_normal();
       if (std::filesystem::exists(abs)) {
         unclassifiable = true;
         break;
       }
-      removes.push_back(ClassifierRemove{.root = *root, .abs = abs, .rel = rel});
+      removes.push_back(ClassifierRemove{.root = root->path, .abs = abs, .rel = rel});
     }
     if (unclassifiable) {
       return false;
     }
 
     for (const auto& [key, destroy] : destroyByKey) {
-      const auto root = findRootFor(destroy.raw);
+      const auto root = findRootForPath(roots, destroy.raw);
       if (!root.has_value()) {
         continue;
       }
-      if (isRootSelf(destroy.raw, *root)) {
+      if (isRootSelf(destroy.raw, root->path)) {
         unclassifiable = true;
         break;
       }
-      const auto rel = relativePathFor(*root, destroy.raw);
-      const auto abs = (*root / rel).lexically_normal();
+      const auto rel = relativePathFor(root->path, destroy.raw);
+      const auto abs = (root->path / rel).lexically_normal();
       if (destroy.pathKind == WatchPathKind::File && !isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
         unclassifiable = true;
         break;
       }
-      removes.push_back(ClassifierRemove{.root = *root, .abs = abs, .rel = rel});
+      removes.push_back(ClassifierRemove{.root = root->path, .abs = abs, .rel = rel});
     }
     if (unclassifiable) {
       return false;
@@ -2779,21 +2951,21 @@ private:
     }
 
     for (auto& [key, op] : upsertByKey) {
-      const auto root = findRootFor(op.raw);
+      const auto root = findRootForPath(roots, op.raw);
       if (!root.has_value()) {
         continue;
       }
-      if (isRootSelf(op.raw, *root)) {
+      if (isRootSelf(op.raw, root->path)) {
         unclassifiable = true;
         break;
       }
-      const auto rel = relativePathFor(*root, op.raw);
-      const auto abs = (*root / rel).lexically_normal();
+      const auto rel = relativePathFor(root->path, op.raw);
+      const auto abs = (root->path / rel).lexically_normal();
       if (abs.extension() == ".cue" || !isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
         unclassifiable = true;
         break;
       }
-      op.root = *root;
+      op.root = root->path;
       op.abs = abs;
       op.rel = rel;
       upserts.push_back(op);
@@ -2802,7 +2974,7 @@ private:
       return false;
     }
 
-    if (renames.empty() && removes.empty() && upserts.empty()) {
+    if (renames.empty() && removes.empty() && upserts.empty() && scopes.empty()) {
       return true;
     }
 
@@ -2854,6 +3026,12 @@ private:
         });
         touchedRoots.insert(remove.root);
       }
+      // 文件级精准批次的歌词对账（任务 8）：readClassifierSong 只读内嵌标签，若不在写缓存/快照
+      // 之前调用 reconcileLyrics，新落点文件（新建/复制/改写）会以空 externalLyrics 落库，丢掉
+      // 磁盘上已存在的 sidecar。与全量（reconcileRoot 的 PublishedSong 尾部）和 scoped（经同一
+      // reconcileRoot）共用同一函数；取消语义一致：Cancelled → return false，由 debounceLoop
+      // 回落 scan() 收尾（有界）。错误收集后以既有 ScanError 发布（全量/scoped 同构）。
+      std::vector<ScannerError> upsertLyricsErrors;
       for (const auto& upsert : upserts) {
         // 新 root 尚未扫描（scan_roots 无记录）时，首个 create 无法精准 upsert
         // （locations.root_path 外键指向 scan_roots），回落全根重扫
@@ -2865,12 +3043,18 @@ private:
           continue;
         }
         auto song = readClassifierSong(upsert.abs);
+        // 必须在 cachedLocationFromSong 之前对账：location 行的 lyricsSource/externalLrc* 取自
+        // song.metadata，顺序颠倒会让缓存行停留在"无外部歌词"的旧判定。
+        const auto lyricsAction = reconcileLyrics(song, effective.scanner, upsertLyricsErrors);
+        if (lyricsAction == ExternalLyricsCacheAction::Cancelled) {
+          return false;
+        }
         const auto location = cachedLocationFromSong(song, upsert.root, upsert.abs, coverExportDir_);
         RootResult::PublishedSong entry{.song = std::move(song),
                                         .treeRelativePath = upsert.rel,
                                         .origin = upsert.created ? ScanItemOrigin::ScannedNew : ScanItemOrigin::RescannedChanged,
                                         .locationId = location.locationId,
-                                        .externalLyricsCacheAction = ExternalLyricsCacheAction::None};
+                                        .externalLyricsCacheAction = lyricsAction};
         const auto existing = std::ranges::find_if(allSongs_, [&](const RootResult::PublishedSong& candidate) {
           return candidate.treeRelativePath == upsert.rel;
         });
@@ -2888,6 +3072,43 @@ private:
         cache.replaceLyrics(location.locationId, "external", entry.song.externalLyrics);
         touchedRoots.insert(upsert.root);
       }
+      if (!upsertLyricsErrors.empty()) {
+        ScannerEventSink lyricsErrorSink;
+        {
+          std::scoped_lock lock{mutex_};
+          lyricsErrorSink = sink_;
+        }
+        for (const auto& error : upsertLyricsErrors) {
+          publishEvent(lyricsErrorSink, ScannerEventType::ScanError, ++eventVersion_, error);
+        }
+      }
+      if (!scopes.empty()) {
+        for (const auto& scope : scopes) {
+          // 与 rename/upsert 同一守卫：locations.root_path 外键指向 scan_roots，
+          // 根尚未扫描时无法写入精准结果 → 回落全根重扫（既有兜底）。
+          if (!cache.loadScanRoot(scope.root.path).has_value()) {
+            spdlog::warn("scoped reconcile requires a scanned root, falling back: {}", pathToUtf8(scope.root.path));
+            return false;
+          }
+        }
+        ScannerEventSink scopeSink;
+        {
+          std::scoped_lock lock{mutex_};
+          scopeSink = sink_;
+        }
+        for (auto& scope : scopes) {
+          auto scoped = runScopedScan(scope);
+          if (scoped.cancelled) {
+            spdlog::debug("scoped reconcile cancelled for {}", pathToUtf8(scope.scopeAbs));
+            return false;
+          }
+          for (const auto& error : scoped.errors) {
+            publishEvent(scopeSink, ScannerEventType::ScanError, ++eventVersion_, error);
+          }
+          mergeScopedResult(scope, scoped);
+          touchedRoots.insert(scope.root.path);
+        }
+      }
     } catch (const std::exception& error) {
       spdlog::warn("classifier precise update failed, falling back to full rescan: {}", error.what());
       return false;
@@ -2896,7 +3117,15 @@ private:
     for (const auto& rootPath : touchedRoots) {
       refreshScanRootHash(rootPath);
     }
-    publishClassifierSnapshot();
+    if (scopes.empty()) {
+      publishClassifierSnapshot();
+    } else {
+      // scoped 子树对账：整树重建（scope 歌曲只并入 allSongs_）后发布。按 publishSnapshotEvents
+      // 顶部的发布契约边界（第 3 类），本路径只发 PlaylistSnapshotUpdated，不发 ScanStarted/
+      // ScanCompleted；纯文件级精准批次（上方 publishClassifierSnapshot）保留既有 ScanCompleted。
+      const auto published = rebuildTreeFromAllSongsAndPublish();
+      publishSnapshotEvents(published, /*publishCompletion=*/false);
+    }
     return true;
   }
 

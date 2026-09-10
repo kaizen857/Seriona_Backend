@@ -208,6 +208,21 @@ void waitForLyrics(const FileScannerService& service, LyricsSource source, std::
   FAIL("timed out waiting for watcher lyrics reconciliation");
 }
 
+// waitForLyrics 前提是快照恰有一首歌；本任务歌词用例是多曲快照，按路径定位。
+void waitForSongLyrics(const FileScannerService& service, const std::filesystem::path& path, LyricsSource source,
+                       std::string_view text) {
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
+    const auto songs = songsIn(service.snapshot());
+    const auto found = std::ranges::find_if(songs, [&](const SongMetadata& song) { return song.filePath == path; });
+    if (found != songs.end() && found->effectiveLyricsSource == source && found->effectiveLyrics.size() == 1U &&
+        found->effectiveLyrics[0].text == text) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for song lyrics reconciliation");
+}
+
 [[nodiscard]] std::size_t scanStartedCount(const std::vector<ScannerEvent>& events) {
   return static_cast<std::size_t>(std::ranges::count_if(events, [](const ScannerEvent& event) {
     return event.type == ScannerEventType::ScanStarted;
@@ -262,6 +277,17 @@ void waitForScanCompletedCount(const std::vector<ScannerEvent>& events, std::mut
                     .pathKind = WatchPathKind::Directory,
                     .effectKind = WatchEffectKind::Other,
                     .associated = {}};
+}
+
+[[nodiscard]] WatchEvent directoryEvent(std::filesystem::path path, WatchEffectKind effect) {
+  return WatchEvent{.path = std::move(path),
+                    .pathKind = WatchPathKind::Directory,
+                    .effectKind = effect,
+                    .associated = {}};
+}
+
+[[nodiscard]] std::size_t eventTypeCount(const std::vector<ScannerEvent>& events, ScannerEventType type) {
+  return static_cast<std::size_t>(std::ranges::count(events, type, &ScannerEvent::type));
 }
 
 [[nodiscard]] std::filesystem::path scannerSidecarPath(const test::TempScannerRoot& temp) {
@@ -1359,6 +1385,436 @@ TEST_CASE("scanner watcher falls back to rescan for first create on an un-scanne
     std::scoped_lock lock{eventsMutex};
     CHECK(scanStartedCount(events) == scannedCountBefore + 1U);
   }
+}
+
+TEST_CASE("scanner watcher scoped reconcile enumerates a directory moved into the root") {
+  test::TempScannerRoot temp{"scanner-watcher-scoped-dir"};
+  const auto loose = test::writeAudioFixture(temp.path(), "loose.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(loose, rawMetadata("Loose"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  CHECK(reader->readCount() == 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // 根外目录（含嵌套子目录 + 2 个音频）整体移入：efsw 只报目录自身 Add+Modified，
+  // 既有子文件无逐事件 → scoped 对账必须自行枚举子树（Gate 0 S1）。
+  const auto outside = temp.path().parent_path() / ("seriona-scoped-dir-in-" + temp.path().filename().string());
+  std::error_code cleanupError;
+  std::filesystem::remove_all(outside, cleanupError);
+  const auto stagedA = test::writeAudioFixture(outside, "a.flac");
+  const auto stagedB = test::writeAudioFixture(outside / "nested", "b.flac");
+  const auto incoming = temp.path() / "incoming";
+  std::filesystem::rename(outside, incoming);
+  const auto trackA = incoming / stagedA.filename();
+  const auto trackB = incoming / "nested" / stagedB.filename();
+  reader->put(trackA, rawMetadata("Scoped A"));
+  reader->put(trackB, rawMetadata("Scoped B"));
+
+  std::size_t startedBefore = 0;
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Created));
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 3U);
+  // 沉降窗口：若事件被拆批/命中兜底而排入全根重扫，其 ScanStarted 与全量读取会在本窗口内出现，
+  // 保证下方"无整根重扫"负向断言不因断言跑在重扫启动之前而假通过。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  const auto songs = songsIn(service->snapshot());
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackA; }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackB; }));
+  // 子树枚举读取 2 个移入文件；全根只有 3 个文件被读 → 无整根重扫。
+  CHECK(reader->readCount() == 3U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(locations.size() == 3U);
+  CHECK(std::ranges::any_of(locations, [&](const cache::CachedLocation& location) { return location.filePath == trackA; }));
+  CHECK(std::ranges::any_of(locations, [&](const cache::CachedLocation& location) { return location.filePath == trackB; }));
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+TEST_CASE("scanner watcher scoped reconcile dedups nested and duplicate directory scopes") {
+  test::TempScannerRoot temp{"scanner-watcher-scoped-dedup"};
+  const auto loose = test::writeAudioFixture(temp.path(), "loose.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(loose, rawMetadata("Loose"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  // 去抖窗口放大到 30ms：确保 5 条 scope 事件落入同一批（嵌套/重复去重的前提）。
+  auto service = makeFileScannerService(FileScannerServiceDependencies{.metadataReader = reader,
+                                                                       .watcherFactory = watchers,
+                                                                       .databasePath = temp.dbPath(),
+                                                                       .coverExportDir = temp.path() / "covers",
+                                                                       .watcherDebounce = std::chrono::milliseconds{30}});
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto outside = temp.path().parent_path() / ("seriona-scoped-nested-" + temp.path().filename().string());
+  std::error_code cleanupError;
+  std::filesystem::remove_all(outside, cleanupError);
+  const auto stagedA = test::writeAudioFixture(outside, "a.flac");
+  const auto stagedB = test::writeAudioFixture(outside / "nested", "b.flac");
+  const auto incoming = temp.path() / "incoming";
+  std::filesystem::rename(outside, incoming);
+  const auto nested = incoming / "nested";
+  const auto trackA = incoming / stagedA.filename();
+  const auto trackB = nested / stagedB.filename();
+  reader->put(trackA, rawMetadata("Scoped A"));
+  reader->put(trackB, rawMetadata("Scoped B"));
+
+  std::vector<std::vector<PublishedSongSnapshot>> publishedBatches;
+  std::mutex publishedMutex;
+  setPublishedSongObserver([&publishedBatches, &publishedMutex](const std::vector<PublishedSongSnapshot>& songs) {
+    std::scoped_lock lock{publishedMutex};
+    publishedBatches.push_back(songs);
+  });
+  struct PublishedObserverClear {
+    ~PublishedObserverClear() { clearPublishedSongObserver(); }
+  } publishedObserverClear;
+
+  std::size_t startedBefore = 0;
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Created));
+  watchers->states[0]->callback(directoryEvent(nested, WatchEffectKind::Created));
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Created));
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Modified));
+  watchers->states[0]->callback(directoryEvent(nested, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 3U);
+  // 沉降窗口：兜底重扫若被排入，其 ScanStarted/全量读取会在本窗口内出现，负向断言防竞态。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  {
+    std::scoped_lock lock{publishedMutex};
+    // 嵌套后的 A/B 合并为一次子树扫描；若 B 被独立扫描或重复扫描，本段会出现第二批。
+    REQUIRE(publishedBatches.size() == 1U);
+    CHECK(publishedBatches[0].size() == 2U);
+  }
+  // 每个移入文件只读一次：合并去重后 1（种子）+ 2（A/a + A/nested/b）= 3。
+  CHECK(reader->readCount() == 3U);
+  const auto songs = songsIn(service->snapshot());
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackA; }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackB; }));
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+TEST_CASE("scanner watcher keeps a moved-in file on the precise classifier path") {
+  test::TempScannerRoot temp{"scanner-watcher-file-in"};
+  const auto loose = test::writeAudioFixture(temp.path(), "loose.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(loose, rawMetadata("Loose"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  CHECK(reader->readCount() == 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto outside = temp.path().parent_path() / ("seriona-file-in-" + temp.path().filename().string());
+  std::error_code cleanupError;
+  std::filesystem::remove_all(outside, cleanupError);
+  const auto staged = test::writeAudioFixture(outside, "incoming.flac");
+  const auto incoming = temp.path() / staged.filename();
+  std::filesystem::rename(staged, incoming);
+  reader->put(incoming, rawMetadata("Moved In File"));
+
+  std::size_t startedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+  // 移入文件 = Add + Modified（完整路径）：仍走既有文件级精准 upsert，不进入 scoped。
+  watchers->states[0]->callback(fileEvent(incoming, WatchEffectKind::Created));
+  watchers->states[0]->callback(fileEvent(incoming, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 2U);
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  CHECK(reader->readCount() == 2U);
+  const auto songs = songsIn(service->snapshot());
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == incoming; }));
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 文件级新增沿用既有精准路径：无 ScanStarted（无全根重扫），快照仅 +1。
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(locations.size() == 2U);
+  CHECK(std::ranges::any_of(locations, [&](const cache::CachedLocation& location) { return location.filePath == incoming; }));
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+// 发布契约（scoped 路径，publishSnapshotEvents 顶部契约第 3 类）与歌词对账（任务 8）：
+// 移入目录内的音频带同名 sidecar 时，scoped 子树枚举经 reconcileRoot 对账外部歌词；
+// 同批只发 1 个 PlaylistSnapshotUpdated，不发 ScanStarted/ScanCompleted。B 无 sidecar =
+// "缺失不崩溃且保留内嵌"负向边界。
+TEST_CASE("scanner watcher scoped reconcile publishes snapshot only and picks up sidecar lyrics") {
+  test::TempScannerRoot temp{"scanner-watcher-scoped-lyrics"};
+  const auto loose = test::writeAudioFixture(temp.path(), "loose.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(loose, rawMetadata("Loose", {RawTagLyricLine{std::chrono::milliseconds{100}, "loose embedded"}}));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto outside = temp.path().parent_path() / ("seriona-scoped-lyrics-" + temp.path().filename().string());
+  std::error_code cleanupError;
+  std::filesystem::remove_all(outside, cleanupError);
+  const auto stagedA = test::writeAudioFixture(outside, "a.flac");
+  const auto stagedB = test::writeAudioFixture(outside / "nested", "b.flac");
+  writeText(outside / "a.lrc", "[00:02.00]moved external\n");
+  const auto incoming = temp.path() / "incoming";
+  std::filesystem::rename(outside, incoming);
+  const auto trackA = incoming / stagedA.filename();
+  const auto trackB = incoming / "nested" / stagedB.filename();
+  reader->put(trackA, rawMetadata("Scoped A", {RawTagLyricLine{std::chrono::milliseconds{100}, "a embedded"}}));
+  reader->put(trackB, rawMetadata("Scoped B", {RawTagLyricLine{std::chrono::milliseconds{100}, "b embedded"}}));
+
+  std::size_t startedBefore = 0;
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Created));
+  watchers->states[0]->callback(directoryEvent(incoming, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 3U);
+  waitForSongLyrics(*service, trackA, LyricsSource::ExternalLrc, "moved external");
+  // 沉降窗口：兜底重扫若被排入，其 ScanStarted 与全量读取会在本窗口内出现，负向断言防竞态。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  const auto songs = songsIn(service->snapshot());
+  const auto foundB = std::ranges::find_if(songs, [&](const SongMetadata& song) { return song.filePath == trackB; });
+  REQUIRE(foundB != songs.end());
+  CHECK(foundB->effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  CHECK(foundB->effectiveLyrics.size() == 1U);
+  CHECK(foundB->effectiveLyrics[0].text == "b embedded");
+  CHECK(reader->readCount() == 3U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(locations.size() == 3U);
+  const auto foundLocation = std::ranges::find_if(locations, [&](const cache::CachedLocation& location) {
+    return location.filePath == trackA;
+  });
+  REQUIRE(foundLocation != locations.end());
+  CHECK(foundLocation->lyricsSource == LyricsSource::ExternalLrc);
+  const auto cachedExternalLyrics = sidecar.loadLyrics(foundLocation->locationId, "external");
+  REQUIRE(cachedExternalLyrics.size() == 1U);
+  CHECK(cachedExternalLyrics[0].text == "moved external");
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+// 发布契约（文件级精准路径，契约第 2 类）与歌词对账（任务 8）：音频落点前磁盘已有同名
+// sidecar 时，精准 upsert 必须完成外部歌词对账；该路径同时保留既有 ScanCompleted 契约
+// （commit 24186ef 起，不得压制）。只报音频事件 = 覆盖 sidecar 事件与音频事件被拆批的窗口。
+TEST_CASE("scanner watcher precise file upsert reconciles sidecar lyrics and keeps ScanCompleted contract") {
+  test::TempScannerRoot temp{"scanner-watcher-precise-lyrics"};
+  const auto seed = test::writeAudioFixture(temp.path(), "seed.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(seed, rawMetadata("Seed"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto fresh = test::writeAudioFixture(temp.path(), "fresh.flac");
+  writeText(temp.path() / "fresh.lrc", "[00:03.00]fresh external\n");
+  reader->put(fresh, rawMetadata("Fresh", {RawTagLyricLine{std::chrono::milliseconds{100}, "fresh embedded"}}));
+
+  std::size_t startedBefore = 0;
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+  watchers->states[0]->callback(fileEvent(fresh, WatchEffectKind::Created));
+  watchers->states[0]->callback(fileEvent(fresh, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 2U);
+  waitForSongLyrics(*service, fresh, LyricsSource::ExternalLrc, "fresh external");
+  waitForScanCompletedCount(events, eventsMutex, completedBefore + 1U);
+  CHECK(reader->readCount() == 2U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore + 1U);
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(locations.size() == 2U);
+  const auto foundLocation = std::ranges::find_if(locations, [&](const cache::CachedLocation& location) {
+    return location.filePath == fresh;
+  });
+  REQUIRE(foundLocation != locations.end());
+  CHECK(foundLocation->lyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(foundLocation->externalLrcPath.has_value());
+  CHECK(foundLocation->externalLrcPath->filename() == "fresh.lrc");
+  const auto cachedExternalLyrics = sidecar.loadLyrics(foundLocation->locationId, "external");
+  REQUIRE(cachedExternalLyrics.size() == 1U);
+  CHECK(cachedExternalLyrics[0].text == "fresh external");
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+// 歌词负向边界（任务 8）：sidecar 存在但不可解析 → 不崩溃、不回落重扫；其余元数据不受损，
+// 外部歌词被清除并回退内嵌；解析错误按既有 ScanError（非致命 MetadataReadFailed）发布。
+TEST_CASE("scanner watcher precise upsert degrades gracefully on a corrupt lyrics sidecar") {
+  test::TempScannerRoot temp{"scanner-watcher-corrupt-lyrics"};
+  const auto seed = test::writeAudioFixture(temp.path(), "seed.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(seed, rawMetadata("Seed"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto broken = test::writeAudioFixture(temp.path(), "broken.flac");
+  writeText(temp.path() / "broken.lrc", "[bad-timestamp]broken line\n");
+  reader->put(broken, rawMetadata("Broken", {RawTagLyricLine{std::chrono::milliseconds{100}, "broken embedded"}}));
+
+  std::size_t startedBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+  }
+  watchers->states[0]->callback(fileEvent(broken, WatchEffectKind::Created));
+  watchers->states[0]->callback(fileEvent(broken, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 2U);
+  // 沉降窗口：损坏 sidecar 若被误升级为异常/兜底重扫，ScanStarted 会在断言前出现。
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  CHECK(reader->readCount() == 2U);
+  const auto songs = songsIn(service->snapshot());
+  const auto found = std::ranges::find_if(songs, [&](const SongMetadata& song) { return song.filePath == broken; });
+  REQUIRE(found != songs.end());
+  CHECK(found->title == "Broken");
+  CHECK(found->effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  REQUIRE(found->effectiveLyrics.size() == 1U);
+  CHECK(found->effectiveLyrics[0].text == "broken embedded");
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(std::ranges::any_of(events, [&](const ScannerEvent& event) {
+      if (event.type != ScannerEventType::ScanError || !std::holds_alternative<ScannerError>(event.payload)) {
+        return false;
+      }
+      const auto& error = std::get<ScannerError>(event.payload);
+      return error.message == "failed to parse external lyrics" && error.code == ScannerErrorCode::MetadataReadFailed &&
+             error.path == temp.path() / "broken.lrc";
+    }));
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  const auto foundLocation = std::ranges::find_if(locations, [&](const cache::CachedLocation& location) {
+    return location.filePath == broken;
+  });
+  REQUIRE(foundLocation != locations.end());
+  CHECK(foundLocation->lyricsSource == LyricsSource::EmbeddedTag);
+  CHECK(sidecar.loadLyrics(foundLocation->locationId, "external").empty());
 }
 
 }
