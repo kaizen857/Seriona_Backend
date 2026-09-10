@@ -15,6 +15,8 @@ extern "C" {
 #include <string_view>
 #include <utility>
 
+#include <spdlog/spdlog.h>
+
 namespace seriona::audio::detail {
 
 namespace {
@@ -118,6 +120,10 @@ std::string ffmpegErrorDetail(int value) {
     return "unknown ffmpeg error " + std::to_string(value);
   }
   return buffer.data();
+}
+
+void logWaveformInvalidPacketSkipped(std::string_view context, int ffmpegCode) {
+  spdlog::warn("{} skipped invalid audio packet: {}", context, ffmpegErrorDetail(ffmpegCode));
 }
 
 WaveformFormatContextPtr openWaveformInput(const std::filesystem::path& filepath) {

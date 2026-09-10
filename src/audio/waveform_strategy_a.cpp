@@ -414,12 +414,7 @@ std::vector<BarData> processAudioChunkStrategyA(const StrategyAChunkRequest& req
     if (packet->stream_index == stream.index) {
       static_cast<void>(stripTrailingId3v1TagIfPresent(*packet, *input, stream));
       if (packet->size > 0) {
-        const int sendResult = avcodec_send_packet(decoder.get(), packet.get());
-        if (sendResult < 0) {
-          av_packet_unref(packet.get());
-          throw strategyADecodeError("failed to send strategy A waveform packet", sendResult);
-        }
-        needsMore = receiveFrames();
+        needsMore = sendWaveformPacket(*decoder, *packet, receiveFrames, "strategy A waveform");
       }
     }
     av_packet_unref(packet.get());
