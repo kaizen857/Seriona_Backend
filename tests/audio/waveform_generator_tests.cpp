@@ -304,6 +304,48 @@ void copyWaveformProbeWithId3v1Tag(const std::filesystem::path& sourceMp3,
   REQUIRE(output.good());
 }
 
+// 追加 1151 字节非音频垃圾到 MP3 末尾（长度取自用户报告文件的垃圾区）。
+// ffmpeg mp3 解复用器会把它作为最后一个包交给解码器，解码器以
+// AVERROR_INVALIDDATA（"Header missing"）拒绝——用于回归"波形生成容忍无效
+// 尾包、不中止整次构建"。
+void appendWaveformProbeJunkTail(const std::filesystem::path& mp3, int junkBytes = 1151) {
+  std::ifstream input{mp3, std::ios::binary | std::ios::ate};
+  REQUIRE(input.good());
+  const auto size = input.tellg();
+  std::vector<char> bytes(static_cast<std::size_t>(size));
+  input.seekg(0);
+  input.read(bytes.data(), static_cast<std::streamsize>(size));
+  input.close();
+
+  std::ofstream output{mp3, std::ios::binary | std::ios::trunc};
+  REQUIRE(output.good());
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+
+  std::uint32_t state = 0x12345678U;
+  for (int index = 0; index < junkBytes; ++index) {
+    state = (state * 1664525U) + 1013904223U;
+    const char byte = static_cast<char>(state >> 24U);
+    output.write(&byte, 1);
+  }
+  REQUIRE(output.good());
+}
+
+struct WaveformProbeJunkTailFixtures {
+  std::filesystem::path cleanMp3;
+  std::filesystem::path junkMp3;
+};
+
+// 同源对照夹具：clean = 正常 MP3，junk = 同一文件追加垃圾尾部。
+WaveformProbeJunkTailFixtures makeWaveformProbeJunkTailFixtures(const std::string& name, std::uint32_t frames) {
+  const auto wav = waveformProbeSineFixture(name + ".wav", frames);
+  const auto cleanMp3 = waveformProbeFixtureDir() / (name + "_clean.mp3");
+  transcodeWaveformProbeMp3(wav, cleanMp3);
+  const auto junkMp3 = waveformProbeFixtureDir() / (name + "_junk.mp3");
+  std::filesystem::copy_file(cleanMp3, junkMp3, std::filesystem::copy_options::overwrite_existing);
+  appendWaveformProbeJunkTail(junkMp3);
+  return {cleanMp3, junkMp3};
+}
+
 WaveformPacketPtr makeSyntheticTerminalTagPacket(int streamIndex, std::uintmax_t fileSize) {
   constexpr int packetSize = 256;
   REQUIRE(fileSize >= static_cast<std::uintmax_t>(packetSize));
@@ -1517,4 +1559,107 @@ TEST_CASE("waveform perf release fixtures meet hard limits and record comparison
   runs.push_back(measureWaveformPerfRun(*flac, simdDisabledConfig, "comparison_enableSIMD_false", false));
 
   writeWaveformPerfReport(runs);
+}
+
+// 回归（用户报告）：畸形 MP3 的尾部垃圾包被解码器拒绝（AVERROR_INVALIDDATA，
+// "Header missing"）时，波形生成必须跳过该包继续，而不是中止整次构建——与播放
+// 链路 ffmpeg_audio_source 的容错策略一致；且无效尾包不得改变其余波形结果。
+TEST_CASE("waveform public junk tail packet is skipped and waveform still builds") {
+  constexpr int barCount = 60;
+  constexpr auto frames = std::uint32_t{48'000 * 3};
+  const auto fixtures = makeWaveformProbeJunkTailFixtures("waveform_public_junk_tail", frames);
+
+  int cleanBarWidth = 0;
+  const auto cleanHeights =
+      buildAudioWaveform(fixtures.cleanMp3.string(), barCount, 320, cleanBarWidth, 68, 0, 0, WaveformConfig{});
+
+  int barWidth = 0;
+  std::vector<int> heights;
+  CHECK_NOTHROW(heights = buildAudioWaveform(fixtures.junkMp3.string(), barCount, 320, barWidth, 68, 0, 0, WaveformConfig{}));
+
+  REQUIRE(heights.size() == static_cast<std::size_t>(barCount));
+  CHECK(heights == cleanHeights);
+  CHECK(barWidth == cleanBarWidth);
+}
+
+// 同一场景的策略 A 无线程池兄弟路径（scalar）回归：无效尾包同样必须被跳过。
+TEST_CASE("waveform scalar junk tail packet is skipped and bars still build") {
+  constexpr int barCount = 24;
+  constexpr auto frames = std::uint32_t{48'000 * 2};
+  const auto fixtures = makeWaveformProbeJunkTailFixtures("waveform_scalar_junk_tail", frames);
+  const auto range = normalizeTimeRange(0, 0, waveformProbeDurationUs(frames));
+  REQUIRE(range.hasDuration);
+
+  const auto cleanBars = buildScalarWaveformBars(fixtures.cleanMp3, barCount, range);
+  std::vector<BarData> bars;
+  CHECK_NOTHROW(bars = buildScalarWaveformBars(fixtures.junkMp3, barCount, range));
+
+  REQUIRE(bars.size() == static_cast<std::size_t>(barCount));
+  requireBarsClose(bars, cleanBars);
+}
+
+// 容错发送助手的确定性单测：垃圾包被跳过（不抛出），解码器保持可用，
+// 后续有效包仍能解码出帧。
+TEST_CASE("waveform ffmpeg tolerant send skips invalid packet and keeps decoder usable") {
+  constexpr auto frames = std::uint32_t{48'000};
+  const auto wav = waveformProbeSineFixture("waveform_tolerant_send.wav", frames);
+  const auto mp3 = waveformProbeFixtureDir() / "waveform_tolerant_send.mp3";
+  transcodeWaveformProbeMp3(wav, mp3);
+
+  auto input = openWaveformInput(mp3);
+  auto& stream = findBestAudioStream(*input);
+
+  WaveformPacketPtr garbage{av_packet_alloc()};
+  REQUIRE(garbage != nullptr);
+  REQUIRE(av_new_packet(garbage.get(), 1151) == 0);
+  std::uint32_t state = 0x12345678U;
+  for (int index = 0; index < garbage->size; ++index) {
+    state = (state * 1664525U) + 1013904223U;
+    garbage->data[index] = static_cast<std::uint8_t>(state >> 24U);
+  }
+  garbage->stream_index = stream.index;
+
+  // 直接发送同一垃圾包：确认 mp3 解码器确实拒绝（容错路径的触发条件）。
+  {
+    auto probeDecoder = openDecoderForStream(stream, 1);
+    const int directSend = avcodec_send_packet(probeDecoder.get(), garbage.get());
+    MESSAGE("direct garbage packet send result=" << directSend);
+    CHECK(directSend == AVERROR_INVALIDDATA);
+  }
+
+  auto decoder = openDecoderForStream(stream, 1);
+  int drainedFrames = 0;
+  WaveformFramePtr frame{av_frame_alloc()};
+  REQUIRE(frame != nullptr);
+  const auto drain = [&] {
+    while (avcodec_receive_frame(decoder.get(), frame.get()) == 0) {
+      ++drainedFrames;
+      av_frame_unref(frame.get());
+    }
+    return true;
+  };
+
+  bool continueDecoding = false;
+  CHECK_NOTHROW(continueDecoding = sendWaveformPacket(*decoder, *garbage, drain, "test waveform"));
+  CHECK(continueDecoding);
+
+  // 跳过无效包后，后续有效包仍可正常解码。
+  int sentValidPackets = 0;
+  while (drainedFrames == 0 && sentValidPackets < 16) {
+    WaveformPacketPtr valid{av_packet_alloc()};
+    REQUIRE(valid != nullptr);
+    int readResult = 0;
+    while ((readResult = av_read_frame(input.get(), valid.get())) >= 0) {
+      if (valid->stream_index == stream.index && valid->size > 0) {
+        break;
+      }
+      av_packet_unref(valid.get());
+    }
+    if (readResult < 0) {
+      break;
+    }
+    ++sentValidPackets;
+    CHECK_NOTHROW(static_cast<void>(sendWaveformPacket(*decoder, *valid, drain, "test waveform")));
+  }
+  CHECK(drainedFrames > 0);
 }

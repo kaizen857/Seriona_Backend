@@ -403,19 +403,7 @@ template <typename Sample>
       continue;
     }
 
-    int sendResult = avcodec_send_packet(decoder.get(), packet.get());
-    if (sendResult == AVERROR(EAGAIN)) {
-      needsMore = receiveFrames();
-      if (!needsMore) {
-        break;
-      }
-      sendResult = avcodec_send_packet(decoder.get(), packet.get());
-    }
-    if (sendResult < 0) {
-      throw strategyBDecodeError("failed to send strategy B waveform packet", sendResult);
-    }
-
-    needsMore = receiveFrames();
+    needsMore = sendWaveformPacket(*decoder, *packet, receiveFrames, "strategy B waveform");
   }
 
   if (needsMore) {

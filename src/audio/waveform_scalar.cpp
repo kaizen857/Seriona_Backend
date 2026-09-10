@@ -348,12 +348,7 @@ std::vector<BarData> buildScalarWaveformBars(const std::filesystem::path& filepa
     if (packet->stream_index == stream.index) {
       static_cast<void>(stripTrailingId3v1TagIfPresent(*packet, *input, stream));
       if (packet->size > 0) {
-        const int sendResult = avcodec_send_packet(decoder.get(), packet.get());
-        if (sendResult < 0) {
-          av_packet_unref(packet.get());
-          throw scalarDecodeError("failed to send scalar waveform packet", sendResult);
-        }
-        needsMore = receiveFrames();
+        needsMore = sendWaveformPacket(*decoder, *packet, receiveFrames, "scalar waveform");
       }
     }
     av_packet_unref(packet.get());
