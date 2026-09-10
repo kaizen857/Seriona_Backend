@@ -333,7 +333,7 @@ TEST_CASE("scanner watcher debounces create modify rename into precise classifie
   std::filesystem::rename(first, renamed);
   reader->put(renamed, rawMetadata("Renamed"));
   std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
-  // wtr rename 对约定：primary = 旧路径（MOVED_FROM），associated = 新路径（MOVED_TO）。
+  // rename 对约定：primary = 旧路径（MOVED_FROM），associated = 新路径（MOVED_TO）。
   WatchEvent rename = fileEvent(first, WatchEffectKind::Renamed);
   rename.associated.push_back(fileEvent(renamed, WatchEffectKind::Renamed));
   watchers->states[0]->callback(fileEvent(created, WatchEffectKind::Created));
@@ -767,8 +767,8 @@ TEST_CASE("scanner watcher precisely removes a directory moved out of the root")
 }
 
 TEST_CASE("scanner watcher dedups same-path move-self and flush destroy within one batch") {
-  // 波 2（wtr-fae-flush todo 3）：目录 mv 出根时 wtr 可能同时报 IN_MOVE_SELF
-  // （Other/Directory → moveSelfByRaw）与 flush destroy（Destroyed/Directory → destroyByKey），
+  // 目录 mv 出根时监视器可能同时上报 move-self（Other/Directory → moveSelfByRaw）
+  // 与 destroy（Destroyed/Directory → destroyByKey），
   // 两路都汇入 removes。applyClassifierBatch 的批内去重（按 pathKey(abs)，保留首个）保证
   // 同路径 remove 只应用一次：精准删除、单次发布、不回落重扫、无重复 ScannerEvent。
   test::TempScannerRoot temp{"scanner-watcher-remove-dedup"};

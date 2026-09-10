@@ -19,11 +19,11 @@ target_link_libraries(seriona_scanner_cold_perf PRIVATE
 
 seriona_enable_warnings(seriona_scanner_cold_perf)
 
-# 目录移出监视根审计程序：真实 FileScannerService + 真实 wtr::watch 监视器，
+# 目录移出监视根审计程序：真实 FileScannerService + 生产 efsw 监视器，
 # 在临时目录做文件系统操作对照实验，验证
-# "目录 mv 出监视根时 wtr.watcher 不产生事件 -> 扫描不触发 -> 播放列表不更新"。
+# "目录 mv 出监视根时监视器不产生事件 -> 扫描不触发 -> 播放列表不更新"。
 # 只链接 seriona_scanner（其依赖 SQLite3/xxhash/TagReaderCore/BS::thread_pool/
-# watcher 头/spdlog 均为 PUBLIC 传递，见根 CMakeLists.txt）。
+# spdlog 均为 PUBLIC 传递，见根 CMakeLists.txt）。
 add_executable(seriona_watch_root_move_audit
   watch_root_move_audit.cpp
 )

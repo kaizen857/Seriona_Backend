@@ -1,8 +1,8 @@
 // 目录移出监视根审计程序（watch_root_move_audit）
 //
 // 独立审计工具：只链接 seriona_scanner，使用真实 FileScannerService
-// （注入式工厂 makeFileScannerService + 生产回填的 WtrFolderWatcherFactory，
-// 即真实的 wtr::watch 监视器），在临时目录做文件系统操作对照实验，
+// （注入式工厂 makeFileScannerService + 生产回填的 EfswFolderWatcherFactory，
+// 即真实的 efsw 监视器），在临时目录做文件系统操作对照实验，
 // 验证"事件驱动精准增量（方案 B）"的核心假设：
 //   - 目录 mv 出监视根 → IN_MOVE_SELF 触发精准删除（树 removeSubtree +
 //     SQLite deleteByPathPrefix），快照收敛为 0 首，scan 不增长；
@@ -391,7 +391,7 @@ void reportMoveOutScene(int index, std::string_view title,
 //   S9 停止/析构竞态
 //
 // 用法：
-//   seriona_watch_root_move_audit                     原有 wtr 移出审计（无参数，行为不变）
+//   seriona_watch_root_move_audit                     原有移出审计（无参数，行为不变）
 //   seriona_watch_root_move_audit --efsw-matrix DIR   efsw 矩阵，日志写 DIR/scenario-*.log
 //   seriona_watch_root_move_audit --efsw-negative     无效路径负向用例（预期非 0 退出）
 //
@@ -1906,10 +1906,10 @@ int runEfswNegative() {
 }  // namespace gate0
 
 // ============================================================================
-// 主流程（原有 wtr 移出审计；无参数模式行为保持不变）
+// 主流程（原有移出审计；无参数模式行为保持不变）
 // ============================================================================
 
-int runWtrAudit() {
+int runProductionAudit() {
   std::cout << "===== Seriona Watch Root Move Audit =====\n";
   std::cout << "验证假设（方案 B）：目录 mv 出监视根 -> IN_MOVE_SELF 精准删除（快照收敛、scan 不增长）；\n";
   std::cout << "                文件 create/modify/delete、根内 rename -> 精准更新（scan 不增长）；\n";
@@ -1931,8 +1931,8 @@ int runWtrAudit() {
   deps.databasePath = tempRoot / "library.sqlite";
   deps.coverExportDir = tempRoot / "artwork";
   // metadataReader / watcherFactory / folderThumbnailSeam 留空：
-  // 生产实现自动回填 ProductionTagMetadataReader 与真实 WtrFolderWatcherFactory
-  // （file_scanner_orchestrator.cpp:967-983），这正是本审计要用的真实监视器。
+  // 生产实现自动回填 ProductionTagMetadataReader 与真实 EfswFolderWatcherFactory
+  // （file_scanner_orchestrator.cpp:1205），这正是本审计要用的真实监视器。
 
   EventLog log;
   auto service = sc::makeFileScannerService(deps);
@@ -2105,7 +2105,7 @@ int runWtrAudit() {
     printSceneHeader(6, "根内目录 rename（对照组）");
     std::error_code ec;
     fs::rename(sub, sub2, ec);
-    // 方案 B：根内 rename -> renameSubtree 精准更新；真实 wtr 可能因
+    // 方案 B：根内 rename -> renameSubtree 精准更新；真实监视器可能因
     // "dir/rename + 后续 file/other" 回落一次重扫（集成测试接受 baseline+1）。
     // 等待"收敛"信号：快照路径已更新到新路径（旧路径无残留、新路径有歌曲）。
     const bool converged =
@@ -2370,8 +2370,8 @@ int runWtrAudit() {
         }
 
         // 判定（方案 B + 集成测试接受语义）：
-        //   真实 wtr 对 mv 出根会报告 file/other 事件 → 分类器回落全根重扫一次
-        //   （集成测试 scanner_wtr_integration_tests.cpp:188 接受 baseline+1），
+        //   真实监视器对 mv 出根会报告 file/other 事件 → 分类器回落全根重扫一次
+        //   （scanner_efsw_integration_tests.cpp 接受 baseline+1），
         //   只要快照收敛（0 首、无 silent/song.wav 残留）即通过；delta==0 为
         //   精准删除（scan 不增长）的理想路径，delta==1 为接受的有界回落。
         //   delta>1 或未收敛 -> FAIL（真实信号）。
@@ -2414,15 +2414,13 @@ int runWtrAudit() {
     }
   }
 
-  // ---------- 场景 11：单文件 mv 出根（fae flush 精准删除） ----------
-  // 波 1a（wtr-fae-flush）：wtr 只对目录加 watch，单文件移出根外时父目录收到
-  // 孤立 IN_MOVED_FROM（目标在根外 → 无 IN_MOVED_TO 配对），parse_ev 将其存入
-  // fae 16 槽环缓冲并以 err_pending 抑制转发 → 上层感知不到，只能靠 60s 对账兜底；
-  // fae ~100ms 超时 flush 以 destroy 事件发出 → orchestrator destroyByKey 精准删除
+  // ---------- 场景 11：单文件 mv 出根（精准删除） ----------
+  // 单文件移出根外时父目录收到孤立 IN_MOVED_FROM（目标在根外 → 无 IN_MOVED_TO
+  // 配对），监视器将其上报为 destroy 事件 → orchestrator destroyByKey 精准删除
   // （快照收敛 0 首、scan 不增长）。
   // 与场景 7/8/9/10（目录 mv，可能回落重扫）区分：单文件 + 短窗口精准语义，
-  // scanStartedDelta 必须 == 0（flush-destroy 精准删除，非对账/回落）。
-  // 观察窗口 3s >> flush 100ms，但 << 60s 对账周期 → 收敛只能来自 flush-destroy。
+  // scanStartedDelta 必须 == 0（destroy 精准删除，非对账/回落）。
+  // 观察窗口 3s >> 监视/去抖延迟，但 << 60s 对账周期 → 收敛只能来自 destroy 精准删除。
   {
     printSceneHeader(11, "单文件 mv 出根（fae flush 精准删除）");
     const fs::path faeDir = musicRoot / "fae";
@@ -2512,8 +2510,8 @@ int runWtrAudit() {
   }
 
   // ---------- 清理 ----------
-  // 显式 stopWatching + stop：wtr close 阻塞等待监视线程退出（watcher.hpp:2405-2409），
-  // 之后再销毁服务与删除临时目录，避免 watcher 扫描未结束的目录。
+  // 显式 stopWatching + stop：停止监视器并等待线程退出，
+  // 之后再销毁服务与删除临时目录，避免监视器扫描未结束的目录。
   service->stopWatching();
   service->stop();
   service.reset();
@@ -2529,14 +2527,14 @@ int runWtrAudit() {
 
 // ============================================================================
 // 入口分发
-//   无参数                      → 原有 wtr 移出审计（11 场景）
+//   无参数                      → 原有移出审计（11 场景）
 //   --efsw-matrix <输出目录>    → Gate 0 efsw 语义矩阵（scenario-*.log + d4）
 //   --efsw-negative             → 无效路径负向用例（明确报错 + 非 0 退出）
 // ============================================================================
 
 int main(int argc, char** argv) {
   if (argc <= 1) {
-    return runWtrAudit();
+    return runProductionAudit();
   }
   const std::string first = argv[1];
   if (first == "--efsw-matrix") {
@@ -2555,7 +2553,7 @@ int main(int argc, char** argv) {
   }
   if (first == "--help" || first == "-h") {
     std::cout << "用法:\n"
-              << "  seriona_watch_root_move_audit                     原有 wtr 移出审计（11 场景）\n"
+              << "  seriona_watch_root_move_audit                     原有移出审计（11 场景）\n"
               << "  seriona_watch_root_move_audit --efsw-matrix DIR   Gate 0 efsw 矩阵"
                  "（日志写 DIR/scenario-*.log）\n"
               << "  seriona_watch_root_move_audit --efsw-negative     无效路径负向用例"

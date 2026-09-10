@@ -124,20 +124,6 @@ target_include_directories(seriona_third_party_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/miniaudio>
 )
 
-add_library(seriona_watcher_headers INTERFACE)
-target_include_directories(seriona_watcher_headers INTERFACE
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/watcher/include>
-)
-
-if(APPLE)
-  # watcher 在 macOS 下走 FSEvents（Linux inotify / Windows ReadDirectoryChangesW
-  # 无需额外库），CFArrayCreate/FSEventStreamCreate 等符号来自这两个框架。
-  target_link_libraries(seriona_watcher_headers INTERFACE
-    "-framework CoreFoundation"
-    "-framework CoreServices"
-  )
-endif()
-
 add_library(seriona_audio STATIC
   src/audio/audio_playback_service.cpp
   src/audio/buffer/pcm_buffer_queue.cpp
@@ -408,7 +394,6 @@ target_link_libraries(seriona_scanner
     PkgConfig::SERIONA_XXHASH
     ${SERIONA_TAGREADER_TARGET}
     BS::thread_pool
-    seriona_watcher_headers
     spdlog::spdlog
 )
 
@@ -485,9 +470,6 @@ if(SERIONA_INSTALL_EXPORT)
     $<INSTALL_INTERFACE:include/third_party/doctest>
     $<INSTALL_INTERFACE:include/third_party/miniaudio>
   )
-  target_include_directories(seriona_watcher_headers INTERFACE
-    $<INSTALL_INTERFACE:include/third_party/watcher>
-  )
   target_include_directories(BS_thread_pool SYSTEM INTERFACE
     $<INSTALL_INTERFACE:include/third_party/thread_pool>
   )
@@ -499,7 +481,7 @@ if(SERIONA_INSTALL_EXPORT)
   )
 
   install(TARGETS seriona_audio seriona_scanner seriona_metadata seriona_app seriona_control
-          seriona_third_party_headers seriona_watcher_headers BS_thread_pool
+          seriona_third_party_headers BS_thread_pool
           efsw-static
     EXPORT SerionaBackendTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -510,8 +492,6 @@ if(SERIONA_INSTALL_EXPORT)
   install(DIRECTORY inc/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(DIRECTORY third_party/doctest third_party/miniaudio
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party)
-  install(DIRECTORY third_party/watcher/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/watcher)
   install(DIRECTORY "${thread_pool_SOURCE_DIR}/include/"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/thread_pool)
   install(DIRECTORY "${efsw_SOURCE_DIR}/include/"
