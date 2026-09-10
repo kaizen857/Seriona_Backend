@@ -70,7 +70,7 @@ TEST_CASE("logging bootstrap initializes and writes all five levels") {
     std::remove((logPath + ".2").c_str());
     std::remove((logPath + ".3").c_str());
 
-    seriona::logging::initialize(spdlog::level::info, logPath);
+    seriona::logging::initialize(spdlog::level::info, std::filesystem::path{logPath});
 
     spdlog::debug("debug message");
     spdlog::info("info message");
@@ -229,4 +229,57 @@ TEST_CASE("prepareLogFile timestamped filename matches expected pattern") {
     CHECK_FALSE(fs::exists(result));
 
     fs::remove_all(tmpDir);
+}
+
+// -----------------------------------------------------------------------
+// 非 ASCII 路径回归：initialize/createDedicatedLogger 的日志文件必须能落在
+// 含中文/假名/西里尔/符号的目录下（Windows 曾因 spdlog 窄 fopen 而失败）。
+// -----------------------------------------------------------------------
+
+[[nodiscard]] std::filesystem::path u8TestPath(const char* utf8) {
+    return std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(utf8)}};
+}
+
+TEST_CASE("logging initialize writes through non-ASCII directories") {
+    const auto root = std::filesystem::temp_directory_path() /
+                      u8TestPath("seriona-logging-日志-テスト-тест-♪-dir");
+    fs::create_directories(root);
+    REQUIRE(fs::is_directory(root));
+
+    const auto mainLog = root / u8TestPath("seriona-日志-テスト.log");
+    seriona::logging::initialize(spdlog::level::off, mainLog);
+
+    spdlog::info("non-ascii log path message 中文/日本語");
+    spdlog::default_logger()->flush();
+
+    std::ifstream in(mainLog);
+    REQUIRE(in.is_open());
+    const std::string content((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+    CHECK(content.find("non-ascii log path message") != std::string::npos);
+    in.close();
+
+    const auto errLog = root / u8TestPath("tagreader-错误-エラー.log");
+    auto dedicated = seriona::logging::createDedicatedLogger("tagreader_errors_non_ascii_test",
+                                                             errLog,
+                                                             spdlog::level::info);
+    REQUIRE(dedicated != nullptr);
+    dedicated->info("dedicated non-ascii 专用日志");
+    dedicated->flush();
+    spdlog::drop("tagreader_errors_non_ascii_test");
+
+    std::ifstream inErr(errLog);
+    REQUIRE(inErr.is_open());
+    const std::string errContent((std::istreambuf_iterator<char>(inErr)),
+                                 std::istreambuf_iterator<char>());
+    CHECK(errContent.find("dedicated non-ascii") != std::string::npos);
+    inErr.close();
+
+    // Windows 上打开中的文件不可删除：先释放全部句柄——局部持有的 dedicated
+    // logger（drop 只注销注册名，shared_ptr 仍在则 sink 不析构）、initialize()
+    // 注册的默认 logger，再清理临时目录。本用例是文件内最后一个用例，
+    // 全局 shutdown 不影响后续用例。
+    dedicated.reset();
+    spdlog::shutdown();
+    fs::remove_all(root);
 }

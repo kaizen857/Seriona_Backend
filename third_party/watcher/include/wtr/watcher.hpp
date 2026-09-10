@@ -382,6 +382,12 @@ inline auto operator<<(
 
 namespace detail::wtr::watcher {
 
+[[nodiscard]] inline auto path_to_utf8(std::filesystem::path const& path) -> std::string
+{
+  const auto utf8 = path.generic_u8string();
+  return {utf8.begin(), utf8.end()};
+}
+
 /*  A semaphore-like construct which can be
     used with the "native" async I/O APIs
     on (currently) Linux and Darwin.
@@ -2050,7 +2056,7 @@ inline auto do_event_send(
         }
       }();
 
-      auto path_key = path_name.generic_string();
+      auto path_key = path_to_utf8(path_name);
       auto path_type = [&]()
       {
         /*  For destroy events and rename-old events, the path no longer exists
@@ -2438,17 +2444,19 @@ public:
             auto abs_path = std::filesystem::absolute(path, ec);
             auto pre_ok = ! ec && std::filesystem::is_directory(abs_path, ec)
                        && ! ec && this->living.state() == sb::state::pending;
-            auto live_msg =
-              (pre_ok ? "s/self/live@" : "e/self/live@") + abs_path.string();
+            auto live_path = std::filesystem::path{
+              std::u8string{pre_ok ? u8"s/self/live@" : u8"e/self/live@"}
+                + abs_path.generic_u8string()};
             callback(
-              {live_msg,
+              {live_path,
                event::effect_type::create,
                event::path_type::watcher});
             auto post_ok = pre_ok && watch(abs_path, callback, this->living);
-            auto die_msg =
-              (post_ok ? "s/self/die@" : "e/self/die@") + abs_path.string();
+            auto die_path = std::filesystem::path{
+              std::u8string{post_ok ? u8"s/self/die@" : u8"e/self/die@"}
+                + abs_path.generic_u8string()};
             callback(
-              {die_msg,
+              {die_path,
                event::effect_type::destroy,
                event::path_type::watcher});
             return pre_ok && post_ok;

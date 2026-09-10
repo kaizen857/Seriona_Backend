@@ -16,9 +16,7 @@ void initializeApplicationLogging(const RuntimePaths& runtimePaths) {
 #endif
 
   const auto logFile = seriona::logging::prepareLogFile(runtimePaths.logFile.parent_path());
-  seriona::logging::initialize(loggerLevel,
-                               seriona::logging::pathText(logFile),
-                               loggerLevel);
+  seriona::logging::initialize(loggerLevel, logFile, loggerLevel);
   spdlog::info("seriona application logging initialized");
   spdlog::info("  data root:   {}", seriona::logging::pathText(runtimePaths.dataRoot));
   spdlog::info("  log file:    {}", seriona::logging::pathText(logFile));

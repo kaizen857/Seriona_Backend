@@ -223,15 +223,24 @@ std::string shellQuoteText(const std::string& text) {
 #endif
 }
 
+std::string waveformFfmpegExecutable() {
+  return shellQuote(std::filesystem::path{SERIONA_TEST_FFMPEG_EXECUTABLE});
+}
+
 void requireWaveformFfmpegCommand(const std::string& command) {
-  const int exitCode = std::system(command.c_str());
+#if defined(_WIN32)
+  const auto systemCommand = '"' + command + '"';
+#else
+  const auto& systemCommand = command;
+#endif
+  const int exitCode = std::system(systemCommand.c_str());
   REQUIRE_MESSAGE(exitCode == 0, "ffmpeg command failed with exit=" << exitCode << ": " << command);
 }
 
 void transcodeWaveformProbeMp3(const std::filesystem::path& sourceWav,
                                const std::filesystem::path& outputMp3,
                                const char* bitrate = "128k") {
-  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = waveformFfmpegExecutable() + " -v error -nostdin -y -i " + shellQuote(sourceWav) +
                        " -map_metadata -1 -id3v2_version 0 -write_id3v1 0 -codec:a libmp3lame -b:a " + bitrate + " " +
                        shellQuote(outputMp3);
 
@@ -240,7 +249,7 @@ void transcodeWaveformProbeMp3(const std::filesystem::path& sourceWav,
 }
 
 void transcodeWaveformProbeFlac(const std::filesystem::path& sourceWav, const std::filesystem::path& outputFlac) {
-  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = waveformFfmpegExecutable() + " -v error -nostdin -y -i " + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a flac " + shellQuote(outputFlac);
 
   requireWaveformFfmpegCommand(command);
@@ -248,7 +257,7 @@ void transcodeWaveformProbeFlac(const std::filesystem::path& sourceWav, const st
 }
 
 void transcodeWaveformProbeM4a(const std::filesystem::path& sourceWav, const std::filesystem::path& outputM4a) {
-  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = waveformFfmpegExecutable() + " -v error -nostdin -y -i " + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a aac -b:a 128k " + shellQuote(outputM4a);
 
   requireWaveformFfmpegCommand(command);
@@ -256,7 +265,7 @@ void transcodeWaveformProbeM4a(const std::filesystem::path& sourceWav, const std
 }
 
 void transcodeWaveformProbeMp4(const std::filesystem::path& sourceWav, const std::filesystem::path& outputMp4) {
-  const auto command = std::string{"ffmpeg -v error -nostdin -y -i "} + shellQuote(sourceWav) +
+  const auto command = waveformFfmpegExecutable() + " -v error -nostdin -y -i " + shellQuote(sourceWav) +
                        " -map_metadata -1 -codec:a aac -b:a 128k -f mp4 " + shellQuote(outputMp4);
 
   requireWaveformFfmpegCommand(command);
@@ -272,7 +281,7 @@ void generateWaveformPerfSourceWav(const std::filesystem::path& outputWav) {
   const auto filter = std::string{"[0:a][1:a]amix=inputs=2:normalize=0,volume=0.7,"} +
                       "aformat=sample_fmts=s16:sample_rates=" + std::to_string(kWaveformPerfSampleRate) +
                       ":channel_layouts=mono";
-  const auto command = std::string{"ffmpeg -v error -nostdin -y -f lavfi -i "} + shellQuoteText(sine) +
+  const auto command = waveformFfmpegExecutable() + " -v error -nostdin -y -f lavfi -i " + shellQuoteText(sine) +
                        " -f lavfi -i " + shellQuoteText(noise) + " -filter_complex " + shellQuoteText(filter) +
                        " -codec:a pcm_s16le " + shellQuote(outputWav);
 

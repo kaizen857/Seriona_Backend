@@ -1122,15 +1122,20 @@ TEST_CASE("scanner watcher refreshes scan-root hash so the next reconcile stays 
       std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
   }();
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  bool incrementalScanCompleted = false;
   for (auto attempt = 0; attempt != 1000; ++attempt) {
-    std::scoped_lock lock{eventsMutex};
-    const auto completed = static_cast<std::size_t>(
-      std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
-    if (completed > completedBefore && songsIn(service->snapshot()).size() == 2U) {
+    {
+      std::scoped_lock lock{eventsMutex};
+      const auto completed = static_cast<std::size_t>(
+        std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
+      incrementalScanCompleted = completed > completedBefore;
+    }
+    if (incrementalScanCompleted && songsIn(service->snapshot()).size() == 2U) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
+  REQUIRE(incrementalScanCompleted);
   CHECK(reader->readCount() == 2U);
   CHECK(songsIn(service->snapshot()).size() == 2U);
 }

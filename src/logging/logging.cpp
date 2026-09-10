@@ -1,21 +1,113 @@
 #include "logging/logging.h"
 
-#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <vector>
 
 namespace seriona {
 namespace logging {
+namespace {
+
+// spdlog 内置 rotating_file_sink 在 Windows 上以窄字符 fopen（ANSI 代码页）
+// 打开文件：UTF-8 路径一旦包含无法映射到代码页的字符即抛
+// "No mapping for the Unicode character exists in the target multi-byte code page"
+// （EILSEQ / ERROR_NO_UNICODE_TRANSLATION），中文等非 ASCII 安装目录必现。
+// 本 sink 改用 std::ofstream(std::filesystem::path)：MSVC 走宽字符（CreateFileW）
+// 通道，libc++/libstdc++ 走 UTF-8 字节直通——三端统一，任意 Unicode 路径可用。
+// 轮转改名与删除同样经 std::filesystem（宽字符安全），不复用 spdlog 内部的窄 rename。
+class Utf8RotatingFileSink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  Utf8RotatingFileSink(std::filesystem::path base_path, std::size_t max_size, std::size_t max_files)
+      : base_path_(std::move(base_path)), max_size_(max_size), max_files_(max_files) {
+    if (max_size_ == 0) {
+      throw spdlog::spdlog_ex("rotating file sink: max_size must be positive");
+    }
+    openFile();
+  }
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    spdlog::memory_buf_t formatted;
+    formatter_->format(msg, formatted);
+    if (current_size_ + formatted.size() > max_size_) {
+      rotate();
+    }
+    file_.write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
+    current_size_ += formatted.size();
+    if (!file_) {
+      throw spdlog::spdlog_ex("rotating file sink: write failed for " + pathText(base_path_));
+    }
+  }
+
+  void flush_() override {
+    if (file_.is_open()) {
+      file_.flush();
+    }
+  }
+
+ private:
+  void openFile() {
+    file_.open(base_path_, std::ios::binary | std::ios::app);
+    if (!file_) {
+      throw spdlog::spdlog_ex("failed opening file " + pathText(base_path_) +
+                              " for writing: " + std::strerror(errno));
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(base_path_, ec);
+    current_size_ = ec ? 0 : static_cast<std::size_t>(size);
+  }
+
+  // spdlog 轮转语义：写满 max_size 后当前文件更名为 base.1（最新轮转），
+  // 既有 base.i 依次后移为 base.(i+1)，最老 base.max_files 删除；随后重开 base 追加。
+  // 目标存在时先删再 rename（Windows/POSIX 覆盖语义不一致）；失败均 best-effort。
+  void rotate() {
+    file_.close();
+    if (max_files_ > 1) {
+      std::error_code ec;
+      std::filesystem::remove(rotatedPath(max_files_), ec);
+      for (std::size_t i = max_files_ - 1; i >= 1; --i) {
+        const auto from = rotatedPath(i);
+        std::error_code existsEc;
+        if (std::filesystem::exists(from, existsEc)) {
+          std::filesystem::remove(rotatedPath(i + 1), ec);
+          std::filesystem::rename(from, rotatedPath(i + 1), ec);
+        }
+      }
+    }
+    std::error_code ec;
+    std::filesystem::remove(rotatedPath(1), ec);
+    std::filesystem::rename(base_path_, rotatedPath(1), ec);
+    openFile();
+  }
+
+  [[nodiscard]] std::filesystem::path rotatedPath(std::size_t index) const {
+    auto path = base_path_;
+    path += "." + std::to_string(index);
+    return path;
+  }
+
+  std::filesystem::path base_path_;
+  std::size_t max_size_{0};
+  std::size_t max_files_{0};
+  std::size_t current_size_{0};
+  std::ofstream file_;
+};
+
+}  // namespace
 
 void initialize(spdlog::level::level_enum console_level,
-                const std::string& log_file_path,
+                const std::filesystem::path& log_file_path,
                 spdlog::level::level_enum logger_level) {
     constexpr const char* pattern =
         "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v";
@@ -25,9 +117,9 @@ void initialize(spdlog::level::level_enum console_level,
     console_sink->set_level(console_level);
     console_sink->set_pattern(pattern);
 
-    std::shared_ptr<spdlog::sinks::rotating_file_sink_mt> file_sink;
+    std::shared_ptr<Utf8RotatingFileSink> file_sink;
     try {
-        file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+        file_sink = std::make_shared<Utf8RotatingFileSink>(
             log_file_path, 1024 * 1024 * 5, 3);
         file_sink->set_level(spdlog::level::trace);
         file_sink->set_pattern(pattern);
@@ -189,8 +281,8 @@ std::shared_ptr<spdlog::logger> createDedicatedLogger(
         "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v";
     
     try {
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            pathText(log_file_path), 1024 * 1024 * 5, 3);
+        auto file_sink = std::make_shared<Utf8RotatingFileSink>(
+            log_file_path, 1024 * 1024 * 5, 3);
         file_sink->set_level(spdlog::level::trace);
         file_sink->set_pattern(pattern);
         

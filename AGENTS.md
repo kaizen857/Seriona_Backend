@@ -47,6 +47,12 @@
 - `seriona_audio` 必须 PRIVATE 链接 `BS::thread_pool`，根 CMake 有 FATAL_ERROR 守卫；AVX2/FMA 参数仅允许施加于 `src/audio/waveform_simd_avx2.cpp`。
 - 路径文本必须经 `src/scanner/path_utf8.h` 的 `pathToUtf8`/`pathFromUtf8` 往返（`src/audio/path_text.h` 同规则），禁止直接 `std::filesystem::path::string()/generic_string()` 进路径通道（Windows 按 ANSI 代码页转换，非 ASCII 路径抛异常或乱码；约束注释另见 sqlite_cache.cpp、logging.h、sqlite_folder_sort_settings_store.cpp）。
 
+## 跨平台兼容性（Windows / Linux / macOS）
+
+- 后端目标平台是 Windows / Linux / macOS 三端（前端三平台产物均内嵌本库），代码编写与功能开发必须保证三端可配置、可构建、可通过 ctest，属硬约束而非发布前适配项；Windows 固定 MSVC + vcpkg，Linux 用 GCC/Clang（sdbus-c++ 仅在 `UNIX AND NOT APPLE` 条件成立时要求），macOS 用 Apple Clang + Homebrew。
+- 平台差异只允许出现在既有平台边界内、由根 CMake 平台条件源选择：`src/audio/device/` 按 OS 的设备枚举/后端源（WASAPI / PipeWire / miniaudio）、`src/metadata/` 的平台私有实现（`metadata_mpris_linux.cpp`、`metadata_windows_private.cpp` 等）、`runtime_paths.h` 的三路运行时路径解析（XDG / macOS `~/Library` / 便携模式）。新增平台行为必须并入这些文件或建立同等级抽象；禁止在公共头（`inc/seriona/`）与共享实现中散落裸 `#ifdef _WIN32`、POSIX-only（unistd/dirent/`::realpath` 等）或 Windows-only API。
+- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；新增平台源或条件分支必须保证每个 OS 分支仍能配置、编译并通过 `-DSERIONA_BUILD_TESTS=ON` 的测试。改动涉及平台行为而本机无法验证另一平台时，在提交信息中说明受影响面与验证方式。
+
 ## 测试与工具
 - 发现：`ctest --test-dir build -N`；全量：`ctest --test-dir build --output-on-failure`；聚焦：`ctest --test-dir build -R '<regex>' --output-on-failure`。
 - 大量测试目标把被测 `src/*.cpp` 直接编入测试二进制（`${PROJECT_SOURCE_DIR}/src/...`，tests/CMakeLists.txt 共 234 处 src 引用）而非链接五个静态库；新增白盒测试沿用该模式，并注意目标之间的共享实现依赖（如 ffmpeg_audio_source.cpp 同时被 filter pipeline 测试直接编译）。
