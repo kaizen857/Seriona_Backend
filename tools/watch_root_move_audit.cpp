@@ -2087,7 +2087,7 @@ int runProductionAudit() {
                        std::to_string(EventLog::deltaScanStarted(before, after));
     report.resultLine = "歌曲数=" + std::to_string(after.tracks) +
                         (reached ? "（-1 达成）" : "（未达成）");
-    report.verdictLine = reached ? "PASS（对照组：rmdir 触发重扫，快照更新）" : "FAIL（对照组异常）";
+    report.verdictLine = reached ? "PASS（精准删除：rmdir 已知目录收敛，快照更新）" : "FAIL（对照组异常）";
     printSceneData(report);
   }
 
@@ -2369,24 +2369,21 @@ int runProductionAudit() {
           std::cout << "  残留证据: 快照中未找到路径含 \"silent/song.wav\" 的歌曲节点\n";
         }
 
-        // 判定（方案 B + 集成测试接受语义）：
-        //   真实监视器对 mv 出根会报告 file/other 事件 → 分类器回落全根重扫一次
-        //   （scanner_efsw_integration_tests.cpp 接受 baseline+1），
-        //   只要快照收敛（0 首、无 silent/song.wav 残留）即通过；delta==0 为
-        //   精准删除（scan 不增长）的理想路径，delta==1 为接受的有界回落。
-        //   delta>1 或未收敛 -> FAIL（真实信号）。
+        // 判定（精准删除语义；不再接受回落）：
+        //   目录 mv 出根应走 File kind + 树中已知目录前缀的精准子树删除，快照收敛
+        //   （0 首、无 silent/song.wav 残留）且 scan 不增长；delta==0 才算通过，
+        //   delta>0 一律 FAIL（1 次为已知回落缺陷，>1 为多次重扫）。
         const bool converged = (after.tracks == 0) && (residualCount == 0);
         std::string verdictLine;
         if (scanStartedDelta > 1) {
-          verdictLine = "FAIL（mv 触发多次重扫（增量 " + std::to_string(scanStartedDelta) +
-                        " > 1），超集成测试接受上限 baseline+1）";
+          verdictLine = "FAIL（多次重扫）";
         } else if (!converged) {
           verdictLine = "FAIL（快照未收敛：mv 后残留 " + std::to_string(after.tracks) +
                         " 首、残留路径 " + std::to_string(residualCount) + "）";
         } else if (scanStartedDelta == 0) {
           verdictLine = "PASS（IN_MOVE_SELF 精准删除：快照 0 首 + scan 不增长）";
         } else {
-          verdictLine = "PASS（mv 收敛：快照 0 首 + scan 有界（1 次回落，集成测试接受））";
+          verdictLine = "FAIL（mv 后残留 1 次回落重扫，修复后应为 0）";
         }
 
         SceneReport report;

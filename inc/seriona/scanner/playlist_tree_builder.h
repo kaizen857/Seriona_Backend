@@ -41,6 +41,10 @@ public:
   void addSong(PlaylistTreeSong song);
   bool upsertSong(PlaylistTreeSong song);
   bool removeSubtree(const std::filesystem::path& relativePath);
+  // 树中已知目录节点判定（不含根）：事件分类器用它识别"路径已消失、适配层判为 File"的
+  // 目录删除事件能否作为精准子树删除候选。注意：无歌曲的目录在 publish 时被剪枝，
+  // 因此它们刻意不算"已知"（此类事件仍走有界回落）。
+  [[nodiscard]] bool isKnownDirectory(const std::filesystem::path& relativePath) const;
   bool renameSubtree(const std::filesystem::path& oldRelativePath, const std::filesystem::path& newRelativePath);
   void attachExternalLyrics(const std::filesystem::path& audioRelativePath,
                             const std::filesystem::path& lrcRelativePath,

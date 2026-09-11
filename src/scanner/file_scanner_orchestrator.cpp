@@ -1768,6 +1768,39 @@ private:
     return referencedPaths;
   }
 
+  // 目录级精准删除与 CUE 语义交叉的守卫判定（两个漂移方向都要拦，否则补丁结果 != 全量重建）：
+  //   1) 被移除子树内存在 CUE 轨（.cue 节点，或其 filePath 指向 .cue）：该 CUE 轨的源音频
+  //      可能在子树之外，精准删除只清子树内条目会让源音频失去 CUE 可见性来源（幽灵/漏删）；
+  //   2) 被移除子树内存在某 CUE 轨引用的源音频，而该 CUE 轨节点位于子树之外：
+  //      cache.deleteLocationsByPathPrefix 会按 source_file_path 命中并删掉子树内源音频的
+  //      locations 行，但 removeSubtree 无法触及子树外的 CUE 轨节点 → 快照/缓存分歧。
+  //   注意：sourceFilePath 是绝对路径（见 playlist_tree_builder.cpp renameSubtree 注释），
+  //   方向 2 必须以"被移除子树的绝对键"（pathKey(abs)）做前缀比较；此前按 root 相对 relText
+  //   比较使方向 2 恒不命中（回归测试暴露，证据 .omo/evidence/move-out-precise/06b）。
+  // 命中任一方向时调用方不得走精准删除，回落扫描兜底。
+  [[nodiscard]] bool removalCrossesCueSemantics(std::string_view relText, std::string_view absKey) const {
+    const auto underOrEqual = [](std::string_view prefix, std::string_view text) {
+      return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0 &&
+             (text.size() == prefix.size() || text[prefix.size()] == '/');
+    };
+    for (const auto& entry : allSongs_) {
+      const auto relativeText = pathToUtf8(entry.treeRelativePath);
+      if (underOrEqual(relText, relativeText)) {
+        const auto filePathText = pathToUtf8(entry.song.metadata.filePath);
+        if (entry.treeRelativePath.extension() == ".cue" || filePathText.ends_with(".cue")) {
+          return true;
+        }
+      }
+      if (!entry.song.metadata.sourceFilePath.empty()) {
+        const auto sourceKey = pathKey(entry.song.metadata.sourceFilePath);
+        if (underOrEqual(absKey, sourceKey) && !underOrEqual(relText, relativeText)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   [[nodiscard]] bool hiddenByCueSourceVisibility(const RootResult::PublishedSong& song,
                                                  const std::unordered_set<std::string>& cueSourcePaths) const {
     const auto& metadata = song.song.metadata;
@@ -2917,6 +2950,41 @@ private:
       return false;
     }
 
+    // 目录 mv 出根时 efsw 对已消失的受监视子目录发出最深优先的级联 Delete；适配层按磁盘
+    // 状态判为 File（watchPathKindFrom 无 stat 依据），仅凭扩展名无法与"未知文件删除"
+    // 区分。预扫描本批 destroy：把"树中已知目录 + 路径确已消失 + 无 CUE 语义交叉"的条目
+    // 录入 preciseDirRemovalPrefixes；主循环再按前缀覆盖整棵级联。两遍方案与到达顺序无关
+    // （最深优先/最浅优先均可命中），且守卫均在预扫描完成，不会因首个未命中条目提前放弃。
+    std::unordered_set<std::string> preciseDirRemovalPrefixes;
+    for (const auto& [key, destroy] : destroyByKey) {
+      if (destroy.pathKind != WatchPathKind::File) {
+        continue;
+      }
+      const auto root = findRootForPath(roots, destroy.raw);
+      if (!root.has_value() || isRootSelf(destroy.raw, root->path)) {
+        continue;
+      }
+      const auto rel = relativePathFor(root->path, destroy.raw);
+      const auto abs = (root->path / rel).lexically_normal();
+      if (isSupportedAudioExtension(abs, effective.scanner.allowedExtensions) || isCueSheetPath(abs)) {
+        continue;
+      }
+      if (treeBuilder_ == nullptr || !treeBuilder_->isKnownDirectory(rel)) {
+        continue;
+      }
+      std::error_code existsError;
+      const bool stillThere = std::filesystem::exists(abs, existsError);
+      // 路径仍存在或 stat 出错都视为"未知"：不能按目录删除处理。
+      if (stillThere || existsError) {
+        continue;
+      }
+      const auto absKey = pathKey(abs);
+      if (removalCrossesCueSemantics(pathToUtf8(rel), absKey)) {
+        continue;
+      }
+      preciseDirRemovalPrefixes.insert(absKey);
+    }
+
     for (const auto& [key, destroy] : destroyByKey) {
       const auto root = findRootForPath(roots, destroy.raw);
       if (!root.has_value()) {
@@ -2928,9 +2996,27 @@ private:
       }
       const auto rel = relativePathFor(root->path, destroy.raw);
       const auto abs = (root->path / rel).lexically_normal();
-      if (destroy.pathKind == WatchPathKind::File && !isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
-        unclassifiable = true;
-        break;
+      if (destroy.pathKind == WatchPathKind::File) {
+        if (isSupportedAudioExtension(abs, effective.scanner.allowedExtensions)) {
+          removes.push_back(ClassifierRemove{.root = root->path, .abs = abs, .rel = rel});
+          continue;
+        }
+        if (isCueSheetPath(abs)) {
+          // 独立 .cue 删除保持既有回落语义（CUE 解析/轨道展开由全量重建负责）。
+          unclassifiable = true;
+          break;
+        }
+        const auto candidateKey = pathKey(abs);
+        const bool coveredByKnownDirectory = std::ranges::any_of(
+            preciseDirRemovalPrefixes, [&candidateKey](const std::string& prefix) {
+              return candidateKey == prefix || candidateKey.rfind(prefix + "/", 0) == 0;
+            });
+        // 覆盖范围：已知目录本身、其下被剪枝的空目录，以及递归上报的文件级 Delete；
+        // 其余 File kind 删除（未知路径/无扩展名/无树节点）维持既有"无法分类即回落"。
+        if (!coveredByKnownDirectory) {
+          unclassifiable = true;
+          break;
+        }
       }
       removes.push_back(ClassifierRemove{.root = root->path, .abs = abs, .rel = rel});
     }
@@ -3026,6 +3112,11 @@ private:
         });
         touchedRoots.insert(remove.root);
       }
+      // removes 已从 allSongs_ 删除整棵子树条目（含原 CUE 源音频条目）：upserts 判定隐藏
+      // 前必须重算 cue 源可见性集合。否则同批"移出含 cue 的目录 + upsert 一个原本被 CUE
+      // 隐藏的源音频"会沿用删除前的陈旧集合，把新条目留在树外（快照/缓存分歧）。
+      // rename 分支已在改写路径后重算（上方 cueSourcePaths = ...），remove 分支在此补齐。
+      cueSourcePaths = cueReferencedAudioPaths(allSongs_);
       // 文件级精准批次的歌词对账（任务 8）：readClassifierSong 只读内嵌标签，若不在写缓存/快照
       // 之前调用 reconcileLyrics，新落点文件（新建/复制/改写）会以空 externalLyrics 落库，丢掉
       // 磁盘上已存在的 sidecar。与全量（reconcileRoot 的 PublishedSong 尾部）和 scoped（经同一

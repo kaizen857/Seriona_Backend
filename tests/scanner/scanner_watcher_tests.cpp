@@ -837,6 +837,167 @@ TEST_CASE("scanner watcher dedups same-path move-self and flush destroy within o
   CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
 }
 
+TEST_CASE("scanner watcher precisely removes a moved-out directory with a file-kind destroy cascade") {
+  // 真实 efsw 对"目录 mv 出根"产生最深优先的级联 Delete：事件到达时路径已不存在，
+  // 适配层按磁盘状态判为 File（watchPathKindFrom 无 stat 依据）。分类器须把这类
+  // "已消失但树中已知的目录路径"识别为精准子树删除（preciseDirRemovalPrefixes），
+  // 不能回落全根重扫。本用例按该形状注入同一 debounce 批次（背靠背、无 sleep）：
+  // 最深目录 → 中间目录 → 目录本身，全部 File kind + Destroyed。
+  test::TempScannerRoot temp{"scanner-watcher-move-out-file-kind"};
+  const auto music = temp.path() / "music";
+  std::filesystem::create_directories(music / "empty" / "deeper");
+  const auto track = test::writeAudioFixture(music, "01.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(track, rawMetadata("Moved Out File Kind"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  CHECK(reader->readCount() == 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  const auto completedBefore = [&events, &eventsMutex] {
+    std::scoped_lock lock{eventsMutex};
+    return static_cast<std::size_t>(
+      std::ranges::count(events, ScannerEventType::ScanCompleted, &ScannerEvent::type));
+  }();
+
+  const auto movedOut = temp.path().parent_path() / ("seriona-move-out-file-kind-" + temp.path().filename().string());
+  std::error_code moveError;
+  std::filesystem::remove_all(movedOut, moveError);
+  std::filesystem::rename(music, movedOut, moveError);
+  REQUIRE_FALSE(moveError);
+
+  watchers->states[0]->callback(fileEvent(music / "empty" / "deeper", WatchEffectKind::Destroyed));
+  watchers->states[0]->callback(fileEvent(music / "empty", WatchEffectKind::Destroyed));
+  watchers->states[0]->callback(fileEvent(music, WatchEffectKind::Destroyed));
+
+  waitForSnapshotSongCount(*service, 0U);
+  waitForScanCompletedCount(events, eventsMutex, completedBefore + 1U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 目录 mv 出根已走精准删除：仅初始扫描，无回落重扫。
+    CHECK(scanStartedCount(events) == 1U);
+  }
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  CHECK(sidecar.loadLocationsByRoot(canonicalRootPath(temp.path())).empty());
+  const auto currentHash = computeDirectoryTreeHash(canonicalRootPath(temp.path()));
+  REQUIRE(currentHash.hash.has_value());
+  CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
+}
+
+// CUE 交叉守卫（removalCrossesCueSemantics）回归的共用夹具：完整扫描（含 seam CUE 轨）→
+// startWatching → 目录移出根 → 注入 File kind Destroyed → 断言保守回落（初始扫描 +1）。
+// configureReader 在扫描前注入 fixture 的 reader 元数据与 CUE seam；移除守卫后精准删除
+// 会让 ScanStarted 停在 1，CHECK 即失败。
+void runMovedOutCueGuardScenario(test::TempScannerRoot& temp, const std::filesystem::path& destroyedDir,
+                                 std::size_t visibleSongsBeforeMove,
+                                 const std::function<void(FakeWatcherMetadataReader&)>& configureReader) {
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  configureReader(*reader);
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, visibleSongsBeforeMove);
+  clearTestCueSheetProvider();
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto movedOut = temp.path().parent_path() / ("seriona-move-out-cue-guard-" + temp.path().filename().string());
+  std::error_code moveError;
+  std::filesystem::remove_all(movedOut, moveError);
+  std::filesystem::rename(destroyedDir, movedOut, moveError);
+  REQUIRE_FALSE(moveError);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  watchers->states[0]->callback(fileEvent(destroyedDir, WatchEffectKind::Destroyed));
+
+  waitForScanStartedCount(events, eventsMutex, 2U);
+  waitForSnapshotSongCount(*service, 0U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    // 守卫保留保守回落：初始扫描 1 次 + 回落重扫 1 次；若被误判为精准删除则只有 1 次。
+    CHECK(scanStartedCount(events) == 2U);
+  }
+}
+
+TEST_CASE("scanner watcher moved-out directory crossing cue semantics keeps fallback rescan") {
+  // 方向 1（removalCrossesCueSemantics 首个方向）：cue 在被移出子树内，其源音频也在内 ——
+  // 精准删除会让子树的 CUE 轨与其源音频之间失去可见性来源，必须保留保守回落。
+  {
+    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-guard"};
+    const auto music = temp.path() / "music";
+    std::filesystem::create_directories(music);
+    const auto cueFile = music / "album.cue";
+    const auto referencedAudio = music / "album.flac";
+    writeText(cueFile, "REM DUMMY COMMENT\n");
+    writeText(referencedAudio, "fake referenced audio");
+    runMovedOutCueGuardScenario(temp, music, 1U, [&referencedAudio](FakeWatcherMetadataReader& reader) {
+      reader.put(referencedAudio, rawMetadata("Bare album file"));
+      setTestCueSheetProvider([&referencedAudio](const std::filesystem::path& cuePath)
+                                  -> std::vector<TestCueTrackData> {
+        if (cuePath.filename() == "album.cue") {
+          return {{.audioFilePath = referencedAudio,
+                   .offset = 0,
+                   .duration = 180000000,
+                   .title = "Cue Track 1",
+                   .artist = "Cue Artist",
+                   .album = "Cue Album",
+                   .trackNumber = 1}};
+        }
+        return {};
+      });
+    });
+  }
+
+  // 方向 2（修复后以被移除子树的绝对键做前缀比较）：cue 在被移出子树之外、引用子树内
+  // 源音频 —— 精准删除会按 source_file_path 删掉 locations 行，却无法触及子树外的 CUE 轨
+  // 节点（快照/缓存分歧），必须同样回落。music 内含可见曲目以保证它是树中已知目录。
+  {
+    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-source"};
+    const auto music = temp.path() / "music";
+    const auto cues = temp.path() / "cues";
+    std::filesystem::create_directories(music);
+    std::filesystem::create_directories(cues);
+    const auto visibleAudio = music / "visible.flac";
+    const auto hiddenAudio = music / "hidden.flac";
+    const auto cueFile = cues / "outside.cue";
+    writeText(visibleAudio, "fake visible audio");
+    writeText(hiddenAudio, "fake hidden source audio");
+    writeText(cueFile, "REM DUMMY COMMENT\n");
+    runMovedOutCueGuardScenario(temp, music, 2U, [&visibleAudio, &hiddenAudio](FakeWatcherMetadataReader& reader) {
+      reader.put(visibleAudio, rawMetadata("Visible Track"));
+      reader.put(hiddenAudio, rawMetadata("Hidden Source"));
+      setTestCueSheetProvider([&hiddenAudio](const std::filesystem::path& cuePath)
+                                  -> std::vector<TestCueTrackData> {
+        if (cuePath.filename() == "outside.cue") {
+          return {{.audioFilePath = hiddenAudio,
+                   .offset = 0,
+                   .duration = 180000000,
+                   .title = "Cue Track 1",
+                   .artist = "Cue Artist",
+                   .album = "Cue Album",
+                   .trackNumber = 1}};
+        }
+        return {};
+      });
+    });
+  }
+}
+
 TEST_CASE("scanner watcher root-internal directory rename converges without rescan") {
   test::TempScannerRoot temp{"scanner-watcher-rename-in-root"};
   const auto music = temp.path() / "music";

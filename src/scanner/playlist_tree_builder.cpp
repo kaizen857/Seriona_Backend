@@ -494,6 +494,11 @@ bool PlaylistTreeBuilder::removeSubtree(const std::filesystem::path& relativePat
   return impl_->removeSubtree(relativePath);
 }
 
+bool PlaylistTreeBuilder::isKnownDirectory(const std::filesystem::path& relativePath) const {
+  const auto iterator = impl_->nodes.find(pathKey(relativePath));
+  return iterator != impl_->nodes.end() && iterator->second.node.kind == PlaylistNodeKind::Directory;
+}
+
 bool PlaylistTreeBuilder::renameSubtree(const std::filesystem::path& oldRelativePath,
                                         const std::filesystem::path& newRelativePath) {
   return impl_->renameSubtree(oldRelativePath, newRelativePath);

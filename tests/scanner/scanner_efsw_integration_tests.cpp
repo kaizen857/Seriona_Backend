@@ -11,7 +11,7 @@
 //   1. 移入文件 → 精准增量（无整根重扫、无 ScanError、快照与缓存一致）。
 //   2. 移入目录（含嵌套子树/既有文件）→ scoped 子树枚举 + 合并。
 //   3. 移入目录内后续写入被实时捕获（watch 覆盖新子树）。
-//   4. 移出（文件精准 / 目录有界回落，回归保持）。
+//   4. 移出（文件与目录均精准删除，回归保持）。
 //   5. 根内移动（文件与目录，回归保持）。
 //   6. 尖峰风暴（快速批量创建 + 目录移入 + 文件批量移入）。
 //   7. 停止/析构竞态（含"事件流/并发中析构"，任务 4 审查门移交缺口）。
@@ -424,8 +424,9 @@ TEST_CASE("efsw integration single file moved out converges precisely") {
 }
 
 // 场景 4b：目录移出根（回归保持）。efsw 产生最深优先的级联 Delete，路径已不存在无 stat
-// 依据 → 适配层判为 File + 无扩展名 → 分类器无法分类 → 有界回落全根重扫一次即收敛
-// （与迁移前旧监视器的目录移出语义一致，不无限增长），快照/缓存/磁盘三方一致。
+// 依据 → 适配层判为 File；分类器以树中已知目录前缀（preciseDirRemovalPrefixes）识别为
+// 精准子树删除（removeSubtree + deleteLocationsByPathPrefix），不再回落全根重扫；
+// 快照/缓存/磁盘三方一致。
 TEST_CASE("efsw integration directory moved out of root converges snapshot sqlite and disk") {
   test::TempScannerRoot temp{"scanner-efsw-dir-move-out"};
   const auto root = temp.path();
@@ -460,8 +461,8 @@ TEST_CASE("efsw integration directory moved out of root converges snapshot sqlit
   CHECK(songs.empty());
   CHECK(std::ranges::none_of(songs, [&music](const SongMetadata& song) { return song.filePath == (music / "01.wav"); }));
   checkSnapshotCachePathsMatch(*service, temp);
-  // 目录 Delete 无扩展名 → 分类器回落全根重扫一次即收敛，不无限增长。
-  CHECK(log.scanStartedCount() <= baseline + 1U);
+  // 目录 mv 出根已走精准删除（File kind + 树中已知目录前缀），无回落重扫。
+  CHECK(log.scanStartedCount() == baseline);
   CHECK(log.scanErrorCount() == 0U);
 
   stopAndDestroy(service);
