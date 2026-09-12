@@ -413,27 +413,55 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
   }
 
   if (root.recursive) {
-    std::filesystem::recursive_directory_iterator iterator(rootPath, directoryOptions(config), error);
-    if (error) {
-      markRootTraversalUnavailable(entries, error);
-      return entries;
-    }
-    for (const std::filesystem::recursive_directory_iterator end; iterator != end; iterator.increment(error)) {
-      if (error) {
-        // 实现差异防御：increment 报错时标准要求迭代器变为 end；若实现仍可解引用，
-        // 记录错误并停止遍历，绝不处理处于错误状态的条目（错误条目仍被 surface）。
-        entries.push_back(makeTraversalError(rootPath, error));
-        error.clear();
-        break;
+    // 手写 DFS 而非 recursive_directory_iterator：libc++（macOS）在 follow_directory_symlink 下
+    // 遇到符号链接环会在 increment 上报 ELOOP 并终止迭代器（libstdc++ 则静默跳过、不下降），
+    // 沿用 RDI 会让单个坏链接截断整棵树的枚举（实现相关且与目录项顺序相关）。逐目录独立枚举 +
+    // 显式下降栈：任何目录的列举失败只终止该目录并 surface 为错误条目，兄弟目录与可读文件不受
+    // 影响；符号链接环在下降检查（is_directory）处被拒，条目本身由分类阶段记为 Error。
+    std::vector<std::filesystem::path> pendingDirectories;
+    pendingDirectories.push_back(rootPath);
+    while (!pendingDirectories.empty()) {
+      const auto directory = std::move(pendingDirectories.back());
+      pendingDirectories.pop_back();
+
+      std::error_code listingError;
+      std::filesystem::directory_iterator iterator(directory, directoryOptions(config), listingError);
+      if (listingError) {
+        if (directory == rootPath) {
+          markRootTraversalUnavailable(entries, listingError);
+          return entries;
+        }
+        entries.push_back(makeTraversalError(rootPath, listingError));
+        continue;
       }
-      const auto& path = iterator->path();
-      allPaths.push_back(path);
-      if (isCueSheetPath(path)) {
-        cueSheetPaths.push_back(path);
+
+      const std::filesystem::directory_iterator end;
+      for (; iterator != end; iterator.increment(listingError)) {
+        if (listingError) {
+          // increment 报错时迭代器已失效（标准要求变为 end）：记录该目录枚举不完整并停止，
+          // 继续处理其余待遍历目录，绝不处理处于错误状态的条目（错误条目仍被 surface）。
+          entries.push_back(makeTraversalError(rootPath, listingError));
+          listingError.clear();
+          break;
+        }
+        const auto& path = iterator->path();
+        allPaths.push_back(path);
+        if (isCueSheetPath(path)) {
+          cueSheetPaths.push_back(path);
+        }
+
+        std::error_code descendError;
+        bool descend = false;
+        if (config.followSymlinks) {
+          descend = std::filesystem::is_directory(path, descendError);
+        } else {
+          const auto linkStatus = std::filesystem::symlink_status(path, descendError);
+          descend = !descendError && std::filesystem::is_directory(linkStatus);
+        }
+        if (descend) {
+          pendingDirectories.push_back(path);
+        }
       }
-    }
-    if (error) {
-      entries.push_back(makeTraversalError(rootPath, error));
     }
   } else {
     std::filesystem::directory_iterator iterator(rootPath, directoryOptions(config), error);
