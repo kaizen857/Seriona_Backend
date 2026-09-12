@@ -2,6 +2,7 @@
 
 #include "file_scanner_orchestrator_test_access.h"
 #include "file_scanner_service_internal.h"
+#include "scanner_internal_types.h"
 #include "scanner_test_harness.h"
 
 #include "seriona/scanner/file_scanner_service.h"
@@ -221,7 +222,7 @@ TEST_CASE("scanner complete e2e: full scan publishes nested cue tree and hides r
   REQUIRE(songNodesWithFilePath(snapshot, nestedAudio).size() == 1U);
 }
 
-TEST_CASE("scanner complete e2e: empty cue remains interpretable without tracks") {
+TEST_CASE("scanner complete e2e: cue container with zero tracks stays out of published snapshot") {
   test::TempScannerRoot temp{"scanner-complete-empty-cue-e2e"};
   const auto cueFile = temp.path() / "empty.cue";
   const auto standaloneAudio = temp.path() / "single.flac";
@@ -239,20 +240,94 @@ TEST_CASE("scanner complete e2e: empty cue remains interpretable without tracks"
     return {};
   }};
 
+  std::size_t observedContainerCount = 0;
+  setPreallocationObserver([&observedContainerCount](const std::vector<IndexedPublishedSong>& nodes) {
+    for (const auto& node : nodes) {
+      if (node.nodeType == NodeType::CueContainer && node.treeRelativePath.filename() == "empty.cue") {
+        ++observedContainerCount;
+      }
+    }
+  });
+
   const auto snapshot = scanRoot(temp.path(), reader);
+  clearPreallocationObserver();
 
   REQUIRE(snapshot.rootNodeId.has_value());
   const auto& root = requireNode(snapshot, *snapshot.rootNodeId);
-  const auto& cueContainer = requireNode(snapshot, "dir:empty.cue");
   const auto& standaloneTrack = requireSongWithTitle(snapshot, "Single Track");
 
-  CHECK(cueContainer.kind == PlaylistNodeKind::Directory);
-  CHECK(cueContainer.displayName == "empty.cue");
-  CHECK_FALSE(cueContainer.song.has_value());
-  CHECK(cueContainer.parentNodeId == root.nodeId);
-  CHECK(cueContainer.childNodeIds.empty());
+  // 先证明首次扫描确实发射了 1 个 CueContainer，快照缺席才等价于"发布层剪除"而非"从未发射"。
+  CHECK(observedContainerCount == 1U);
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:empty.cue"; }));
+  CHECK(std::ranges::none_of(root.childNodeIds, [](const std::string& nodeId) { return nodeId == "dir:empty.cue"; }));
   CHECK(songNodesWithFilePath(snapshot, cueFile).empty());
   REQUIRE(songNodesWithFilePath(snapshot, standaloneAudio).size() == 1U);
   CHECK(standaloneTrack.parentNodeId == root.nodeId);
+}
+
+TEST_CASE("scanner complete e2e: cue container reappears once its tracks materialize") {
+  test::TempScannerRoot temp{"scanner-complete-cue-rematerialize-e2e"};
+  const auto cueFile = temp.path() / "live.cue";
+  const auto referencedAudio = temp.path() / "live.flac";
+  const auto standaloneAudio = temp.path() / "single.flac";
+
+  writeText(cueFile, "FILE \"live.flac\" WAVE\n");
+  writeText(standaloneAudio, "fake standalone audio");
+
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(standaloneAudio, makeMetadata("Single Track"));
+
+  std::atomic<bool> tracksAvailable{false};
+  const TestCueProviderGuard cueProvider{[&referencedAudio, &tracksAvailable](const fs::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "live.cue" || !tracksAvailable.load()) {
+      return {};
+    }
+    return {{.audioFilePath = referencedAudio,
+             .offset = 0,
+             .duration = 180000000,
+             .title = "Cue Opening",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  }};
+
+  auto service = makeFileScannerService(FileScannerServiceDependencies{.metadataReader = reader,
+                                                                        .watcherFactory = nullptr,
+                                                                        .databasePath = temp.path() / "cache.db",
+                                                                        .coverExportDir = temp.path() / "covers"});
+  ScanEvents events;
+  service->setEventSink([&events](const ScannerEvent& event) { events.onEvent(event); });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(events.waitForScanCompletion(std::chrono::seconds{5}));
+
+  const auto emptySnapshot = events.snapshot;
+  REQUIRE(emptySnapshot.rootNodeId.has_value());
+  CHECK(std::ranges::none_of(emptySnapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:live.cue"; }));
+  CHECK(songNodesWithFilePath(emptySnapshot, cueFile).empty());
+  REQUIRE(songNodesWithFilePath(emptySnapshot, standaloneAudio).size() == 1U);
+
+  writeText(referencedAudio, "fake referenced audio");
+  reader->put(referencedAudio, makeMetadata("Bare Album File"));
+  writeText(cueFile, "FILE \"live.flac\" WAVE\n  TRACK 01 AUDIO\n");
+  tracksAvailable.store(true);
+
+  ScanEvents rescanEvents;
+  service->setEventSink([&rescanEvents](const ScannerEvent& event) { rescanEvents.onEvent(event); });
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(rescanEvents.waitForScanCompletion(std::chrono::seconds{5}));
+
+  const auto& populated = rescanEvents.snapshot;
+  const auto& cueContainer = requireNode(populated, "dir:live.cue");
+  const auto& track = requireSongWithTitle(populated, "Cue Opening");
+
+  CHECK(cueContainer.kind == PlaylistNodeKind::Directory);
+  CHECK(cueContainer.displayName == "live.cue");
+  CHECK_FALSE(cueContainer.song.has_value());
+  REQUIRE(track.parentNodeId.has_value());
+  CHECK(*track.parentNodeId == cueContainer.nodeId);
+  CHECK(std::ranges::find(cueContainer.childNodeIds, track.nodeId) != cueContainer.childNodeIds.end());
+  CHECK(songNodesWithFilePath(populated, referencedAudio).empty());
+  REQUIRE(songNodesWithFilePath(populated, cueFile).size() == 1U);
 }
 

@@ -75,8 +75,6 @@ struct MutableNode {
   PlaylistNode node{};
   std::filesystem::path relativePath{"."};
   PlaylistTreeStats stats{};
-  bool explicitDirectory{false};
-  bool virtualDirectory{false};
 };
 
 // MutableNode 变体的 cue 轨判定：cue 轨的父节点是 cue 虚拟目录（键 = relativePath 本身），
@@ -107,7 +105,6 @@ struct PlaylistTreeBuilder::Impl {
         entry.node.parentNodeId = parent;
       }
     }
-    entry.explicitDirectory = entry.explicitDirectory || key == "." || !displayName.empty();
     if (!displayName.empty() && key != ".") {
       entry.node.displayName = displayNameFor(relativePath, displayName);
     }
@@ -164,9 +161,7 @@ struct PlaylistTreeBuilder::Impl {
   }
 
   void addVirtualDirectoryNode(PlaylistTreeSong song) {
-    auto& entry = ensureDirectory(song.relativePath, displayNameFor(song.relativePath, pathKey(song.relativePath)));
-    entry.explicitDirectory = true;
-    entry.virtualDirectory = true;
+    (void)ensureDirectory(song.relativePath, displayNameFor(song.relativePath, pathKey(song.relativePath)));
   }
 
   [[nodiscard]] PlaylistTreeStats recomputeStats(const std::string& key) {
@@ -220,13 +215,16 @@ struct PlaylistTreeBuilder::Impl {
     }
   }
 
+  // 空目录（含无子节点的 CUE 虚拟目录）一律剪除：无效 CUE（引用音频缺失、解析出 0 轨）
+  // 不得以空 "cue 文件夹" 形态进入已发布树；发布层会删除本 builder 的 nodes 中该空目录
+  // 条目（orchestrator 侧 allSongs_/缓存记账不受影响），待轨道出现后由 ensureDirectory 重建。
   void pruneEmptyDirectories() {
     bool removed = true;
     while (removed) {
       removed = false;
       for (auto iterator = nodes.begin(); iterator != nodes.end();) {
         const auto removable = iterator->first != "." && iterator->second.node.kind == PlaylistNodeKind::Directory &&
-                               iterator->second.node.childNodeIds.empty() && !iterator->second.virtualDirectory;
+                               iterator->second.node.childNodeIds.empty();
         if (removable) {
           iterator = nodes.erase(iterator);
           removed = true;

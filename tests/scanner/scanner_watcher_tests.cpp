@@ -4151,6 +4151,77 @@ TEST_CASE("scanner watcher whole root cover scope without subdirectories resolve
   CHECK(seamCalls == 0U);
 }
 
+// 0→N 再物化的 watcher 事件路径：既有 cue 用例初始都 ≥1 轨，本用例初始 provider 返回 0 轨
+// （容器被发布层剪除、源音频被 FILE 引用隐藏），仅靠 cue Modified 事件驱动容器 + 轨出现。
+TEST_CASE("scanner watcher cue modified from zero tracks re-materializes container and track") {
+  test::TempScannerRoot temp{"scanner-watcher-cue-zero-to-one"};
+  const auto setsDir = temp.path() / "sets";
+  std::filesystem::create_directories(setsDir);
+  const auto cue = setsDir / "live.cue";
+  const auto source = setsDir / "live.flac";
+  const auto standalone = temp.path() / "single.flac";
+  writeText(cue, "FILE \"live.flac\" WAVE\n");
+  writeText(source, "fake cue source audio");
+  writeText(standalone, "fake standalone audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(standalone, rawMetadata("Standalone"));
+  reader->put(source, rawMetadata("Live Source"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  auto service = makeWatcherService(temp, reader, watchers);
+
+  std::atomic<bool> tracksAvailable{false};
+  setTestCueSheetProvider([&source, &tracksAvailable](const std::filesystem::path& cuePath)
+                              -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "live.cue" || !tracksAvailable.load()) {
+      return {};
+    }
+    return {{.audioFilePath = source,
+             .offset = 0,
+             .duration = 60000000,
+             .title = "Cue Track 1",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  });
+  struct CueProviderClear {
+    ~CueProviderClear() { clearTestCueSheetProvider(); }
+  } cueProviderClear;
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  const auto emptySnapshot = service->snapshot();
+  CHECK(std::ranges::none_of(emptySnapshot.nodes, [](const PlaylistNode& node) {
+    return node.nodeId == "dir:sets/live.cue";
+  }));
+  CHECK(std::ranges::none_of(emptySnapshot.nodes, [&cue](const PlaylistNode& node) {
+    return node.song.has_value() && node.song->filePath == cue;
+  }));
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  tracksAvailable.store(true);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  writeText(cue, "FILE \"live.flac\" WAVE\n  TRACK 01 AUDIO\n");
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+
+  waitForSnapshotSongCount(*service, 2U);
+  const auto snapshot = service->snapshot();
+  const auto container = std::ranges::find(snapshot.nodes, "dir:sets/live.cue", &PlaylistNode::nodeId);
+  REQUIRE(container != snapshot.nodes.end());
+  CHECK(container->kind == PlaylistNodeKind::Directory);
+  const auto track = std::ranges::find_if(snapshot.nodes, [](const PlaylistNode& node) {
+    return node.song.has_value() && node.song->title == "Cue Track 1";
+  });
+  REQUIRE(track != snapshot.nodes.end());
+  REQUIRE(track->parentNodeId.has_value());
+  CHECK(*track->parentNodeId == container->nodeId);
+  CHECK(std::ranges::find(container->childNodeIds, track->nodeId) != container->childNodeIds.end());
+  CHECK(std::ranges::none_of(snapshot.nodes, [&](const PlaylistNode& node) {
+    return node.song.has_value() && node.song->filePath == source;
+  }));
+}
+
 #if !defined(_WIN32)
 // 不可读目录根（chmod 000）：opendir 失败但 stat 成功。必须识别为 rootUnavailable（保留既有
 // 索引与缓存、上报错误），绝不能把空枚举当磁盘真相合并而清空该根。

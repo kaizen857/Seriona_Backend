@@ -124,7 +124,7 @@ TEST_CASE("playlist tree builder keeps parent access by node id without shared o
   CHECK(std::ranges::find(parent.childNodeIds, songNode.nodeId) != parent.childNodeIds.end());
 }
 
-TEST_CASE("playlist tree builder publishes CueContainer metadata as virtual cue directory") {
+TEST_CASE("playlist tree builder prunes CueContainer with zero tracks from published snapshot") {
   PlaylistTreeBuilder builder{"Music"};
   SongMetadata cueContainer{};
   cueContainer.filePath = "sets/live.cue";
@@ -136,20 +136,85 @@ TEST_CASE("playlist tree builder publishes CueContainer metadata as virtual cue 
 
   const auto snapshot = builder.publish();
   const auto& sets = requireNode(snapshot, "dir:sets");
-  const auto& cue = requireNode(snapshot, "dir:sets/live.cue");
   const auto& normal = requireSong(snapshot, "Normal");
 
-  CHECK(cue.kind == PlaylistNodeKind::Directory);
-  CHECK(cue.displayName == "live.cue");
-  CHECK_FALSE(cue.song.has_value());
-  REQUIRE(cue.parentNodeId.has_value());
-  CHECK(*cue.parentNodeId == sets.nodeId);
-  CHECK(std::ranges::find(sets.childNodeIds, cue.nodeId) != sets.childNodeIds.end());
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:sets/live.cue"; }));
+  CHECK(std::ranges::none_of(sets.childNodeIds, [](const std::string& nodeId) { return nodeId == "dir:sets/live.cue"; }));
 
   CHECK(normal.kind == PlaylistNodeKind::Track);
   CHECK(normal.nodeId == "track:sets/normal.flac");
   REQUIRE(normal.parentNodeId.has_value());
   CHECK(*normal.parentNodeId == sets.nodeId);
+}
+
+TEST_CASE("playlist tree builder re-materializes CueContainer when a cue track is upserted later") {
+  PlaylistTreeBuilder builder{"Music"};
+  SongMetadata cueContainer{};
+  cueContainer.filePath = "sets/live.cue";
+  cueContainer.logicalTrackId = "sets/live.cue";
+
+  builder.addSong({.relativePath = "sets/live.cue", .metadata = cueContainer});
+  const auto emptySnapshot = builder.publish();
+  CHECK(std::ranges::none_of(emptySnapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:sets/live.cue"; }));
+
+  builder.upsertSong({.relativePath = "sets/live.cue", .metadata = cueTrack("Intro", "sets/live.cue", "sets/live.flac", 1U)});
+  const auto populatedSnapshot = builder.publish();
+  const auto& cue = requireNode(populatedSnapshot, "dir:sets/live.cue");
+  const auto& track = requireSong(populatedSnapshot, "Intro");
+
+  CHECK(cue.kind == PlaylistNodeKind::Directory);
+  CHECK(cue.displayName == "live.cue");
+  CHECK_FALSE(cue.song.has_value());
+  REQUIRE(cue.parentNodeId.has_value());
+  CHECK(*cue.parentNodeId == "dir:sets");
+  REQUIRE(track.parentNodeId.has_value());
+  CHECK(*track.parentNodeId == cue.nodeId);
+  CHECK(std::ranges::find(cue.childNodeIds, track.nodeId) != cue.childNodeIds.end());
+}
+
+TEST_CASE("playlist tree builder rejects remove and rename of a pruned CueContainer without touching siblings") {
+  PlaylistTreeBuilder builder{"Music"};
+  SongMetadata cueContainer{};
+  cueContainer.filePath = "sets/live.cue";
+  cueContainer.logicalTrackId = "sets/live.cue";
+
+  builder.addSong({.relativePath = "sets/live.cue", .metadata = cueContainer});
+  builder.addSong({.relativePath = "sets/normal.flac", .metadata = song("Normal", "sets/normal.flac", std::chrono::seconds{15})});
+
+  const auto prunedSnapshot = builder.publish();
+  CHECK(std::ranges::none_of(prunedSnapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:sets/live.cue"; }));
+
+  CHECK_FALSE(builder.removeSubtree("sets/live.cue"));
+  CHECK_FALSE(builder.renameSubtree("sets/live.cue", "sets/moved.cue"));
+
+  const auto snapshot = builder.publish();
+  const auto& sets = requireNode(snapshot, "dir:sets");
+  const auto& normal = requireSong(snapshot, "Normal");
+
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:sets/live.cue"; }));
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:sets/moved.cue"; }));
+  CHECK(normal.nodeId == "track:sets/normal.flac");
+  REQUIRE(normal.parentNodeId.has_value());
+  CHECK(*normal.parentNodeId == sets.nodeId);
+  REQUIRE(sets.childNodeIds.size() == 1U);
+  CHECK(sets.childNodeIds[0] == normal.nodeId);
+}
+
+TEST_CASE("playlist tree builder cascades prune from a zero-track CueContainer to its empty parent directory") {
+  PlaylistTreeBuilder builder{"Music"};
+  SongMetadata cueContainer{};
+  cueContainer.filePath = "solo/live.cue";
+  cueContainer.logicalTrackId = "solo/live.cue";
+
+  builder.addSong({.relativePath = "solo/live.cue", .metadata = cueContainer});
+
+  const auto snapshot = builder.publish();
+  REQUIRE(snapshot.rootNodeId.has_value());
+  const auto& root = requireNode(snapshot, *snapshot.rootNodeId);
+
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:solo/live.cue"; }));
+  CHECK(std::ranges::none_of(snapshot.nodes, [](const PlaylistNode& node) { return node.nodeId == "dir:solo"; }));
+  CHECK(std::ranges::none_of(root.childNodeIds, [](const std::string& nodeId) { return nodeId == "dir:solo"; }));
 }
 
 TEST_CASE("playlist tree builder nests CueTrack nodes under their CueContainer directory") {
