@@ -4,8 +4,10 @@
 // （注入式工厂 makeFileScannerService + 生产回填的 EfswFolderWatcherFactory，
 // 即真实的 efsw 监视器），在临时目录做文件系统操作对照实验，
 // 验证"事件驱动精准增量（方案 B）"的核心假设：
-//   - 目录 mv 出监视根 → IN_MOVE_SELF 触发精准删除（树 removeSubtree +
+//   - 子目录 mv 出监视根 → 级联 Delete 精准删除（树 removeSubtree +
 //     SQLite deleteByPathPrefix），快照收敛为 0 首，scan 不增长；
+//   - 监视根自身 mv 出 → 保留既有索引等待恢复（B1：watcher 事件不得清空索引），
+//     显式根清理走 removeRoot；
 //   - 文件 create/modify/delete、根内 rename → 精准 upsert/renameSubtree，
 //     scan 不增长（不触发 ScanStarted）；
 //   - mv 出根后的残留 watch 幽灵事件（向移出目录写入）经 exists 守卫丢弃，
@@ -117,6 +119,78 @@ void writeMinimalWav(const fs::path& path) {
     const std::uint16_t zero = 0;
     out.write(reinterpret_cast<const char*>(&zero), 2);
   }
+}
+
+// 最小合法 CUE（TagReader ReadCueSheet 可解析）：FILE 指向同目录音频，trackCount 个 TRACK。
+void writeCueSheet(const fs::path& path, std::string_view audioName, int trackCount = 1) {
+  fs::create_directories(path.parent_path());
+  std::ofstream out{path};
+  out << "TITLE \"Album\"\nPERFORMER \"Artist\"\nFILE \"" << audioName << "\" WAVE\n";
+  for (int track = 1; track <= trackCount; ++track) {
+    out << "  TRACK " << (track < 10 ? "0" : "") << track << " AUDIO\n";
+    out << "    TITLE \"Track " << track << "\"\n";
+    out << "    INDEX 01 " << (track == 1 ? "00:00:00" : "00:02:00") << "\n";
+  }
+}
+
+void writeText(const fs::path& path, const std::string& content) {
+  fs::create_directories(path.parent_path());
+  std::ofstream out{path};
+  out << content;
+}
+
+// 1×1 合法 PNG：供生产封面 seam（TagReader::ExportFolderCover）真实导出文件夹缩略图。
+void writeMinimalPng(const fs::path& path) {
+  static const unsigned char kPng[] = {
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+      0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
+      0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+      0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+      0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+  fs::create_directories(path.parent_path());
+  std::ofstream out{path, std::ios::binary};
+  out.write(reinterpret_cast<const char*>(kPng), sizeof(kPng));
+}
+
+[[nodiscard]] std::optional<std::string> snapshotDirectoryThumbnail(const sc::FileScannerService& service,
+                                                                   std::string_view displayName) {
+  for (const auto& node : service.snapshot().nodes) {
+    if (node.kind == sc::PlaylistNodeKind::Directory && node.displayName == displayName) {
+      return node.thumbnailPath;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::size_t snapshotSongCountUnder(const sc::FileScannerService& service, const fs::path& directory) {
+  const auto prefix = directory.generic_string() + "/";
+  std::size_t count = 0;
+  for (const auto& node : service.snapshot().nodes) {
+    if (node.song.has_value() && node.song->filePath.generic_string().rfind(prefix, 0) == 0) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+[[nodiscard]] bool snapshotHasPath(const sc::FileScannerService& service, const fs::path& path) {
+  return std::ranges::any_of(service.snapshot().nodes, [&](const sc::PlaylistNode& node) {
+    return node.song.has_value() && node.song->filePath == path;
+  });
+}
+
+[[nodiscard]] bool snapshotLyricsContain(const sc::FileScannerService& service, const fs::path& audioPath,
+                                         std::string_view text) {
+  for (const auto& node : service.snapshot().nodes) {
+    if (!node.song.has_value() || node.song->filePath != audioPath) {
+      continue;
+    }
+    return std::ranges::any_of(node.song->effectiveLyrics, [&](const sc::LyricLine& line) {
+      return line.text == text;
+    });
+  }
+  return false;
 }
 
 // ============================================================================
@@ -308,6 +382,16 @@ void printSceneHeader(int index, std::string_view title) {
   std::cout << "\n[场景 " << index << "] " << title << "\n";
 }
 
+// FAIL 计数：默认生产审计的判定参与进程退出码，使其可作回归门禁（有 FAIL 则非零退出）。
+std::size_t g_auditFailures = 0;
+
+void printVerdictLine(std::string_view verdict) {
+  std::cout << "  判定    : " << verdict << "\n";
+  if (verdict.rfind("FAIL", 0) == 0) {
+    ++g_auditFailures;
+  }
+}
+
 void printSceneData(const SceneReport& report) {
   std::cout << "  操作    : " << report.action << "\n";
   std::cout << "  基线    : " << report.baselineLine << "\n";
@@ -315,7 +399,7 @@ void printSceneData(const SceneReport& report) {
     std::cout << "  窗口内  : " << report.deltaLine << "\n";
   }
   std::cout << "  结果    : " << report.resultLine << "\n";
-  std::cout << "  判定    : " << report.verdictLine << "\n";
+  printVerdictLine(report.verdictLine);
 }
 
 // 移动出根场景的判定与报告（场景 7/8/9-mv 共用）
@@ -2274,12 +2358,13 @@ int runProductionAudit() {
     }
     std::cout << "  验证    : 快照内 musicRoot 歌曲=" << musicRootInSnapshot
               << " musicB 歌曲=" << musicBInSnapshot << "\n";
-    std::cout << "  判定    : " << ((controlReady && rescanned && musicBInSnapshot >= 2U)
-                                        ? "PASS（对照组：第二根内 create 触发重扫，两个根歌曲并入快照）"
-                                        : "FAIL（对照组异常）")
-              << "\n";
+    printVerdictLine((controlReady && rescanned && musicBInSnapshot >= 2U)
+                         ? "PASS（对照组：第二根内 create 触发重扫，两个根歌曲并入快照）"
+                         : "FAIL（对照组异常）");
 
-    // 对 musicB 整体 mv 出根，再在移出目录内写文件，判定快照是否冻结
+    // 对 musicB 整体 mv 出根：B1 语义 = 根路径暂时性丢失保留既有索引（等待恢复 / 周期
+    // Reconcile 收敛），watcher 事件不得清空它；根外写入的幽灵事件必须被丢弃。
+    // 显式根删除（用户确认）走 removeRoot：清索引 + 缓存并停止监视该根。
     const fs::path musicBPath = musicB;
     fs::rename(musicBPath, movedB, ec);
     if (ec) {
@@ -2287,13 +2372,31 @@ int runProductionAudit() {
       std::cout << "  判定    : UNKNOWN（无法执行实验）\n";
     } else {
       std::this_thread::sleep_for(kPostMoveSettle);
-      const auto before = log.baseline();
+      const auto beforeMove = log.baseline();
       writeMinimalWav(movedB / "h.wav");
       std::this_thread::sleep_for(kObserveWindow);
-      const auto after = log.baseline();
-      reportMoveOutScene(9, "多根场景（第二根 mv 出根）", before, after,
-                         "rename(musicB -> musicB-moved)；沉降 200ms；写 musicB-moved/h.wav；观察 2s",
-                         service.get(), movedB.generic_string());
+      const auto afterMove = log.baseline();
+      const auto musicBKept = snapshotSongCountUnder(*service, musicBPath);
+      const auto ghostCount = snapshotSongCountUnder(*service, movedB);
+      const auto moveScanDelta = EventLog::deltaScanStarted(beforeMove, afterMove);
+      const bool removed = service->removeRoot(musicBPath);
+      std::this_thread::sleep_for(kPostMoveSettle);
+      const auto afterRemove = log.baseline();
+      const auto musicBAfterRemove = snapshotSongCountUnder(*service, musicBPath);
+      SceneReport report;
+      report.action = "rename(musicB -> musicB-moved)；写 musicB-moved/h.wav；观察 2s；removeRoot(musicB)";
+      report.baselineLine = "mv 前歌曲数=" + std::to_string(beforeMove.tracks);
+      report.deltaLine = "mv 窗口 ScanStarted增量=" + std::to_string(moveScanDelta) +
+                         " removeRoot 后歌曲数=" + std::to_string(afterRemove.tracks);
+      report.resultLine = "保留索引歌曲数=" + std::to_string(musicBKept) +
+                          " 幽灵条目数=" + std::to_string(ghostCount) +
+                          " removeRoot 后残留=" + std::to_string(musicBAfterRemove) +
+                          (removed ? "（removeRoot=true）" : "（removeRoot=false）");
+      report.verdictLine = (musicBKept >= 2U && ghostCount == 0U && moveScanDelta == 0 && removed &&
+                            musicBAfterRemove == 0U)
+                               ? "PASS（根丢失保留索引 + 幽灵丢弃；removeRoot 显式清理）"
+                               : "FAIL（根丢失被清空 / 幽灵条目 / removeRoot 未清理）";
+      printSceneData(report);
     }
   }
 
@@ -2474,6 +2577,276 @@ int runProductionAudit() {
     }
   }
 
+  // ---------- 场景 12：共置 cue+audio 目录 mv 出根（用户命中形状） ----------
+  {
+    printSceneHeader(12, "共置 cue+audio 目录 mv 出根（用户命中形状）");
+    const fs::path cueAlbum = musicRoot / "cue-album";
+    const fs::path cueAlbumOut = tempRoot / "cue-album-out";
+    std::error_code ec;
+    fs::remove_all(cueAlbum, ec);
+    fs::remove_all(cueAlbumOut, ec);
+    writeMinimalWav(cueAlbum / "album.wav");
+    writeCueSheet(cueAlbum / "album.cue", "album.wav", 1);
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, cueAlbum / "album.cue"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    fs::rename(cueAlbum, cueAlbumOut, ec);
+    const bool converged = waitUntil(
+        [&] { return !fs::exists(cueAlbum) && snapshotSongCountUnder(*service, cueAlbum) == 0U; },
+        kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    SceneReport report;
+    report.action = "建 cue-album（album.cue + album.wav）→ mv 出根；等待快照收敛为空";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted) +
+                          " 歌曲数=" + std::to_string(before.tracks);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta);
+    report.resultLine = "移出目录歌曲数=" + std::to_string(snapshotSongCountUnder(*service, cueAlbum)) +
+                        (converged ? "（已收敛）" : "（未收敛）");
+    report.verdictLine = (indexed && converged && scanDelta == 0)
+                             ? "PASS（用户形状：共置 cue+源精准前缀删除，无 Full/无扫描）"
+                             : "FAIL（cue 目录移出触发扫描或未收敛）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 13：空目录 / 仅封面目录 mv 出根（幂等精准删除） ----------
+  {
+    printSceneHeader(13, "空目录 / 仅封面目录 mv 出根");
+    const fs::path emptyDir = musicRoot / "empty-dir";
+    const fs::path coverDir = musicRoot / "cover-only-dir";
+    const fs::path dirOut = tempRoot / "dir-shapes-out";
+    std::error_code ec;
+    fs::remove_all(dirOut, ec);
+    fs::create_directories(dirOut, ec);
+    fs::create_directories(emptyDir);
+    fs::create_directories(coverDir);
+    writeText(coverDir / "cover.jpg", "fake cover bytes");
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    fs::rename(emptyDir, dirOut / "empty-dir", ec);
+    const bool emptyGone = waitUntil([&] { return !fs::exists(emptyDir); }, kSceneTimeout);
+    fs::rename(coverDir, dirOut / "cover-only-dir", ec);
+    const bool coverGone = waitUntil([&] { return !fs::exists(coverDir); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    const auto ghostUnderOut = snapshotSongCountUnder(*service, dirOut);
+    SceneReport report;
+    report.action = "建 empty-dir / cover-only-dir → 依次 mv 出根；等待目录消失";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted) +
+                          " 歌曲数=" + std::to_string(before.tracks);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta);
+    report.resultLine = std::string{"空目录移出="} + (emptyGone ? "是" : "否") +
+                        " 仅封面目录移出=" + (coverGone ? "是" : "否") +
+                        " 歌曲数=" + std::to_string(after.tracks) +
+                        " 移出目录幽灵=" + std::to_string(ghostUnderOut);
+    report.verdictLine = (emptyGone && coverGone && scanDelta == 0 && after.tracks == before.tracks &&
+                          ghostUnderOut == 0U)
+                             ? "PASS（幂等精准删除：索引无变化、无幽灵、无扫描）"
+                             : "FAIL（空/封面目录移出触发扫描或索引漂移）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 14：.cue 原地修改（1 轨 → 2 轨，T1 scope） ----------
+  {
+    printSceneHeader(14, ".cue 原地修改（1 轨 → 2 轨）");
+    const fs::path modDir = musicRoot / "cue-modify";
+    std::error_code ec;
+    fs::remove_all(modDir, ec);
+    writeMinimalWav(modDir / "album.wav");
+    writeCueSheet(modDir / "album.cue", "album.wav", 1);
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, modDir / "album.cue"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    std::this_thread::sleep_for(5ms);
+    writeCueSheet(modDir / "album.cue", "album.wav", 2);
+    const bool twoTracks = waitUntil([&] { return snapshotSongCountUnder(*service, modDir) >= 2U; }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    SceneReport report;
+    report.action = "建 cue-modify（1 轨）→ 改写为 2 轨；等待 2 条 CUE 轨入快照";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted) +
+                          " 歌曲数=" + std::to_string(before.tracks);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta);
+    report.resultLine = "cue-modify 歌曲数=" + std::to_string(snapshotSongCountUnder(*service, modDir));
+    report.verdictLine = (indexed && twoTracks && scanDelta == 0)
+                             ? "PASS（T1 父目录 scope：cue 重解析，无 Full）"
+                             : "FAIL（cue 修改回落扫描或未重解析）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 15：.cue 删除（源重新可见，T0 孤儿 upsert） ----------
+  {
+    printSceneHeader(15, ".cue 删除（源重新可见）");
+    const fs::path orphanDir = musicRoot / "cue-delete";
+    std::error_code ec;
+    fs::remove_all(orphanDir, ec);
+    writeMinimalWav(orphanDir / "album.wav");
+    writeCueSheet(orphanDir / "album.cue", "album.wav", 1);
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, orphanDir / "album.cue"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    fs::remove(orphanDir / "album.cue", ec);
+    const bool sourceVisible =
+        waitUntil([&] { return snapshotHasPath(*service, orphanDir / "album.wav"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    SceneReport report;
+    report.action = "建 cue-delete（cue 引用 album.wav）→ 删除 cue；等待源重新可见";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta);
+    report.resultLine = std::string{"源可见="} + (sourceVisible ? "是" : "否") +
+                        " 目录歌曲数=" + std::to_string(snapshotSongCountUnder(*service, orphanDir));
+    report.verdictLine = (indexed && sourceVisible && scanDelta == 0)
+                             ? "PASS（T0 孤儿源重 upsert：cue 删除后源重新可见，无 Full）"
+                             : "FAIL（cue 删除回落扫描或源未重新可见）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 16：封面增 / 删（T1 父目录 scope） ----------
+  {
+    printSceneHeader(16, "封面增 / 删（父目录 scope）");
+    const fs::path coverZone = musicRoot / "cover-zone";
+    std::error_code ec;
+    fs::remove_all(coverZone, ec);
+    writeMinimalWav(coverZone / "01.wav");
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, coverZone / "01.wav"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    const auto thumbnailBefore = snapshotDirectoryThumbnail(*service, "cover-zone");
+    writeMinimalPng(coverZone / "cover.jpg");
+    const bool added = waitUntil([&] { return fs::exists(coverZone / "cover.jpg"); }, kSceneTimeout);
+    const bool thumbnailAdded = waitUntil(
+        [&] { return snapshotDirectoryThumbnail(*service, "cover-zone").has_value(); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto afterAdd = log.baseline();
+    fs::remove(coverZone / "cover.jpg", ec);
+    const bool removed = waitUntil([&] { return !fs::exists(coverZone / "cover.jpg"); }, kSceneTimeout);
+    const bool thumbnailRemoved = waitUntil(
+        [&] { return !snapshotDirectoryThumbnail(*service, "cover-zone").has_value(); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto afterRemove = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, afterRemove);
+    SceneReport report;
+    report.action = "建 cover-zone/01.wav → 写真实 PNG cover.jpg → 删除 cover.jpg";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted) +
+                          " 歌曲数=" + std::to_string(before.tracks);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta) +
+                       " 增后增量=" + std::to_string(EventLog::deltaScanStarted(before, afterAdd));
+    report.resultLine = std::string{"封面增="} + (added ? "是" : "否") +
+                        " 删=" + (removed ? "是" : "否") +
+                        " 缩略图增=" + (thumbnailAdded ? "是" : "否") +
+                        " 缩略图删=" + (thumbnailRemoved ? "是" : "否") +
+                        " 歌曲数=" + std::to_string(afterRemove.tracks);
+    report.verdictLine = (indexed && added && removed && !thumbnailBefore.has_value() && thumbnailAdded &&
+                          thumbnailRemoved && scanDelta == 0)
+                             ? "PASS（父目录 scope 刷新文件夹缩略图，无 Full）"
+                             : "FAIL（封面增删触发扫描或缩略图未刷新）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 17：.lrc 增 / 改（T0 歌词对账） ----------
+  {
+    printSceneHeader(17, ".lrc 增 / 改（T0 歌词对账）");
+    const fs::path lrcZone = musicRoot / "lrc-zone";
+    std::error_code ec;
+    fs::remove_all(lrcZone, ec);
+    writeMinimalWav(lrcZone / "01.wav");
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, lrcZone / "01.wav"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    writeText(lrcZone / "01.lrc", "[00:01.00]first line\n");
+    const bool firstLanded =
+        waitUntil([&] { return snapshotLyricsContain(*service, lrcZone / "01.wav", "first line"); }, kSceneTimeout);
+    std::this_thread::sleep_for(5ms);
+    writeText(lrcZone / "01.lrc", "[00:01.00]second line\n");
+    const bool secondLanded =
+        waitUntil([&] { return snapshotLyricsContain(*service, lrcZone / "01.wav", "second line"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    SceneReport report;
+    report.action = "建 lrc-zone/01.wav → 写 01.lrc → 改写 01.lrc；等待歌词落地";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta) +
+                       " FileScanned增量=" +
+                       std::to_string(EventLog::deltaCount(before, after, sc::ScannerEventType::FileScanned));
+    report.resultLine = std::string{"首行落地="} + (firstLanded ? "是" : "否") +
+                        " 改后落地=" + (secondLanded ? "是" : "否");
+    report.verdictLine = (indexed && firstLanded && secondLanded && scanDelta == 0)
+                             ? "PASS（T0 歌词对账：不重读标签、无 Full）"
+                             : "FAIL（.lrc 变更回落扫描或歌词未落地）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 18：含 cue 目录 rm -rf（级联删除） ----------
+  {
+    printSceneHeader(18, "含 cue 目录 rm -rf（级联删除）");
+    const fs::path rmrfDir = musicRoot / "cue-rmrf";
+    std::error_code ec;
+    fs::remove_all(rmrfDir, ec);
+    writeMinimalWav(rmrfDir / "album.wav");
+    writeCueSheet(rmrfDir / "album.cue", "album.wav", 1);
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, rmrfDir / "album.cue"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    fs::remove_all(rmrfDir, ec);
+    const bool converged = waitUntil(
+        [&] { return !fs::exists(rmrfDir) && snapshotSongCountUnder(*service, rmrfDir) == 0U; },
+        kSceneTimeout);
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto after = log.baseline();
+    const auto scanDelta = EventLog::deltaScanStarted(before, after);
+    SceneReport report;
+    report.action = "建 cue-rmrf（cue+源）→ remove_all；等待快照收敛为空";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted) +
+                          " 歌曲数=" + std::to_string(before.tracks);
+    report.deltaLine = "ScanStarted增量=" + std::to_string(scanDelta);
+    report.resultLine = "rm -rf 后歌曲数=" + std::to_string(snapshotSongCountUnder(*service, rmrfDir)) +
+                        (converged ? "（已收敛）" : "（未收敛）");
+    report.verdictLine = (indexed && converged && scanDelta == 0)
+                             ? "PASS（级联精准删除，无 Full）"
+                             : "FAIL（rm -rf 触发扫描或未收敛）";
+    printSceneData(report);
+  }
+
+  // ---------- 场景 19：未扫描 root 首个事件（Reconcile 首次索引） ----------
+  {
+    printSceneHeader(19, "未扫描 root 首个事件（首次索引）");
+    const fs::path freshRoot = tempRoot / "musicC";
+    std::error_code ec;
+    fs::remove_all(freshRoot, ec);
+    fs::create_directories(freshRoot);
+    service->startWatching({sc::ScannerRoot{musicRoot, true}, sc::ScannerRoot{freshRoot, true}});
+    std::this_thread::sleep_for(kBaselineSettle);
+    const auto before = log.baseline();
+    writeMinimalWav(freshRoot / "first.wav");
+    const bool indexed = waitUntil([&] { return snapshotHasPath(*service, freshRoot / "first.wav"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto afterFirst = log.baseline();
+    const auto mid = log.baseline();
+    writeMinimalWav(freshRoot / "second.wav");
+    const bool second = waitUntil([&] { return snapshotHasPath(*service, freshRoot / "second.wav"); }, kSceneTimeout);
+    std::this_thread::sleep_for(kPostMoveSettle);
+    const auto afterSecond = log.baseline();
+    const auto firstDelta = EventLog::deltaScanStarted(before, afterFirst);
+    const auto secondDelta = EventLog::deltaScanStarted(mid, afterSecond);
+    SceneReport report;
+    report.action = "startWatching 未扫描 musicC → 写 first.wav → 写 second.wav";
+    report.baselineLine = "ScanStarted=" + std::to_string(before.scanStarted);
+    report.deltaLine = "首次增量=" + std::to_string(firstDelta) + " 二次增量=" + std::to_string(secondDelta);
+    report.resultLine = std::string{"首文件入快照="} + (indexed ? "是" : "否") +
+                        " 次文件入快照=" + (second ? "是" : "否");
+    // 首次索引是 Reconcile（INV-4 例外，至少一次扫描）；第二次 create 必须回到精准路径（零扫描）。
+    report.verdictLine = (indexed && second && firstDelta >= 1 && secondDelta == 0)
+                             ? "PASS（首次索引一次 Reconcile，后续精准更新无扫描）"
+                             : "FAIL（未扫描 root 事件未收敛或二次事件触发扫描）";
+    printSceneData(report);
+  }
+
   // ---------- 收尾：汇总表 ----------
   std::cout << "\n===== 汇总（判定依据：ScanStarted 增量 / 快照版本与歌曲数 / 残留路径）=====\n";
   std::cout << "场景 1 文件create   : 对照组，预期精准更新且快照歌曲数 +1\n";
@@ -2484,9 +2857,17 @@ int runProductionAudit() {
   std::cout << "场景 6 根内rename   : 精准更新（renameSubtree），预期路径收敛、歌曲数不变、scan 不增长\n";
   std::cout << "场景 7 mv出根+根外写: 核心实验，预期 IN_MOVE_SELF 精准删除（0 首）+ 幽灵事件丢弃、scan 不增长\n";
   std::cout << "场景 8 根外继续写   : 核心实验延续，预期幽灵事件丢弃、快照收敛、scan 不增长\n";
-  std::cout << "场景 9 多根mv出根   : 核心实验延伸，预期精准删除 + 幽灵事件丢弃、scan 不增长\n";
+  std::cout << "场景 9 多根mv出根   : 根丢失保留索引（B1）+ 幽灵事件丢弃、scan 不增长；removeRoot 显式清理\n";
   std::cout << "场景 10 纯静默mv出根: 用户复现场景，预期 IN_MOVE_SELF 精准删除（快照 0 首 + scan 不增长）\n";
   std::cout << "场景 11 单文件mv出根 : fae flush 精准删除，预期快照 0 首 + scan 不增长（3s 窗口内，非对账回落）\n";
+  std::cout << "场景 12 共置cue移出 : 用户形状，预期精准前缀删除（0 首）+ scan 不增长（无 Full）\n";
+  std::cout << "场景 13 空/封面目录 : 幂等精准删除，预期索引无变化 + scan 不增长\n";
+  std::cout << "场景 14 cue原地修改 : T1 父目录 scope，预期重解析出 2 轨 + scan 不增长\n";
+  std::cout << "场景 15 cue删除     : T0 孤儿源重 upsert，预期源重新可见 + scan 不增长\n";
+  std::cout << "场景 16 封面增删    : 父目录 scope，预期歌曲数不变 + scan 不增长\n";
+  std::cout << "场景 17 .lrc增改    : T0 歌词对账，预期歌词落地 + scan 不增长\n";
+  std::cout << "场景 18 含cue rm -rf: 级联精准删除，预期 0 首 + scan 不增长\n";
+  std::cout << "场景 19 未扫描root  : 首次索引一次 Reconcile，二次 create 精准零扫描\n";
   std::cout << "注：以上预期为方案 B 语义；实际判定以上方各场景输出为准。\n";
 
   const auto finalErrors = log.errors();
@@ -2519,12 +2900,17 @@ int runProductionAudit() {
   }
 
   std::cout << "\n===== 审计结束 =====\n";
+  if (g_auditFailures > 0) {
+    std::cout << "存在 " << g_auditFailures << " 条 FAIL 判定，进程以非零退出（回归门禁）。\n";
+    return 1;
+  }
+  std::cout << "全部判定 PASS。\n";
   return 0;
 }
 
 // ============================================================================
 // 入口分发
-//   无参数                      → 原有移出审计（11 场景）
+//   无参数                      → 原有移出审计（19 场景）
 //   --efsw-matrix <输出目录>    → Gate 0 efsw 语义矩阵（scenario-*.log + d4）
 //   --efsw-negative             → 无效路径负向用例（明确报错 + 非 0 退出）
 // ============================================================================

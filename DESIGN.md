@@ -42,7 +42,7 @@ seriona_app（静态库，仅 application_logging/runtime_paths/logging，当前
 | miniaudio 回调线程 | `seriona_audio` | 无锁读 PCM 环 + 增益/混音；EQ 激活时走 f32 中间域处理链（EQ→音量→限幅→量化）；频谱摘录零分配（实时约束，见 §11） |
 | 扫描线程（单） | `seriona_scanner` | 串行执行扫描请求（容量 16 的队列） |
 | 扫描 worker 池 | `seriona_scanner` | BS::thread_pool 并发读取元数据（TagReader 有信号量限流） |
-| watcher 线程 | `seriona_scanner` | efsw 文件系统事件经适配层映射为内部事件（跨平台后端；根自身移出/删除由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整事件入队 → 50ms 去抖归并 → 分类器精准增量更新（目录移入走 scoped 子树对账）；60s 周期对账兜底 |
+| watcher 线程 | `seriona_scanner` | efsw 文件系统事件经适配层映射为内部事件（跨平台后端；根自身移出/删除由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整事件入队 → 50ms 去抖归并 → 分类器精准增量更新（目录移入/移出、CUE/歌词/封面走精确或 scoped 对账；无法精准定位/事件丢失/周期探测走 Reconcile，永不回落全量重扫）；60s 周期对账兜底 |
 | 控制事件循环（单） | `seriona_control` | 所有命令归约与后端事件处理（串行化点） |
 | 订阅投递线程（每订阅类型一个） | `seriona_control` | 快照拷贝后异步回调订阅者 |
 | 封面解析线程 | `seriona_control` | TagReader 封面提取（有界 latest-wins 队列） |
@@ -102,15 +102,15 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.2 seriona_scanner（扫描与缓存）
 
-- `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, watcherDebounce}`。
-- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
+- `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, folderThumbnailSeam, watcherDebounce, reconcileInterval}`。接口另提供显式根移除 `removeRoot`（清空该根索引与缓存并停止监视）；根暂时性丢失不清理索引，仅在用户显式调用 `removeRoot` 时清空。
+- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 按 root 合并进长期索引（缺失/不可用的 root 保留既有条目与缓存）→ 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
 - 事件顺序：ScanStarted →（每 root：ScanError/FileScanned）→ ProgressUpdated（worker 阶段按 `progressInterval`（默认 250ms）节流中途发布，结束后必发一次最终汇总；`filesScanned` 为"已完成节点数"（含内联 CUE 曲目/容器与失败任务），结束恒有 `filesScanned + filesSkipped == filesDiscovered`）→ PlaylistSnapshotUpdated → ScanCompleted；取消路径先发一条 code=Cancelled 的 ScanError 再发 ScanStopped。
-- 缓存：`SQLiteCache`，固定 v3 schema（`user_version=0` 初始化、非 0 非 3 抛 unsupported，无迁移桥）；5 张表 content/locations/lyrics/scan_roots/scan_errors + 8 个索引；WAL + `synchronous=NORMAL` + 64MB 页缓存；写事务 `BEGIN IMMEDIATE`、读写各持独立互斥锁（并发依赖 SQLite busy timeout 500ms）。**实际读写的是 `<databasePath>.scan-roots.sqlite` 独立文件**；传入的主库文件仅被打开初始化，扫描流程不读写。缓存另提供路径级精准写接口（按路径前缀删除、子树改名改写既有行），供事件驱动的精准增量更新使用，不读取元数据。
-- 身份哈希：`computeContentId`（duration/title/artist 链式 XXH64）与 `computeLocationId`（路径/大小/mtime，CUE 轨道追加 offset/index）——实现经 `hash_utils.cpp` 文本包含 `song_identity.cpp` 进入生产库。目录树哈希：XXH3_128bits 流式 Merkle（只含文件名/类型/子哈希，跳过 `.lrc`）。
+- 缓存：`SQLiteCache`，固定 v3 schema（`user_version=0` 初始化、非 0 非 3 抛 unsupported，无迁移桥）；5 张表 content/locations/lyrics/scan_roots/scan_errors + 8 个索引；WAL + `synchronous=NORMAL` + 64MB 页缓存；写事务 `BEGIN IMMEDIATE`、读写各持独立互斥锁（并发依赖 SQLite busy timeout 500ms）。**实际读写的是 `<databasePath>.scan-roots.sqlite` 独立文件**；传入的主库文件仅被打开初始化，扫描流程不读写。缓存另提供路径级精准写接口（按路径前缀删除、子树改名改写既有行、scoped 删除+写入单事务合并、歌词批量单事务对账、显式根删除），供事件驱动的精准增量更新使用，不读取元数据。
+- 身份哈希：`computeContentId`（duration/title/artist 链式 XXH64）与 `computeLocationId`（路径/大小/mtime，CUE 轨道追加 offset/index）——实现经 `hash_utils.cpp` 文本包含 `song_identity.cpp` 进入生产库。目录树哈希：XXH3_128bits 流式 Merkle（只含文件名/类型/子哈希，跳过 `.lrc`）。身份判据不含 ctime/inode（Windows 无 inode 且裸 POSIX API 违反平台边界），因此"大小与 mtime 均未变"的原地编辑不会被 Reconcile 发现，需用户显式 `forceRescan` 兜底。
 - 并发配置：worker 数默认 `hardware_concurrency`，TagReader 并发默认同 worker 数；环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY` 覆盖，`SERIONA_SCANNER_DISABLE_CONCURRENCY=1` 强制串行。
-- 自动更新（事件驱动精准增量 + 对账兜底）：efsw watcher（FetchContent 固定 commit 的跨平台库：Linux inotify / Windows / macOS FSEvents；适配层把 efsw 动作映射为内部 `WatchEvent`，同目录与跨目录 rename 统一为 Renamed 对，根自身移出/删除无后端事件时由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并去重 → 可精准定位时走路径级精准更新（树补丁 + SQLite 精准 API，不触发全根扫描）；移入含未扫描文件的新目录走 scoped 子树对账（只枚举该子树并并入树/缓存，发布仅快照）；无法分类 / watcher 消息 / 队列溢出 → 回落全根增量重扫；另有 60s 周期对账兜底（目录树哈希探测，仅变化才重扫）。
+- 自动更新（事件驱动精准增量 + Reconcile 对账兜底）：efsw watcher（FetchContent 固定 commit 的跨平台库：Linux inotify / Windows / macOS FSEvents；适配层把 efsw 动作映射为内部 `WatchEvent`，同目录与跨目录 rename 统一为 Renamed 对，根自身移出/删除无后端事件时由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并去重 → 可精准定位时走路径级精准更新（树补丁 + SQLite 精准 API，不触发全根扫描）；目录移入走 scoped 子树对账（只枚举该子树并并入树/缓存，scope 内增量计划命中缓存时不重读标签，发布仅快照）；目录移出与 CUE 交叉（cue 删而源在 / 源删而 cue 在）走精确前缀删除 + 孤儿源重 upsert / cueRefresh scoped 重解析；`.lrc` 走 T0 歌词对账；封面走父目录 scoped 并强制重读该目录歌曲标签（封面增删不改音频 size/mtime，缓存直灌会让歌曲级 `artworkPath`/`thumbnailPath` 陈旧）。**watcher 事件路径（含无法分类兜底、watcher 消息、队列溢出、周期探测）绝不进入全量重扫**：这些场景提交内部 Reconcile（全根 stat 遍历 + locationId 比对 + 仅变化文件重读；哈希缺失/缓存不可读时中止并保留既有索引），并置 per-root 脏标记供周期探测无条件收敛；另有 60s 周期对账兜底。根自身移出/删除保留既有索引等待恢复，显式根清理走 `removeRoot`。
 - TagReader 适配：`TagReader::Read`/`ReadCueSheet`（全局命名空间外部库）；适配头直接包含 `<TagReader.hpp>` 并暴露其类型，属实现导向头。
-- 文件夹缩略图解析（scanner-internal `folder_thumbnail_resolver.{h,cpp}`，不进 `inc/seriona/` 稳定边界）：扫描收尾阶段为非根 Directory 节点解析 node-level 缩略图，回填 `PlaylistNode::thumbnailPath` 随快照下发（Track 节点该字段留空，歌曲缩略图走 `SongMetadata::thumbnailPath`）。case 1 经导出 seam（生产侧由 `exportFolderCoverThumbnail` 装配 `TagReader::ExportFolderCover`，ThumbnailOnly+Ignore，只查目录自身）导出封面；case 2 回退取后代歌曲中已解析缩略图的第一首（(filename, relativeDirectory) 字节序升序）；根目录恒空；确定性全序比较，seam 异常被吞掉，单文件夹失败不阻断扫描。
+- 文件夹缩略图解析（scanner-internal `folder_thumbnail_resolver.{h,cpp}`，不进 `inc/seriona/` 稳定边界）：扫描收尾阶段为非根 Directory 节点解析 node-level 缩略图，回填 `PlaylistNode::thumbnailPath` 随快照下发（Track 节点该字段留空，歌曲缩略图走 `SongMetadata::thumbnailPath`）。case 1 经导出 seam（生产侧由 `exportFolderCoverThumbnail` 装配 `TagReader::ExportFolderCover`，ThumbnailOnly+Ignore，只查目录自身）导出封面；case 2 回退取后代歌曲中已解析缩略图的第一首（(filename, relativeDirectory) 字节序升序）；根目录恒空；确定性全序比较，seam 异常被吞掉，单文件夹失败不阻断扫描。watcher 局部批次只重解析 touched 子树 + 祖先链，未受影响目录回填上次解析结果（builder 每次重建，不回填会让文件夹封面在任意事件后消失）。
 - 测试专用：`scan_scheduler.{h,cpp}`（通用任务调度器）不编译进任何库，仅测试目标直接编译。
 
 ### 4.3 seriona_metadata（平台媒体集成）
@@ -182,13 +182,13 @@ main(argc=2, 路径存在)                       main.cpp
 
 ### 7.2 扫描流程
 
-扫描存在两条路径：**全量/增量重扫**（手动 `scanLibrary`、事件无法精准定位时的回落）与**事件驱动的精准增量**（watcher 事件主路径），两者共用扫描队列串行化。
+扫描存在两条路径：**全量/增量重扫**（手动 `scanLibrary`、首次索引）与**事件驱动的精准增量 + Reconcile 对账**（watcher 事件主路径），两者共用扫描队列串行化。
 
-**全量/增量重扫**：入队 → 单扫描线程逐 root 计算目录树哈希，与 `scan-roots.sqlite` 中 `CachedScanRoot` 比对决定全量/增量；增量时逐文件用 `computeLocationId`（路径/大小/mtime）判定 added/changed/unchanged/deleted，unchanged 走缓存直灌（含 CUE 轨道与歌词），changed/added 构造 worker 任务并发读元数据；结束后歌词协调（外置 LRC 哈希比对/重解析/清除）→ 缓存写回（单事务，失败整体回滚）→ `PlaylistTreeBuilder` 聚合 → `resolveFolderThumbnails` 为非根 Directory 节点解析 node-level 缩略图（`folder_thumbnail_resolver`：生产 seam 经 `exportFolderCoverThumbnail` 接 `TagReader::ExportFolderCover` 导出，回退取后代歌曲已解析缩略图，根目录恒空）→ `PlaylistSnapshotUpdated`。
+**全量/增量重扫**：入队 → 单扫描线程逐 root 计算目录树哈希，与 `scan-roots.sqlite` 中 `CachedScanRoot` 比对决定全量/增量；增量时逐文件用 `computeLocationId`（路径/大小/mtime）判定 added/changed/unchanged/deleted，unchanged 走缓存直灌（含 CUE 轨道与歌词），changed/added 构造 worker 任务并发读元数据；结束后歌词协调（外置 LRC 哈希比对/重解析/清除）→ 缓存写回（单事务，失败整体回滚）→ 按 root 合并进长期索引（缺失/不可用 root 保留既有条目与缓存）→ `PlaylistTreeBuilder` 聚合 → `resolveFolderThumbnails` 为非根 Directory 节点解析 node-level 缩略图（`folder_thumbnail_resolver`：生产 seam 经 `exportFolderCoverThumbnail` 接 `TagReader::ExportFolderCover` 导出，回退取后代歌曲已解析缩略图，根目录恒空）→ `PlaylistSnapshotUpdated`。
 
-**事件驱动精准增量**（watcher 事件主路径）：efsw 文件系统事件经适配层映射为完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并同批去重 → 可精准定位的批次执行路径级操作：长生命周期 `PlaylistTreeBuilder` 成员的子树删除 / 子树改名 / 单歌 upsert（树补丁）+ SQLite 精准 API（路径前缀删除、子树改名改写既有行），不读取元数据、不触发扫描；每批处理后发布完整快照（控制层整树替换假设不变）。移入含未扫描文件的新目录走 scoped 子树对账（子树枚举 + 前缀清理后并入，发布契约只发 `PlaylistSnapshotUpdated`）；无法分类的事件 / watcher 消息 / 队列溢出标记 / 根自身被移出 → 回落全根增量重扫。
+**事件驱动精准增量**（watcher 事件主路径）：efsw 文件系统事件经适配层映射为完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并同批去重 → 可精准定位的批次执行路径级操作：长生命周期 `PlaylistTreeBuilder` 成员的子树删除 / 子树改名 / 单歌 upsert（树补丁）+ SQLite 精准 API（路径前缀删除、子树改名改写既有行），不读取元数据、不触发扫描；每批处理后发布完整快照（控制层整树替换假设不变）。移入含未扫描文件的新目录走 scoped 子树对账（子树枚举 + 前缀清理后并入，scope 内增量计划命中缓存时不重读标签，发布契约只发 `PlaylistSnapshotUpdated`）；目录移出 / CUE 交叉 / `.lrc` / 封面各有专用精确或 scoped 处理；无法分类的事件 / watcher 消息 / 队列溢出标记 / 周期探测 → 提交 **Reconcile**（全根 stat + locationId 比对 + 仅变化文件重读；不因哈希缺失/不一致升级全量，哈希缺失或缓存不可读时中止并保留既有索引）；根自身移出/删除保留既有索引等待恢复。
 
-**周期对账兜底**：事件驱动之外，以可注入周期（默认 60s）对全部根做目录树哈希探测，仅 hash 变化才回落重扫、无变化零发布；覆盖事件丢失、队列溢出等静默失效，保证极端情况下最终收敛。
+**周期对账兜底**：事件驱动之外，以可注入周期（默认 60s）对全部根做目录树哈希探测；哈希变化或该根有脏标记（批次被丢弃、队列满折叠）时提交 Reconcile，无变化且无脏标记零发布；覆盖事件丢失、队列溢出等静默失效，保证极端情况下最终收敛。
 
 ### 7.3 元数据分享（Linux MPRIS）
 

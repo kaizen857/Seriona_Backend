@@ -86,6 +86,18 @@ void writeMinimalWav(const std::filesystem::path& path) {
   }
 }
 
+// 最小合法 CUE（TagReader ReadCueSheet 可解析）：FILE 指向同目录音频，trackCount 个 TRACK。
+void writeCueSheet(const std::filesystem::path& path, std::string_view audioName, int trackCount = 1) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out{path};
+  out << "TITLE \"Album\"\nPERFORMER \"Artist\"\nFILE \"" << audioName << "\" WAVE\n";
+  for (int track = 1; track <= trackCount; ++track) {
+    out << "  TRACK " << (track < 10 ? "0" : "") << track << " AUDIO\n";
+    out << "    TITLE \"Track " << track << "\"\n";
+    out << "    INDEX 01 " << (track == 1 ? "00:00:00" : "00:02:00") << "\n";
+  }
+}
+
 // 事件日志：真实 efsw 回调为异步多线程投递，采集与计数必须加锁。
 class RealEfswEventLog {
 public:
@@ -653,6 +665,295 @@ TEST_CASE("efsw integration large directory move-in enumerates 100+ files precis
 
   stopAndDestroy(service);
   std::filesystem::remove_all(staging, ec);
+}
+
+// 场景 9（用户命中形状）：目录（共置 .cue + 音频）整体移出监视根。分类器经
+// collectCueCrossings 判定 fileUnder && sourceUnder → 两交叉集合都不命中 → 纯精准前缀删除；
+// 快照/缓存收敛为空，ScanStarted 不增长（watcher 路径绝不出现 ScanMode::Full）。
+TEST_CASE("efsw integration moved-out directory with colocated cue and audio converges precisely") {
+  test::TempScannerRoot temp{"scanner-efsw-cue-move-out"};
+  const auto root = temp.path();
+  const auto album = root / "album";
+  writeMinimalWav(album / "album.wav");
+  writeCueSheet(album / "album.cue", "album.wav");
+  const auto movedOut = temp.path().parent_path() / ("seriona-efsw-cue-moved-" + temp.path().filename().string());
+  std::error_code ec;
+  std::filesystem::remove_all(movedOut, ec);
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+  const auto errorsBefore = log.scanErrorCount();
+
+  std::filesystem::rename(album, movedOut, ec);
+  REQUIRE_FALSE(ec);
+
+  CHECK(waitUntil(
+      [&] {
+        return snapshotSongPaths(*service).empty() && locationsForRoot(temp).empty() &&
+               !std::filesystem::exists(album);
+      },
+      std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == errorsBefore);
+  CHECK(songsIn(service->snapshot()).empty());
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+  std::filesystem::remove_all(movedOut, ec);
+}
+
+// 场景 10：空目录与仅封面目录移出。去 isKnownDirectory 门后两者都是幂等精准前缀删除
+// （索引无对应条目 → 零变化），不触发任何扫描。
+TEST_CASE("efsw integration empty and cover-only directories moved out converge without rescan") {
+  test::TempScannerRoot temp{"scanner-efsw-empty-cover-out"};
+  const auto root = temp.path();
+  writeMinimalWav(root / "music" / "01.wav");
+  std::filesystem::create_directories(root / "empty");
+  std::filesystem::create_directories(root / "cover-only");
+  {
+    std::ofstream cover{root / "cover-only" / "cover.jpg"};
+    cover << "not a real image";
+  }
+  const auto movedOut = temp.path().parent_path() / ("seriona-efsw-empty-cover-" + temp.path().filename().string());
+  std::error_code ec;
+  std::filesystem::remove_all(movedOut, ec);
+  std::filesystem::create_directories(movedOut, ec);
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+
+  std::filesystem::rename(root / "empty", movedOut / "empty", ec);
+  REQUIRE_FALSE(ec);
+  CHECK(waitUntil([&] { return !std::filesystem::exists(root / "empty"); }, std::chrono::seconds{5}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(waitForSnapshotPaths(*service, {root / "music" / "01.wav"}, std::chrono::seconds{5}));
+
+  std::filesystem::rename(root / "cover-only", movedOut / "cover-only", ec);
+  REQUIRE_FALSE(ec);
+  CHECK(waitUntil([&] { return !std::filesystem::exists(root / "cover-only"); }, std::chrono::seconds{5}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  CHECK(waitForSnapshotPaths(*service, {root / "music" / "01.wav"}, std::chrono::seconds{5}));
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+  std::filesystem::remove_all(movedOut, ec);
+}
+
+// 场景 11：.cue 原地修改（1 轨 → 2 轨）与 .cue 删除（源重新可见）。
+// 修改走 T1 scope = cue 父目录（scope 内增量计划）；删除走 T0 交叉感知删除 + 孤儿源重 upsert。
+// 两者都不触发 ScanStarted（无 Full），scoped 修改按契约也不发 ScanCompleted。
+TEST_CASE("efsw integration cue modify and delete converge without rescan") {
+  test::TempScannerRoot temp{"scanner-efsw-cue-modify-delete"};
+  const auto root = temp.path();
+  const auto album = root / "album";
+  writeMinimalWav(album / "album.wav");
+  writeCueSheet(album / "album.cue", "album.wav", 1);
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  writeCueSheet(album / "album.cue", "album.wav", 2);
+  waitForSnapshotSongCount(*service, 2U, std::chrono::seconds{10});
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  std::error_code ec;
+  std::filesystem::remove(album / "album.cue", ec);
+  REQUIRE_FALSE(ec);
+  CHECK(waitUntil(
+      [&] {
+        const auto songs = songsIn(service->snapshot());
+        return songs.size() == 1U && songs[0].filePath == (album / "album.wav");
+      },
+      std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+}
+
+// 场景 12：封面增删。谓词命中 → T1 scope = 父目录；目录缩略图刷新，歌曲级条目不变。
+// 两个方向都不触发 ScanStarted（无 Full）。
+TEST_CASE("efsw integration cover add and remove converge without rescan") {
+  test::TempScannerRoot temp{"scanner-efsw-cover-add-remove"};
+  const auto root = temp.path();
+  const auto music = root / "music";
+  writeMinimalWav(music / "01.wav");
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+
+  {
+    std::ofstream cover{music / "cover.jpg"};
+    cover << "fake cover bytes";
+  }
+  CHECK(waitUntil([&] { return std::filesystem::exists(music / "cover.jpg"); }, std::chrono::seconds{5}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(waitForSnapshotPaths(*service, {music / "01.wav"}, std::chrono::seconds{5}));
+
+  std::error_code ec;
+  std::filesystem::remove(music / "cover.jpg", ec);
+  REQUIRE_FALSE(ec);
+  CHECK(waitUntil([&] { return !std::filesystem::exists(music / "cover.jpg"); }, std::chrono::seconds{5}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  CHECK(waitForSnapshotPaths(*service, {music / "01.wav"}, std::chrono::seconds{5}));
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+}
+
+// 场景 13：.lrc 增/改。T0 歌词对账：不发 ScanStarted、不重读标签、不刷新树哈希；
+// 快照歌词来源切换到外部 sidecar 并随改写更新。
+TEST_CASE("efsw integration lrc add and modify update lyrics without rescan") {
+  test::TempScannerRoot temp{"scanner-efsw-lrc-modify"};
+  const auto root = temp.path();
+  const auto music = root / "music";
+  writeMinimalWav(music / "01.wav");
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+
+  {
+    std::ofstream lrc{music / "01.lrc"};
+    lrc << "[00:01.00]first line\n";
+  }
+  CHECK(waitUntil(
+      [&] {
+        const auto songs = songsIn(service->snapshot());
+        return songs.size() == 1U && songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc &&
+               songs[0].effectiveLyrics.size() == 1U && songs[0].effectiveLyrics[0].text == "first line";
+      },
+      std::chrono::seconds{10}));
+  CHECK(log.scanStartedCount() == startedBefore);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  {
+    std::ofstream lrc{music / "01.lrc"};
+    lrc << "[00:01.00]second line\n";
+  }
+  CHECK(waitUntil(
+      [&] {
+        const auto songs = songsIn(service->snapshot());
+        return songs.size() == 1U && songs[0].effectiveLyrics.size() == 1U &&
+               songs[0].effectiveLyrics[0].text == "second line";
+      },
+      std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+}
+
+// 场景 14：含 .cue 的目录 rm -rf（级联删除，可能拆多批）。共置 cue+源在移除前缀内 →
+// 无孤儿；快照/缓存收敛为空，全程无 ScanStarted（无 Full）。
+TEST_CASE("efsw integration rm rf directory with cue converges without rescan") {
+  test::TempScannerRoot temp{"scanner-efsw-cue-rmrf"};
+  const auto root = temp.path();
+  const auto album = root / "album";
+  writeMinimalWav(album / "album.wav");
+  writeCueSheet(album / "album.cue", "album.wav");
+  writeMinimalWav(album / "disc" / "bonus.wav");
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log, std::chrono::milliseconds{50});
+  service->scan({ScannerRoot{.path = root}}, ScanMode::Full);
+  waitForInitialScanCompleted(log);
+  waitForSnapshotSongCount(*service, 2U);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+  const auto startedBefore = log.scanStartedCount();
+
+  std::error_code ec;
+  std::filesystem::remove_all(album, ec);
+  REQUIRE(ec.value() == 0);
+
+  CHECK(waitUntil(
+      [&] {
+        return snapshotSongPaths(*service).empty() && locationsForRoot(temp).empty() &&
+               !std::filesystem::exists(album);
+      },
+      std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedBefore);
+  CHECK(log.scanErrorCount() == 0U);
+  CHECK(songsIn(service->snapshot()).empty());
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
+}
+
+// 场景 15：未扫描 root 的首个事件（无 scan_roots 行）。树未种子化 → 丢弃批次 + 置脏 +
+// 提交该 root 的 Reconcile（设计 §13.3-3：首次索引不读作"watcher 触发全量重扫"）。
+// 收敛后第二次 create 回到文件级精准路径，ScanStarted 不再增长。
+TEST_CASE("efsw integration first event on an un-scanned root indexes via reconcile") {
+  test::TempScannerRoot temp{"scanner-efsw-unscanned-root"};
+  const auto root = temp.path();
+
+  RealEfswEventLog log;
+  auto service = makeRealEfswService(temp, log);
+  service->startWatching({ScannerRoot{.path = root}});
+  CHECK(waitForScanQuiescence(log));
+
+  writeMinimalWav(root / "first.wav");
+  CHECK(waitForSnapshotPaths(*service, {root / "first.wav"}, std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanErrorCount() == 0U);
+  checkSnapshotCachePathsMatch(*service, temp);
+  const auto startedAfterFirst = log.scanStartedCount();
+
+  writeMinimalWav(root / "second.wav");
+  CHECK(waitForSnapshotPaths(*service, {root / "first.wav", root / "second.wav"}, std::chrono::seconds{10}));
+  CHECK(waitForScanQuiescence(log));
+  CHECK(log.scanStartedCount() == startedAfterFirst);
+  CHECK(log.scanErrorCount() == 0U);
+  checkSnapshotCachePathsMatch(*service, temp);
+
+  stopAndDestroy(service);
 }
 
 // 事件流活跃期间析构服务：生产者线程持续写入触发事件，主线程确认至少一批事件已处理、

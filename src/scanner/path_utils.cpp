@@ -237,6 +237,17 @@ bool isLyricsSidecarPath(const std::filesystem::path& path) {
   return normalizedExtension(path) == ".lrc";
 }
 
+bool isCoverSidecar(const std::filesystem::path& path) {
+  static const std::unordered_set<std::string> coverStems{"cover", "front", "folder", "album", "artwork"};
+  static const std::unordered_set<std::string> coverExtensions{".png", ".jpg", ".jpeg", ".bmp",
+                                                               ".webp", ".gif", ".tiff"};
+  if (!coverExtensions.contains(normalizedExtension(path))) {
+    return false;
+  }
+  const auto stem = pathToUtf8(path.stem());
+  return coverStems.contains(lowerAscii(stem));
+}
+
 std::filesystem::path expectedLyricsSidecarPath(const std::filesystem::path& audioPath) {
   auto sidecar = audioPath;
   sidecar.replace_extension(".lrc");

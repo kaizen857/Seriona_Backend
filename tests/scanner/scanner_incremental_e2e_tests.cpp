@@ -208,7 +208,8 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
   return makeFileScannerService(FileScannerServiceDependencies{.metadataReader = std::move(reader),
                                                                .watcherFactory = nullptr,
                                                                .databasePath = temp.dbPath(),
-                                                               .coverExportDir = temp.path() / "covers"});
+                                                               .coverExportDir = temp.path() / "covers",
+                                                               .folderThumbnailSeam = nullptr});
 }
 
 [[nodiscard]] std::shared_ptr<FileScannerService> makeServiceWithSeam(test::TempScannerRoot& temp,
@@ -1887,10 +1888,10 @@ TEST_CASE("scanner progress events keep scanned plus skipped within discovered a
   ScannerEventLog eventLog;
   service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
 
-  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
-  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+  static_cast<void>(runScanAndWait(*service, eventLog, temp.path(), ScanMode::Full, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; }));
+  static_cast<void>(runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; }));
   reader->put(b, rawMetadata("B Changed"));
-  runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; });
+  static_cast<void>(runScanAndWait(*service, eventLog, temp.path(), ScanMode::Incremental, [](const PlaylistTreeSnapshot& snapshot) { return songsIn(snapshot).size() == 3U; }));
 
   const auto progressEvents = eventLog.progressEvents();
   REQUIRE(progressEvents.size() >= 3U);

@@ -5,6 +5,7 @@
 
 #include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
+#include "seriona/scanner/song_identity.h"
 
 #include <doctest.h>
 
@@ -150,6 +151,7 @@ void writeText(const std::filesystem::path& path, const std::string& text) {
                                                                .watcherFactory = std::move(watcherFactory),
                                                                .databasePath = temp.dbPath(),
                                                                .coverExportDir = temp.path() / "covers",
+                                                               .folderThumbnailSeam = nullptr,
                                                                .watcherDebounce = std::chrono::milliseconds{5}});
 }
 
@@ -196,6 +198,18 @@ void waitForSnapshotSongPath(const FileScannerService& service, const std::files
   FAIL("timed out waiting for watcher snapshot song path");
 }
 
+// 等待快照重新发布（generatedAt 推进）：用于"内容数不变但必须等某次扫描真正落地"的同步点。
+// 不能用 version：它是 per-builder 计数，整树重建换新 builder 会重置。
+void waitForSnapshotRepublish(const FileScannerService& service, std::chrono::steady_clock::time_point before) {
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    if (service.snapshot().generatedAt > before) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  FAIL("timed out waiting for snapshot republish");
+}
+
 void waitForLyrics(const FileScannerService& service, LyricsSource source, std::string_view text) {
   for (auto attempt = 0; attempt != 1000; ++attempt) {
     const auto songs = songsIn(service.snapshot());
@@ -227,21 +241,6 @@ void waitForSongLyrics(const FileScannerService& service, const std::filesystem:
   return static_cast<std::size_t>(std::ranges::count_if(events, [](const ScannerEvent& event) {
     return event.type == ScannerEventType::ScanStarted;
   }));
-}
-
-// 等待回落重扫真正开始，而不是固定 sleep：慢机器（CI runner）上 30ms 常常
-// 不够，断言会在重扫启动前就跑完。
-void waitForScanStartedCount(const std::vector<ScannerEvent>& events, std::mutex& mutex, std::size_t expected) {
-  for (auto attempt = 0; attempt != 2000; ++attempt) {
-    {
-      std::scoped_lock lock{mutex};
-      if (scanStartedCount(events) >= expected) {
-        return;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds{5});
-  }
-  FAIL("timed out waiting for fallback rescan to start");
 }
 
 // 等待事件计数到达阈值（代替固定沉降窗）：发布在慢机上可能迟到 >30ms；
@@ -357,7 +356,13 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   auto reader = std::make_shared<FakeWatcherMetadataReader>();
   reader->put(audio, rawMetadata("Song", {RawTagLyricLine{std::chrono::milliseconds{100}, "embedded"}}));
   auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
   auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
 
   service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
   waitForSnapshotSongCount(*service, 1U);
@@ -377,6 +382,11 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
   REQUIRE(songs[0].effectiveLyrics.size() == 1U);
   CHECK(songs[0].effectiveLyrics[0].text == "external");
+  // .lrc 修改是 T0 歌词对账（不发 ScanStarted），且排除出树哈希 → 不刷新 hash、不触发扫描。
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
 
   std::filesystem::remove(lrc);
   watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Destroyed));
@@ -387,6 +397,10 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].effectiveLyricsSource == LyricsSource::EmbeddedTag);
   CHECK(songs[0].effectiveLyrics[0].text == "embedded");
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
 }
 
 TEST_CASE("scanner watcher warning error and overflow messages force root reconciliation") {
@@ -647,6 +661,7 @@ TEST_CASE("scanner watcher marks fallback rescan when event queue overflows") {
                                                                        .watcherFactory = watchers,
                                                                        .databasePath = temp.dbPath(),
                                                                        .coverExportDir = temp.path() / "covers",
+                                                                       .folderThumbnailSeam = nullptr,
                                                                        .watcherDebounce = std::chrono::milliseconds{1000}});
 
   bool sawFallback = false;
@@ -893,13 +908,23 @@ TEST_CASE("scanner watcher precisely removes a moved-out directory with a file-k
   CHECK(scanRootHashInDatabase(temp) == *currentHash.hash);
 }
 
-// CUE 交叉守卫（removalCrossesCueSemantics）回归的共用夹具：完整扫描（含 seam CUE 轨）→
-// startWatching → 目录移出根 → 注入 File kind Destroyed → 断言保守回落（初始扫描 +1）。
-// configureReader 在扫描前注入 fixture 的 reader 元数据与 CUE seam；移除守卫后精准删除
-// 会让 ScanStarted 停在 1，CHECK 即失败。
-void runMovedOutCueGuardScenario(test::TempScannerRoot& temp, const std::filesystem::path& destroyedDir,
-                                 std::size_t visibleSongsBeforeMove,
-                                 const std::function<void(FakeWatcherMetadataReader&)>& configureReader) {
+// CUE 移出形状回归夹具（新语义，设计 §3.2 / Oracle B3）：完整扫描（含 seam CUE 轨）→
+// startWatching → 目录移出根 + 注入 File kind Destroyed → 等待收敛。
+// 断言 ScanStarted 不增：目录移出不再回落扫描（无论 Full 还是 Reconcile），而是
+//   1) 共置 cue+源 = 纯精准前缀删除；
+//   2) cue 移出、源在外 = 孤儿源重 upsert 为可见曲目；
+//   3) 源移出、cue 在外 = cueRefresh scope（cue 父目录）重解析。
+struct MovedOutCueOutcome {
+  std::size_t scanStartedBefore{0};
+  std::size_t scanStartedAfter{0};
+  std::vector<SongMetadata> songs;
+  std::shared_ptr<FileScannerService> service;
+};
+
+MovedOutCueOutcome runMovedOutCuePreciseScenario(
+    test::TempScannerRoot& temp, const std::filesystem::path& destroyedDir, std::size_t visibleSongsBeforeMove,
+    const std::function<bool(const std::vector<SongMetadata>&)>& converged,
+    const std::function<void(FakeWatcherMetadataReader&)>& configureReader) {
   auto reader = std::make_shared<FakeWatcherMetadataReader>();
   configureReader(*reader);
   auto watchers = std::make_shared<CapturingWatcherFactory>();
@@ -917,7 +942,13 @@ void runMovedOutCueGuardScenario(test::TempScannerRoot& temp, const std::filesys
   service->startWatching({ScannerRoot{.path = temp.path()}});
   REQUIRE(watchers->states.size() == 1U);
 
-  const auto movedOut = temp.path().parent_path() / ("seriona-move-out-cue-guard-" + temp.path().filename().string());
+  std::size_t startedBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+  }
+
+  const auto movedOut = temp.path().parent_path() / ("seriona-move-out-cue-precise-" + temp.path().filename().string());
   std::error_code moveError;
   std::filesystem::remove_all(movedOut, moveError);
   std::filesystem::rename(destroyedDir, movedOut, moveError);
@@ -925,49 +956,141 @@ void runMovedOutCueGuardScenario(test::TempScannerRoot& temp, const std::filesys
   std::this_thread::sleep_for(std::chrono::milliseconds{3});
   watchers->states[0]->callback(fileEvent(destroyedDir, WatchEffectKind::Destroyed));
 
-  waitForScanStartedCount(events, eventsMutex, 2U);
-  waitForSnapshotSongCount(*service, 0U);
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    if (converged(songsIn(service->snapshot()))) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  // 沉降窗口：若批次被兜底为扫描（Full/Reconcile），其 ScanStarted 会在窗口内出现，负向断言防竞态。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  MovedOutCueOutcome outcome;
+  outcome.songs = songsIn(service->snapshot());
+  outcome.service = service;
   {
     std::scoped_lock lock{eventsMutex};
-    // 守卫保留保守回落：初始扫描 1 次 + 回落重扫 1 次；若被误判为精准删除则只有 1 次。
-    CHECK(scanStartedCount(events) == 2U);
+    outcome.scanStartedBefore = startedBefore;
+    outcome.scanStartedAfter = scanStartedCount(events);
   }
+  // events/eventsMutex 是本函数局部量：返回后调用方仍可能对 service 发起扫描（全量重建对比），
+  // 必须摘除引用它们的 sink，避免扫描线程回调悬垂引用。
+  service->setEventSink(nullptr);
+  return outcome;
 }
 
-TEST_CASE("scanner watcher moved-out directory crossing cue semantics keeps fallback rescan") {
-  // 方向 1（removalCrossesCueSemantics 首个方向）：cue 在被移出子树内，其源音频也在内 ——
-  // 精准删除会让子树的 CUE 轨与其源音频之间失去可见性来源，必须保留保守回落。
+TEST_CASE("scanner watcher moved-out cue directory converges precisely without fallback rescan") {
+  // 形状 1（共置 cue+源，用户命中形状）：fileUnder && sourceUnder → 两个交叉集合都不命中 →
+  // 纯精准前缀删除；无孤儿、无 cueRefresh、无扫描。
   {
-    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-guard"};
+    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-colocated"};
     const auto music = temp.path() / "music";
     std::filesystem::create_directories(music);
     const auto cueFile = music / "album.cue";
     const auto referencedAudio = music / "album.flac";
     writeText(cueFile, "REM DUMMY COMMENT\n");
     writeText(referencedAudio, "fake referenced audio");
-    runMovedOutCueGuardScenario(temp, music, 1U, [&referencedAudio](FakeWatcherMetadataReader& reader) {
-      reader.put(referencedAudio, rawMetadata("Bare album file"));
-      setTestCueSheetProvider([&referencedAudio](const std::filesystem::path& cuePath)
-                                  -> std::vector<TestCueTrackData> {
-        if (cuePath.filename() == "album.cue") {
-          return {{.audioFilePath = referencedAudio,
-                   .offset = 0,
-                   .duration = 180000000,
-                   .title = "Cue Track 1",
-                   .artist = "Cue Artist",
-                   .album = "Cue Album",
-                   .trackNumber = 1}};
-        }
-        return {};
-      });
-    });
+    const auto outcome = runMovedOutCuePreciseScenario(
+        temp, music, 1U, [](const std::vector<SongMetadata>& songs) { return songs.empty(); },
+        [&referencedAudio](FakeWatcherMetadataReader& reader) {
+          reader.put(referencedAudio, rawMetadata("Bare album file"));
+          setTestCueSheetProvider([&referencedAudio](const std::filesystem::path& cuePath)
+                                      -> std::vector<TestCueTrackData> {
+            if (cuePath.filename() == "album.cue") {
+              return {{.audioFilePath = referencedAudio,
+                       .offset = 0,
+                       .duration = 180000000,
+                       .title = "Cue Track 1",
+                       .artist = "Cue Artist",
+                       .album = "Cue Album",
+                       .trackNumber = 1}};
+            }
+            return {};
+          });
+        });
+    CHECK(outcome.scanStartedAfter == outcome.scanStartedBefore);
+    CHECK(outcome.songs.empty());
   }
 
-  // 方向 2（修复后以被移除子树的绝对键做前缀比较）：cue 在被移出子树之外、引用子树内
-  // 源音频 —— 精准删除会按 source_file_path 删掉 locations 行，却无法触及子树外的 CUE 轨
-  // 节点（快照/缓存分歧），必须同样回落。music 内含可见曲目以保证它是树中已知目录。
+  // 形状 2（cue 移出、源在外）：cue 没了、源还在 → 交叉收集器产出孤儿源，重 upsert 为可见
+  // 普通曲目（源重新可见），同样不触发扫描。
   {
-    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-source"};
+    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-orphan"};
+    const auto music = temp.path() / "music";
+    const auto audioDir = temp.path() / "audio";
+    std::filesystem::create_directories(music);
+    std::filesystem::create_directories(audioDir);
+    const auto cueFile = music / "album.cue";
+    const auto orphanAudio = audioDir / "album.flac";
+    writeText(cueFile, "REM DUMMY COMMENT\n");
+    writeText(orphanAudio, "fake orphan audio");
+    const auto outcome = runMovedOutCuePreciseScenario(
+        temp, music, 1U,
+        [&orphanAudio](const std::vector<SongMetadata>& songs) {
+          return songs.size() == 1U && songs[0].filePath == orphanAudio;
+        },
+        [&orphanAudio](FakeWatcherMetadataReader& reader) {
+          reader.put(orphanAudio, rawMetadata("Orphan Source"));
+          setTestCueSheetProvider([&orphanAudio](const std::filesystem::path& cuePath)
+                                      -> std::vector<TestCueTrackData> {
+            if (cuePath.filename() == "album.cue") {
+              return {{.audioFilePath = orphanAudio,
+                       .offset = 0,
+                       .duration = 180000000,
+                       .title = "Cue Track 1",
+                       .artist = "Cue Artist",
+                       .album = "Cue Album",
+                       .trackNumber = 1}};
+            }
+            return {};
+          });
+        });
+    CHECK(outcome.scanStartedAfter == outcome.scanStartedBefore);
+    REQUIRE(outcome.songs.size() == 1U);
+    CHECK(outcome.songs[0].filePath == orphanAudio);
+    CHECK(outcome.songs[0].title == "Orphan Source");
+
+    // 补丁结果 == 全量重建：孤儿 upsert 后再跑一次用户显式 Full 扫描，快照与缓存必须一致
+    // （设计 §3.4：任何 CUE 局部改动必须同时更新 allSongs_/树/缓存，否则与全量重建分歧）。
+    cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+    const auto patchedLocations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+    REQUIRE(patchedLocations.size() == 1U);
+    CHECK(patchedLocations[0].filePath == orphanAudio);
+
+    // 必须等待 Full 真正完成（快照重新发布）再采样：补丁快照已满足歌曲数，只等计数
+    // 会在 Full 未落地时提前对比（对比恒真）。
+    const auto publishedBefore = outcome.service->snapshot().generatedAt;
+    outcome.service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+    waitForSnapshotRepublish(*outcome.service, publishedBefore);
+    const auto rebuiltSongs = songsIn(outcome.service->snapshot());
+    REQUIRE(rebuiltSongs.size() == outcome.songs.size());
+    for (std::size_t index = 0; index < rebuiltSongs.size(); ++index) {
+      CHECK(rebuiltSongs[index].filePath == outcome.songs[index].filePath);
+      CHECK(rebuiltSongs[index].title == outcome.songs[index].title);
+      CHECK(rebuiltSongs[index].artist == outcome.songs[index].artist);
+      CHECK(rebuiltSongs[index].album == outcome.songs[index].album);
+      CHECK(rebuiltSongs[index].logicalTrackId == outcome.songs[index].logicalTrackId);
+    }
+    const auto rebuiltLocations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+    REQUIRE(rebuiltLocations.size() == patchedLocations.size());
+    std::vector<std::string> patchedIds;
+    patchedIds.reserve(patchedLocations.size());
+    for (const auto& location : patchedLocations) {
+      patchedIds.push_back(location.locationId);
+    }
+    std::vector<std::string> rebuiltIds;
+    rebuiltIds.reserve(rebuiltLocations.size());
+    for (const auto& location : rebuiltLocations) {
+      rebuiltIds.push_back(location.locationId);
+    }
+    std::ranges::sort(patchedIds);
+    std::ranges::sort(rebuiltIds);
+    CHECK(rebuiltIds == patchedIds);
+  }
+
+  // 形状 3（源移出、cue 在外）：cue 还在、源没了 → cueRefreshTargets → T1 scope = cue 父目录
+  // 重解析；scoped 契约不发 ScanStarted。music 内含可见曲目保证它是树中已知目录。
+  {
+    test::TempScannerRoot temp{"scanner-watcher-move-out-cue-refresh"};
     const auto music = temp.path() / "music";
     const auto cues = temp.path() / "cues";
     std::filesystem::create_directories(music);
@@ -978,23 +1101,27 @@ TEST_CASE("scanner watcher moved-out directory crossing cue semantics keeps fall
     writeText(visibleAudio, "fake visible audio");
     writeText(hiddenAudio, "fake hidden source audio");
     writeText(cueFile, "REM DUMMY COMMENT\n");
-    runMovedOutCueGuardScenario(temp, music, 2U, [&visibleAudio, &hiddenAudio](FakeWatcherMetadataReader& reader) {
-      reader.put(visibleAudio, rawMetadata("Visible Track"));
-      reader.put(hiddenAudio, rawMetadata("Hidden Source"));
-      setTestCueSheetProvider([&hiddenAudio](const std::filesystem::path& cuePath)
-                                  -> std::vector<TestCueTrackData> {
-        if (cuePath.filename() == "outside.cue") {
-          return {{.audioFilePath = hiddenAudio,
-                   .offset = 0,
-                   .duration = 180000000,
-                   .title = "Cue Track 1",
-                   .artist = "Cue Artist",
-                   .album = "Cue Album",
-                   .trackNumber = 1}};
-        }
-        return {};
-      });
-    });
+    const auto outcome = runMovedOutCuePreciseScenario(
+        temp, music, 2U, [](const std::vector<SongMetadata>& songs) { return songs.empty(); },
+        [&visibleAudio, &hiddenAudio](FakeWatcherMetadataReader& reader) {
+          reader.put(visibleAudio, rawMetadata("Visible Track"));
+          reader.put(hiddenAudio, rawMetadata("Hidden Source"));
+          setTestCueSheetProvider([&hiddenAudio](const std::filesystem::path& cuePath)
+                                      -> std::vector<TestCueTrackData> {
+            if (cuePath.filename() == "outside.cue") {
+              return {{.audioFilePath = hiddenAudio,
+                       .offset = 0,
+                       .duration = 180000000,
+                       .title = "Cue Track 1",
+                       .artist = "Cue Artist",
+                       .album = "Cue Album",
+                       .trackNumber = 1}};
+            }
+            return {};
+          });
+        });
+    CHECK(outcome.scanStartedAfter == outcome.scanStartedBefore);
+    CHECK(outcome.songs.empty());
   }
 }
 
@@ -1211,6 +1338,128 @@ TEST_CASE("scanner watcher root-internal rename with overlapping sibling prefix 
   }
 }
 
+TEST_CASE("scanner watcher cue file rename rewrites logicalTrackId and tree keys") {
+  test::TempScannerRoot temp{"scanner-watcher-rename-cue-file"};
+  const auto music = temp.path() / "music";
+  std::filesystem::create_directories(music);
+  const auto oldCue = music / "album.cue";
+  const auto newCue = music / "album-renamed.cue";
+  const auto referencedAudio = music / "album.flac";
+  writeText(oldCue, "REM DUMMY COMMENT\n");
+  writeText(referencedAudio, "fake referenced audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(referencedAudio, rawMetadata("Bare album file"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  setTestCueSheetProvider([&referencedAudio](const std::filesystem::path& cuePath)
+                              -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() == "album.cue") {
+      return {{.audioFilePath = referencedAudio,
+               .offset = 0,
+               .duration = 180000000,
+               .title = "Cue Track 1",
+               .artist = "Cue Artist",
+               .album = "Cue Album",
+               .trackNumber = 1}};
+    }
+    return {};
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  std::string logicalBefore;
+  for (const auto& node : service->snapshot().nodes) {
+    if (node.song.has_value() && node.song->filePath == oldCue) {
+      logicalBefore = node.song->logicalTrackId;
+    }
+  }
+  REQUIRE_FALSE(logicalBefore.empty());
+  // 缓存侧基线：rename 前 cue 轨 locations 行的身份（locationId 含路径，rename 后必须重算）。
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  std::string oldLocationId;
+  std::uint64_t cueFileSize = 0;
+  std::int64_t cueFileMtimeNs = 0;
+  std::optional<std::chrono::milliseconds> cueOffset;
+  std::optional<std::uint32_t> cueIndex;
+  for (const auto& location : sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()))) {
+    if (location.filePath == oldCue) {
+      oldLocationId = location.locationId;
+      cueFileSize = location.fileSizeBytes;
+      cueFileMtimeNs = location.fileMtimeNs;
+      cueOffset = location.cueTrackOffset;
+      cueIndex = location.cueTrackIndex;
+    }
+  }
+  REQUIRE_FALSE(oldLocationId.empty());
+  clearTestCueSheetProvider();
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // .cue 文件级 rename（efsw 单条 Moved，旧路径为 primary）：树键 = logicalTrackId =
+  // <absCue>#trackN，前缀改写必须命中 '#' 分支（B7 三处修复点）。
+  std::filesystem::rename(oldCue, newCue);
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  WatchEvent rename = WatchEvent{.path = oldCue, .pathKind = WatchPathKind::File,
+                                 .effectKind = WatchEffectKind::Renamed, .associated = {}};
+  rename.associated.push_back(WatchEvent{.path = newCue, .pathKind = WatchPathKind::File,
+                                         .effectKind = WatchEffectKind::Renamed, .associated = {}});
+  watchers->states[0]->callback(rename);
+
+  waitForSnapshotSongPath(*service, newCue);
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+
+  const auto snapshot = service->snapshot();
+  const auto trackSuffix = logicalBefore.substr(logicalBefore.rfind('#'));
+  const auto oldCuePrefix = logicalBefore.substr(0, logicalBefore.rfind('#'));
+  CHECK(std::ranges::none_of(snapshot.nodes, [&](const PlaylistNode& node) {
+    return node.nodeId.find(oldCuePrefix) != std::string::npos || node.nodeId.find("album.cue") != std::string::npos;
+  }));
+  const SongMetadata* renamedSong = nullptr;
+  std::string renamedNodeId;
+  for (const auto& node : snapshot.nodes) {
+    if (node.song.has_value() && node.song->filePath == newCue) {
+      renamedSong = &*node.song;
+      renamedNodeId = node.nodeId;
+    }
+  }
+  REQUIRE(renamedSong != nullptr);
+  CHECK(renamedSong->logicalTrackId != logicalBefore);
+  CHECK(renamedSong->logicalTrackId.rfind(oldCuePrefix, 0) != 0);
+  CHECK(renamedSong->logicalTrackId.ends_with(trackSuffix));
+  CHECK(renamedSong->trackId == renamedSong->logicalTrackId);
+  // 树节点身份 = "track:" + logicalTrackId：键同样必须指向新 cue 路径，否则旧键残留为幽灵轨节点。
+  CHECK(renamedNodeId == "track:" + renamedSong->logicalTrackId);
+  // 缓存侧：旧 cue 路径行消失；新行 file_path 指向新 cue 路径且 locationId 按新路径重算
+  // （computeLocationId 纳入路径，故必须与旧值不同且等于新路径的期望值）。
+  const auto renamedLocations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  CHECK(std::ranges::none_of(renamedLocations, [&](const cache::CachedLocation& location) {
+    return location.filePath == oldCue;
+  }));
+  const cache::CachedLocation* renamedLocation = nullptr;
+  for (const auto& location : renamedLocations) {
+    if (location.filePath == newCue) {
+      renamedLocation = &location;
+    }
+  }
+  REQUIRE(renamedLocation != nullptr);
+  CHECK(renamedLocation->locationId != oldLocationId);
+  const auto cueMtime = std::filesystem::file_time_type{
+      std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{cueFileMtimeNs})};
+  CHECK(renamedLocation->locationId == computeLocationId(newCue, cueFileSize, cueMtime, cueOffset, cueIndex));
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
+}
+
 TEST_CASE("scanner watcher drops ghost create events for paths absent on disk") {
   test::TempScannerRoot temp{"scanner-watcher-ghost-create"};
   const auto track = test::writeAudioFixture(temp.path(), "real.flac");
@@ -1243,7 +1492,7 @@ TEST_CASE("scanner watcher drops ghost create events for paths absent on disk") 
   }
 }
 
-TEST_CASE("scanner watcher falls back to rescan when move-self path still exists") {
+TEST_CASE("scanner watcher move-self with existing path converges via scoped reconcile without rescan") {
   test::TempScannerRoot temp{"scanner-watcher-move-self-ambiguous"};
   const auto music = temp.path() / "music";
   std::filesystem::create_directories(music);
@@ -1263,14 +1512,38 @@ TEST_CASE("scanner watcher falls back to rescan when move-self path still exists
   waitForSnapshotSongCount(*service, 1U);
   service->startWatching({ScannerRoot{.path = temp.path()}});
   REQUIRE(watchers->states.size() == 1U);
+  std::size_t startedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
 
-  // 目录仍存在于磁盘（歧义：可能是移出后被同名目录顶替）→ 无法精准判定 → 回落全根重扫。
+  // 目录仍存在于磁盘（歧义：可能是移出后被同名目录顶替）：新语义按目录 scope 收敛
+  // （scope 内增量计划命中缓存 → 标签零重读），不再回落重扫。
   watchers->states[0]->callback(directorySelfEvent(music));
-  waitForSnapshotSongCount(*service, 1U);
-  waitForScanStartedCount(events, eventsMutex, 2U);
+  bool sawSnapshot = false;
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    {
+      std::scoped_lock lock{eventsMutex};
+      if (eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) > snapshotBefore) {
+        sawSnapshot = true;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  CHECK(sawSnapshot);
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
   const auto songs = songsIn(service->snapshot());
   REQUIRE(songs.size() == 1U);
   CHECK(songs[0].filePath == track);
+  CHECK(reader->readCount() == 1U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+  }
 }
 
 TEST_CASE("scanner watcher refreshes scan-root hash so the next reconcile stays incremental") {
@@ -1404,6 +1677,7 @@ TEST_CASE("scanner watcher periodic reconcile rescans silent disk changes withou
       .watcherFactory = watchers,
       .databasePath = temp.dbPath(),
       .coverExportDir = temp.path() / "covers",
+      .folderThumbnailSeam = nullptr,
       .watcherDebounce = std::chrono::milliseconds{5},
       .reconcileInterval = std::chrono::milliseconds{30}});
 
@@ -1437,6 +1711,7 @@ TEST_CASE("scanner watcher periodic reconcile does not publish when nothing chan
       .watcherFactory = watchers,
       .databasePath = temp.dbPath(),
       .coverExportDir = temp.path() / "covers",
+      .folderThumbnailSeam = nullptr,
       .watcherDebounce = std::chrono::milliseconds{5},
       .reconcileInterval = std::chrono::milliseconds{30}});
   service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
@@ -1475,12 +1750,12 @@ TEST_CASE("scanner watcher periodic reconcile does not publish when nothing chan
 }
 
 TEST_CASE("scanner watcher falls back to rescan for first create on an un-scanned new root") {
-  // 守卫语义（波 4.1 MAJOR-2）：locations.root_path 外键指向 scan_roots，
+  // 守卫语义（波 4.1 MAJOR-2 / 设计 §13.3-3）：locations.root_path 外键指向 scan_roots，
   // 而 scan_roots 行只在扫描完成时写入。新 root 尚未扫描时，其首个 create 无法精准
   // upsert（否则插入 root_path 无外键父行 → FOREIGN KEY constraint failed），
-  // 分类器守卫（loadScanRoot 无值）直接回落全根重扫；重扫写入该 root 的 scan_roots，
-  // 后续 create 才能走精准更新。本用例断言回落后的收敛行为（歌曲进快照 + 触发重扫），
-  // FK 警告消除由 tools/watch_root_move_audit 场景 9 的日志验证。
+  // 分类器守卫（loadScanRoot 无值）改为提交该 root 的 Reconcile（永不 Full）；
+  // Reconcile 写入 scan_roots，后续 create 才能走精准更新。本用例断言收敛行为
+  // （歌曲进快照 + 触发一次扫描），FK 警告消除由 tools/watch_root_move_audit 场景 9 的日志验证。
   test::TempScannerRoot temp{"scanner-watcher-new-root"};
   const auto musicA = temp.path() / "musicA";
   const auto musicB = temp.path() / "musicB";
@@ -1517,8 +1792,8 @@ TEST_CASE("scanner watcher falls back to rescan for first create on an un-scanne
   std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
   watchers->states[1]->callback(fileEvent(trackB, WatchEffectKind::Created));
 
-  // 守卫回落：musicB 未扫描 → 不精准 upsert → 触发全根重扫，
-  // 重扫写入 musicB 的 scan_roots 记录，b.flac 进入快照。
+  // 守卫改走 Reconcile（永不 Full）：musicB 未扫描 → 不精准 upsert → 提交 Reconcile，
+  // Reconcile 写入 musicB 的 scan_roots 记录，b.flac 进入快照。
   waitForSnapshotSongCount(*service, 2U);
   auto songs = songsIn(service->snapshot());
   CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackB; }));
@@ -1546,6 +1821,64 @@ TEST_CASE("scanner watcher falls back to rescan for first create on an un-scanne
     std::scoped_lock lock{eventsMutex};
     CHECK(scanStartedCount(events) == scannedCountBefore + 1U);
   }
+}
+
+TEST_CASE("scanner watcher keeps unavailable root entries and cache when root disappears") {
+  // B1：根路径暂时性丢失（卸载/网络卷/删除）不得清空既有索引与缓存。runScan 按 root 合并：
+  // 缺失 root 的对账中止（hash 缺失），其条目与 locations/scan_roots 行原样保留；
+  // 其余 root 正常增量收敛。
+  test::TempScannerRoot temp{"scanner-watcher-root-unavailable"};
+  const auto musicA = temp.path() / "musicA";
+  const auto musicB = temp.path() / "musicB";
+  std::filesystem::create_directories(musicA);
+  std::filesystem::create_directories(musicB);
+  const auto trackA = test::writeAudioFixture(musicA, "a.flac");
+  const auto trackB = test::writeAudioFixture(musicB, "b.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(trackA, rawMetadata("Track A"));
+  reader->put(trackB, rawMetadata("Track B"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = musicA}, ScannerRoot{.path = musicB}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 2U);
+  CHECK(reader->readCount() == 2U);
+  service->startWatching({ScannerRoot{.path = musicA}, ScannerRoot{.path = musicB}});
+  REQUIRE(watchers->states.size() == 2U);
+
+  const auto movedB = temp.path().parent_path() / ("seriona-root-gone-" + temp.path().filename().string());
+  std::error_code moveError;
+  std::filesystem::remove_all(movedB, moveError);
+  std::filesystem::rename(musicB, movedB, moveError);
+  REQUIRE_FALSE(moveError);
+
+  std::size_t completedBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+  }
+  // watcher 失事件信号 → Reconcile（永不 Full）：musicA 增量对账命中缓存（零标签重读），
+  // musicB 对账中止（hash 缺失）→ 条目保留。
+  watchers->states[0]->callback(watcherMessage("w/sys/q_overflow@"));
+  waitForScanCompletedCount(events, eventsMutex, completedBefore + 1U);
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 2U);
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackA; }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == trackB; }));
+  CHECK(reader->readCount() == 2U);
+
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  CHECK(sidecar.loadLocationsByRoot(canonicalRootPath(musicA)).size() == 1U);
+  CHECK(sidecar.loadLocationsByRoot(canonicalRootPath(musicB)).size() == 1U);
+  CHECK(sidecar.loadScanRoot(canonicalRootPath(musicB)).has_value());
 }
 
 TEST_CASE("scanner watcher scoped reconcile enumerates a directory moved into the root") {
@@ -1632,6 +1965,7 @@ TEST_CASE("scanner watcher scoped reconcile dedups nested and duplicate director
                                                                        .watcherFactory = watchers,
                                                                        .databasePath = temp.dbPath(),
                                                                        .coverExportDir = temp.path() / "covers",
+                                                                       .folderThumbnailSeam = nullptr,
                                                                        .watcherDebounce = std::chrono::milliseconds{30}});
   service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
     std::scoped_lock lock{eventsMutex};
@@ -1976,6 +2310,284 @@ TEST_CASE("scanner watcher precise upsert degrades gracefully on a corrupt lyric
   REQUIRE(foundLocation != locations.end());
   CHECK(foundLocation->lyricsSource == LyricsSource::EmbeddedTag);
   CHECK(sidecar.loadLyrics(foundLocation->locationId, "external").empty());
+}
+
+TEST_CASE("scanner watcher keeps unaffected directory thumbnails across precise batches") {
+  test::TempScannerRoot temp{"scanner-watcher-thumbnail-cache"};
+  const auto dirAlpha = temp.path() / "alpha";
+  const auto dirBeta = temp.path() / "beta";
+  const auto songAlpha = test::writeAudioFixture(dirAlpha, "a.flac");
+  const auto songBeta = test::writeAudioFixture(dirBeta, "b.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(songAlpha, rawMetadata("Alpha"));
+  reader->put(songBeta, rawMetadata("Beta"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  // 非 nullptr seam：alpha 有 marker 才解析出缩略图（模拟真实文件夹封面导出）。
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+      .metadataReader = reader,
+      .watcherFactory = watchers,
+      .databasePath = temp.dbPath(),
+      .coverExportDir = temp.path() / "covers",
+      .folderThumbnailSeam = [](const std::filesystem::path& directory) -> std::optional<std::filesystem::path> {
+        if (std::filesystem::exists(directory / "cover.marker")) {
+          return directory / "thumb.png";
+        }
+        return std::nullopt;
+      },
+      .watcherDebounce = std::chrono::milliseconds{5}});
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+  writeText(dirAlpha / "cover.marker", "x");
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 2U);
+  const auto thumbnailFor = [&](std::string_view displayName) -> std::optional<std::string> {
+    for (const auto& node : service->snapshot().nodes) {
+      if (node.kind == PlaylistNodeKind::Directory && node.displayName == displayName) {
+        return node.thumbnailPath;
+      }
+    }
+    return std::nullopt;
+  };
+  const auto alphaThumbnail = thumbnailFor("alpha");
+  REQUIRE(alphaThumbnail.has_value());
+  CHECK(std::filesystem::path{*alphaThumbnail} == dirAlpha / "thumb.png");
+  CHECK(thumbnailFor("beta") == std::nullopt);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // 在 beta 目录精准创建文件：发布只重解析 beta 子树，alpha 必须从缓存回填缩略图
+  // （R13.1 回归：未受影响目录的 thumbnailPath 不得被清成 nullopt）。
+  const auto created = test::writeAudioFixture(dirBeta, "c.flac");
+  reader->put(created, rawMetadata("Gamma"));
+  watchers->states[0]->callback(fileEvent(created, WatchEffectKind::Created));
+  waitForSnapshotSongCount(*service, 3U);
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  const auto alphaAfter = thumbnailFor("alpha");
+  REQUIRE(alphaAfter.has_value());
+  CHECK(std::filesystem::path{*alphaAfter} == dirAlpha / "thumb.png");
+  // 受影响目录 beta 重解析：无 marker → 保持无缩略图（不是残留陈旧值）。
+  CHECK(thumbnailFor("beta") == std::nullopt);
+}
+
+TEST_CASE("scanner watcher cover event re-reads directory tags so song artwork is refreshed") {
+  test::TempScannerRoot temp{"scanner-watcher-cover-reread"};
+  const auto music = temp.path() / "music";
+  const auto song = test::writeAudioFixture(music, "01.flac");
+  const auto cover = music / "cover.jpg";
+  writeText(cover, "fake cover bytes");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  auto withCover = rawMetadata("Song");
+  withCover.coverPath = temp.path() / "export" / "cover.png";
+  withCover.thumbnailPath = temp.path() / "export" / "thumb.png";
+  reader->put(song, withCover);
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  CHECK(reader->readCount() == 1U);
+  const auto artworkBefore = songsIn(service->snapshot())[0].artworkPath;
+  REQUIRE(artworkBefore.has_value());
+  REQUIRE_FALSE(artworkBefore->empty());
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // 封面删除：谓词命中 → scope 强制重读该目录歌曲标签（R13.2）。音频 size/mtime 未变，
+  // 若走缓存直灌则歌曲级 artwork 保持陈旧。
+  reader->put(song, rawMetadata("Song"));
+  std::filesystem::remove(cover);
+  watchers->states[0]->callback(fileEvent(cover, WatchEffectKind::Destroyed));
+  waitForReadCount(*reader, 2U);
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
+    const auto songs = songsIn(service->snapshot());
+    if (songs.size() == 1U && (!songs[0].artworkPath.has_value() || songs[0].artworkPath->empty())) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  const auto artworkCleared = !songs[0].artworkPath.has_value() || songs[0].artworkPath->empty();
+  CHECK(artworkCleared);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
+}
+
+TEST_CASE("scanner watcher scoped merge restores external cue rows and converges after cue unref") {
+  test::TempScannerRoot temp{"scanner-watcher-scope-external-cue"};
+  const auto scopeDir = temp.path() / "album";
+  const auto cueDir = temp.path() / "cues";
+  std::filesystem::create_directories(scopeDir);
+  std::filesystem::create_directories(cueDir);
+  const auto source = scopeDir / "s.flac";
+  const auto cue = cueDir / "c.cue";
+  writeText(source, "fake source audio");
+  writeText(cue, "REM DUMMY COMMENT\n");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(source, rawMetadata("Source Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+  setTestCueSheetProvider([&source](const std::filesystem::path& cuePath)
+                              -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() == "c.cue") {
+      return {{.audioFilePath = source,
+               .offset = 0,
+               .duration = 180000000,
+               .title = "Cue Track 1",
+               .artist = "Cue Artist",
+               .album = "Cue Album",
+               .trackNumber = 1}};
+    }
+    return {};
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);  // 只有 cue 轨可见（源被 cue 隐藏）
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // 触发 album 目录的 scoped 对账（Modified Directory）：scope 内枚举会读到源音频，而 cue 在
+  // scope 外仍引用它 → B2 补偿：cue 轨缓存行恢复、源不写普通 location 行、快照保持隐藏。
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto scopeCacheState = [&] {
+    const auto locations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+    return locations.size() == 1U && locations[0].filePath == cue && locations[0].sourceFilePath == source;
+  };
+  watchers->states[0]->callback(directoryEvent(scopeDir, WatchEffectKind::Modified));
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
+    if (scopeCacheState()) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  CHECK(scopeCacheState());
+  CHECK(std::ranges::none_of(sidecar.loadLocationsByRoot(canonicalRootPath(temp.path())),
+                             [&](const cache::CachedLocation& location) { return location.filePath == source; }));
+  {
+    const auto songs = songsIn(service->snapshot());
+    REQUIRE(songs.size() == 1U);
+    CHECK(songs[0].filePath == cue);
+  }
+
+  // cue 改为不再引用源：cue 父目录 scoped 重解析后，被抑制的源必须补孤儿 upsert，
+  // 快照与缓存都要与全量重建一致（B2 家族收敛）。
+  clearTestCueSheetProvider();
+  std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  writeText(cue, "REM DUMMY COMMENT v2\n");
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+  for (auto attempt = 0; attempt != 1000; ++attempt) {
+    const auto songs = songsIn(service->snapshot());
+    if (songs.size() == 1U && songs[0].filePath == source) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{30});
+  const auto patchedSongs = songsIn(service->snapshot());
+  REQUIRE(patchedSongs.size() == 1U);
+  CHECK(patchedSongs[0].filePath == source);
+  const auto patchedLocations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(patchedLocations.size() == 1U);
+  CHECK(patchedLocations[0].filePath == source);
+
+  const auto publishedBefore = service->snapshot().generatedAt;
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotRepublish(*service, publishedBefore);
+  const auto rebuiltSongs = songsIn(service->snapshot());
+  REQUIRE(rebuiltSongs.size() == patchedSongs.size());
+  CHECK(rebuiltSongs[0].filePath == patchedSongs[0].filePath);
+  const auto rebuiltLocations = sidecar.loadLocationsByRoot(canonicalRootPath(temp.path()));
+  REQUIRE(rebuiltLocations.size() == patchedLocations.size());
+  CHECK(rebuiltLocations[0].filePath == patchedLocations[0].filePath);
+}
+
+TEST_CASE("scanner watcher scoped cost gate switches oversized scopes to reconcile") {
+  test::TempScannerRoot temp{"scanner-watcher-scope-cost-gate"};
+  const auto loose = test::writeAudioFixture(temp.path(), "loose.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(loose, rawMetadata("Loose"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  // 播种 > max(500, root 文件数/10) 条 scope 前缀缓存行：成本门必须把 scoped 全读改判 Reconcile。
+  const auto big = temp.path() / "big";
+  std::filesystem::create_directories(big);
+  cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  cache::CachedScanRoot seededRoot{};
+  seededRoot.rootPath = canonicalRootPath(temp.path());
+  seededRoot.directoryTreeHash = "seeded-hash";
+  seededRoot.totalFiles = 501;
+  cache.updateScanRoot(seededRoot);
+  SongMetadata meta;
+  meta.title = "Big";
+  meta.duration = std::chrono::milliseconds{1000};
+  cache.upsertContent("big-content", meta);
+  for (int index = 0; index < 501; ++index) {
+    cache::CachedLocation location{};
+    location.locationId = "big-loc-" + std::to_string(index);
+    location.contentId = "big-content";
+    location.rootPath = canonicalRootPath(temp.path());
+    location.filePath = big / ("t" + std::to_string(index) + ".flac");
+    location.sourceFilePath = location.filePath;
+    cache.upsertLocation(location);
+  }
+
+  std::size_t startedBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+  }
+  // Modified Directory → 候选 scope；成本门（501 > 500）→ requestReconcile（ScanStarted 可见），
+  // 而不是 scoped 全读（scoped 契约不发 ScanStarted）。
+  watchers->states[0]->callback(directoryEvent(big, WatchEffectKind::Modified));
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    {
+      std::scoped_lock lock{eventsMutex};
+      if (scanStartedCount(events) > startedBefore) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) > startedBefore);
+  }
+  // Reconcile 只对账变化文件：磁盘 big 目录为空，无标签重读（成本门的目的）。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  CHECK(reader->readCount() == 1U);
 }
 
 }

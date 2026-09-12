@@ -339,6 +339,10 @@ struct PlaylistTreeBuilder::Impl {
         keyRewrites[key] = newAbsText;
       } else if (!oldAbsText.empty() && key.rfind(oldAbsText + "/", 0) == 0) {
         keyRewrites[key] = newAbsText + key.substr(oldAbsText.size());
+      } else if (!oldAbsText.empty() && key.rfind(oldAbsText + "#", 0) == 0) {
+        // CUE 轨节点键 = logicalTrackId = <absCue>#trackN：文件级 .cue rename 时
+        // 前缀规则必须命中 '#' 后缀，否则旧键残留为幽灵轨节点（B7）。
+        keyRewrites[key] = newAbsText + key.substr(oldAbsText.size());
       }
     }
     for (const auto& [key, updatedKey] : keyRewrites) {
@@ -368,6 +372,9 @@ struct PlaylistTreeBuilder::Impl {
         return newAbsText;
       }
       if (!oldAbsText.empty() && text.rfind(oldAbsText + "/", 0) == 0) {
+        return newAbsText + text.substr(oldAbsText.size());
+      }
+      if (!oldAbsText.empty() && text.rfind(oldAbsText + "#", 0) == 0) {
         return newAbsText + text.substr(oldAbsText.size());
       }
       return text;
@@ -492,11 +499,6 @@ bool PlaylistTreeBuilder::upsertSong(PlaylistTreeSong song) {
 
 bool PlaylistTreeBuilder::removeSubtree(const std::filesystem::path& relativePath) {
   return impl_->removeSubtree(relativePath);
-}
-
-bool PlaylistTreeBuilder::isKnownDirectory(const std::filesystem::path& relativePath) const {
-  const auto iterator = impl_->nodes.find(pathKey(relativePath));
-  return iterator != impl_->nodes.end() && iterator->second.node.kind == PlaylistNodeKind::Directory;
 }
 
 bool PlaylistTreeBuilder::renameSubtree(const std::filesystem::path& oldRelativePath,

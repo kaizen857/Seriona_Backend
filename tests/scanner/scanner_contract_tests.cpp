@@ -41,6 +41,11 @@ public:
     return removeLocationResult_;
   }
 
+  bool removeRoot(const std::filesystem::path& path) override {
+    removedRootPaths_.push_back(path);
+    return removeRootResult_;
+  }
+
   seriona::scanner::ScannerEventSink sink_{};
   seriona::scanner::ScannerConfig config_{};
   std::vector<seriona::scanner::ScannerRoot> roots_{};
@@ -48,7 +53,9 @@ public:
   seriona::scanner::ScanMode mode_{seriona::scanner::ScanMode::Incremental};
   seriona::scanner::PlaylistTreeSnapshot snapshot_{};
   std::vector<std::filesystem::path> removedPaths_{};
+  std::vector<std::filesystem::path> removedRootPaths_{};
   bool removeLocationResult_{true};
+  bool removeRootResult_{true};
   bool watchingStopped_{false};
   bool stopped_{false};
 };

@@ -479,6 +479,63 @@ std::int64_t SQLiteCache::deleteLocationsByPathPrefixNoTransaction(const std::st
   return sqlite3_changes(asDb(db_));
 }
 
+std::int64_t SQLiteCache::countLocationsByPathPrefix(const std::string& rootPath, const std::string& filePathPrefix) const {
+  std::lock_guard<std::mutex> lock{readerMutex_};
+  Statement count{
+      asDb(db_),
+      "SELECT COUNT(*) FROM locations "
+      "WHERE root_path=?1 AND ("
+      "file_path=?2 OR substr(file_path, 1, length(?3) + 1) = ?3 || '/' "
+      "OR source_file_path=?4 OR substr(source_file_path, 1, length(?5) + 1) = ?5 || '/'"
+      ");"};
+  count.bind(1, rootPath);
+  count.bind(2, filePathPrefix);
+  count.bind(3, filePathPrefix);
+  count.bind(4, filePathPrefix);
+  count.bind(5, filePathPrefix);
+  return count.stepRow() ? count.int64Column(0) : 0;
+}
+
+void SQLiteCache::replaceLocationsByPathPrefixWithSongs(const std::string& rootPath,
+                                                        const std::string& filePathPrefix,
+                                                        const std::vector<CacheWriteSong>& songs,
+                                                        const std::vector<CacheWriteSong>& restored) {
+  auto transaction = beginWriter();
+  deleteLocationsByPathPrefixNoTransaction(rootPath, filePathPrefix);
+  for (const auto& songWrite : songs) {
+    upsertContentNoTransaction(songWrite.location.contentId, songWrite.song.metadata);
+    upsertLocationNoTransaction(songWrite.location);
+    replaceLyricsNoTransaction(songWrite.location.locationId, "embedded", songWrite.song.embeddedLyrics);
+    replaceLyricsNoTransaction(songWrite.location.locationId, "external", songWrite.song.externalLyrics);
+  }
+  for (const auto& songWrite : restored) {
+    upsertContentNoTransaction(songWrite.location.contentId, songWrite.song.metadata);
+    upsertLocationNoTransaction(songWrite.location);
+    replaceLyricsNoTransaction(songWrite.location.locationId, "embedded", songWrite.song.embeddedLyrics);
+    replaceLyricsNoTransaction(songWrite.location.locationId, "external", songWrite.song.externalLyrics);
+  }
+  transaction.commit();
+}
+
+void SQLiteCache::applyLyricsCacheUpdates(const std::vector<LyricsCacheUpdate>& updates) {
+  if (updates.empty()) {
+    return;
+  }
+  auto transaction = beginWriter();
+  for (const auto& update : updates) {
+    applyLyricsCacheUpdateNoTransaction(update);
+  }
+  transaction.commit();
+}
+
+void SQLiteCache::deleteScanRoot(const std::filesystem::path& rootPath) {
+  auto transaction = beginWriter();
+  Statement remove{asDb(db_), "DELETE FROM scan_roots WHERE root_path=?1;"};
+  remove.bind(1, pathText(rootPath));
+  remove.stepDone();
+  transaction.commit();
+}
+
 std::int64_t SQLiteCache::replaceLocationsBySubtree(const std::string& rootPath, const std::string& oldPrefix, const std::string& newPrefix) {
   if (oldPrefix == newPrefix) {
     return 0;

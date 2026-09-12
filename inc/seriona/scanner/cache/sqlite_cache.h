@@ -131,14 +131,26 @@ public:
   void pruneDeletedLocations(const std::filesystem::path& rootPath, const std::vector<std::string>& retainedLocationIds);
   std::int64_t deleteLocationsByPathPrefix(const std::string& rootPath, const std::string& filePathPrefix);
   std::int64_t deleteLocationsByPathPrefixNoTransaction(const std::string& rootPath, const std::string& filePathPrefix);
+  [[nodiscard]] std::int64_t countLocationsByPathPrefix(const std::string& rootPath,
+                                                        const std::string& filePathPrefix) const;
+  // 单事务：删除 root 下 file_path/source_file_path 以 filePathPrefix 开头的行，再写入 songs，
+  // 最后恢复 restored（scope 外 cue 轨的补偿行，见 B2）。scoped 子树对账的原子合并入口。
+  void replaceLocationsByPathPrefixWithSongs(const std::string& rootPath,
+                                             const std::string& filePathPrefix,
+                                             const std::vector<CacheWriteSong>& songs,
+                                             const std::vector<CacheWriteSong>& restored);
   // 单事务：把 root 下 file_path/source_file_path 以 oldPrefix（= 或 前缀/）开头的行改写为 newPrefix 前缀。
   // 数据来自既有缓存行改写，绝不重读元数据/触发扫描。返回受影响行数。
   std::int64_t replaceLocationsBySubtree(const std::string& rootPath, const std::string& oldPrefix, const std::string& newPrefix);
   void replaceLyrics(const std::string& locationId, const std::string& kind, const std::vector<LyricLine>& lyrics);
   [[nodiscard]] std::vector<LyricLine> loadLyrics(const std::string& locationId, const std::string& kind) const;
+  // 单事务批量歌词对账（.lrc 事件专用；不得构造 ScanRootCacheWrite，其空 retained 会清空 root）。
+  void applyLyricsCacheUpdates(const std::vector<LyricsCacheUpdate>& updates);
   void updateScanRoot(const CachedScanRoot& root);
   void recordScanRootCacheWrite(const ScanRootCacheWrite& write);
   [[nodiscard]] std::optional<CachedScanRoot> loadScanRoot(const std::filesystem::path& rootPath) const;
+  // 删除 root 的 scan_roots 行；locations/scan_errors 经外键级联清理（显式根移除专用）。
+  void deleteScanRoot(const std::filesystem::path& rootPath);
   void saveErrors(const std::filesystem::path& rootPath, const std::vector<CachedScanError>& errors);
   [[nodiscard]] std::vector<CachedScanError> loadErrors(const std::filesystem::path& rootPath) const;
   void clearErrors(const std::filesystem::path& rootPath);
