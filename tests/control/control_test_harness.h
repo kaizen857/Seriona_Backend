@@ -180,8 +180,6 @@ public:
   [[nodiscard]] std::size_t emitEventCalls() const noexcept;
   [[nodiscard]] std::size_t removeLocationCalls() const noexcept;
   [[nodiscard]] const std::vector<std::filesystem::path>& removeLocationPaths() const noexcept;
-  [[nodiscard]] std::size_t removeRootCalls() const noexcept;
-  [[nodiscard]] const std::vector<std::filesystem::path>& removeRootPaths() const noexcept;
 
   [[nodiscard]] const std::optional<scanner::ScannerConfig>& lastConfigured() const noexcept;
   [[nodiscard]] const std::optional<std::vector<scanner::ScannerRoot>>& lastScannedRoots() const noexcept;
@@ -215,8 +213,6 @@ private:
   std::size_t emitEventCalls_{0};
   std::size_t removeLocationCalls_{0};
   std::vector<std::filesystem::path> removeLocationPaths_{};
-  std::size_t removeRootCalls_{0};
-  std::vector<std::filesystem::path> removeRootPaths_{};
   std::optional<scanner::ScannerConfig> lastConfigured_{};
   std::optional<std::vector<scanner::ScannerRoot>> lastScannedRoots_{};
   std::optional<scanner::ScanMode> lastScanMode_{};

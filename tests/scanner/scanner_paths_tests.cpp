@@ -5,6 +5,10 @@
 
 #include <doctest.h>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -237,6 +241,97 @@ TEST_CASE("cue sheet classification distinguishes from similar extensions") {
   CHECK(requireRelativePath(entries, "also-not.cu").kind == PathEntryKind::Unsupported);
   CHECK(requireRelativePath(entries, "prefix.cue.bak").kind == PathEntryKind::Unsupported);
 }
+
+#if !defined(_WIN32)
+// 不可读目录根：stat 成功但 opendir 失败（skip_permission_denied 会静默吞掉 EACCES，必须用
+// 无选项预探测）。discoverScannerPaths 须把根条目降级为 PermissionDenied（size==1 守卫
+// → rootUnavailable，调用方保留索引），而不是返回"空枚举"。
+TEST_CASE("scanner path discovery marks an unreadable directory root as unavailable") {
+  test::TempScannerRoot root("scanner-paths-unreadable-root");
+  if (::geteuid() == 0) {
+    MESSAGE("running as root: permission bits are not enforced; skipping");
+    return;
+  }
+  writeTextFile(root.path() / "song.flac", "audio");
+
+  struct RootPermissionGuard {
+    std::filesystem::path path;
+    ~RootPermissionGuard() {
+      std::error_code error;
+      std::filesystem::permissions(path, std::filesystem::perms::owner_all, error);
+    }
+  } permissionGuard{root.path()};
+  std::error_code permissionError;
+  std::filesystem::permissions(root.path(), std::filesystem::perms::none, permissionError);
+  REQUIRE_FALSE(permissionError);
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  REQUIRE(entries.size() == 1U);
+  CHECK(entries.front().kind == PathEntryKind::PermissionDenied);
+  REQUIRE_FALSE(entries.front().errors.empty());
+}
+
+// 不可读子目录（非根）：目录自身被枚举到但内容被 skip_permission_denied 静默跳过，必须显式
+// 探测并 surface 为 PermissionDenied 条目（部分枚举信号），根条目仍是 DirectoryRoot（可读根
+// 不得被误判为 rootUnavailable）。
+TEST_CASE("scanner path discovery surfaces an unreadable subdirectory as a permission error") {
+  test::TempScannerRoot root("scanner-paths-unreadable-subdir");
+  if (::geteuid() == 0) {
+    MESSAGE("running as root: permission bits are not enforced; skipping");
+    return;
+  }
+  const auto audio = test::writeAudioFixture(root.path(), "song.flac");
+  const auto denied = root.path() / "denied";
+  writeTextFile(denied / "hidden.flac", "audio");
+
+  struct DeniedPermissionGuard {
+    std::filesystem::path path;
+    ~DeniedPermissionGuard() {
+      std::error_code error;
+      std::filesystem::permissions(path, std::filesystem::perms::owner_all, error);
+    }
+  } permissionGuard{denied};
+  std::error_code permissionError;
+  std::filesystem::permissions(denied, std::filesystem::perms::none, permissionError);
+  REQUIRE_FALSE(permissionError);
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  CHECK(entries.front().kind == PathEntryKind::DirectoryRoot);
+  const auto deniedEntry = std::ranges::find(entries, PathEntryKind::PermissionDenied, &ClassifiedPath::kind);
+  REQUIRE(deniedEntry != entries.end());
+  CHECK(deniedEntry->path == denied);
+  REQUIRE_FALSE(deniedEntry->errors.empty());
+  // 可读歌曲仍被完整枚举（部分枚举不阻断其余条目）。
+  CHECK(requireRelativePath(entries, "song.flac").kind == PathEntryKind::AudioCandidate);
+  CHECK(requireRelativePath(entries, "song.flac").path == audio);
+}
+
+// 子项分类错误（symlink 环 → Error 条目）不构成 rootUnavailable：根条目仍处理、可读文件
+// 仍在枚举中，错误条目只作为"部分枚举"信号交给调用方置脏。
+TEST_CASE("scanner path discovery keeps a readable root with child errors") {
+  test::TempScannerRoot root("scanner-paths-child-error");
+  const auto audio = test::writeAudioFixture(root.path(), "song.flac");
+  std::error_code linkError;
+  std::filesystem::create_symlink("b-link", root.path() / "a-link", linkError);
+  if (linkError) {
+    MESSAGE("symlink creation unavailable: " << linkError.message());
+    return;
+  }
+  std::filesystem::create_symlink("a-link", root.path() / "b-link", linkError);
+  REQUIRE_FALSE(linkError);
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true}, {.followSymlinks = true});
+
+  CHECK(entries.size() > 1U);
+  CHECK(entries.front().kind == PathEntryKind::DirectoryRoot);
+  CHECK(std::ranges::any_of(entries, [](const ClassifiedPath& entry) { return entry.kind == PathEntryKind::Error; }));
+  const auto& song = requireRelativePath(entries, "song.flac");
+  CHECK(song.kind == PathEntryKind::AudioCandidate);
+  CHECK(song.path == audio);
+}
+#endif
 
 }
 }

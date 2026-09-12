@@ -550,7 +550,10 @@ std::int64_t SQLiteCache::replaceLocationsBySubtree(const std::string& rootPath,
   auto transaction = beginWriter();
 
   std::vector<RenamedRow> renamed;
-  const auto oldRows = loadLocationsByRoot(rootPath);
+  // rootPath 为 UTF-8 文本（调用方约定：orchestrator 传 pathKey()）；显式经 pathFromUtf8
+  // 构造，避免 std::filesystem::path(std::string) 在 Windows/MSVC 按 ACP 解释导致非 ASCII
+  // 根查空（rename 行丢失）。公共头签名不可改，只能在边界转换。
+  const auto oldRows = loadLocationsByRoot(pathFromUtf8(rootPath));
   renamed.reserve(oldRows.size());
   for (const auto& row : oldRows) {
     const auto rewrittenPath = rewritePathPrefix(pathText(row.filePath), oldPrefix, newPrefix);

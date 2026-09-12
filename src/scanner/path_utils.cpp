@@ -136,6 +136,37 @@ struct ParsedCueToken {
   return result;
 }
 
+// 枚举到的子目录无法打开（chmod 000 等）：skip_permission_denied 会静默跳过其内容且不产生
+// 任何 error，调用方无法据此判定枚举不完整（prune 活行后不置脏、周期对账也不排程）。显式
+// 探测失败必须 surface 为 PermissionDenied/Error 条目，路径指向该目录本身。
+[[nodiscard]] ClassifiedPath makeDirectoryProbeError(const ClassifiedPath& directory, const std::error_code& error) {
+  ClassifiedPath result;
+  result.path = directory.path;
+  result.relativePath = directory.relativePath;
+  result.relativeUtf8 = directory.relativeUtf8;
+  result.displayName = directory.displayName;
+  const bool permissionDenied = error == std::errc::permission_denied;
+  result.kind = permissionDenied ? PathEntryKind::PermissionDenied : PathEntryKind::Error;
+  result.errors.push_back(makeError(ScannerErrorCode::PermissionDenied, directory.path,
+                                    "failed to enumerate scanner subdirectory", error.message()));
+  return result;
+}
+
+// 根自身无法打开（stat 成功但 opendir/遍历启动失败，如 chmod 000 的目录）：把根条目降级为
+// PermissionDenied/Error，使调用方的 size==1 守卫识别为 rootUnavailable（保留既有索引），
+// 而不是把"空枚举"当作磁盘真相合并（会清空该根的索引与缓存）。
+void markRootTraversalUnavailable(std::vector<ClassifiedPath>& entries, const std::error_code& error) {
+  if (entries.empty()) {
+    return;
+  }
+  auto& rootEntry = entries.front();
+  const bool permissionDenied = error == std::errc::permission_denied;
+  rootEntry.kind = permissionDenied ? PathEntryKind::PermissionDenied : PathEntryKind::Error;
+  rootEntry.errors.push_back(makeError(permissionDenied ? ScannerErrorCode::PermissionDenied
+                                                        : ScannerErrorCode::RootUnavailable,
+                                       rootEntry.path, "failed to open scanner root for traversal", error.message()));
+}
+
 [[nodiscard]] std::filesystem::directory_options directoryOptions(const PathClassificationConfig& config) {
   auto options = std::filesystem::directory_options::skip_permission_denied;
   if (config.followSymlinks) {
@@ -368,13 +399,32 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
   std::vector<std::filesystem::path> cueSheetPaths;
   std::error_code error;
 
+  // skip_permission_denied 会把"根自身 EACCES"在迭代器构造时静默吞掉（libstdc++ 实测：
+  // ec=Success 且 it==end），因此先以无选项构造探测根可打开性；失败即根不可读，降级根条目
+  // （size==1 守卫 → rootUnavailable）。可读根的中途遍历错误仍追加错误条目（size>1，不误判）。
+  {
+    std::error_code openError;
+    const std::filesystem::directory_iterator openProbe{rootPath, std::filesystem::directory_options::none, openError};
+    static_cast<void>(openProbe);
+    if (openError) {
+      markRootTraversalUnavailable(entries, openError);
+      return entries;
+    }
+  }
+
   if (root.recursive) {
-    for (std::filesystem::recursive_directory_iterator iterator(rootPath, directoryOptions(config), error), end;
-         iterator != end; iterator.increment(error)) {
+    std::filesystem::recursive_directory_iterator iterator(rootPath, directoryOptions(config), error);
+    if (error) {
+      markRootTraversalUnavailable(entries, error);
+      return entries;
+    }
+    for (const std::filesystem::recursive_directory_iterator end; iterator != end; iterator.increment(error)) {
       if (error) {
+        // 实现差异防御：increment 报错时标准要求迭代器变为 end；若实现仍可解引用，
+        // 记录错误并停止遍历，绝不处理处于错误状态的条目（错误条目仍被 surface）。
         entries.push_back(makeTraversalError(rootPath, error));
         error.clear();
-        continue;
+        break;
       }
       const auto& path = iterator->path();
       allPaths.push_back(path);
@@ -382,19 +432,29 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
         cueSheetPaths.push_back(path);
       }
     }
+    if (error) {
+      entries.push_back(makeTraversalError(rootPath, error));
+    }
   } else {
-    for (std::filesystem::directory_iterator iterator(rootPath, directoryOptions(config), error), end; iterator != end;
-         iterator.increment(error)) {
+    std::filesystem::directory_iterator iterator(rootPath, directoryOptions(config), error);
+    if (error) {
+      markRootTraversalUnavailable(entries, error);
+      return entries;
+    }
+    for (const std::filesystem::directory_iterator end; iterator != end; iterator.increment(error)) {
       if (error) {
         entries.push_back(makeTraversalError(rootPath, error));
         error.clear();
-        continue;
+        break;
       }
       const auto& path = iterator->path();
       allPaths.push_back(path);
       if (isCueSheetPath(path)) {
         cueSheetPaths.push_back(path);
       }
+    }
+    if (error) {
+      entries.push_back(makeTraversalError(rootPath, error));
     }
   }
 
@@ -418,6 +478,17 @@ std::vector<ClassifiedPath> discoverScannerPaths(const ScannerRoot& root, const 
   for (const auto& path : allPaths) {
     auto classified = classifyScannerPath(rootPath, path, config);
     if (classified.kind == PathEntryKind::Directory) {
+      // 可读性探测：skip_permission_denied 会让不可读子目录的内容被静默跳过（libstdc++ 实测
+      // 无 error），调用方无法判定枚举不完整 → prune 活行后不置脏、周期对账也不排程。每个
+      // 枚举到的目录额外一次 opendir（成本有界，每目录至多一次）；失败即 surface 错误条目。
+      // followSymlinks=false 时目录符号链接已在 classifyScannerPath 归为 Symlink，不会走到这里。
+      std::error_code probeError;
+      const std::filesystem::directory_iterator probe{classified.path, std::filesystem::directory_options::none,
+                                                      probeError};
+      static_cast<void>(probe);
+      if (probeError) {
+        entries.push_back(makeDirectoryProbeError(classified, probeError));
+      }
       continue;
     }
     if (classified.kind == PathEntryKind::CueSheet) {

@@ -333,9 +333,7 @@ bool FakeFileScannerService::removeLocation(const std::filesystem::path& path) {
   return removeLocationResult_;
 }
 
-bool FakeFileScannerService::removeRoot(const std::filesystem::path& path) {
-  ++removeRootCalls_;
-  removeRootPaths_.push_back(path);
+bool FakeFileScannerService::removeRoot(const std::filesystem::path&) {
   return true;
 }
 
@@ -373,14 +371,6 @@ std::size_t FakeFileScannerService::removeLocationCalls() const noexcept {
 
 const std::vector<std::filesystem::path>& FakeFileScannerService::removeLocationPaths() const noexcept {
   return removeLocationPaths_;
-}
-
-std::size_t FakeFileScannerService::removeRootCalls() const noexcept {
-  return removeRootCalls_;
-}
-
-const std::vector<std::filesystem::path>& FakeFileScannerService::removeRootPaths() const noexcept {
-  return removeRootPaths_;
 }
 
 void FakeFileScannerService::setRemoveLocationResult(bool result) noexcept {

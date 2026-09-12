@@ -2065,7 +2065,7 @@ int runProductionAudit() {
         " FileScanned增量=" + std::to_string(EventLog::deltaCount(before, after, sc::ScannerEventType::FileScanned));
     report.resultLine = "歌曲数=" + std::to_string(after.tracks) +
                         (reached ? "（+1 达成）" : "（未达成）");
-    report.verdictLine = reached ? "PASS（对照组：create 触发重扫，快照更新）" : "FAIL（对照组异常）";
+    report.verdictLine = reached ? "PASS（精准更新：create upsert，快照歌曲数 +1）" : "FAIL（对照组异常）";
     printSceneData(report);
   }
 
@@ -2129,7 +2129,7 @@ int runProductionAudit() {
                        std::to_string(EventLog::deltaScanStarted(before, after));
     report.resultLine = "歌曲数=" + std::to_string(after.tracks) +
                         (reached ? "（-1 达成）" : "（未达成）");
-    report.verdictLine = reached ? "PASS（对照组：delete 触发重扫，快照更新）" : "FAIL（对照组异常）";
+    report.verdictLine = reached ? "PASS（精准删除：delete 收敛，快照歌曲数 -1）" : "FAIL（对照组异常）";
     printSceneData(report);
   }
 
@@ -2150,7 +2150,7 @@ int runProductionAudit() {
                        std::to_string(EventLog::deltaScanStarted(before, after));
     report.resultLine = "歌曲数=" + std::to_string(after.tracks) +
                         (reached ? "（+1 达成）" : "（未达成）");
-    report.verdictLine = reached ? "PASS（对照组：子目录内 create 触发重扫）" : "FAIL（对照组异常）";
+    report.verdictLine = reached ? "PASS（精准更新：子目录 create upsert，快照歌曲数 +1）" : "FAIL（对照组异常）";
     printSceneData(report);
   }
 
@@ -2852,7 +2852,7 @@ int runProductionAudit() {
   std::cout << "场景 1 文件create   : 对照组，预期精准更新且快照歌曲数 +1\n";
   std::cout << "场景 2 文件modify   : 精准更新（upsertSong），预期歌曲数不变、scan 不增长\n";
   std::cout << "场景 3 文件delete   : 对照组，预期精准更新且快照歌曲数 -1\n";
-  std::cout << "场景 4 子目录create : 对照组，预期回落重扫且快照歌曲数 +1\n";
+  std::cout << "场景 4 子目录create : 对照组，预期精准更新且快照歌曲数 +1\n";
   std::cout << "场景 5 目录rmdir    : 对照组，预期精准更新且快照歌曲数 -1\n";
   std::cout << "场景 6 根内rename   : 精准更新（renameSubtree），预期路径收敛、歌曲数不变、scan 不增长\n";
   std::cout << "场景 7 mv出根+根外写: 核心实验，预期 IN_MOVE_SELF 精准删除（0 首）+ 幽灵事件丢弃、scan 不增长\n";
@@ -2936,7 +2936,7 @@ int main(int argc, char** argv) {
   }
   if (first == "--help" || first == "-h") {
     std::cout << "用法:\n"
-              << "  seriona_watch_root_move_audit                     原有移出审计（11 场景）\n"
+              << "  seriona_watch_root_move_audit                     原有移出审计（19 场景）\n"
               << "  seriona_watch_root_move_audit --efsw-matrix DIR   Gate 0 efsw 矩阵"
                  "（日志写 DIR/scenario-*.log）\n"
               << "  seriona_watch_root_move_audit --efsw-negative     无效路径负向用例"

@@ -43,7 +43,7 @@
 
 ## 不可破坏的约束
 - miniaudio 回调最终进入 `AudioOutputDevice::renderCallback()`；实时路径只能读 PCM 队列、补静音、应用音量/静音、更新原子计数，禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁和设备生命周期操作。
-- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底。
+- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`/`replaceLocationsByPathPrefixWithSongs`/`applyLyricsCacheUpdates`/`deleteScanRoot`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底；`FileScannerService::removeRoot`（`inc/seriona/scanner/scanner_contracts.h`）为显式移除扫描根的清理出口：清空该根索引与缓存、停止监视并重发快照，目标不是已知扫描根时返回 false。
 - 音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture；不要依赖真实硬件、版权媒体或仓库媒体样本。
 - `seriona_audio` 必须 PRIVATE 链接 `BS::thread_pool`，根 CMake 有 FATAL_ERROR 守卫；AVX2/FMA 参数仅允许施加于 `src/audio/waveform_simd_avx2.cpp`。
 - 路径文本必须经 `src/scanner/path_utf8.h` 的 `pathToUtf8`/`pathFromUtf8` 往返（`src/audio/path_text.h` 同规则），禁止直接 `std::filesystem::path::string()/generic_string()` 进路径通道（Windows 按 ANSI 代码页转换，非 ASCII 路径抛异常或乱码；约束注释另见 sqlite_cache.cpp、logging.h、sqlite_folder_sort_settings_store.cpp）。

@@ -1,3 +1,4 @@
+#include "folder_thumbnail_cache.h"
 #include "folder_thumbnail_resolver.h"
 
 #include <doctest.h>
@@ -6,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -242,6 +244,50 @@ TEST_CASE("folder thumbnail resolver skips the root directory entirely (C6)") {
 
   CHECK(!result.has_value());
   CHECK(exportCalls == 0U);
+}
+
+TEST_CASE("folder thumbnail cache erase matches only the exact rel key") {
+  std::unordered_map<std::string, std::string> cache;
+  cache[folderThumbnailCacheKey("/music/rootA", "album")] = "a";
+  cache[folderThumbnailCacheKey("/music/rootB", "album")] = "b";
+  cache[folderThumbnailCacheKey("/music/rootA", "album2")] = "a2";
+  cache[folderThumbnailCacheKey("/music/rootA", "xalbum")] = "xa";
+
+  const auto erased = eraseFolderThumbnailCacheDirectory(cache, "album");
+
+  // 同 relKey 的跨根行同为陈旧行（调用点：没有任何物理根映射该 relKey），但前缀相似键不得连坐。
+  CHECK(erased == 2U);
+  CHECK(cache.size() == 2U);
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "album2")));
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "xalbum")));
+}
+
+TEST_CASE("folder thumbnail cache erase is exact for rel keys containing colon and newline") {
+  std::unordered_map<std::string, std::string> cache;
+  cache[folderThumbnailCacheKey("/music/rootA", "a:b")] = "colon";
+  cache[folderThumbnailCacheKey("/music/rootA", "a:b/c")] = "colon-child";
+  cache[folderThumbnailCacheKey("/music/rootA", "a")] = "plain";
+  cache[folderThumbnailCacheKey("/music/rootA", "b:a:b")] = "suffix";
+  cache[folderThumbnailCacheKey("/music/rootA", "a\nb")] = "newline";
+  cache[folderThumbnailCacheKey("/music/rootA", "a\nb/c")] = "newline-child";
+
+  CHECK(eraseFolderThumbnailCacheDirectory(cache, "a:b") == 1U);
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "a:b/c")));
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "a")));
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "b:a:b")));
+  CHECK(eraseFolderThumbnailCacheDirectory(cache, "a\nb") == 1U);
+  CHECK(cache.contains(folderThumbnailCacheKey("/music/rootA", "a\nb/c")));
+}
+
+TEST_CASE("folder thumbnail cache key length prefix disambiguates the root rel boundary") {
+  // 无长度前缀时 /m/a + b\nc 与 /m/a\nb + c 会产生同一文本键（'\n' 分隔歧义）；
+  // 长度前缀必须区分二者，erase 只命中精确 relKey。
+  const auto first = folderThumbnailCacheKey("/m/a", "b\nc");
+  const auto second = folderThumbnailCacheKey("/m/a\nb", "c");
+  CHECK(first != second);
+  std::unordered_map<std::string, std::string> cache{{first, "first"}, {second, "second"}};
+  CHECK(eraseFolderThumbnailCacheDirectory(cache, "b\nc") == 1U);
+  CHECK(cache.contains(second));
 }
 
 }  // namespace
