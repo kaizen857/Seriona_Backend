@@ -173,6 +173,11 @@ public:
   // scanner 缓存（locations 行 + 播放树）并重新发布快照。目标不存在返回 true
   // （幂等成功）；目标为扫描根本身时拒绝并返回 false。
   virtual bool removeLocation(const std::filesystem::path& absolutePath) = 0;
+  // 显式移除扫描根：清空该根的索引条目与缓存（locations/scan_roots，级联删除），
+  // 停止监视该根并重新发布快照。目标不是已知扫描根时返回 false。与 removeLocation
+  // 拒绝根不同，本 API 是"用户确认根已永久删除"的最终清理出口；缺失/不可用根在
+  // 恢复前保留索引，不因本 API 以外的路径被清空。
+  virtual bool removeRoot(const std::filesystem::path& absolutePath) = 0;
 };
 
 }

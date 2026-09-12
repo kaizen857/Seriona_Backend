@@ -53,6 +53,10 @@ struct ClassifiedPath {
 [[nodiscard]] bool isExcludedContainerExtension(const std::filesystem::path& path);
 [[nodiscard]] bool isCueSheetPath(const std::filesystem::path& path);
 [[nodiscard]] bool isLyricsSidecarPath(const std::filesystem::path& path);
+// Sidecar cover predicate mirrored from TagReader (src/cover/SidecarCover.cpp):
+// stem in {cover, front, folder, album, artwork} (ASCII case-insensitive) and
+// extension in {.png, .jpg, .jpeg, .bmp, .webp, .gif, .tiff}. Random images do not match.
+[[nodiscard]] bool isCoverSidecar(const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path expectedLyricsSidecarPath(const std::filesystem::path& audioPath);
 [[nodiscard]] std::string serializeRelativeUtf8(const std::filesystem::path& root,
                                                 const std::filesystem::path& path);

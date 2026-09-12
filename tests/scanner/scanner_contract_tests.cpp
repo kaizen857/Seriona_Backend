@@ -41,6 +41,8 @@ public:
     return removeLocationResult_;
   }
 
+  bool removeRoot(const std::filesystem::path&) override { return true; }
+
   seriona::scanner::ScannerEventSink sink_{};
   seriona::scanner::ScannerConfig config_{};
   std::vector<seriona::scanner::ScannerRoot> roots_{};

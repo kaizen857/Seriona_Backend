@@ -103,13 +103,6 @@ void seedCachedLocation(cache::SQLiteCache& cache, const cache::CachedLocation& 
   return std::ranges::any_of(entries, [&path](const ClassifiedPath& entry) { return pathKey(entry.path) == pathKey(path); });
 }
 
-[[nodiscard]] bool containsDeletedPath(const std::vector<cache::CachedLocation>& locations,
-                                       const std::filesystem::path& path) {
-  return std::ranges::any_of(locations, [&path](const cache::CachedLocation& location) {
-    return pathKey(location.filePath) == pathKey(path);
-  });
-}
-
 [[nodiscard]] bool containsLocationId(const std::vector<std::string>& locationIds, const std::string& locationId) {
   return std::ranges::find(locationIds, locationId) != locationIds.end();
 }
@@ -151,12 +144,17 @@ TEST_CASE("incremental scan plan classifies unchanged added deleted and changed 
   const auto plan = planIncrementalScan(rootPath, entries, cachedLocations);
 
   CHECK(plan.added.size() == 1U);
-  CHECK(plan.deleted.size() == 2U);
   CHECK(plan.changed.size() == 1U);
   CHECK(containsPath(plan.added, addedPath));
   CHECK(containsPath(plan.changed, changedPath));
-  CHECK(containsDeletedPath(plan.deleted, deletedAPath));
-  CHECK(containsDeletedPath(plan.deleted, deletedBPath));
+  // 已删除路径不进入计划：删除收敛由 retainedLocationIds + prune 承担（plan.deleted 已随
+  // 死代码清理移除，见设计 §13.3-7），但绝不能误分类为 added/changed/unchanged。
+  CHECK_FALSE(containsPath(plan.added, deletedAPath));
+  CHECK_FALSE(containsPath(plan.added, deletedBPath));
+  CHECK_FALSE(containsPath(plan.changed, deletedAPath));
+  CHECK_FALSE(containsPath(plan.changed, deletedBPath));
+  CHECK_FALSE(containsPath(plan.unchanged, deletedAPath));
+  CHECK_FALSE(containsPath(plan.unchanged, deletedBPath));
 }
 
 TEST_CASE("incremental scan plan treats absent cache as all current candidates added") {
@@ -169,7 +167,6 @@ TEST_CASE("incremental scan plan treats absent cache as all current candidates a
   const auto plan = planIncrementalScan(rootPath, entries, {});
 
   CHECK(plan.added.size() == 2U);
-  CHECK(plan.deleted.empty());
   CHECK(plan.changed.empty());
   CHECK(containsPath(plan.added, firstPath));
   CHECK(containsPath(plan.added, secondPath));

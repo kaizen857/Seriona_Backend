@@ -203,6 +203,111 @@ TEST_CASE("SQLiteCache: replaces lyrics for location") {
   CHECK(loaded[0].text == "Line 2");
 }
 
+TEST_CASE("SQLiteCache: applyLyricsCacheUpdates commits atomically and never prunes locations") {
+  test::TempScannerRoot temp{"cache-apply-lyrics"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+
+  CachedScanRoot scanRoot{};
+  scanRoot.rootPath = temp.path();
+  cache.updateScanRoot(scanRoot);
+  SongMetadata meta;
+  meta.title = "Song";
+  meta.duration = std::chrono::milliseconds{1000};
+  cache.upsertContent("content-1", meta);
+  cache.upsertContent("content-2", meta);
+
+  CachedLocation first;
+  first.locationId = "loc-1";
+  first.contentId = "content-1";
+  first.rootPath = temp.path();
+  first.filePath = temp.path() / "first.flac";
+  first.sourceFilePath = first.filePath;
+  first.lyricsSource = LyricsSource::EmbeddedTag;
+  cache.upsertLocation(first);
+
+  CachedLocation second;
+  second.locationId = "loc-2";
+  second.contentId = "content-2";
+  second.rootPath = temp.path();
+  second.filePath = temp.path() / "second.flac";
+  second.sourceFilePath = second.filePath;
+  second.lyricsSource = LyricsSource::ExternalLrc;
+  second.externalLrcPath = temp.path() / "old.lrc";
+  second.externalLrcHash = "old-hash";
+  cache.upsertLocation(second);
+  cache.replaceLyrics("loc-2", "external", {{.timestamp = std::chrono::milliseconds{10}, .text = "old"}});
+
+  // 批外行：不在任何更新批内，必须原样保留（锁定"不按批内 retained 剪枝/不清库"）。
+  CachedLocation third;
+  third.locationId = "loc-3";
+  third.contentId = "content-2";
+  third.rootPath = temp.path();
+  third.filePath = temp.path() / "third.flac";
+  third.sourceFilePath = third.filePath;
+  third.lyricsSource = LyricsSource::EmbeddedTag;
+  cache.upsertLocation(third);
+  cache.replaceLyrics("loc-3", "embedded", {{.timestamp = std::chrono::milliseconds{30}, .text = "third embedded"}});
+
+  // 单事务批量对账：两个 location 的歌词更新一起提交；与 ScanRootCacheWrite 的空 retained
+  // prune 不同，本 API 绝不清空库中其它 location 行。
+  cache.applyLyricsCacheUpdates({
+      LyricsCacheUpdate{.locationId = "loc-1",
+                        .externalLrcPath = temp.path() / "first.lrc",
+                        .externalLrcMtimeNs = 111,
+                        .externalLrcHash = "hash-1",
+                        .externalLyrics = {{.timestamp = std::chrono::milliseconds{1}, .text = "first external"}},
+                        .effectiveLyricsSource = LyricsSource::ExternalLrc,
+                        .removeExternalLyrics = false},
+      LyricsCacheUpdate{.locationId = "loc-2",
+                        .externalLrcPath = std::nullopt,
+                        .externalLrcMtimeNs = std::nullopt,
+                        .externalLrcHash = std::nullopt,
+                        .externalLyrics = {},
+                        .effectiveLyricsSource = LyricsSource::EmbeddedTag,
+                        .removeExternalLyrics = true},
+  });
+
+  const auto firstLyrics = cache.loadLyrics("loc-1", "external");
+  REQUIRE(firstLyrics.size() == 1U);
+  CHECK(firstLyrics[0].text == "first external");
+  CHECK(cache.loadLyrics("loc-2", "external").empty());
+  REQUIRE(cache.loadLocation("loc-1").has_value());
+  REQUIRE(cache.loadLocation("loc-2").has_value());
+  CHECK(cache.loadLocation("loc-1")->lyricsSource == LyricsSource::ExternalLrc);
+  CHECK(cache.loadLocation("loc-2")->lyricsSource == LyricsSource::EmbeddedTag);
+  CHECK(cache.loadLocationsByRoot(temp.path()).size() == 3U);
+  const auto thirdLocation = cache.loadLocation("loc-3");
+  REQUIRE(thirdLocation.has_value());
+  CHECK(thirdLocation->lyricsSource == LyricsSource::EmbeddedTag);
+  const auto thirdLyrics = cache.loadLyrics("loc-3", "embedded");
+  REQUIRE(thirdLyrics.size() == 1U);
+  CHECK(thirdLyrics[0].text == "third embedded");
+
+  // 事务性：批内后一条因未知 location 触发歌词外键失败时，前一条必须一并回滚（不半提交）。
+  CHECK_THROWS_AS(
+      static_cast<void>(cache.applyLyricsCacheUpdates({
+          LyricsCacheUpdate{.locationId = "loc-1",
+                            .externalLrcPath = temp.path() / "first.lrc",
+                            .externalLrcMtimeNs = std::nullopt,
+                            .externalLrcHash = "hash-2",
+                            .externalLyrics = {{.timestamp = std::chrono::milliseconds{2}, .text = "must roll back"}},
+                            .effectiveLyricsSource = LyricsSource::ExternalLrc,
+                            .removeExternalLyrics = false},
+          LyricsCacheUpdate{.locationId = "loc-missing",
+                            .externalLrcPath = std::nullopt,
+                            .externalLrcMtimeNs = std::nullopt,
+                            .externalLrcHash = std::nullopt,
+                            .externalLyrics = {{.timestamp = std::chrono::milliseconds{3}, .text = "fk violation"}},
+                            .effectiveLyricsSource = LyricsSource::ExternalLrc,
+                            .removeExternalLyrics = false},
+      })),
+      std::runtime_error);
+  const auto rolledBack = cache.loadLyrics("loc-1", "external");
+  REQUIRE(rolledBack.size() == 1U);
+  CHECK(rolledBack[0].text == "first external");
+  CHECK(cache.loadLocationsByRoot(temp.path()).size() == 3U);
+}
+
 TEST_CASE("SQLiteCache: recordScanRootCacheWrite batches root songs lyrics and prune") {
   test::TempScannerRoot temp{"cache-batch-write"};
   SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};

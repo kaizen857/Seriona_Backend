@@ -333,6 +333,10 @@ bool FakeFileScannerService::removeLocation(const std::filesystem::path& path) {
   return removeLocationResult_;
 }
 
+bool FakeFileScannerService::removeRoot(const std::filesystem::path&) {
+  return true;
+}
+
 std::size_t FakeFileScannerService::setEventSinkCalls() const noexcept {
   return setEventSinkCalls_;
 }

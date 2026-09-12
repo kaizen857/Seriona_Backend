@@ -59,7 +59,7 @@ struct FileScannerServiceDependencies {
   std::filesystem::path coverExportDir;
   // 文件夹缩略图导出 seam：null 时 orchestrator 装配生产 adapter（TagReader::ExportFolderCover，
   // ThumbnailOnly + Ignore）；测试注入 fake 断言接线。
-  FolderThumbnailExportSeam folderThumbnailSeam;
+  FolderThumbnailExportSeam folderThumbnailSeam{};
   std::chrono::milliseconds watcherDebounce{50};
   std::chrono::milliseconds reconcileInterval{60000};
 };

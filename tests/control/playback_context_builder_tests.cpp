@@ -72,7 +72,8 @@ namespace {
                                .kind = scanner::PlaylistNodeKind::Directory,
                                .displayName = std::move(displayName),
                                .song = std::nullopt,
-                               .childNodeIds = std::move(children)};
+                               .childNodeIds = std::move(children),
+                               .thumbnailPath = std::nullopt};
 }
 
 [[nodiscard]] scanner::PlaylistNode rootNode(std::vector<std::string> children) {
@@ -89,7 +90,8 @@ namespace {
                                .kind = scanner::PlaylistNodeKind::Track,
                                .displayName = metadata.title,
                                .song = std::move(metadata),
-                               .childNodeIds = {}};
+                               .childNodeIds = {},
+                               .thumbnailPath = std::nullopt};
 }
 
 [[nodiscard]] std::filesystem::file_time_type fileTimeAtSeconds(const int seconds) {

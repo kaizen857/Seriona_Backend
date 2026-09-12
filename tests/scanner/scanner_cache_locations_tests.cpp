@@ -1043,5 +1043,45 @@ TEST_CASE("SQLiteCache: replaceLocationsBySubtree is a no-op for unmatched and i
   CHECK(locations[0].filePath == file);
 }
 
+// 非 ASCII 根 + 根内目录 rename：replaceLocationsBySubtree 的 rootPath 参数按 UTF-8 文本
+// 传入（orchestrator 的 pathKey 约定），实现内必须经 pathFromUtf8 构造再查缓存；MSVC 下
+// path(std::string) 按 ACP 解释会让非 ASCII 根查空、rename 行丢失（自愈但缓存不收敛）。
+TEST_CASE("SQLiteCache: replaceLocationsBySubtree converges under a non-ASCII root") {
+  test::TempScannerRoot temp{"cache-replace-by-subtree-utf8"};
+  SQLiteCache cache{ScannerCacheConfig{.databasePath = temp.dbPath()}};
+  const auto root = temp.path() / std::filesystem::path{u8"音乐库"};
+  cache.updateScanRoot(CachedScanRoot{.rootPath = root});
+
+  SongMetadata meta;
+  meta.duration = std::chrono::milliseconds{100000};
+  meta.title = "song";
+  cache.upsertContent("c-utf8", meta);
+
+  const auto oldDir = root / std::filesystem::path{u8"专辑A"};
+  const auto newDir = root / std::filesystem::path{u8"专辑B"};
+  const auto oldFile = oldDir / "song.flac";
+  constexpr std::int64_t kMtimeNs = 777;
+  const auto mtime = fileTimeFromNanoseconds(kMtimeNs);
+  cache.upsertLocation(CachedLocation{.locationId = computeLocationId(oldFile, 1024, mtime),
+                                      .contentId = "c-utf8",
+                                      .rootPath = root,
+                                      .filePath = oldFile,
+                                      .fileSizeBytes = 1024,
+                                      .fileMtimeNs = kMtimeNs,
+                                      .sourceFilePath = oldFile});
+
+  const auto utf8Text = [](const std::filesystem::path& path) {
+    const auto text = path.generic_u8string();
+    return std::string{text.begin(), text.end()};
+  };
+  const auto renamed = cache.replaceLocationsBySubtree(utf8Text(root), utf8Text(oldDir), utf8Text(newDir));
+
+  CHECK(renamed == 1);
+  const auto locations = cache.loadLocationsByRoot(root);
+  REQUIRE(locations.size() == 1);
+  CHECK(locations[0].filePath == newDir / "song.flac");
+  CHECK(locations[0].sourceFilePath == newDir / "song.flac");
+}
+
 }  // namespace
 }  // namespace seriona::scanner::cache

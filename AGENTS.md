@@ -21,12 +21,13 @@
 - 配置并构建：`cmake -S . -B build -DSERIONA_BUILD_TESTS=ON && cmake --build build -j<N>`。
 - **Windows 构建工具链固定为 MSVC（Visual Studio 2022 x64 + Visual Studio 生成器，依赖经 vcpkg 提供），是 Windows 下唯一受支持的构建工具；禁止使用 MinGW/msys2 等其它工具链构建或验证本仓库**（ABI 与 Windows SDK 链接语义不同，会产出 MSVC 下不存在的构建路径与测试结果，例如 WASAPI 枚举缺 `ksuser` 链接、symlink/文件时间等权限行为差异）。命令行工具 `build/seriona` 的交互终端模式仅支持 Unix 类系统（Windows 上恒报 `interactive terminal input is required`，属预期，验证走前端应用或测试二进制）。
 - 运行：`build/seriona /path/to/music-root-or-file`；只接受一个已存在的文件或目录路径。
-- 配置要求 CMake 3.20+、C++23、`pkg-config` 可解析 FFmpeg 的 `libavformat libavcodec libavutil libavfilter libswresample` 与 `libxxhash`，CMake 可找到 `spdlog`、`SQLite3`。
+- 配置要求 CMake 3.27+、C++23、`pkg-config` 可解析 FFmpeg 的 `libavformat libavcodec libavutil libavfilter libswresample` 与 `libxxhash`，CMake 可找到 `spdlog`、`SQLite3`。
 - 仅当 CMake 条件 `UNIX AND NOT APPLE` 成立时还要求 `pkg-config` 可解析 `sdbus-c++`；不要把该条件改写成“Linux”。
 - TagReader 依赖：优先 `find_package(TagReaderCore CONFIG QUIET)`（CI 顺序链复用已安装产物）；未命中时依次使用 `-DSERIONA_TAGREADER_SOURCE_DIR=<path>`、相邻 `../TagReader`，否则 FetchContent 拉取 `https://github.com/kaizen857/TagReader.git` 的 `main`；vendored 的 TagReader 以 `EXCLUDE_FROM_ALL` 加入且其测试目标被剥离，ctest 里不会有 TagReader 测试。
-- `SERIONA_INSTALL_EXPORT=ON`（默认 OFF，前端嵌入时不受影响）：独立构建时安装导出 5 库 + 3 头库 + BS_thread_pool，生成 `SerionaBackendConfig`（模板 `cmake/SerionaBackendConfig.cmake.in`，`find_dependency` 重建 FFMPEG/XXHASH/PIPEWIRE/SDBUS/SQLite3/spdlog/TagReaderCore），供 CI 顺序链 `find_package(SerionaBackend)` 复用。
+- `SERIONA_INSTALL_EXPORT=ON`（默认 OFF，前端嵌入时不受影响）：独立构建时安装导出 5 库 + 2 头库（`seriona_third_party_headers`、`BS_thread_pool`）+ `efsw-static`，生成 `SerionaBackendConfig`（模板 `cmake/SerionaBackendConfig.cmake.in`，`find_dependency` 重建 FFMPEG/XXHASH/PIPEWIRE/SDBUS/SQLite3/spdlog/Threads/TagReaderCore），供 CI 顺序链 `find_package(SerionaBackend)` 复用。
 - Release 优化三仓库统一：LTO 由 `release` preset 提供，GNU/Clang 下 `-march=x86-64` 基线（替代 `-march=native`，产物可跨机器分发）；警告级别经 `seriona_enable_warnings()`（GNU/Clang `-Wall -Wextra -Wpedantic`，MSVC `/W4 /permissive-`），全仓无 `-Werror`。
 - `SERIONA_BUILD_APP`、`SERIONA_BUILD_TESTS`、`SERIONA_BUILD_TOOLS` 默认分别为 ON、ON、OFF；线程池 FetchContent 固定 `bshoshany/thread-pool` v4.1.0。
+- efsw 依赖（文件监视）：与线程池同为 FetchContent 供给：固定 `SpartanJ/efsw` commit `41ddf6822f2d0dec7e14fafa09c4cef391137b20`（commit 不保证可浅克隆，`GIT_SHALLOW FALSE`），仅构建静态库（`BUILD_SHARED_LIBS=OFF`、`BUILD_STATIC_LIBS=ON`、`BUILD_TEST_APP=OFF`、`EFSW_INSTALL=OFF`，设置后按原值恢复），不走外部 `find_package` 或 vcpkg 端口；`SERIONA_INSTALL_EXPORT=ON` 时 `efsw-static` 与 efsw 头文件随导出安装。Homebrew 无 efsw 公式、外部 `find_package` 三端供给不可行，属「跨平台兼容性」依赖供给规则的已记录例外（thread_pool 同类先例）。
 
 ## 入口与模块边界
 - 五个静态库是 `seriona_audio`、`seriona_scanner`、`seriona_metadata`、`seriona_control`、`seriona_app`，并导出别名 `SerionaBackend::{audio,scanner,metadata,control,app}`（前端 `Seriona/CMakeLists.txt` 通过别名链接）。可执行文件 `seriona` 直接编译 terminal、runtime_paths、logging 源，链接 `seriona_control` 而不链接 `seriona_app`，仅 Release 直接追加 `PkgConfig::SERIONA_FFMPEG`。
@@ -42,7 +43,7 @@
 
 ## 不可破坏的约束
 - miniaudio 回调最终进入 `AudioOutputDevice::renderCallback()`；实时路径只能读 PCM 队列、补静音、应用音量/静音、更新原子计数，禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁和设备生命周期操作。
-- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底。
+- scanner 缓存实现为 `SQLiteCache`，schema 固定 v3：`user_version=0` 直接初始化 v3，任何非 0 且非 3 版本报 unsupported；不存在 v2 迁移桥。缓存另有事件驱动的路径级精确写 API `deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`/`replaceLocationsByPathPrefixWithSongs`/`applyLyricsCacheUpdates`/`deleteScanRoot`（`inc/seriona/scanner/cache/sqlite_cache.h`），`PlaylistTreeBuilder` 提供 `upsertSong`/`removeSubtree`/`renameSubtree`，服务依赖含 `reconcileInterval{60000}` 的 60s 周期对账兜底；`FileScannerService::removeRoot`（`inc/seriona/scanner/scanner_contracts.h`）为显式移除扫描根的清理出口：清空该根索引与缓存、停止监视并重发快照，目标不是已知扫描根时返回 false。
 - 音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture；不要依赖真实硬件、版权媒体或仓库媒体样本。
 - `seriona_audio` 必须 PRIVATE 链接 `BS::thread_pool`，根 CMake 有 FATAL_ERROR 守卫；AVX2/FMA 参数仅允许施加于 `src/audio/waveform_simd_avx2.cpp`。
 - 路径文本必须经 `src/scanner/path_utf8.h` 的 `pathToUtf8`/`pathFromUtf8` 往返（`src/audio/path_text.h` 同规则），禁止直接 `std::filesystem::path::string()/generic_string()` 进路径通道（Windows 按 ANSI 代码页转换，非 ASCII 路径抛异常或乱码；约束注释另见 sqlite_cache.cpp、logging.h、sqlite_folder_sort_settings_store.cpp）。
@@ -51,16 +52,17 @@
 
 - 后端目标平台是 Windows / Linux / macOS 三端（前端三平台产物均内嵌本库），代码编写与功能开发必须保证三端可配置、可构建、可通过 ctest，属硬约束而非发布前适配项；Windows 固定 MSVC + vcpkg，Linux 用 GCC/Clang（sdbus-c++ 仅在 `UNIX AND NOT APPLE` 条件成立时要求），macOS 用 Apple Clang + Homebrew。
 - 平台差异只允许出现在既有平台边界内、由根 CMake 平台条件源选择：`src/audio/device/` 按 OS 的设备枚举/后端源（WASAPI / PipeWire / miniaudio）、`src/metadata/` 的平台私有实现（`metadata_mpris_linux.cpp`、`metadata_windows_private.cpp` 等）、`runtime_paths.h` 的三路运行时路径解析（XDG / macOS `~/Library` / 便携模式）。新增平台行为必须并入这些文件或建立同等级抽象；禁止在公共头（`inc/seriona/`）与共享实现中散落裸 `#ifdef _WIN32`、POSIX-only（unistd/dirent/`::realpath` 等）或 Windows-only API。
-- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；新增平台源或条件分支必须保证每个 OS 分支仍能配置、编译并通过 `-DSERIONA_BUILD_TESTS=ON` 的测试。改动涉及平台行为而本机无法验证另一平台时，在提交信息中说明受影响面与验证方式。
+- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；新增平台源或条件分支必须保证每个 OS 分支仍能配置、编译并通过 `-DSERIONA_BUILD_TESTS=ON` 的测试。已记录例外（thread_pool 先例，efsw 沿用）：`bshoshany/thread-pool` 与 efsw 经 FetchContent 固定版本/commit 供给并随 `SERIONA_INSTALL_EXPORT` 打包进导出，不经 vcpkg/系统包/Homebrew：Homebrew 无对应公式，外部 `find_package` 三端供给不可行（详见「构建、运行与依赖」）。改动涉及平台行为而本机无法验证另一平台时，在提交信息中说明受影响面与验证方式。
+- watcher 的文件系统后端统一由 efsw 提供（Linux inotify / Windows ReadDirectoryChangesW / macOS FSEvents，macOS 所需 CoreFoundation/CoreServices 由上游自带），不再有 watcher 平台私有源或 vendored 平台补丁；上条平台边界清单（audio 设备、metadata 平台实现、runtime_paths）保持不变。
 
 ## 测试与工具
 - 发现：`ctest --test-dir build -N`；全量：`ctest --test-dir build --output-on-failure`；聚焦：`ctest --test-dir build -R '<regex>' --output-on-failure`。
-- 大量测试目标把被测 `src/*.cpp` 直接编入测试二进制（`${PROJECT_SOURCE_DIR}/src/...`，tests/CMakeLists.txt 共 234 处 src 引用）而非链接五个静态库；新增白盒测试沿用该模式，并注意目标之间的共享实现依赖（如 ffmpeg_audio_source.cpp 同时被 filter pipeline 测试直接编译）。
+- 大量测试目标把被测 `src/*.cpp` 直接编入测试二进制（`${PROJECT_SOURCE_DIR}/src/...`，tests/CMakeLists.txt 共 286 处 `${PROJECT_SOURCE_DIR}/src/` 引用，口径：按出现次数计、排除注释行，含注释共 298）而非链接五个静态库；新增白盒测试沿用该模式，并注意目标之间的共享实现依赖（如 ffmpeg_audio_source.cpp 同时被 filter pipeline 测试直接编译）。
 - 常用正则有 `seriona\.audio`、`seriona\.scanner`、`seriona\.metadata`、`seriona\.control`、`seriona\.logging`、`seriona\.runtime_paths`、`seriona\.application_logging`。
 - doctest 测试二进制必须恰有一个 `main`；多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，少数自带普通入口，禁止重复定义。
-- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 240s，`seriona.control_artwork_resolver` 超时 60s，`seriona.scanner.wtr_integration` 超时 180s。
+- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 900s，`seriona.control_artwork_resolver` 超时 300s，`seriona.scanner.efsw_integration` 超时 300s。
 - `seriona_scanner_cache_tests`、`seriona_scanner_cache_content_tests`、v2→v3 migration、backup rollback、phase1 integration 目标在 `tests/CMakeLists.txt` 中禁用，不要假设可运行或已有迁移。
 - `scanner_song_identity_tests.cpp` 无独立目标，song identity 用例经 `seriona.scanner.song_identity`（`seriona_scanner_hash_tests --test-case="scanner song identity*"`）运行；`seriona.scanner.cue_parsing` 与 `seriona.scanner.folder_thumbnail` 是各自独立目标。
 - `seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test` 只构建不注册 CTest，直接运行 `build/tests/<target>`；`seriona.audio_fixture`、`seriona.scanner.cache.perf` 已注册。
-- `-DSERIONA_BUILD_TOOLS=ON` 才加入 `seriona_scanner_cold_perf`、`seriona_miniaudio_platform_probe` 和 `seriona_watch_root_move_audit`；只有 `seriona_miniaudio_platform_probe` 是 `EXCLUDE_FROM_ALL`（用 `cmake --build build --target seriona_miniaudio_platform_probe` 显式构建），`seriona_watch_root_move_audit` 随默认 `all` 目标构建、链接 `seriona_scanner` 且 include 路径伸入 `src/` 私有头 `file_scanner_service_internal.h`（审计“目录移出监视根”场景）。
+- `-DSERIONA_BUILD_TOOLS=ON` 才加入 `seriona_scanner_cold_perf`、`seriona_miniaudio_platform_probe` 和 `seriona_watch_root_move_audit`；只有 `seriona_miniaudio_platform_probe` 是 `EXCLUDE_FROM_ALL`（用 `cmake --build build --target seriona_miniaudio_platform_probe` 显式构建），`seriona_watch_root_move_audit` 随默认 `all` 目标构建、链接 `seriona_scanner` 与 `efsw-static`、include 路径伸入 `src/` 私有头 `file_scanner_service_internal.h`：无参数跑“目录移出监视根”审计；`--efsw-matrix DIR` 跑 Gate 0 efsw 语义实测矩阵（S1 目录移入 / S2 文件移入 / S3 移出 / S4 根内 rename / S5 跨目录移动 OFF-ON / S6 create-modify-delete / S7 UTF-8 路径 / S8 尖峰风暴 / S9 停止析构竞态，日志写 `DIR/scenario-*.log`），`--efsw-negative` 为无效路径负向用例；矩阵为迁移决策与 GO/NO-GO 提供一手证据。
 - `SERIONA_SCANNER_SIMULATE_MISSING_SQLITE`、`SERIONA_SCANNER_SIMULATE_MISSING_XXHASH`、`SERIONA_METADATA_SIMULATE_MISSING_SDBUS` 会故意令配置失败；第三项仅在 `UNIX AND NOT APPLE` 分支生效，正常构建不要开启。

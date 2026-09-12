@@ -169,6 +169,7 @@ public:
   void stop() override;
   [[nodiscard]] scanner::PlaylistTreeSnapshot snapshot() const override;
   bool removeLocation(const std::filesystem::path& path) override;
+  bool removeRoot(const std::filesystem::path& path) override;
 
   [[nodiscard]] std::size_t setEventSinkCalls() const noexcept;
   [[nodiscard]] std::size_t configureCalls() const noexcept;

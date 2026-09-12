@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.27)
 
 project(Seriona VERSION 0.1.0 LANGUAGES CXX)
 
@@ -61,6 +61,55 @@ FetchContent_Declare(thread_pool
 )
 FetchContent_MakeAvailable(thread_pool)
 
+# ---------------------------------------------------------------------------
+# efsw 1.7.2（文件监视；本任务仅接入构建与导出，默认监视器切换在后续任务）。
+# 固定 commit（1.7.2 发布后的 develop 合并点），commit 不保证可浅克隆，故
+# GIT_SHALLOW FALSE。
+#
+# 上游选项名核实自拉取到的 efsw 1.7.2 源码（_deps/efsw-src/CMakeLists.txt）：
+#   BUILD_SHARED_LIBS 默认 ON                  → 关闭：仅需静态库，不构建共享库
+#   BUILD_STATIC_LIBS 默认 ON                  → 显式保留 efsw-static
+#   BUILD_TEST_APP    默认主工程 ON / 子工程 OFF → 关闭：不构建上游测试应用
+#   EFSW_INSTALL      默认主工程 ON / 子工程 OFF → 关闭：自安装由本文件导出段统一负责
+# option() 尊重同作用域同名普通变量（CMP0077 NEW），故在 MakeAvailable 前设置；
+# 这些通用变量名会泄漏到后续 add_subdirectory，设置后按原值恢复（含未定义状态）。
+# macOS：上游已为 efsw/efsw-static 自带 CoreFoundation/CoreServices
+# （efsw-src/CMakeLists.txt Apple 分支），本仓无需重复添加。
+# ---------------------------------------------------------------------------
+set(SERIONA_EFSW_OPTION_NAMES
+  BUILD_SHARED_LIBS
+  BUILD_STATIC_LIBS
+  BUILD_TEST_APP
+  EFSW_INSTALL
+)
+foreach(SERIONA_EFSW_OPTION_NAME IN LISTS SERIONA_EFSW_OPTION_NAMES)
+  if(DEFINED ${SERIONA_EFSW_OPTION_NAME})
+    set("SERIONA_EFSW_SAVED_${SERIONA_EFSW_OPTION_NAME}" "${${SERIONA_EFSW_OPTION_NAME}}")
+  else()
+    set("SERIONA_EFSW_SAVED_${SERIONA_EFSW_OPTION_NAME}" "<efsw-unset>")
+  endif()
+endforeach()
+set(BUILD_SHARED_LIBS OFF)
+set(BUILD_STATIC_LIBS ON)
+set(BUILD_TEST_APP OFF)
+set(EFSW_INSTALL OFF)
+FetchContent_Declare(efsw
+  GIT_REPOSITORY https://github.com/SpartanJ/efsw.git
+  GIT_TAG 41ddf6822f2d0dec7e14fafa09c4cef391137b20
+  GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(efsw)
+foreach(SERIONA_EFSW_OPTION_NAME IN LISTS SERIONA_EFSW_OPTION_NAMES)
+  if("SERIONA_EFSW_SAVED_${SERIONA_EFSW_OPTION_NAME}" STREQUAL "<efsw-unset>")
+    unset(${SERIONA_EFSW_OPTION_NAME})
+  else()
+    set(${SERIONA_EFSW_OPTION_NAME} "${SERIONA_EFSW_SAVED_${SERIONA_EFSW_OPTION_NAME}}")
+  endif()
+  unset("SERIONA_EFSW_SAVED_${SERIONA_EFSW_OPTION_NAME}")
+endforeach()
+unset(SERIONA_EFSW_OPTION_NAMES)
+unset(SERIONA_EFSW_OPTION_NAME)
+
 if(NOT TARGET BS::thread_pool)
   add_library(BS_thread_pool INTERFACE)
   add_library(BS::thread_pool ALIAS BS_thread_pool)
@@ -74,20 +123,6 @@ target_include_directories(seriona_third_party_headers INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/doctest>
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/miniaudio>
 )
-
-add_library(seriona_watcher_headers INTERFACE)
-target_include_directories(seriona_watcher_headers INTERFACE
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/watcher/include>
-)
-
-if(APPLE)
-  # watcher 在 macOS 下走 FSEvents（Linux inotify / Windows ReadDirectoryChangesW
-  # 无需额外库），CFArrayCreate/FSEventStreamCreate 等符号来自这两个框架。
-  target_link_libraries(seriona_watcher_headers INTERFACE
-    "-framework CoreFoundation"
-    "-framework CoreServices"
-  )
-endif()
 
 add_library(seriona_audio STATIC
   src/audio/audio_playback_service.cpp
@@ -359,9 +394,14 @@ target_link_libraries(seriona_scanner
     PkgConfig::SERIONA_XXHASH
     ${SERIONA_TAGREADER_TARGET}
     BS::thread_pool
-    seriona_watcher_headers
     spdlog::spdlog
 )
+
+# efsw 静态库当前仅供 scanner 内部实现使用（公共头未暴露 efsw 类型），故用 PRIVATE：
+# 其 include 目录只参与 seriona_scanner 自身编译。静态库的 PRIVATE 依赖会以
+# $<LINK_ONLY:efsw-static> 形式进入导出接口，导出段因此必须把 efsw-static
+# 一并加入 SerionaBackendTargets（见文件末尾导出段）。
+target_link_libraries(seriona_scanner PRIVATE efsw-static)
 
 
 target_link_libraries(seriona_control
@@ -430,15 +470,19 @@ if(SERIONA_INSTALL_EXPORT)
     $<INSTALL_INTERFACE:include/third_party/doctest>
     $<INSTALL_INTERFACE:include/third_party/miniaudio>
   )
-  target_include_directories(seriona_watcher_headers INTERFACE
-    $<INSTALL_INTERFACE:include/third_party/watcher>
-  )
   target_include_directories(BS_thread_pool SYSTEM INTERFACE
     $<INSTALL_INTERFACE:include/third_party/thread_pool>
   )
+  # efsw 头文件保持 include/ 前缀安装（include/third_party/efsw/efsw/efsw.hpp），
+  # 消费方经该 INSTALL_INTERFACE 使用 #include <efsw/efsw.hpp>。
+  # 上游 efsw-static 自带的 $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}> 保留不动。
+  target_include_directories(efsw-static INTERFACE
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/third_party/efsw>
+  )
 
   install(TARGETS seriona_audio seriona_scanner seriona_metadata seriona_app seriona_control
-          seriona_third_party_headers seriona_watcher_headers BS_thread_pool
+          seriona_third_party_headers BS_thread_pool
+          efsw-static
     EXPORT SerionaBackendTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -448,10 +492,10 @@ if(SERIONA_INSTALL_EXPORT)
   install(DIRECTORY inc/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   install(DIRECTORY third_party/doctest third_party/miniaudio
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party)
-  install(DIRECTORY third_party/watcher/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/watcher)
   install(DIRECTORY "${thread_pool_SOURCE_DIR}/include/"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/thread_pool)
+  install(DIRECTORY "${efsw_SOURCE_DIR}/include/"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/third_party/efsw)
 
   install(EXPORT SerionaBackendTargets
     FILE SerionaBackendTargets.cmake

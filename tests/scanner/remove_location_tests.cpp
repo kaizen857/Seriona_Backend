@@ -108,6 +108,7 @@ struct ServiceFixture {
         .watcherFactory = nullptr,
         .databasePath = databasePath,
         .coverExportDir = temp.path() / "covers",
+        .folderThumbnailSeam = nullptr,
         .watcherDebounce = std::chrono::milliseconds{10},
         .reconcileInterval = std::chrono::milliseconds{60000}});
     service->setEventSink([this](const ScannerEvent& event) { scanState.onEvent(event); });
@@ -240,4 +241,103 @@ TEST_CASE("scanner removeLocation refuses to remove a scan root") {
   CHECK_FALSE(removed);  // 扫描根是保留边界
   CHECK(fs::exists(fixture.root));
   CHECK(fs::exists(fixture.root / "a.flac"));
+}
+
+TEST_CASE("scanner removeRoot clears index and cache for an explicit root removal") {
+  ServiceFixture fixture{};
+  fixture.putSong("a.flac", "Alpha");
+  fixture.putSong("b.flac", "Beta");
+  fixture.scanAndWatch();
+  REQUIRE(snapshotHasSong(fixture.service->snapshot(), fixture.root / "a.flac"));
+  REQUIRE(cacheHasLocation(fixture.databasePath, fixture.root, fixture.root / "a.flac"));
+
+  const bool removed = fixture.service->removeRoot(fixture.root);
+
+  CHECK(removed);
+  // 显式根移除是最终清理出口：快照歌曲、locations、scan_roots 行都必须清空
+  // （空树仍保留 Library 根 Directory 节点，故断言"无歌曲节点"而非 nodes 为空）。
+  CHECK(std::ranges::none_of(fixture.service->snapshot().nodes, [](const PlaylistNode& node) {
+    return node.song.has_value();
+  }));
+  CHECK_FALSE(cacheHasLocation(fixture.databasePath, fixture.root, fixture.root / "a.flac"));
+  CHECK_FALSE(cacheHasLocation(fixture.databasePath, fixture.root, fixture.root / "b.flac"));
+  const auto cacheDb = fs::path{fixture.databasePath.generic_string() + ".scan-roots.sqlite"};
+  const cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = cacheDb}};
+  CHECK_FALSE(cache.loadScanRoot(fixture.root).has_value());
+  CHECK(cache.loadLocationsByRoot(fixture.root).empty());
+  // 磁盘文件保持不动：removeRoot 只清索引，不删用户文件。
+  CHECK(fs::exists(fixture.root / "a.flac"));
+  CHECK(fs::exists(fixture.root / "b.flac"));
+}
+
+TEST_CASE("scanner removeRoot refuses unknown paths and non-root locations") {
+  ServiceFixture fixture{};
+  fixture.putSong("folder/a.flac", "Alpha");
+  fixture.scanAndWatch();
+
+  CHECK_FALSE(fixture.service->removeRoot(fixture.root / "folder"));
+  CHECK_FALSE(fixture.service->removeRoot(fixture.root / "never-existed"));
+  CHECK(snapshotHasSong(fixture.service->snapshot(), fixture.root / "folder" / "a.flac"));
+  CHECK(cacheHasLocation(fixture.databasePath, fixture.root, fixture.root / "folder" / "a.flac"));
+}
+
+// 跨根同 rel 布局：removeLocation(rootA/album) 只应清 rootA 的条目与缓存行；rootB 的同 rel
+// 歌曲必须保留在快照/树中（修复前 allSongs_ 按 treeRelativePath 前缀跨根擦除 → rootB 的歌曲
+// 从快照永久消失，而其缓存行仍在 → 快照/缓存分歧，直到重扫才恢复）。
+TEST_CASE("scanner removeLocation cross root keeps the other root's songs") {
+  test::TempScannerRoot temp{"scanner-remove-location-cross-root"};
+  const auto rootA = temp.path() / "rootA";
+  const auto rootB = temp.path() / "rootB";
+  const auto albumA = rootA / "album";
+  const auto albumB = rootB / "album";
+  const auto songA = albumA / "a.flac";
+  const auto songB = albumB / "b.flac";
+  for (const auto& path : {songA, songB}) {
+    fs::create_directories(path.parent_path());
+    writeText(path, "fake audio");
+  }
+  auto reader = std::make_shared<FakeMetadataReader>();
+  reader->put(songA, makeMetadata("A"));
+  reader->put(songB, makeMetadata("B"));
+  const auto databasePath = temp.dbPath("library.sqlite");
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+      .metadataReader = reader,
+      .watcherFactory = nullptr,
+      .databasePath = databasePath,
+      .coverExportDir = temp.path() / "covers",
+      .folderThumbnailSeam = nullptr,
+      .watcherDebounce = std::chrono::milliseconds{10},
+      .reconcileInterval = std::chrono::milliseconds{60000}});
+  ScanState scanState;
+  service->setEventSink([&scanState](const ScannerEvent& event) { scanState.onEvent(event); });
+  struct ServiceStopGuard {
+    std::shared_ptr<FileScannerService> service;
+    ~ServiceStopGuard() {
+      service->stopWatching();
+      service->stop();
+      service->setEventSink(nullptr);
+    }
+  } stopGuard{service};
+
+  service->scan({ScannerRoot{.path = rootA, .recursive = true}, ScannerRoot{.path = rootB, .recursive = true}},
+                ScanMode::Full);
+  REQUIRE(scanState.waitForScan(std::chrono::seconds{10}));
+  service->startWatching({ScannerRoot{.path = rootA, .recursive = true}, ScannerRoot{.path = rootB, .recursive = true}});
+  REQUIRE(snapshotHasSong(service->snapshot(), songA));
+  REQUIRE(snapshotHasSong(service->snapshot(), songB));
+
+  const bool removed = service->removeLocation(albumA);
+
+  CHECK(removed);
+  CHECK_FALSE(snapshotHasSong(service->snapshot(), songA));
+  CHECK(snapshotHasSong(service->snapshot(), songB));
+  CHECK_FALSE(cacheHasLocation(databasePath, rootA, songA));
+  CHECK(cacheHasLocation(databasePath, rootB, songB));
+  // 合并树 album 目录节点由 rootB 的存活条目重建（track 节点键仍是 rootB 的 rel）。
+  const auto snapshot = service->snapshot();
+  const auto trackNode = std::ranges::find_if(snapshot.nodes, [&](const PlaylistNode& node) {
+    return node.song.has_value() && node.song->filePath == songB;
+  });
+  REQUIRE(trackNode != snapshot.nodes.end());
+  CHECK(trackNode->nodeId == "track:album/b.flac");
 }

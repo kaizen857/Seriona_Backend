@@ -112,6 +112,46 @@ TEST_CASE("scan mode decision falls back to full when directory tree hash is una
   CHECK_FALSE(decision.directoryTreeHash.has_value());
 }
 
+TEST_CASE("scan mode decision tracks a single file root through full and incremental") {
+  test::TempScannerRoot temp{"scan-mode-single-file-root"};
+  const auto audioPath = test::writeAudioFixture(temp.path(), "song.flac");
+  const auto databasePath = externalDatabasePath(temp);
+  const auto rootPath = rootPathFor(ScannerRoot{.path = audioPath});
+
+  // 单文件根：computeDirectoryTreeHash 合成 path+size+mtime 身份哈希（不再返回 nullopt），
+  // 否则该根永远无法进入 Incremental/Reconcile 决策。
+  const auto firstDecision = decideScanMode(ScannerRoot{.path = audioPath}, ScanMode::Incremental, databasePath);
+  CHECK(std::filesystem::exists(audioPath));
+  CHECK(firstDecision.mode == ScanMode::Full);
+  REQUIRE(firstDecision.directoryTreeHash.has_value());
+
+  auto cache = openScanRootCache(databasePath);
+  cache.updateScanRoot(scanRootRecord(rootPath, firstDecision, 1U, std::chrono::milliseconds{5}));
+
+  const auto secondDecision = decideScanMode(ScannerRoot{.path = audioPath}, ScanMode::Incremental, databasePath);
+  CHECK(secondDecision.mode == ScanMode::Incremental);
+  CHECK(secondDecision.directoryTreeHash == firstDecision.directoryTreeHash);
+
+  // 文件被修改（内容/大小/mtime 变化）→ 身份哈希变化 → 决策升级 Full 重读。
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  writeText(audioPath, "changed single file root bytes");
+  const auto changedDecision = decideScanMode(ScannerRoot{.path = audioPath}, ScanMode::Incremental, databasePath);
+  CHECK(changedDecision.mode == ScanMode::Full);
+  REQUIRE(changedDecision.directoryTreeHash.has_value());
+  CHECK(*changedDecision.directoryTreeHash != *firstDecision.directoryTreeHash);
+}
+
+TEST_CASE("scan mode decision returns no hash for a missing single file root") {
+  test::TempScannerRoot temp{"scan-mode-missing-file-root"};
+  const auto missing = temp.path() / "gone.flac";
+
+  const auto decision = decideScanMode(ScannerRoot{.path = missing}, ScanMode::Incremental, externalDatabasePath(temp));
+
+  // 缺失根必须保持 nullopt（Reconcile 据此中止并保留既有索引），不得合成哈希。
+  CHECK(decision.mode == ScanMode::Full);
+  CHECK_FALSE(decision.directoryTreeHash.has_value());
+}
+
 TEST_CASE("scan mode decision falls back to full when scan-root cache cannot be opened") {
   test::TempScannerRoot temp{"scan-mode-cache-open-error"};
   const auto audioPath = test::writeAudioFixture(temp.path(), "song.flac");

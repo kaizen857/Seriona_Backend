@@ -153,8 +153,45 @@ constexpr char kHashSeparator = '\0';
     return result;
   }
   if (!std::filesystem::is_directory(status)) {
-    result.errors.push_back(makeTreeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
-                                             "directory tree hash requires a directory"));
+    // 单文件根（常规文件）：没有目录树可递归，合成一个稳定的身份哈希（规范化路径 + size +
+    // mtime）。这样 Full 会写入它、decideScanMode 会比对它、内部 Reconcile 也能计算它，
+    // 单文件根与目录根在扫描模式判定/脏标记收敛上语义一致；文件被修改必然改变 size/mtime →
+    // 哈希变化 → 下次决策升级 Full 或对账重读。只有"路径缺失/不可读"才返回 nullopt（保持
+    // 既有 Reconcile 中止语义），非常规文件仍按 UnsupportedPath 处理。
+    if (!std::filesystem::is_regular_file(status)) {
+      result.errors.push_back(makeTreeHashError(HashErrorCode::UnsupportedPath, ScannerErrorCode::UnsupportedFile, path,
+                                               "directory tree hash requires a directory"));
+      return result;
+    }
+    std::error_code sizeError;
+    const auto size = std::filesystem::file_size(path, sizeError);
+    if (sizeError) {
+      result.errors.push_back(makeTreeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
+                                               "directory tree hash file root size is unreadable", sizeError.message()));
+      return result;
+    }
+    std::error_code mtimeError;
+    const auto mtime = std::filesystem::last_write_time(path, mtimeError);
+    if (mtimeError) {
+      result.errors.push_back(makeTreeHashError(HashErrorCode::IoFailure, ScannerErrorCode::RootUnavailable, path,
+                                               "directory tree hash file root mtime is unreadable", mtimeError.message()));
+      return result;
+    }
+
+    auto fileState = createHashState();
+    if (fileState == nullptr) {
+      result.errors.push_back(makeTreeHashError(HashErrorCode::IoFailure, ScannerErrorCode::CacheUnavailable, path,
+                                               "failed to initialize directory tree hash state"));
+      return result;
+    }
+    static_cast<void>(updateHash(*fileState, "file"));
+    static_cast<void>(updateHashSeparator(*fileState));
+    static_cast<void>(updateHash(*fileState, pathToUtf8(path.lexically_normal())));
+    static_cast<void>(updateHashSeparator(*fileState));
+    static_cast<void>(updateHash(*fileState, std::to_string(size)));
+    static_cast<void>(updateHashSeparator(*fileState));
+    static_cast<void>(updateHash(*fileState, std::to_string(mtime.time_since_epoch().count())));
+    result.hash = canonicalHex(XXH3_128bits_digest(fileState.get()));
     return result;
   }
 
