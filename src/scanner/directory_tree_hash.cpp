@@ -190,7 +190,10 @@ constexpr char kHashSeparator = '\0';
     static_cast<void>(updateHashSeparator(*fileState));
     static_cast<void>(updateHash(*fileState, std::to_string(size)));
     static_cast<void>(updateHashSeparator(*fileState));
-    static_cast<void>(updateHash(*fileState, std::to_string(mtime.time_since_epoch().count())));
+    // libc++ 下 file_time_type::rep 为 __int128，std::to_string 无该重载且与整型重载二义
+    // （同 song_identity.cpp 的 toStableText 处理），显式收窄到 64 位；纳秒计数远在 int64 内。
+    const auto mtimeTicks = static_cast<long long>(mtime.time_since_epoch().count());
+    static_cast<void>(updateHash(*fileState, std::to_string(mtimeTicks)));
     result.hash = canonicalHex(XXH3_128bits_digest(fileState.get()));
     return result;
   }

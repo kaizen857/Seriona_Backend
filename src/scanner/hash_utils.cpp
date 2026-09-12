@@ -25,8 +25,6 @@
 namespace seriona::scanner {
 namespace {
 
-constexpr std::uint64_t kHashSeed = 0;
-
 struct Xxh3StateDeleter {
   void operator()(XXH3_state_t* state) const noexcept { static_cast<void>(XXH3_freeState(state)); }
 };
