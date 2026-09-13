@@ -3987,6 +3987,21 @@ private:
         if (!std::filesystem::exists(upsert.abs)) {
           return true;
         }
+        // 无内容变化的 Modified 不得算作变更：文件管理器/索引器会以写模式打开文件后零写入关闭
+        // （KDE Dolphin 浏览根目录即对可见音频产生 IN_CLOSE_WRITE，实测大小与 mtime 均未变），
+        // efsw 将其映射为 Modified。位置身份（路径+大小+mtime，与全量/增量扫描同一口径）命中
+        // 缓存说明内容未变，跳过重读并保持 anyMutation=false；否则每轮浏览都会误发快照与
+        // 扫描完成事件（前端"曲库已更新/曲库扫描完成"弹窗风暴）。
+        if (!upsert.created) {
+          const auto currentSize = fileSizeBytes(upsert.abs);
+          const auto currentMtime = fileMtime(upsert.abs);
+          if (currentSize.has_value() && currentMtime.has_value()) {
+            const auto currentLocationId = computeLocationId(upsert.abs, *currentSize, currentMtime);
+            if (!currentLocationId.empty() && cache.loadLocation(currentLocationId).has_value()) {
+              return true;
+            }
+          }
+        }
         auto song = readClassifierSong(upsert.abs);
         // 必须在 cachedLocationFromSong 之前对账：location 行的 lyricsSource/externalLrc* 取自
         // song.metadata，顺序颠倒会让缓存行停留在"无外部歌词"的旧判定。

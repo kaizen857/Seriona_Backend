@@ -394,7 +394,10 @@ TEST_CASE("scanner watcher debounces create modify rename into precise classifie
   watchers->states[0]->callback(fileEvent(renamed, WatchEffectKind::Modified));
   watchers->states[0]->callback(rename);
 
-  waitForReadCount(*reader, 3U);
+  // 语义说明：批内 rename 已用缓存 mtime/size 重写新路径的位置身份，随后的 renamed
+  // Modified 命中"位置身份命中缓存即跳过"闸门，不再重读——内容未变时重读是冗余；created
+  // 仍照常重读。故读计数为 初始 1 + created 1 = 2。
+  waitForReadCount(*reader, 2U);
   waitForSnapshotSongCount(*service, 2U);
   auto songs = songsIn(service->snapshot());
   CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == created; }));
@@ -1599,6 +1602,57 @@ TEST_CASE("scanner watcher move-self with existing path converges via scoped rec
     std::scoped_lock lock{eventsMutex};
     CHECK(scanStartedCount(events) == startedBefore);
   }
+}
+
+// 零写入 Modified 回归：文件管理器以写模式打开音频后零写入关闭（IN_CLOSE_WRITE）不改变
+// 大小/mtime，事件不得触发标签重读、快照重发或扫描完成通知（桌面端"浏览曲库根目录即弹
+// 曲库已更新/曲库扫描完成"的根因）；内容真实变化（mtime 推进）时必须照常重读与发布。
+TEST_CASE("scanner watcher unchanged Modified event is a no-op until the file really changes") {
+  test::TempScannerRoot temp{"scanner-watcher-noop-modified"};
+  const auto track = test::writeAudioFixture(temp.path(), "01.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(track, rawMetadata("Noop"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  waitForScanCompletedCount(events, eventsMutex, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto readsAfterScan = reader->readCount();
+  const auto generatedAtBefore = service->snapshot().generatedAt;
+  std::size_t completedBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+  }
+
+  // 零写入（大小/mtime 均未变）：事件应被完全忽略。沉降窗后再补读计数断言：即使误发
+  // 事件迟到、正对照的 count+1 等待被它先行满足，多出的一次重读仍会被读计数抓到。
+  watchers->states[0]->callback(fileEvent(track, WatchEffectKind::Modified));
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  CHECK(reader->readCount() == readsAfterScan);
+  CHECK(service->snapshot().generatedAt == generatedAtBefore);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+  }
+
+  // 正对照：重写同一 fixture 推进 mtime（内容真实变化）→ 照常重读并发布完成事件。
+  const auto rewritten = test::writeAudioFixture(temp.path(), "01.flac");
+  CHECK(rewritten == track);
+  watchers->states[0]->callback(fileEvent(track, WatchEffectKind::Modified));
+  waitForScanCompletedCount(events, eventsMutex, completedBefore + 1U);
+  CHECK(reader->readCount() == readsAfterScan + 1U);
+  CHECK(service->snapshot().generatedAt > generatedAtBefore);
 }
 
 TEST_CASE("scanner watcher refreshes scan-root hash so the next reconcile stays incremental") {
