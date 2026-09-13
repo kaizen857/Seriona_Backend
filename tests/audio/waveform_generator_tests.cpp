@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -52,6 +53,56 @@ constexpr int kWaveformPerfDurationSeconds = 180;
   return false;
 #endif
 }
+
+// 病态 CPU 超订探测（审计 BE-09）：9:1 饥饿（nice19 被测进程 + 同核 8 个 nice0 占位）下
+// 180s 媒体夹具生成与多格式波形构建的墙钟可放大 ~600x（实测 908s 被 TIMEOUT 900 杀死，
+// 正常 3.43s），此时墙钟性能数字不具回归意义。固定整数循环同时采样进程 CPU 时间与墙钟：
+// 非超订机器（含低频慢 CPU）比值 ≈1，超订机器比值 ≈被抢占倍数，命中即判定病态调度。
+//
+// 单窗口会被调度器的一次性突刺骗成 ≈1：2026-09-13 极端档复现中，2ms 窗口实测约每 5 个
+// 有 2 个满速（stretch≈1.00，其余 400–820）；首次调用恰落在满速窗时测出 1.005 并进入
+// 数小时的重型路径。把窗口加大到 10ms CPU 后 6/6 样本均为饥饿值（400–620），说明该突刺
+// 只能覆盖 ~2ms 级窗口。故取 5 个 10ms 窗口的拉伸比中位数：偶发突刺即便命中个别窗口，
+// 也无法同时覆盖多数 10ms 窗口；测量前先让出一次调度，避开 exec/唤醒后的首个时间片。
+[[nodiscard]] bool waveformPerfPathologicallyStarved() {
+  constexpr auto kSampleCpu = std::chrono::microseconds{10'000};
+  constexpr int kSampleCount = 5;
+  constexpr double kPathologicalStretchThreshold = 8.0;
+  std::uint64_t accumulator = 0x9E3779B97F4A7C15ULL;
+  const auto cpuElapsed = [](std::clock_t begin) {
+    const auto micros =
+        static_cast<double>(std::clock() - begin) * 1'000'000.0 / static_cast<double>(CLOCKS_PER_SEC);
+    return std::chrono::microseconds{static_cast<std::int64_t>(micros)};
+  };
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  std::array<double, kSampleCount> stretches{};
+  for (auto& stretch : stretches) {
+    const auto wallStart = std::chrono::steady_clock::now();
+    const auto cpuStart = std::clock();
+    auto cpu = cpuElapsed(cpuStart);
+    while (cpu < kSampleCpu) {
+      for (int index = 0; index < 2048; ++index) {
+        accumulator = (accumulator * 6364136223846793005ULL) + 1442695040888963407ULL;
+      }
+      cpu = cpuElapsed(cpuStart);
+    }
+    const auto wall = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wallStart);
+    stretch = (wall.count() > 0 && cpu.count() > 0)
+                  ? static_cast<double>(wall.count()) / static_cast<double>(cpu.count())
+                  : 1.0;
+  }
+  auto sorted = stretches;
+  std::ranges::sort(sorted);
+  const auto median = sorted[kSampleCount / 2];
+  std::cout << "waveform perf scheduling probe: stretches=[";
+  for (std::size_t index = 0; index < stretches.size(); ++index) {
+    std::cout << (index == 0 ? "" : " ") << stretches[index];
+  }
+  std::cout << "] median=" << median << " accumulator=" << accumulator << '\n';
+  return median > kPathologicalStretchThreshold;
+}
+
 constexpr int kWaveformPerfSampleRate = 44'100;
 constexpr int kWaveformPerfChannels = 1;
 constexpr int kWaveformPerfBarCount = 400;
@@ -1539,6 +1590,12 @@ TEST_CASE("waveform thread_pool injected task failure propagates as runtime_erro
 }
 
 TEST_CASE("waveform perf release fixtures meet hard limits and record comparison run") {
+  // 审计 BE-09：病态 CPU 超订下墙钟性能证据无意义（正常 3.43s 被放大到 908s+，撞 CTest
+  // TIMEOUT 900）；探测命中时跳过重型夹具生成与多格式测量，打印说明后直接通过。
+  if (waveformPerfPathologicallyStarved()) {
+    std::cout << "waveform perf skipped: pathological CPU oversubscription detected\n";
+    return;
+  }
   const auto fixtures = makeWaveformPerfFixtures();
   auto productionConfig = WaveformConfig{};
   productionConfig.threadCount = 0;

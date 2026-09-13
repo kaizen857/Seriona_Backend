@@ -60,7 +60,7 @@
 - 大量测试目标把被测 `src/*.cpp` 直接编入测试二进制（`${PROJECT_SOURCE_DIR}/src/...`，tests/CMakeLists.txt 共 286 处 `${PROJECT_SOURCE_DIR}/src/` 引用，口径：按出现次数计、排除注释行，含注释共 298）而非链接五个静态库；新增白盒测试沿用该模式，并注意目标之间的共享实现依赖（如 ffmpeg_audio_source.cpp 同时被 filter pipeline 测试直接编译）。
 - 常用正则有 `seriona\.audio`、`seriona\.scanner`、`seriona\.metadata`、`seriona\.control`、`seriona\.logging`、`seriona\.runtime_paths`、`seriona\.application_logging`。
 - doctest 测试二进制必须恰有一个 `main`；多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`，少数自带普通入口，禁止重复定义。
-- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 900s，`seriona.control_artwork_resolver` 超时 300s，`seriona.scanner.efsw_integration` 超时 300s。
+- cancellation 单独注册为 `seriona.playback_state_machine_cancellation`，普通状态机测试显式排除它；`seriona.audio.waveform.perf` 超时 3600s（慢机审计 BE-09：极端饥饿下测试内病态调度守卫跳过重型测量，属性为守卫未触发时的兜底），`seriona.control_artwork_resolver` 超时 300s，`seriona.scanner.efsw_integration` 超时 900s（慢机审计 BE-08：极端饥饿整条实测 178–190s）。
 - `seriona_scanner_cache_tests`、`seriona_scanner_cache_content_tests`、v2→v3 migration、backup rollback、phase1 integration 目标在 `tests/CMakeLists.txt` 中禁用，不要假设可运行或已有迁移。
 - `scanner_song_identity_tests.cpp` 无独立目标，song identity 用例经 `seriona.scanner.song_identity`（`seriona_scanner_hash_tests --test-case="scanner song identity*"`）运行；`seriona.scanner.cue_parsing` 与 `seriona.scanner.folder_thumbnail` 是各自独立目标。
 - `seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test` 只构建不注册 CTest，直接运行 `build/tests/<target>`；`seriona.audio_fixture`、`seriona.scanner.cache.perf` 已注册。
