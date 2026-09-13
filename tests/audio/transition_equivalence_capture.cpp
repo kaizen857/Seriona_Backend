@@ -29,6 +29,16 @@ constexpr std::uint32_t kCapSampleRate = 48'000;
 constexpr std::uint16_t kCapChannels = 2;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
+// 慢机预算：极端饥饿（nice19 对 8×nice0 占位，≈600x）下单条 worker 命令的调度延迟
+// 可达数秒；固定 5s 事件窗会在 worker 尚未跑到时误判（BE-02 的 natural-end 失败）。
+constexpr auto kSlowMachineWaitBudget = std::chrono::seconds{180};
+
+// 慢机生产同步：每 kSlowMachineSyncBlocks 块（240 帧/块）投递一次服务进度屏障，让
+// worker 续产——饥饿下 worker ticker 长时间拿不到 CPU，仅靠 5ms 睡眠节奏会在 ring
+// 排空后读到静音补零，逐样本基线被污染。屏障不消费音频、不改 PCM 内容（仅推进 worker
+// 进度与事件），故对基线字节零影响；正常档 ring 恒满，屏障为空操作。
+constexpr std::uint32_t kSlowMachineSyncBlocks = 8U;
+
 std::uint32_t bytesPerSampleOf(AudioSampleFormat format) {
   switch (format) {
     case AudioSampleFormat::Int16:
@@ -163,8 +173,11 @@ public:
   [[nodiscard]] AudioDeviceFormat currentFormat() const override { return current; }
 
   void consumeFrames(std::uint32_t frames) {
+    // 慢机守卫（建模真实设备）：未 initialize / 已 uninitialize 时不投递回调。原实现
+    // 抛异常，饥饿下 worker 尚未执行到 initialize 就会把测试打断；改为静默不投递——
+    // 真发生内容缺失时逐样本哈希断言会失败，仍能暴露问题。
     if (userData == nullptr) {
-      throw std::runtime_error("capture backend not initialized");
+      return;
     }
     const std::size_t bytesPerFrame =
         static_cast<std::size_t>(current.channelCount) * bytesPerSampleOf(current.sampleFormat);
@@ -216,20 +229,8 @@ bool hasTrackChangedSince(const std::vector<BackendEvent>& events, const std::st
   });
 }
 
-// 以 ≈ 实时节奏消费 240 帧/步（5ms 音频 + 5ms 睡眠）：两树 worker 命令处理窗口都不会
-// 造成人工欠载（learnings T11：fake 消费节奏必须 ≈ 实时，否则任何命令处理窗口都会制造
-// 测试自造欠载静音块，破坏样本确定性）。
-void pacedConsume(CaptureFakeBackend& fake, std::uint32_t frames) {
-  std::uint32_t driven = 0U;
-  while (driven < frames) {
-    fake.consumeFrames(240U);
-    driven += 240U;
-    std::this_thread::sleep_for(5ms);
-  }
-}
-
 void waitForStateSince(const EventLog& log, std::size_t fromCount, PlaybackState state) {
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     const auto snapshot = log.snapshot();
     const auto begin = snapshot.begin() + static_cast<std::ptrdiff_t>(std::min(fromCount, snapshot.size()));
@@ -242,7 +243,7 @@ void waitForStateSince(const EventLog& log, std::size_t fromCount, PlaybackState
 }
 
 void waitForEventTypeSince(const EventLog& log, std::size_t fromCount, BackendEventType type) {
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     const auto snapshot = log.snapshot();
     const auto begin = snapshot.begin() + static_cast<std::ptrdiff_t>(std::min(fromCount, snapshot.size()));
@@ -276,6 +277,25 @@ struct ScenarioSession {
   bool direct{false};
   std::vector<std::uint8_t> captured;
 };
+
+// 以 ≈ 实时节奏消费 240 帧/步（5ms 音频 + 5ms 睡眠）：两树 worker 命令处理窗口都不会
+// 造成人工欠载（learnings T11：fake 消费节奏必须 ≈ 实时，否则任何命令处理窗口都会制造
+// 测试自造欠载静音块，破坏样本确定性）。
+// 慢机生产同步：每 kSlowMachineSyncBlocks 块先行投递一次服务进度屏障（worker 续产），
+// 避免饥饿下 ring 排空读静音；屏障不消费音频、不改字节，仅推进 worker 进度。
+void pacedConsume(ScenarioSession& session, std::uint32_t frames) {
+  std::uint32_t driven = 0U;
+  std::uint32_t blocksSinceSync = 0U;
+  while (driven < frames) {
+    if (blocksSinceSync == 0U) {
+      static_cast<void>(session.service->queryPlaybackClock());
+    }
+    session.fake->consumeFrames(240U);
+    driven += 240U;
+    blocksSinceSync = (blocksSinceSync + 1U) % kSlowMachineSyncBlocks;
+    std::this_thread::sleep_for(5ms);
+  }
+}
 
 void makeSession(ScenarioSession& session, AudioSampleFormat format, bool direct) {
   auto backend = std::make_unique<CaptureFakeBackend>();
@@ -327,9 +347,9 @@ EquivCapture capturePlaythrough(ScenarioSession& session, const TrackPlaybackReq
   // 相同 + 队列耗尽后渲染全零"，不以 PlaybackEnded 事件到达时刻驱动（消除事件/消费
   // 交错竞态；字节长度基线按 122 块锁定）。事件事后核验自然播完确实发生——事件派发
   // 可能滞后于消费完成（慢机），核验用带 deadline 的等待而非即时快照。
-  pacedConsume(*session.fake, 240U * 122U);
+  pacedConsume(session, 240U * 122U);
   // 事件可能在消费过程中已派发（自然结束于尾块窗口内），故核验扫描完整事件日志。
-  const auto endedDeadline = std::chrono::steady_clock::now() + 5s;
+  const auto endedDeadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   bool ended = false;
   while (std::chrono::steady_clock::now() < endedDeadline) {
     const auto snapshot = session.log.snapshot();
@@ -348,25 +368,25 @@ EquivCapture capturePlaythrough(ScenarioSession& session, const TrackPlaybackReq
 
 EquivCapture capturePauseResume(ScenarioSession& session, const TrackPlaybackRequest& request) {
   loadAndPlay(session, request);
-  pacedConsume(*session.fake, 2400U);  // 50ms
+  pacedConsume(session, 2400U);  // 50ms
   const std::size_t eventsBeforePause = session.log.size();
   session.service->pause();
   waitForStateSince(session.log, eventsBeforePause, PlaybackState::Paused);
   session.service->resume();
   waitForStateSince(session.log, eventsBeforePause, PlaybackState::Playing);
-  pacedConsume(*session.fake, 2400U);  // 50ms
+  pacedConsume(session, 2400U);  // 50ms
   session.service->stop();
   return finalizeSession(session);
 }
 
 EquivCapture captureSeek(ScenarioSession& session, const TrackPlaybackRequest& request) {
   loadAndPlay(session, request);
-  pacedConsume(*session.fake, 2400U);  // 50ms
+  pacedConsume(session, 2400U);  // 50ms
   const std::size_t eventsBeforeSeek = session.log.size();
   session.service->seek(700ms);
   waitForEventTypeSince(session.log, eventsBeforeSeek, BackendEventType::PositionDiscontinuity);
   waitForStateSince(session.log, eventsBeforeSeek, PlaybackState::Playing);
-  pacedConsume(*session.fake, 2400U);  // 700ms 起 50ms
+  pacedConsume(session, 2400U);  // 700ms 起 50ms
   session.service->stop();
   return finalizeSession(session);
 }
@@ -375,11 +395,11 @@ EquivCapture captureSwitch(ScenarioSession& session,
                            const TrackPlaybackRequest& requestA,
                            const TrackPlaybackRequest& requestB) {
   loadAndPlay(session, requestA);
-  pacedConsume(*session.fake, 2400U);  // A 前 50ms
+  pacedConsume(session, 2400U);  // A 前 50ms
   const std::size_t eventsBeforeSwitch = session.log.size();
   session.service->loadTrack(requestB);
   session.service->play();
-  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     const auto snapshot = session.log.snapshot();
     const auto begin = snapshot.begin() + static_cast<std::ptrdiff_t>(std::min(eventsBeforeSwitch, snapshot.size()));
@@ -395,7 +415,7 @@ EquivCapture captureSwitch(ScenarioSession& session,
   if (!hasTrackChangedSince(window, requestB.trackId) || !hasStateSince(window, PlaybackState::Playing)) {
     throw std::runtime_error("switch: target track not adopted");
   }
-  pacedConsume(*session.fake, 2400U);  // B 前 50ms
+  pacedConsume(session, 2400U);  // B 前 50ms
   session.service->stop();
   return finalizeSession(session);
 }

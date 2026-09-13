@@ -25,6 +25,11 @@ using namespace std::chrono_literals;
 namespace seriona::audio {
 namespace {
 
+// 慢机预算：极端饥饿（nice19 对 8×nice0 占位，≈600x）下单条 worker 命令的调度延迟
+// 可达数秒（审计实测 1.5–4.6s）；固定 2s/3s 等待会把"worker 尚未跑到"误判为失败
+// （BE-02 崩溃链起点）。所有等待改为宽裕预算 + 条件轮询：条件满足即返回，正常档零等待。
+constexpr auto kSlowMachineWaitBudget = std::chrono::seconds{180};
+
 constexpr std::uint32_t kSampleRate = 48'000;
 constexpr std::uint16_t kChannels = 1;
 constexpr std::uint16_t kBitsPerSample = 16;
@@ -209,7 +214,7 @@ public:
 
   void waitForStart() {
     std::unique_lock lock{mutex};
-    REQUIRE(entered.wait_for(lock, 2s, [&] { return startEntered; }));
+    REQUIRE(entered.wait_for(lock, kSlowMachineWaitBudget, [&] { return startEntered; }));
   }
 
   void unblockStart() {
@@ -282,8 +287,21 @@ private:
   std::vector<BackendEvent> events_{};
 };
 
+// 慢机轮询原语：谓词满足即返回（条件轮询，预算耗尽返回末值）。
+template <typename Predicate>
+bool waitUntil(Predicate&& predicate, std::chrono::milliseconds timeout = kSlowMachineWaitBudget) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(1ms);
+  }
+  return predicate();
+}
+
 void waitForEventCount(const EventLog& events, std::size_t count) {
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (events.size() < count && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(1ms);
   }
@@ -291,7 +309,7 @@ void waitForEventCount(const EventLog& events, std::size_t count) {
 }
 
 void waitForState(const EventLog& events, PlaybackState state) {
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     const auto states = statesFrom(events.snapshot());
     if (std::find(states.begin(), states.end(), state) != states.end()) {
@@ -302,14 +320,68 @@ void waitForState(const EventLog& events, PlaybackState state) {
   FAIL("expected playback state was not delivered");
 }
 
+// 慢机：resume 后等"新增的"Playing——同状态历史事件（play#1）会让 waitForState
+// 立即命中，导致 start 计数尚未 +1 就继续（paused-reload 用例已有同款教训）。
+void waitForNewState(const EventLog& events, PlaybackState state) {
+  const auto statesBefore = statesFrom(events.snapshot()).size();
+  REQUIRE(waitUntil([&] {
+    const auto states = statesFrom(events.snapshot());
+    return states.size() > statesBefore && states.back() == state;
+  }));
+}
+
+// 慢机：等指定事件类型出现（worker 命令可能仍在队列中，按事件总数/时钟读值断言
+// 会评估陈旧状态）。PositionDiscontinuity 仅由 seek 产生，出现即 seek 已执行。
+void waitForEventType(const EventLog& events, BackendEventType type) {
+  REQUIRE(waitUntil([&] {
+    const auto snapshot = events.snapshot();
+    return std::any_of(snapshot.begin(), snapshot.end(),
+                       [type](const BackendEvent& event) { return event.type == type; });
+  }));
+}
+
+// 慢机时钟新鲜度：反复投递 queryPlaybackClock（命令 FIFO 于 worker 串行域），直到
+// 快照满足条件或预算耗尽——原直接读在饥饿下会拿到 2s 超时的陈旧值。
+template <typename Query, typename Predicate>
+PlaybackClockSnapshot waitForClock(Query&& query,
+                                   Predicate&& condition,
+                                   std::chrono::milliseconds budget = kSlowMachineWaitBudget) {
+  auto snapshot = query();
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (!condition(snapshot) && std::chrono::steady_clock::now() < deadline) {
+    snapshot = query();
+  }
+  return snapshot;
+}
+
+// 慢机 worker 进度屏障（同 seamless 测试 queryProgressTick 语义）：queryPlaybackClock 的
+// 2s 兜底在饥饿下会超时返回陈旧快照，不能证明"命令/进度 tick 已在 worker 执行"。判据 =
+// 返回快照的 sampledAt 不早于发起时刻（由 worker 上真实执行的进度 tick 写入）；未达标则
+// 重投（命令 FIFO 于 worker 串行域），直到达标或预算耗尽——正常档一次命中，零等待。
+// 淡入握手/下行腿发布/收尾归零判定都发生在 worker 进度 tick 上，纯帧驱动在饥饿下会在
+// 发布前烧尽帧预算（审计单曲 7 例失败根因）。
+template <typename PlaybackHost>
+PlaybackClockSnapshot waitForWorkerProgress(PlaybackHost& host) {
+  const auto issuedAt = std::chrono::steady_clock::now();
+  auto snapshot = host.queryPlaybackClock();
+  const auto deadline = issuedAt + kSlowMachineWaitBudget;
+  while (snapshot.sampledAt < issuedAt && std::chrono::steady_clock::now() < deadline) {
+    snapshot = host.queryPlaybackClock();
+  }
+  return snapshot;
+}
+
 }
 
 TEST_CASE("audio_player_single_track supports fake-device command path") {
   const auto path = sineFixture("audio_player_single_track.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   auto* fake = backend.get();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 声明序即析构逆序：eventLog 须先于 player 声明——测试中止（REQUIRE 失败）时
+  // player/service 先析构（join worker + 清 sink），worker 迟到派发才不会触碰
+  // 已销毁的 eventLog（BE-02 失败链上的悬垂 sink SIGSEGV）。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
   AudioOutputConfig config{};
   config.preferredDeviceId = "fake-device";
@@ -333,17 +405,29 @@ TEST_CASE("audio_player_single_track supports fake-device command path") {
   waitForState(eventLog, PlaybackState::Ready);
   player.play();
   waitForState(eventLog, PlaybackState::Playing);
+  // 慢机：Playing 事件 = initialize+start 已完成的证据，consume 才安全；时钟读值
+  // 改为新鲜度等待（原始直读在饥饿下可能拿到超时陈旧快照）。
   fake->consumeFrames(2400U);
-  const auto afterPlay = player.queryPlaybackClock();
+  const auto afterPlay = waitForClock([&] { return player.queryPlaybackClock(); },
+                                      [](const PlaybackClockSnapshot& snapshot) {
+                                        return snapshot.position >= 40ms;
+                                      });
   player.pause();
   waitForState(eventLog, PlaybackState::Paused);
-  const auto paused = player.queryPlaybackClock();
+  const auto paused = waitForClock([&] { return player.queryPlaybackClock(); },
+                                   [&](const PlaybackClockSnapshot& snapshot) {
+                                     return snapshot.position >= afterPlay.position;
+                                   });
   player.resume();
-  waitForState(eventLog, PlaybackState::Playing);
+  waitForNewState(eventLog, PlaybackState::Playing);
   fake->consumeFrames(2400U);
   player.seek(700ms);
+  waitForEventType(eventLog, BackendEventType::PositionDiscontinuity);
   waitForEventCount(eventLog, 8U);
-  const auto afterSeek = player.queryPlaybackClock();
+  const auto afterSeek = waitForClock([&] { return player.queryPlaybackClock(); },
+                                      [](const PlaybackClockSnapshot& snapshot) {
+                                        return snapshot.position >= 700ms;
+                                      });
   player.stop();
   waitForState(eventLog, PlaybackState::Stopped);
 
@@ -379,8 +463,9 @@ TEST_CASE("audio_player_public_commands_enqueue_without_waiting_for_device_start
   const auto path = sineFixture("audio_player_nonblocking_commands.wav", kSampleRate * 2U);
   auto backend = std::make_unique<BlockingStartAudioOutputDeviceBackend>();
   auto* fake = backend.get();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 同前：eventLog 先声明，测试中止时 worker 迟到派发不触碰已销毁的日志。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
   AudioOutputConfig config{};
   config.preferredDeviceId = "blocking-device";
@@ -427,8 +512,9 @@ TEST_CASE("audio_player_public_commands_enqueue_without_waiting_for_device_start
 TEST_CASE("audio_player_single_track seek reuses the open source after the file is removed") {
   const auto path = sineFixture("audio_player_seek_reuses_open_source.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 同前：eventLog 先声明，测试中止时 worker 迟到派发不触碰已销毁的日志。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
 
   AudioOutputConfig config{};
@@ -456,7 +542,7 @@ TEST_CASE("audio_player_single_track seek reuses the open source after the file 
 
   player.seek(700ms);
 
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   auto afterSeek = player.queryPlaybackClock();
   while (afterSeek.position < 700ms && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(1ms);
@@ -479,8 +565,11 @@ TEST_CASE("audio_player_single_track ignores duration metadata as a hard stop wh
   const auto path = sineFixture("audio_player_duration_without_offset.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   auto* fake = backend.get();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 声明序即析构逆序：eventLog 须先于 player 声明——测试中止（REQUIRE 失败）时
+  // player/service 先析构（join worker + 清 sink），worker 迟到派发才不会触碰
+  // 已销毁的 eventLog（BE-02 失败链上的悬垂 sink SIGSEGV）。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
 
   AudioOutputConfig config{};
@@ -512,7 +601,7 @@ TEST_CASE("audio_player_single_track ignores duration metadata as a hard stop wh
     static_cast<void>(player.queryPlaybackClock());
   }
 
-  const auto clock = player.queryPlaybackClock();
+  const auto clock = waitForWorkerProgress(player);
   const auto events = eventLog.snapshot();
   CHECK(clock.position >= 250ms);
   CHECK(std::none_of(events.begin(), events.end(), [](const BackendEvent& event) {
@@ -526,8 +615,11 @@ TEST_CASE("audio_player_single_track honors bounded segment duration when the se
   const auto path = sineFixture("audio_player_bounded_segment_offset_zero.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   auto* fake = backend.get();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 声明序即析构逆序：eventLog 须先于 player 声明——测试中止（REQUIRE 失败）时
+  // player/service 先析构（join worker + 清 sink），worker 迟到派发才不会触碰
+  // 已销毁的 eventLog（BE-02 失败链上的悬垂 sink SIGSEGV）。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
 
   AudioOutputConfig config{};
@@ -560,7 +652,7 @@ TEST_CASE("audio_player_single_track honors bounded segment duration when the se
     static_cast<void>(player.queryPlaybackClock());
   }
 
-  const auto clock = player.queryPlaybackClock();
+  const auto clock = waitForWorkerProgress(player);
   const auto events = eventLog.snapshot();
   CHECK(clock.position <= 150ms);
   CHECK(std::any_of(events.begin(), events.end(), [](const BackendEvent& event) {
@@ -574,8 +666,11 @@ TEST_CASE("audio_player_single_track paused output reload stays paused without e
   const auto path = sineFixture("audio_player_paused_reload.wav", kSampleRate * 2U);
   auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
   auto* fake = backend.get();
-  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
+  // 声明序即析构逆序：eventLog 须先于 player 声明——测试中止（REQUIRE 失败）时
+  // player/service 先析构（join worker + 清 sink），worker 迟到派发才不会触碰
+  // 已销毁的 eventLog（BE-02 失败链上的悬垂 sink SIGSEGV）。
   EventLog eventLog;
+  AudioPlayer player{makeAudioPlaybackService(std::move(backend))};
   player.setEventSink(eventLog.sink());
 
   TrackPlaybackRequest request{};
@@ -599,7 +694,7 @@ TEST_CASE("audio_player_single_track paused output reload stays paused without e
   player.seek(1200ms);
   player.pause();
 
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  const auto deadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     const auto states = statesFrom(eventLog.snapshot());
     if (states.size() > stateCountBeforeReload && states.back() == PlaybackState::Paused) {
@@ -618,7 +713,7 @@ TEST_CASE("audio_player_single_track paused output reload stays paused without e
     }
   }
 
-  const auto pausedAfterReload = player.queryPlaybackClock();
+  const auto pausedAfterReload = waitForWorkerProgress(player);
   CHECK(pausedAfterReload.trackId == "paused-reload");
   CHECK(pausedAfterReload.position >= 1150ms);
   CHECK(pausedAfterReload.position <= 1250ms);
@@ -628,7 +723,7 @@ TEST_CASE("audio_player_single_track paused output reload stays paused without e
   const auto statesBeforeResume = statesFrom(eventLog.snapshot()).size();
   player.resume();
   bool resumedToPlaying = false;
-  const auto resumeDeadline = std::chrono::steady_clock::now() + 3s;
+  const auto resumeDeadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (std::chrono::steady_clock::now() < resumeDeadline) {
     const auto states = statesFrom(eventLog.snapshot());
     if (states.size() > statesBeforeResume && states.back() == PlaybackState::Playing) {
@@ -648,18 +743,6 @@ namespace {
 
 // —— T6 传送淡变收尾测试基础设施 ——
 
-template <typename Predicate>
-bool waitUntil(Predicate&& predicate, std::chrono::milliseconds timeout = 3s) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (predicate()) {
-      return true;
-    }
-    std::this_thread::sleep_for(1ms);
-  }
-  return predicate();
-}
-
 float currentMasterGain(FakeAudioOutputDeviceBackend& fake) {
   REQUIRE(fake.userData != nullptr);
   return fake.userData->masterEnvelopeGain();
@@ -667,13 +750,21 @@ float currentMasterGain(FakeAudioOutputDeviceBackend& fake) {
 
 // 播放后推进冷启动淡入（即时 0 → ticker 观测归零 → 发布 0→1），直到增益完全建立
 // （≈1.0）。否则 pause 会落在零增益窗内，淡出从 0 起算 → 瞬时完成（行为正确但测不到轨迹）。
-void driveUntilGainEstablished(FakeAudioOutputDeviceBackend& fake, std::uint32_t maxFrames = 30'000U) {
+template <typename PlaybackHost>
+void driveUntilGainEstablished(PlaybackHost& host,
+                               FakeAudioOutputDeviceBackend& fake,
+                               std::uint32_t maxFrames = 30'000U) {
   std::uint32_t driven = 0U;
+  std::uint32_t chunk = 0U;
   while (driven < maxFrames) {
     fake.consumeFrames(240U);
     driven += 240U;
+    ++chunk;
     if (currentMasterGain(fake) >= 0.99F) {
       return;
+    }
+    if (chunk % 10U == 0U) {
+      waitForWorkerProgress(host);
     }
     std::this_thread::sleep_for(1ms);
   }
@@ -692,20 +783,53 @@ bool hasRealError(const std::vector<BackendEvent>& events) {
   });
 }
 
+// 事件计数（忽略 BufferUnderrun PlaybackError）：欠载报告在突发驱动/饥饿下是正常现象
+// （同 hasRealError 口径），"窗口内零事件/零错误"断言按同口径排除，避免饥饿伪失败。
+std::size_t countReportedEvents(const std::vector<BackendEvent>& events) {
+  return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), [](const BackendEvent& event) {
+    if (event.type != BackendEventType::PlaybackError) {
+      return true;
+    }
+    return std::get<PlaybackError>(event.payload).code != PlaybackErrorCode::BufferUnderrun;
+  }));
+}
+
+// 饥饿安全帧消费：只消费 ring 中真实存在的帧，绝不触发回调补静音。饥饿下 worker 续喂慢于
+// 测试消费时，"整块 240 帧"驱动会制造欠载静音块——样本级阶跃（爆音）与窗口内错误计数会被
+// 伪信号污染。返回实际消费帧数；0 = ring 暂空（调用方短睡后重试，waitUntil 自带 1ms 轮询）。
+std::uint32_t consumeAvailableFrames(FakeAudioOutputDeviceBackend& fake, std::uint32_t maxFrames) {
+  if (fake.queue == nullptr) {
+    return 0U;
+  }
+  const auto frames = std::min(maxFrames, fake.queue->availableFrames());
+  if (frames == 0U) {
+    return 0U;
+  }
+  fake.consumeFrames(frames);
+  return frames;
+}
+
 // 从暂停观测时刻起驱动 240 帧（5ms）块，直到事件日志出现新事件（收尾完成发布——
 // 事件在 stopDevice 之后推送，互斥日志同步保证 stop 计数可见）。返回 [驱动总帧数, 增益采样]。
-std::pair<std::uint32_t, std::vector<float>> driveUntilFinishingDone(const EventLog& events,
-                                                                     std::size_t eventsAtStart,
+template <typename PlaybackHost>
+std::pair<std::uint32_t, std::vector<float>> driveUntilFinishingDone(PlaybackHost& host,
+                                                                     const EventLog& events,
                                                                      FakeAudioOutputDeviceBackend& fake,
                                                                      std::uint32_t maxFrames = 30'000U) {
   std::vector<float> gains;
   std::uint32_t driven = 0U;
+  std::uint32_t chunk = 0U;
+  const auto reportedAtStart = countReportedEvents(events.snapshot());
   while (driven < maxFrames) {
     fake.consumeFrames(240U);
     driven += 240U;
+    ++chunk;
     gains.push_back(currentMasterGain(fake));
-    if (events.size() > eventsAtStart) {
+    if (countReportedEvents(events.snapshot()) > reportedAtStart) {
       break;
+    }
+    if (chunk % 10U == 0U) {
+      waitForWorkerProgress(host);
     }
     std::this_thread::sleep_for(1ms);
   }
@@ -762,11 +886,13 @@ struct FadingPlayer {
     player.configureOutput(config);
   }
 
+  // 声明序即析构逆序：events 必须位列最前——销毁时 player/service 先析构（join worker
+  // + 清 sink），events 最后析构，测试中止路径的迟到事件派发不会触碰已销毁日志。
+  EventLog events;
   std::unique_ptr<FakeAudioOutputDeviceBackend> backend;
   FakeAudioOutputDeviceBackend* fake{nullptr};
   std::shared_ptr<AudioPlaybackService> service;
   AudioPlayer player;
-  EventLog events;
 };
 
 }
@@ -780,17 +906,16 @@ TEST_CASE("audio_player_finishing pause fade-out runs to zero then stops device 
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
+  driveUntilGainEstablished(fading.player, *fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
 
-  const auto prePauseClock = fading.player.queryPlaybackClock();
+  const auto prePauseClock = waitForWorkerProgress(fading.player);
   fading.player.pause();
   waitForState(fading.events, PlaybackState::Paused);
-  const auto eventsAtPause = fading.events.size();
   const auto pausedIndex = pausedEventIndex(fading.events.snapshot());
   REQUIRE(fake->stopCalls.load() == 0);  // 逻辑 Paused 已发，设备仍在运行（淡出中）
 
   // 驱动渲染块直到收尾完成（归零后 stopDevice + 定格发布）。
-  const auto [driven, gains] = driveUntilFinishingDone(fading.events, eventsAtPause, *fake);
+  const auto [driven, gains] = driveUntilFinishingDone(fading.player, fading.events, *fake);
   CHECK(driven >= 4'320U);  // 淡出至少吃掉 ~90ms（100ms 目标）
   CHECK(driven <= 10'000U);
   REQUIRE(fake->stopCalls.load() == 1);
@@ -824,8 +949,8 @@ TEST_CASE("audio_player_finishing pause fade-out runs to zero then stops device 
   CHECK(fake->startCalls.load() == 1);  // 未重启设备
 
   // R3：归零点定格——时钟冻结，且定格在淡出末尾（≈暂停点+淡出长），而非淡出前位置。
-  const auto frozen = fading.player.queryPlaybackClock();
-  const auto frozenAgain = fading.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(fading.player);
+  const auto frozenAgain = waitForWorkerProgress(fading.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position == frozenAgain.position);
   const auto advance = frozen.position - prePauseClock.position;
@@ -844,7 +969,7 @@ TEST_CASE("audio_player_finishing resume during fade-out keeps device running an
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
+  driveUntilGainEstablished(fading.player, *fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
 
   fading.player.pause();
   waitForState(fading.events, PlaybackState::Paused);
@@ -865,7 +990,7 @@ TEST_CASE("audio_player_finishing resume during fade-out keeps device running an
   CHECK(fake->startCalls.load() == 1);
   CHECK(fake->stopCalls.load() == 0);
 
-  const auto resumedClock = fading.player.queryPlaybackClock();
+  const auto resumedClock = waitForWorkerProgress(fading.player);
   CHECK(resumedClock.continuous);
   // 位置从暂停+淡出消费处继续（≈25ms 后），无回退。
   CHECK(resumedClock.position >= 40ms);
@@ -908,21 +1033,20 @@ TEST_CASE("audio_player_finishing resume after fade-out completes restarts devic
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
+  driveUntilGainEstablished(fading.player, *fake);  // 等冷启动淡入跑完（gain≈1.0），避开零增益窗
 
   fading.player.pause();
   waitForState(fading.events, PlaybackState::Paused);
-  const auto eventsAtPause = fading.events.size();
 
   // 完整走完淡出（设备停、时钟定格）。
-  const auto [driven, fadeGains] = driveUntilFinishingDone(fading.events, eventsAtPause, *fake);
+  const auto [driven, fadeGains] = driveUntilFinishingDone(fading.player, fading.events, *fake);
   REQUIRE(fake->stopCalls.load() == 1);
   REQUIRE(driven > 0U);
   // stop 会复位包络到 1.0，末尾采样可能读回复位值——归零断言用全程最小值。
   const auto fadeMinimum = std::min_element(fadeGains.begin(), fadeGains.end());
   REQUIRE(fadeMinimum != fadeGains.end());
   CHECK(*fadeMinimum <= 0.02F);
-  const auto frozenBeforeResume = fading.player.queryPlaybackClock();
+  const auto frozenBeforeResume = waitForWorkerProgress(fading.player);
   CHECK_FALSE(frozenBeforeResume.continuous);
 
   // 冷恢复：设备重新启动（第二次 backend start），位置从归零点继续（精确相等）。
@@ -933,7 +1057,7 @@ TEST_CASE("audio_player_finishing resume after fade-out completes restarts devic
     return states.size() > stateCountBeforeResume && states.back() == PlaybackState::Playing;
   }));
   CHECK(fake->startCalls.load() == 2);
-  const auto afterResumeClock = fading.player.queryPlaybackClock();
+  const auto afterResumeClock = waitForWorkerProgress(fading.player);
   CHECK(afterResumeClock.continuous);
   CHECK(afterResumeClock.position >= frozenBeforeResume.position);
   CHECK(afterResumeClock.position <= frozenBeforeResume.position + 5ms);
@@ -980,8 +1104,9 @@ TEST_CASE("audio_player_finishing pause without fade enabled stays instant (regr
     auto backend = std::make_unique<FakeAudioOutputDeviceBackend>();
     auto* fake = backend.get();
     auto service = makeAudioPlaybackService(std::move(backend));
-    AudioPlayer player{service};
+    // 同前：eventLog 先声明，测试中止时 worker 迟到派发不触碰已销毁的日志。
     EventLog eventLog;
+    AudioPlayer player{service};
     player.setEventSink(eventLog.sink());
     if (zeroMilliseconds) {
       TransitionConfig transition{};
@@ -1008,7 +1133,7 @@ TEST_CASE("audio_player_finishing pause without fade enabled stays instant (regr
     CHECK(fake->stopCalls.load() == 1);
 
     // 无淡出：时钟立即定格在暂停位置，无额外消费推进。
-    const auto frozen = player.queryPlaybackClock();
+    const auto frozen = waitForWorkerProgress(player);
     CHECK_FALSE(frozen.continuous);
     player.setEventSink(BackendEventSink{});
   }
@@ -1065,7 +1190,7 @@ TEST_CASE("audio_player_finishing bounded track ending during fade-out stops at 
   }
   REQUIRE(fake->stopCalls.load() == 1);
   CHECK(driven <= 4'800U);  // ≤100ms：无残余淡出窗口
-  const auto frozen = fading.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(fading.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position <= 130ms);
 
@@ -1097,7 +1222,7 @@ TEST_CASE("audio_player_finishing natural end with fade enabled stays instant (r
   waitForState(fading.events, PlaybackState::Playing);
 
   bool ended = false;
-  const auto endDeadline = std::chrono::steady_clock::now() + 2s;
+  const auto endDeadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (!ended && std::chrono::steady_clock::now() < endDeadline) {
     fake->consumeFrames(1'200U);
     const auto snapshot = fading.events.snapshot();
@@ -1110,7 +1235,7 @@ TEST_CASE("audio_player_finishing natural end with fade enabled stays instant (r
   }
   REQUIRE(ended);
   CHECK(fake->stopCalls.load() == 1);
-  const auto clock = fading.player.queryPlaybackClock();
+  const auto clock = waitForWorkerProgress(fading.player);
   CHECK_FALSE(clock.continuous);
   CHECK(clock.position <= 130ms);
 
@@ -1129,7 +1254,7 @@ TEST_CASE("audio_player_finishing fade disabled during fade-out resume returns t
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);
+  driveUntilGainEstablished(fading.player, *fake);
 
   fading.player.pause();
   waitForState(fading.events, PlaybackState::Paused);
@@ -1182,7 +1307,7 @@ TEST_CASE("audio_player_finishing fade disabled during fade-out resume returns t
   CHECK(fake->stopCalls.load() == 0);
 
   // 满增益保持（非瞬时巧合）：位置连续推进、增益不回零。
-  const auto clockAfterFull = fading.player.queryPlaybackClock();
+  const auto clockAfterFull = waitForWorkerProgress(fading.player);
   CHECK(clockAfterFull.continuous);
   for (int index = 0; index < 6; ++index) {
     fake->consumeFrames(240U);
@@ -1200,7 +1325,7 @@ TEST_CASE("audio_player_finishing illegal seek during stop fade-out keeps finish
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);
+  driveUntilGainEstablished(fading.player, *fake);
 
   // stop（fade on → StopCleanup 收尾）：逻辑 Stopped 已发，设备仍在淡出运行。
   fading.player.stop();
@@ -1248,8 +1373,8 @@ TEST_CASE("audio_player_finishing illegal seek during stop fade-out keeps finish
   CHECK(fake->startCalls.load() == 1);
 
   // StopCleanup 完成：时钟定格、逻辑态仍 Stopped、位置无回退。
-  const auto frozen = fading.player.queryPlaybackClock();
-  const auto frozenAgain = fading.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(fading.player);
+  const auto frozenAgain = waitForWorkerProgress(fading.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position == frozenAgain.position);
   const auto states = statesFrom(fading.events.snapshot());
@@ -1284,11 +1409,13 @@ struct ConfigurablePlayer {
     player.configureOutput(config);
   }
 
+  // 声明序即析构逆序：events 必须位列最前——销毁时 player/service 先析构（join worker
+  // + 清 sink），events 最后析构，测试中止路径的迟到事件派发不会触碰已销毁日志。
+  EventLog events;
   std::unique_ptr<FakeAudioOutputDeviceBackend> backend;
   FakeAudioOutputDeviceBackend* fake{nullptr};
   std::shared_ptr<AudioPlaybackService> service;
   AudioPlayer player;
-  EventLog events;
 };
 
 // 装载并播放到增益满（无 transport fade 时 stop 复位包络 1.0 → 立即满足）。
@@ -1297,7 +1424,7 @@ void loadAndPlayToFullGain(ConfigurablePlayer& player, const TrackPlaybackReques
   waitForState(player.events, PlaybackState::Ready);
   player.player.play();
   waitForState(player.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*player.fake);
+  driveUntilGainEstablished(player.player, *player.fake);
 }
 
 std::size_t countEvents(const std::vector<BackendEvent>& events, BackendEventType type) {
@@ -1310,6 +1437,7 @@ std::size_t countEvents(const std::vector<BackendEvent>& events, BackendEventTyp
 // 影响不可作驱动信号——以增益为信号（轨迹由回调消费推进，确定性随块推进）。
 std::vector<float> driveUntilFullGain(ConfigurablePlayer& player,
                                       std::uint32_t maxFrames = 30'000U) {
+  waitForWorkerProgress(player.player);
   std::vector<float> gains;
   std::uint32_t driven = 0U;
   while (driven < maxFrames) {
@@ -1336,6 +1464,9 @@ DipDriveResult driveSeekDipUntilZero(ConfigurablePlayer& player,
                                      std::size_t eventsAtStart,
                                      std::uint32_t maxFrames = 30'000U) {
   DipDriveResult result;
+  // 饥饿屏障：下行腿由 worker 处理 loadTrack/seek 命令时发布；纯帧上限会在命令执行前烧尽，
+  // 且之后不再消费帧 → 归零点永不达成（ShortDip：gains.back()==1.0 且 adopt 永不发生）。
+  waitForWorkerProgress(player.player);
   // 禁止提前出现：TrackChanged/Loading/PositionDiscontinuity（seek dip 期间逻辑当前曲不变、
   // 状态机事件推迟到归零点——提前出现 = 实现回退成瞬时或状态漂移）。
   while (result.drivenFrames < maxFrames) {
@@ -1375,7 +1506,7 @@ TEST_CASE("audio_player_t11 seek dip: playing seek with fade dips master to zero
   ConfigurablePlayer player{transition};
   player.configureOutput(60ms);
   loadAndPlayToFullGain(player, makeSineRequest(path, "t11-seekdip"));
-  const auto before = player.player.queryPlaybackClock();
+  const auto before = waitForWorkerProgress(player.player);
   REQUIRE(before.continuous);
 
   const auto eventsAtSeek = player.events.size();
@@ -1448,7 +1579,7 @@ TEST_CASE("audio_player_t11 seek dip: playing seek with fade dips master to zero
   const auto riseGains = driveUntilFullGain(player);
   REQUIRE_FALSE(riseGains.empty());
   CHECK(riseGains.back() >= 0.99F);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.continuous);
   CHECK(after.position >= 1200ms);
   CHECK(after.position <= 1400ms);  // 上行 100ms + 余量
@@ -1520,7 +1651,7 @@ TEST_CASE("audio_player_t11 seek dip: second seek during dip only updates the pe
   const auto riseGains = driveUntilFullGain(player);
   REQUIRE_FALSE(riseGains.empty());
   CHECK(riseGains.back() >= 0.99F);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.continuous);
   CHECK(after.position >= 1500ms);
   CHECK(after.position <= 1800ms);  // 上行 150ms + 余量
@@ -1538,7 +1669,7 @@ TEST_CASE("audio_player_t11 seek dip: pause during dip converts to pause-freeze 
   ConfigurablePlayer player{transition};
   player.configureOutput(60ms);
   loadAndPlayToFullGain(player, makeSineRequest(path, "t11-seekdip-pause"));
-  const auto before = player.player.queryPlaybackClock();
+  const auto before = waitForWorkerProgress(player.player);
 
   player.player.seek(1800ms);
 
@@ -1582,8 +1713,8 @@ TEST_CASE("audio_player_t11 seek dip: pause during dip converts to pause-freeze 
   CHECK(std::none_of(postPause.begin() + static_cast<std::ptrdiff_t>(eventsBeforePause), postPause.end(),
                      [](const BackendEvent& event) { return event.type == BackendEventType::TrackChanged; }));
   // 时钟定格：连续播放结束；位置 < seek 目标（seek 未应用），从 dip 打断点位置定格。
-  const auto frozen = player.player.queryPlaybackClock();
-  const auto frozenAgain = player.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(player.player);
+  const auto frozenAgain = waitForWorkerProgress(player.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position == frozenAgain.position);
   CHECK(frozen.position < 1800ms);
@@ -1651,7 +1782,7 @@ TEST_CASE("audio_player_t11 seek: seek while paused stays instant even with fade
 
   // 无 dip：设备未重启（start 计数不变）；增益无轨迹（设备停，包络保持复位值 1.0）。
   CHECK(player.fake->startCalls.load() == startCallsBefore);
-  const auto frozen = player.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(player.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position >= 895ms);
   CHECK(frozen.position <= 905ms);
@@ -1662,7 +1793,7 @@ TEST_CASE("audio_player_t11 seek: seek while paused stays instant even with fade
     const auto states = statesFrom(player.events.snapshot());
     return !states.empty() && states.back() == PlaybackState::Playing;
   }));
-  const auto resumed = player.player.queryPlaybackClock();
+  const auto resumed = waitForWorkerProgress(player.player);
   CHECK(resumed.continuous);
   CHECK(resumed.position >= 900ms);
   player.player.setEventSink(BackendEventSink{});
@@ -1677,7 +1808,7 @@ TEST_CASE("audio_player_t11 seek: seek during finishing pause-fade is deferred a
   waitForState(fading.events, PlaybackState::Ready);
   fading.player.play();
   waitForState(fading.events, PlaybackState::Playing);
-  driveUntilGainEstablished(*fake);
+  driveUntilGainEstablished(fading.player, *fake);
 
   fading.player.pause();
   waitForState(fading.events, PlaybackState::Paused);
@@ -1687,13 +1818,16 @@ TEST_CASE("audio_player_t11 seek: seek during finishing pause-fade is deferred a
   fake->consumeFrames(1'200U);  // 淡出进行中（25ms / 100ms）
   REQUIRE(currentMasterGain(*fake) > 0.4F);
   const auto eventsAtSeek = fading.events.size();
+  const auto reportedAtSeek = countReportedEvents(fading.events.snapshot());
   fading.player.seek(1500ms);
-  // seek 命令本身零事件（仅冻结目标）。
+  // seek 命令本身零事件（仅冻结目标）；计数忽略 BufferUnderrun PlaybackError——饥饿下收尾
+  // ticker 的欠载报告是正常现象（同 hasRealError 口径），非 seek 产生的事件。
   const auto deadline = std::chrono::steady_clock::now() + 300ms;
-  while (std::chrono::steady_clock::now() < deadline && fading.events.size() == eventsAtSeek) {
+  while (std::chrono::steady_clock::now() < deadline &&
+         countReportedEvents(fading.events.snapshot()) == reportedAtSeek) {
     std::this_thread::sleep_for(1ms);
   }
-  CHECK(fading.events.size() == eventsAtSeek);  // 淡出期 seek 不产生任何事件
+  CHECK(countReportedEvents(fading.events.snapshot()) == reportedAtSeek);  // 淡出期 seek 不产生真实事件
   REQUIRE(fake->stopCalls.load() == 0);
 
   // 驱动到收尾完成：归零点 stopDevice + 定格位置补做物理 seek（1500ms）。
@@ -1707,8 +1841,8 @@ TEST_CASE("audio_player_t11 seek: seek during finishing pause-fade is deferred a
   REQUIRE(fading.events.size() > eventsAtFinish);
   REQUIRE(fake->stopCalls.load() == 1);
 
-  const auto frozen = fading.player.queryPlaybackClock();
-  const auto frozenAgain = fading.player.queryPlaybackClock();
+  const auto frozen = waitForWorkerProgress(fading.player);
+  const auto frozenAgain = waitForWorkerProgress(fading.player);
   CHECK_FALSE(frozen.continuous);
   CHECK(frozen.position == frozenAgain.position);
   // 定格位置 = seek 目标（1500ms）：收尾补做物理 seek + clock.seek(target)。
@@ -1735,7 +1869,7 @@ TEST_CASE("audio_player_t11 seek: seek during finishing pause-fade is deferred a
     return !latest.empty() && latest.back() == PlaybackState::Playing;
   }));
   CHECK(fake->startCalls.load() == 2);
-  const auto afterResume = fading.player.queryPlaybackClock();
+  const auto afterResume = waitForWorkerProgress(fading.player);
   CHECK(afterResume.continuous);
   CHECK(afterResume.position >= 1500ms);
   CHECK(afterResume.position <= 1560ms);
@@ -1764,7 +1898,7 @@ TEST_CASE("audio_player_t11 manual switch: Off stays an instant hard cut (TrackC
   const auto postSwitch = player.events.snapshot();
   CHECK(countEvents(postSwitch, BackendEventType::PositionDiscontinuity) == 0U);
   CHECK(countEvents(postSwitch, BackendEventType::AdvanceCompleted) == 0U);
-  const auto clock = player.player.queryPlaybackClock();
+  const auto clock = waitForWorkerProgress(player.player);
   CHECK(clock.trackId == "t11-manual-off-b");
   player.player.setEventSink(BackendEventSink{});
 }
@@ -1833,7 +1967,7 @@ TEST_CASE("audio_player_t11 manual switch: ShortDip dips master, adopts staged t
   const auto riseGains = driveUntilFullGain(player);
   REQUIRE_FALSE(riseGains.empty());
   CHECK(riseGains.back() >= 0.99F);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t11-manual-dip-b");
   CHECK(after.continuous);
   CHECK(after.position >= 0ms);
@@ -1877,7 +2011,7 @@ TEST_CASE("audio_player_t11 manual switch: FullCrossfade with matching preloaded
   const auto postZero = player.events.snapshot();
   CHECK(countEvents(postZero, BackendEventType::AdvanceCompleted) == 0U);
   CHECK(countEvents(postZero, BackendEventType::PositionDiscontinuity) == 0U);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t11-manual-overlap-b");
   CHECK(after.continuous);
   player.player.setEventSink(BackendEventSink{});
@@ -1900,10 +2034,11 @@ TEST_CASE("audio_player_t11 manual switch review F2: near-end FullCrossfade drai
 
   // 播放到 ≈200ms（剩余 ≈200ms=40 块）：排空先于 source1 上行腿完成 2-3 块
   // （source1 腿需先经即时 0 观测+受理）→ 修复前双腿冻结于 g1≈0.93 <0.98，promote 永不达。
-  for (int index = 0; index < 40; ++index) {
-    player.fake->consumeFrames(240U);
-    std::this_thread::sleep_for(1ms);
-  }
+  std::uint32_t preSwitchDriven = 0U;
+  REQUIRE(waitUntil([&] {
+    preSwitchDriven += consumeAvailableFrames(*player.fake, 240U);
+    return preSwitchDriven >= 9'600U;
+  }));
   const auto eventsAtSwitch = player.events.size();
   player.player.prepareNext(makeSineRequest(pathB, "t11-review-f2-b"));
   player.player.loadTrack(makeSineRequest(pathB, "t11-review-f2-b"));
@@ -1917,11 +2052,18 @@ TEST_CASE("audio_player_t11 manual switch review F2: near-end FullCrossfade drai
   float prevChannel1 = 0.0F;
   bool havePreviousFrame = false;
   REQUIRE(waitUntil([&] {
-    player.fake->consumeFrames(240U);
-    // 实时节奏：240 帧(5ms@48k) + 4ms 内睡 + waitUntil 的 1ms ≈ 48k/s——避免超实时消费
-    // 在 worker 处理 prepareNext(B)/切歌命令期间饿死主源 ring（60ms 容量），否则测试自身
-    // 制造人工欠载静音块（样本步进断言误报，非服务爆音）。
-    std::this_thread::sleep_for(4ms);
+    const auto before = player.events.snapshot();
+    if (std::any_of(before.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch), before.end(),
+                    [](const BackendEvent& event) {
+                      return event.type == BackendEventType::PlaybackStateChanged &&
+                             std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Playing;
+                    })) {
+      return true;
+    }
+    const auto frames = consumeAvailableFrames(*player.fake, 240U);
+    if (frames == 0U) {
+      return false;
+    }
     minMaster = std::min(minMaster, currentMasterGain(*player.fake));
     const auto* samples = reinterpret_cast<const float*>(player.fake->callbackBuffer.data());
     const auto frameCount = player.fake->callbackBuffer.size() / (2U * sizeof(float));
@@ -1953,7 +2095,7 @@ TEST_CASE("audio_player_t11 manual switch review F2: near-end FullCrossfade drai
                       }) == 1U);
   CHECK(countEvents(postSwitch, BackendEventType::AdvanceCompleted) == 0U);
   CHECK(countEvents(postSwitch, BackendEventType::PositionDiscontinuity) == 0U);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t11-review-f2-b");
   CHECK(after.continuous);
   player.player.setEventSink(BackendEventSink{});
@@ -1982,22 +2124,24 @@ TEST_CASE("audio_player_t11 manual switch review F1: seek dip in flight supersed
   // 恢复 1.0（不被冻结于 0）；重叠推进不被 dip 屏蔽（source1 腿发布 → promote）。
   bool sawPlaying = false;
   REQUIRE(waitUntil([&] {
-    player.fake->consumeFrames(240U);
-    std::this_thread::sleep_for(4ms);
     const auto snapshot = player.events.snapshot();
-    if (std::any_of(snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch), snapshot.end(),
-                    [](const BackendEvent& event) {
-                      return event.type == BackendEventType::PlaybackStateChanged &&
-                             std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Playing;
-                    })) {
+    const auto window = snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch);
+    if (std::any_of(window, snapshot.end(), [](const BackendEvent& event) {
+          return event.type == BackendEventType::PlaybackStateChanged &&
+                 std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Playing;
+        })) {
       sawPlaying = true;
     }
-    return std::any_of(snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch), snapshot.end(),
-                       [](const BackendEvent& event) {
-                         return event.type == BackendEventType::TrackChanged &&
-                                std::get<TrackChanged>(event.payload).request.trackId == "t11-review-f1-b";
-                       });
-   }));
+    const bool sawSwitch = std::any_of(window, snapshot.end(), [](const BackendEvent& event) {
+      return event.type == BackendEventType::TrackChanged &&
+             std::get<TrackChanged>(event.payload).request.trackId == "t11-review-f1-b";
+    });
+    if (sawSwitch && sawPlaying) {
+      return true;
+    }
+    static_cast<void>(consumeAvailableFrames(*player.fake, 240U));
+    return false;
+  }));
    CHECK(sawPlaying);
     const auto postSwitch = player.events.snapshot();
     const auto switchWindow = postSwitch.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch);
@@ -2013,7 +2157,7 @@ TEST_CASE("audio_player_t11 manual switch review F1: seek dip in flight supersed
                  std::get<TrackChanged>(event.payload).request.trackId == "t11-review-f1-b";
         }) == 1U);
   CHECK(countEvents(postSwitch, BackendEventType::AdvanceCompleted) == 0U);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t11-review-f1-b");
   CHECK(after.continuous);
   player.player.setEventSink(BackendEventSink{});
@@ -2042,27 +2186,30 @@ TEST_CASE("audio_player_t11 manual switch review F3: FullCrossfade ready-slot sw
 
   bool sawPlaying = false;
   REQUIRE(waitUntil([&] {
-    player.fake->consumeFrames(240U);
-    std::this_thread::sleep_for(4ms);
     const auto snapshot = player.events.snapshot();
-    if (std::any_of(snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch), snapshot.end(),
-                    [](const BackendEvent& event) {
-                      return event.type == BackendEventType::PlaybackStateChanged &&
-                             std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Playing;
-                    })) {
+    const auto window = snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch);
+    if (std::any_of(window, snapshot.end(), [](const BackendEvent& event) {
+          return event.type == BackendEventType::PlaybackStateChanged &&
+                 std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Playing;
+        })) {
       sawPlaying = true;
     }
-    return std::any_of(snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch), snapshot.end(),
-                       [](const BackendEvent& event) {
-                         return event.type == BackendEventType::TrackChanged &&
-                                std::get<TrackChanged>(event.payload).request.trackId == "t11-review-f3-b";
-                       });
+    const bool sawSwitch = std::any_of(window, snapshot.end(), [](const BackendEvent& event) {
+      return event.type == BackendEventType::TrackChanged &&
+             std::get<TrackChanged>(event.payload).request.trackId == "t11-review-f3-b";
+    });
+    if (sawSwitch && sawPlaying) {
+      return true;
+    }
+    static_cast<void>(consumeAvailableFrames(*player.fake, 240U));
+    return false;
   }));
   const auto postSwitch = player.events.snapshot();
   const auto switchWindow = postSwitch.begin() + static_cast<std::ptrdiff_t>(eventsAtSwitch);
   CHECK(sawPlaying);
   CHECK(std::count_if(switchWindow, postSwitch.end(), [](const BackendEvent& event) {
-          return event.type == BackendEventType::PlaybackError;
+          return event.type == BackendEventType::PlaybackError &&
+                 std::get<PlaybackError>(event.payload).code != PlaybackErrorCode::BufferUnderrun;
         }) == 0U);
   CHECK(std::count_if(switchWindow, postSwitch.end(), [](const BackendEvent& event) {
           return event.type == BackendEventType::TrackChanged &&
@@ -2070,7 +2217,7 @@ TEST_CASE("audio_player_t11 manual switch review F3: FullCrossfade ready-slot sw
         }) == 1U);
   CHECK(countEvents(postSwitch, BackendEventType::AdvanceCompleted) == 0U);
   CHECK(countEvents(postSwitch, BackendEventType::PositionDiscontinuity) == 0U);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t11-review-f3-b");
   CHECK(after.continuous);
   player.player.setEventSink(BackendEventSink{});
@@ -2162,7 +2309,7 @@ TEST_CASE("audio_player_t13 manual switch: Direct mode ignores dip and crossfade
       minMaster = std::min(minMaster, currentMasterGain(*player.fake));
     }
     CHECK(minMaster >= 0.99F);
-    const auto after = player.player.queryPlaybackClock();
+    const auto after = waitForWorkerProgress(player.player);
     CHECK(after.trackId == "t13-direct-gear-b");
     CHECK(after.continuous);
     player.player.setEventSink(BackendEventSink{});
@@ -2205,7 +2352,7 @@ TEST_CASE("audio_player_t13 manual switch: Direct mode ignores dip and crossfade
     REQUIRE(waitUntil([&] { return player.fake->startCalls.load() == startBefore + 1; }));
     CHECK(player.fake->initializeCalls.load() == initBefore + 1);
     CHECK(player.fake->startCalls.load() == startBefore + 1);
-    const auto after = player.player.queryPlaybackClock();
+    const auto after = waitForWorkerProgress(player.player);
     CHECK(after.trackId == "t13-direct-gear-b");
     player.player.setEventSink(BackendEventSink{});
   }
@@ -2269,7 +2416,7 @@ TEST_CASE("audio_player_t13 manual switch: pause during FullCrossfade overlap ab
     minMaster = std::min(minMaster, currentMasterGain(*player.fake));
   }
   CHECK(minMaster >= 0.99F);
-  const auto after = player.player.queryPlaybackClock();
+  const auto after = waitForWorkerProgress(player.player);
   CHECK(after.trackId == "t13-overlap-pause-a");
   CHECK(after.continuous);
   const auto* samples = reinterpret_cast<const float*>(player.fake->callbackBuffer.data());
