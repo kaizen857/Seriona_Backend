@@ -2852,16 +2852,36 @@ TEST_CASE("scanner watcher first event on an un-scanned single file root indexes
   CHECK(sidecar.loadLocationsByRoot(rootPath).size() == 1U);
 
   // 周期探测静默窗口：Reconcile 记录身份哈希后哈希命中 → 不再排扫描（修复前会每 30ms 空转）。
-  std::this_thread::sleep_for(std::chrono::milliseconds{100});
-  std::size_t startedAfterReconcile = 0;
+  // 慢机鲁棒：GitHub runner 上事件/探测管道的在途收敛可能跨越固定采样边界（实测 Debian 13
+  // 在一个 150ms 固定窗内出现成批 0ms no-op reconcile）。改为先等管道彻底静默（连续 4 个
+  // 50ms 采样窗无新增 ScanStarted），再断言静默可持续：真正的持续空转（每周期重排扫描）
+  // 永远无法静默，会在静默等待上超时失败——缺陷检出能力不降，只是不再依赖机器速度。
+  std::size_t quiescedCount = 0;
   {
     std::scoped_lock lock{eventsMutex};
-    startedAfterReconcile = scanStartedCount(events);
+    quiescedCount = scanStartedCount(events);
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  bool quiesced = false;
+  int stableRounds = 0;
+  for (int attempt = 0; attempt != 200 && !quiesced; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    std::size_t current = 0;
+    {
+      std::scoped_lock lock{eventsMutex};
+      current = scanStartedCount(events);
+    }
+    if (current == quiescedCount) {
+      quiesced = ++stableRounds >= 4;
+    } else {
+      stableRounds = 0;
+      quiescedCount = current;
+    }
+  }
+  REQUIRE_MESSAGE(quiesced, "scanner did not quiesce: periodic probe keeps scheduling reconciles");
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
   {
     std::scoped_lock lock{eventsMutex};
-    CHECK(scanStartedCount(events) == startedAfterReconcile);
+    CHECK(scanStartedCount(events) == quiescedCount);
   }
   CHECK(reader->readCount() == 1U);
 }
