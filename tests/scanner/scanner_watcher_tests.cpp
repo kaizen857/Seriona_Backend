@@ -461,6 +461,72 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   }
 }
 
+// 零变化 .lrc 事件回归：hash 未变的同内容重写（mtime 可推进）不得发布快照与扫描完成——
+// 否则同步工具/编辑器的同内容保存会误发「曲库已更新/曲库扫描完成」。真实内容变化（hash
+// 推进）必须照常对账并发布。
+TEST_CASE("scanner watcher unchanged lrc event does not publish until content really changes") {
+  test::TempScannerRoot temp{"scanner-watcher-lrc-noop"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(audio, rawMetadata("Song", {RawTagLyricLine{std::chrono::milliseconds{100}, "embedded"}}));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto lrc = temp.path() / "song.lrc";
+  writeText(lrc, "[00:02.00]external\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
+  watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Modified));
+  waitForLyrics(*service, LyricsSource::ExternalLrc, "external");
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+
+  // 同内容重写（hash 不变）：纯 no-op，不得发布。
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  writeText(lrc, "[00:02.00]external\n");
+  watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Modified));
+  // 沉降窗远大于去抖（5ms）与批处理耗时：no-op 必须自成一批并被处理完（慢机不产生假失败）；
+  // 随后真实变化的"恰 +1"精确计数兜底捕获任何迟到（含排队）的额外发布。
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  writeText(lrc, "[00:03.00]updated\n");
+  watchers->states[0]->callback(fileEvent(lrc, WatchEffectKind::Modified));
+  waitForLyrics(*service, LyricsSource::ExternalLrc, "updated");
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  CHECK(reader->readCount() == 1U);
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore + 1U);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "updated");
+}
+
 TEST_CASE("scanner watcher warning error and overflow messages force root reconciliation") {
   test::TempScannerRoot temp{"scanner-watcher-warning"};
   const auto first = test::writeAudioFixture(temp.path(), "first.flac");
@@ -1578,29 +1644,31 @@ TEST_CASE("scanner watcher move-self with existing path converges via scoped rec
     snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
   }
 
-  // 目录仍存在于磁盘（歧义：可能是移出后被同名目录顶替）：新语义按目录 scope 收敛
-  // （scope 内增量计划命中缓存 → 标签零重读），不再回落重扫。
+  // 目录仍存在于磁盘（歧义：可能是移出后被同名目录顶替）：按目录 scope 收敛（scope 内增量
+  // 计划命中缓存 → 标签零重读），不再回落重扫。磁盘内容与索引完全一致（全部命中缓存身份、
+  // 缓存行数不变）时 scoped 收敛不得发布——无变化事件不发快照。
   watchers->states[0]->callback(directorySelfEvent(music));
-  bool sawSnapshot = false;
-  for (auto attempt = 0; attempt != 2000; ++attempt) {
-    {
-      std::scoped_lock lock{eventsMutex};
-      if (eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) > snapshotBefore) {
-        sawSnapshot = true;
-        break;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  // 沉降窗远大于去抖（5ms）与批处理耗时：no-op 批次必须先于真实变化被处理完（慢机不产生
+  // 假失败）；随后真实变化的"恰 +1"精确计数兜底捕获任何迟到（含排队）的额外发布。
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore);
   }
-  CHECK(sawSnapshot);
-  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  const auto replacement = test::writeAudioFixture(music, "02.flac");
+  reader->put(replacement, rawMetadata("Replacement"));
+  watchers->states[0]->callback(fileEvent(replacement, WatchEffectKind::Created));
+  waitForSnapshotSongCount(*service, 2U);
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
   const auto songs = songsIn(service->snapshot());
-  REQUIRE(songs.size() == 1U);
-  CHECK(songs[0].filePath == track);
-  CHECK(reader->readCount() == 1U);
+  REQUIRE(songs.size() == 2U);
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == track; }));
+  CHECK(std::ranges::any_of(songs, [&](const SongMetadata& song) { return song.filePath == replacement; }));
+  CHECK(reader->readCount() == 2U);
   {
     std::scoped_lock lock{eventsMutex};
     CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
   }
 }
 
@@ -3361,6 +3429,174 @@ TEST_CASE("scanner watcher cue sidecar lrc update refreshes all cue tracks with 
     REQUIRE(external.size() == 1U);
     CHECK(external[0].text == "cue external");
   }
+}
+
+// 零变化 .cue 事件回归：文件未被写入的 Modified（写模式打开零写入模型，位置身份未变）驱动
+// 的 scoped 收敛必须零发布——scope 内增量扫描全部命中缓存身份且缓存行数不变时不得误发
+// 「曲库已更新」。真实 cue 内容变化（mtime 推进）必须照常收敛发布。
+TEST_CASE("scanner watcher unchanged cue event does not publish until cue really changes") {
+  test::TempScannerRoot temp{"scanner-watcher-cue-noop"};
+  const auto albumDir = temp.path() / "album";
+  std::filesystem::create_directories(albumDir);
+  const auto cue = albumDir / "album.cue";
+  const auto source = albumDir / "album.flac";
+  writeText(cue, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+  writeText(source, "fake source audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(source, rawMetadata("Source Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+  setTestCueSheetProvider([&source](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "album.cue") {
+      return {};
+    }
+    return {{.audioFilePath = source,
+             .offset = 0,
+             .duration = 60000000,
+             .title = "Track 1",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  });
+  struct CueProviderClear {
+    ~CueProviderClear() { clearTestCueSheetProvider(); }
+  } cueProviderClear;
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  std::size_t startedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+
+  // 未写入的 Modified：位置身份未变 → 零发布（scope 不建或 scoped 收敛零变化）。
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+  // 沉降窗远大于去抖（5ms）与批处理耗时：no-op 必须自成一批并被处理完（慢机不产生假失败）；
+  // 随后真实变化的"恰 +1"精确计数兜底捕获任何迟到（含排队）的额外发布。
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
+  writeText(cue, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:01:00\n");
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    {
+      std::scoped_lock lock{eventsMutex};
+      if (eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) > snapshotBefore) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].filePath == cue);
+}
+
+// 根级 .cue 零变化事件：位置身份命中缓存 → 不建 scope、不回落整根 Reconcile（父目录 == root
+// 时 scope 被拒，否则每轮写模式打开都会重扫 + 通知）。真实变化（mtime 推进）仍按既有设计
+// 回落一次 Reconcile 收敛。no-op 与真实变化间隔超过去抖窗，确保各自成批、可区分。
+TEST_CASE("scanner watcher unchanged root level cue event does not reconcile") {
+  test::TempScannerRoot temp{"scanner-watcher-root-cue-noop"};
+  const auto cue = temp.path() / "album.cue";
+  const auto source = temp.path() / "album.flac";
+  writeText(cue, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+  writeText(source, "fake source audio");
+
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(source, rawMetadata("Source Track"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+  setTestCueSheetProvider([&source](const std::filesystem::path& cuePath) -> std::vector<TestCueTrackData> {
+    if (cuePath.filename() != "album.cue") {
+      return {};
+    }
+    return {{.audioFilePath = source,
+             .offset = 0,
+             .duration = 60000000,
+             .title = "Track 1",
+             .artist = "Cue Artist",
+             .album = "Cue Album",
+             .trackNumber = 1}};
+  });
+  struct CueProviderClear {
+    ~CueProviderClear() { clearTestCueSheetProvider(); }
+  } cueProviderClear;
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  std::size_t startedBefore = 0;
+  std::size_t completedBefore = 0;
+  std::size_t snapshotBefore = 0;
+  {
+    std::scoped_lock lock{eventsMutex};
+    startedBefore = scanStartedCount(events);
+    completedBefore = eventTypeCount(events, ScannerEventType::ScanCompleted);
+    snapshotBefore = eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated);
+  }
+
+  // 未写入的 Modified：纯 no-op。沉降窗远大于去抖（5ms）与批处理耗时，慢机同样成立；
+  // 随后真实变化的"恰 +1"精确计数兜底捕获任何迟到（含排队）的额外 Reconcile。
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore);
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
+  writeText(cue, "FILE \"album.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 01 00:01:00\n");
+  watchers->states[0]->callback(fileEvent(cue, WatchEffectKind::Modified));
+  for (auto attempt = 0; attempt != 2000; ++attempt) {
+    {
+      std::scoped_lock lock{eventsMutex};
+      if (scanStartedCount(events) > startedBefore) {
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == startedBefore + 1U);
+    CHECK(eventTypeCount(events, ScannerEventType::ScanCompleted) == completedBefore + 1U);
+    CHECK(eventTypeCount(events, ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore + 1U);
+  }
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].filePath == cue);
 }
 
 // 非递归根：addScope 必须透传真实 recursive=false —— 封面 scope 不得按递归子树枚举，

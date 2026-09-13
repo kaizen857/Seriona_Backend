@@ -3076,6 +3076,35 @@ private:
     return false;
   }
 
+  // .cue 零变化闸门：cue 文件大小/mtime + 各轨 source 身份全部命中缓存 → 内容未变。
+  // 缓存不可用、无行或任一轨身份不符 → 返回 false（按真实变化处理，宁可扫描不可漏）。
+  [[nodiscard]] bool cueCacheIdentityIntact(const std::filesystem::path& rootPath,
+                                            const std::filesystem::path& cuePath) const {
+    const auto cueSize = fileSizeBytes(cuePath);
+    const auto cueMtime = fileMtime(cuePath);
+    const auto cueMtimeNs = fileTimeNanoseconds(cueMtime);
+    if (!cueSize.has_value() || !cueMtimeNs.has_value()) {
+      return false;
+    }
+    try {
+      const cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+      bool sawCueRow = false;
+      for (const auto& location : cache.loadLocationsByRoot(rootPath)) {
+        if (!isCueCachedLocation(location) || pathKey(location.filePath) != pathKey(cuePath)) {
+          continue;
+        }
+        sawCueRow = true;
+        if (!cueLocationMatchesCacheHitIdentity(location, cuePath, cueSize, cueMtime, cueMtimeNs)) {
+          return false;
+        }
+      }
+      return sawCueRow;
+    } catch (const std::exception& error) {
+      spdlog::warn("cue identity probe failed for {}: {}", pathToUtf8(cuePath), error.what());
+      return false;
+    }
+  }
+
   // 单文件根判定：根路径自身就是一条已索引歌曲（root 的 filePath == 根路径）。
   [[nodiscard]] bool rootHasIndexedSelfEntry(const std::filesystem::path& rootPath) const {
     const auto rootKey = pathKey(rootPath);
@@ -3121,7 +3150,11 @@ private:
   // scoped 结果并入长期成员 allSongs_，并以既有精确写 API 收敛缓存：先按 scope 前缀清理
   // 树/缓存，再写入扫描结果（disk truth）。重复/嵌套 scope 合并后仍幂等，且能清理"移入后
   // 又被移出"留下的残留行。删除 + 写入 + scope 外 cue 补偿行恢复在同一事务内（R13.5）。
-  void mergeScopedResult(const ScopedScanTarget& target, RootResult& result) {
+  // 返回 scope 子树是否发生实际变化（调用方据此决定是否发布）。非 force scope（cue 增改/
+  // 目录/孤儿源）以「路径+位置身份」多重集比较：全部命中缓存身份的 scoped 增量扫描结果与
+  // 既有条目完全一致时不发布（无变化事件不得误发「曲库已更新」）；force scope（封面）必须
+  // 无条件视为变化——artwork 刷新依赖扫描期标签重读，其变化可能不反映在位置身份上。
+  [[nodiscard]] bool mergeScopedResult(const ScopedScanTarget& target, RootResult& result) {
     const auto rootPath = rootPathFor(target.root);
     const auto rootKey = pathKey(rootPath);
     std::filesystem::path scopeAbs;
@@ -3135,9 +3168,9 @@ private:
       scopeRelText = pathToUtf8(scopeRel);
       scopeAbs = (rootPath / scopeRel).lexically_normal();
     }
-    std::erase_if(allSongs_, [&](const RootResult::PublishedSong& entry) {
-      // treeRelativePath 是根相对路径：多根共享同一 rel 前缀时（如两个根的 album/）不得跨根
-      // 擦除，否则后合并的 scope 会抹掉另一个根刚写入的同前缀歌曲。先按 sourceRoot 归属过滤。
+    // scope 归属谓词：擦除与变化检测共用。treeRelativePath 是根相对路径：多根共享同一 rel
+    // 前缀时（如两个根的 album/）不得跨根擦除/误判，先按 sourceRoot 归属过滤。
+    const auto entryWithinScope = [&](const RootResult::PublishedSong& entry) {
       if (pathKey(entry.sourceRoot) != rootKey) {
         return false;
       }
@@ -3146,8 +3179,22 @@ private:
       }
       const auto relative = pathToUtf8(entry.treeRelativePath);
       return relative == scopeRelText || relative.rfind(scopeRelText + "/", 0) == 0;
-    });
+    };
+    const auto signatureOf = [](const RootResult::PublishedSong& entry) {
+      return pathToUtf8(entry.treeRelativePath) + "\x1f" + entry.locationId.value_or(std::string{});
+    };
+    std::vector<std::string> beforeSignatures;
+    if (!target.forceTagReread) {
+      for (const auto& entry : allSongs_) {
+        if (entryWithinScope(entry)) {
+          beforeSignatures.push_back(signatureOf(entry));
+        }
+      }
+    }
+    std::erase_if(allSongs_, entryWithinScope);
     cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
+    const auto scopePrefixKey = pathKey(scopeAbs);
+    const auto cacheRowCountBefore = cache.countLocationsByPathPrefix(pathKey(rootPath), scopePrefixKey);
 
     // B2 补偿：deleteLocationsByPathPrefix 同时匹配 source_file_path，会删掉"source 在 scope 内、
     // cue 在 scope 外"的 cue 轨行；scope 内枚举无法重建它们。merge 前收集这些行，merge 后原样恢复，
@@ -3190,6 +3237,19 @@ private:
       allSongs_.push_back(std::move(publishedSong));
     }
     cache.replaceLocationsByPathPrefixWithSongs(pathKey(rootPath), pathKey(scopeAbs), writes, externalCueRows);
+    if (target.forceTagReread) {
+      return true;
+    }
+    std::vector<std::string> afterSignatures;
+    for (const auto& entry : allSongs_) {
+      if (entryWithinScope(entry)) {
+        afterSignatures.push_back(signatureOf(entry));
+      }
+    }
+    std::ranges::sort(beforeSignatures);
+    std::ranges::sort(afterSignatures);
+    const auto cacheRowCountAfter = cache.countLocationsByPathPrefix(pathKey(rootPath), scopePrefixKey);
+    return beforeSignatures != afterSignatures || cacheRowCountBefore != cacheRowCountAfter;
   }
 
   [[nodiscard]] cache::CachedSong readClassifierSong(const std::filesystem::path& path) {
@@ -3802,8 +3862,12 @@ private:
       if (isCueSheetPath(abs)) {
         // .cue 新建/修改：T1 scope = cue 父目录（R1/§3.3）；父目录 == root → Reconcile。
         if (std::filesystem::exists(abs)) {
-          addScope(*root, abs.parent_path());
-          noteShapeChange(root->path);
+          // 零写入/同内容重写（位置身份未变）不建 scope：cue 父目录 == root 时否则会回落
+          // 整根 Reconcile——无变化事件不得触发扫描与通知。
+          if (op.created || !cueCacheIdentityIntact(root->path, abs)) {
+            addScope(*root, abs.parent_path());
+            noteShapeChange(root->path);
+          }
         }
         continue;
       }
@@ -4091,9 +4155,20 @@ private:
           }
           for (const auto index : bucket->second) {
             auto& entry = allSongs_[index];
+            const auto hadExternalLyrics =
+                !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
             const auto action = applyLyricsSidecarProbe(entry.song, lrcPath, probe, effective.scanner);
-            touchedPaths.push_back(entry.treeRelativePath);
-            anyMutation = true;
+            const auto hasExternalLyrics =
+                !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
+            // action None 且外部歌词在位状态不变才是纯 no-op（hash 未变、同内容重写或写模式打开
+            // 零写入）：内容没有变化时不得置变更/发布（与音频位置身份闸门同类），否则会误发快照
+            // 与扫描完成事件。applyLyricsSidecarProbe 在 readExternalLyrics=false 时清空内存外部
+            // 歌词但同样返回 None——那是真实可见变化，不得压制。树侧仍 upsert 以同步 path/mtime，
+            // 无发布时不可见。
+            if (action != ExternalLyricsCacheAction::None || hadExternalLyrics != hasExternalLyrics) {
+              touchedPaths.push_back(entry.treeRelativePath);
+              anyMutation = true;
+            }
             if (hidden(entry)) {
               // 全量语义下被 cue 隐藏的源音频不入缓存，无可更新的 location 行。
               continue;
@@ -4172,45 +4247,47 @@ private:
             requestReconcile(scope.root.path);
             continue;
           }
-          mergeScopedResult(scope, scoped);
+          const bool scopeChanged = mergeScopedResult(scope, scoped);
           if (scoped.enumerationIncomplete) {
             // scoped 合并同样按前缀破坏性收敛：部分枚举会让 scope 内未能枚举的活行丢失，
             // 置脏由后续 Reconcile 重读恢复（与根扫描同一收敛保证）。
             markPendingReconcile(scope.root.path);
           }
-          if (scope.wholeRoot) {
-            // wholeRoot 影响的是该根的全部目录：传入该根当前全部目录 rel 前缀，而不是空路径
-            // （空路径 = 整库受影响，会让其他根的目录也重跑缩略图 seam；成本门只约束标签重读，
-            // 不约束该 seam）。rel 前缀经去重避免重复路径撑大 touched 列表；该根无子目录时
-            // 用 kNoTouchedDirectory 哨兵保证批次不落入"整库受影响"语义。
-            const auto scopeRootKey = pathKey(rootPathFor(scope.root));
-            std::unordered_set<std::string> touchedDirKeys;
-            bool touchedAnyDirectory = false;
-            for (const auto& entry : allSongs_) {
-              if (pathKey(entry.sourceRoot) != scopeRootKey) {
-                continue;
-              }
-              std::filesystem::path prefix;
-              const auto& relative = entry.treeRelativePath;
-              for (auto component = relative.begin(); component != relative.end(); ++component) {
-                prefix /= *component;
-                if (std::next(component) == relative.end()) {
-                  break;  // 最后一段是文件本身，不是目录
+          if (scopeChanged) {
+            if (scope.wholeRoot) {
+              // wholeRoot 影响的是该根的全部目录：传入该根当前全部目录 rel 前缀，而不是空路径
+              // （空路径 = 整库受影响，会让其他根的目录也重跑缩略图 seam；成本门只约束标签重读，
+              // 不约束该 seam）。rel 前缀经去重避免重复路径撑大 touched 列表；该根无子目录时
+              // 用 kNoTouchedDirectory 哨兵保证批次不落入"整库受影响"语义。
+              const auto scopeRootKey = pathKey(rootPathFor(scope.root));
+              std::unordered_set<std::string> touchedDirKeys;
+              bool touchedAnyDirectory = false;
+              for (const auto& entry : allSongs_) {
+                if (pathKey(entry.sourceRoot) != scopeRootKey) {
+                  continue;
                 }
-                if (touchedDirKeys.insert(pathToUtf8(prefix)).second) {
-                  touchedPaths.push_back(prefix);
-                  touchedAnyDirectory = true;
+                std::filesystem::path prefix;
+                const auto& relative = entry.treeRelativePath;
+                for (auto component = relative.begin(); component != relative.end(); ++component) {
+                  prefix /= *component;
+                  if (std::next(component) == relative.end()) {
+                    break;  // 最后一段是文件本身，不是目录
+                  }
+                  if (touchedDirKeys.insert(pathToUtf8(prefix)).second) {
+                    touchedPaths.push_back(prefix);
+                    touchedAnyDirectory = true;
+                  }
                 }
               }
+              if (!touchedAnyDirectory) {
+                touchedPaths.push_back(kNoTouchedDirectory);
+              }
+            } else {
+              touchedPaths.push_back(relativePathFor(rootPathFor(scope.root), scope.scopeAbs));
             }
-            if (!touchedAnyDirectory) {
-              touchedPaths.push_back(kNoTouchedDirectory);
-            }
-          } else {
-            touchedPaths.push_back(relativePathFor(rootPathFor(scope.root), scope.scopeAbs));
+            anyMutation = true;
           }
           ranScopedScan = true;
-          anyMutation = true;
         }
       }
 
