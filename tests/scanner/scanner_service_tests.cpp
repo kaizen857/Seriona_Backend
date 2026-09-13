@@ -196,12 +196,19 @@ void forceNextScanIncrementalForCurrentTree(const test::TempScannerRoot& temp) {
   return songs;
 }
 
-// Budget for scanner worker async completion (scan round + SQLite writes); generous for slow CI machines.
-inline constexpr auto kEventWaitBudget = std::chrono::seconds{3};
+// 事件/读取等待预算（审计 BE-07 同族硬化）：nice0 9:1 饥饿叠加并发负载时，极小根的单次
+// 扫描 + 事件派发也会超过旧 3s（极端档实测 10/23 用例撞穿 3s 事件预算）。与快照预算一样
+// 按“谓词成立即返回”的收敛式等待放大上限：快机耗时不变，上限只兜底真正的服务挂起。
+inline constexpr auto kEventWaitBudget = std::chrono::seconds{300};
+
+// 慢机收敛预算（审计 BE-07）：96 文件全量扫描 + 快照发布在 9:1 CPU 饥饿下实测需
+// 11.5–15.3s（≈600x 等效减速），旧 5s 硬编码 deadline 必然截断未满快照。以下等待都是
+// “谓词成立即返回”的收敛式等待，放大上限只兜底真正的服务挂起（快机耗时不变）。
+inline constexpr auto kSlowConvergenceBudget = std::chrono::milliseconds{300'000};
 
 template <typename Predicate>
 [[nodiscard]] PlaylistTreeSnapshot waitForSnapshot(const FileScannerService& service, Predicate predicate) {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  const auto deadline = std::chrono::steady_clock::now() + kSlowConvergenceBudget;
   while (std::chrono::steady_clock::now() < deadline) {
     auto snapshot = service.snapshot();
     if (predicate(snapshot)) {
