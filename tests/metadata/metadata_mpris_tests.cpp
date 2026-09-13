@@ -164,27 +164,53 @@ TEST_CASE("linux mpris production object is visible on the session bus") {
                                                                          .timelineUpdateInterval = std::chrono::milliseconds{1000}});
   REQUIRE(start.accepted);
 
-  try {
-    // 必须显式走 session 总线：MPRIS 对象就导出在 session 总线上，而不带连接的
-    // createProxy 重载用的是 createBusConnection()（sd_bus_open，默认总线）。在 CI
-    // 容器里以 root 运行时它会去连不存在的系统总线，报 Failed to open bus。
-    auto proxy = sdbus::createProxy(sdbus::createSessionBusConnection(),
-                                    sdbus::ServiceName{seriona::metadata::detail::kMprisBusName},
-                                    sdbus::ObjectPath{seriona::metadata::detail::kMprisObjectPath},
-                                    sdbus::dont_run_event_loop_thread);
-    std::string introspectionXml;
-    proxy->callMethod("Introspect")
-        .onInterface("org.freedesktop.DBus.Introspectable")
-        .withTimeout(std::chrono::milliseconds{500})
-        .storeResultsTo(introspectionXml);
+  // 必须显式走 session 总线：MPRIS 对象就导出在 session 总线上，而不带连接的
+  // createProxy 重载用的是 createBusConnection()（sd_bus_open，默认总线）。在 CI
+  // 容器里以 root 运行时它会去连不存在的系统总线，报 Failed to open bus。
+  //
+  // 饥饿档下单次调用可能整段超时（审计实测 7.5-7.9s 内
+  // org.freedesktop.DBus.Error.Timeout / Connection timed out），固定 500ms 预算
+  // 必然被打穿。改为收敛式重试：单次调用给足超时，整体以宽裕 deadline 重试直到
+  // 成功；introspectability 断言保持不变。
+  constexpr auto kIntrospectCallTimeout = std::chrono::seconds{30};
+  constexpr auto kIntrospectRetryDeadline = std::chrono::seconds{180};
+  constexpr auto kIntrospectRetryDelay = std::chrono::milliseconds{250};
 
+  std::string introspectionXml;
+  std::string lastErrorName;
+  std::string lastErrorMessage;
+  bool introspected = false;
+  const auto deadline = std::chrono::steady_clock::now() + kIntrospectRetryDeadline;
+  for (;;) {
+    try {
+      auto proxy = sdbus::createProxy(sdbus::createSessionBusConnection(),
+                                      sdbus::ServiceName{seriona::metadata::detail::kMprisBusName},
+                                      sdbus::ObjectPath{seriona::metadata::detail::kMprisObjectPath},
+                                      sdbus::dont_run_event_loop_thread);
+      proxy->callMethod("Introspect")
+          .onInterface("org.freedesktop.DBus.Introspectable")
+          .withTimeout(kIntrospectCallTimeout)
+          .storeResultsTo(introspectionXml);
+      introspected = true;
+      break;
+    } catch (const sdbus::Error& error) {
+      lastErrorName = error.getName();
+      lastErrorMessage = error.getMessage();
+      if (std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      std::this_thread::sleep_for(kIntrospectRetryDelay);
+    }
+  }
+
+  if (introspected) {
     CHECK(introspectionXml.find(seriona::metadata::detail::kMprisRootInterface) != std::string::npos);
     CHECK(introspectionXml.find(seriona::metadata::detail::kMprisPlayerInterface) != std::string::npos);
     CHECK(introspectionXml.find("PlaybackStatus") != std::string::npos);
     CHECK(introspectionXml.find("Metadata") != std::string::npos);
-  } catch (const sdbus::Error& error) {
-    CAPTURE(error.getName());
-    CAPTURE(error.getMessage());
+  } else {
+    CAPTURE(lastErrorName);
+    CAPTURE(lastErrorMessage);
     FAIL("MPRIS object must be introspectable on the session bus");
   }
 

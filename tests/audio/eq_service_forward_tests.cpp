@@ -29,6 +29,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -141,11 +142,12 @@ public:
                            .supportedSampleFormats = {AudioSampleFormat::Float32},
                            .supportedSampleRates = {kSampleRate},
                            .isDefaultDevice = false};
-  int initializeCalls{0};
-  int startCalls{0};
-  int stopCalls{0};
-  int uninitializeCalls{0};
-  bool started{false};
+  // 计数器/状态由 worker 线程（backend 方法）写、测试线程读 → atomic 防无同步轮询数据竞争。
+  std::atomic<int> initializeCalls{0};
+  std::atomic<int> startCalls{0};
+  std::atomic<int> stopCalls{0};
+  std::atomic<int> uninitializeCalls{0};
+  std::atomic<bool> started{false};
 };
 
 TrackPlaybackRequest requestFor(const std::filesystem::path& path) {
@@ -195,11 +197,36 @@ bool isFactoryDefaultConfig(const EqualizerConfig& config) {
   return sameEqConfig(config, EqualizerConfig{});
 }
 
-// 命令队列屏障：queryPlaybackClock 经 promise/future 投递到 worker 串行域，
-// 返回时此前全部入队命令已执行完（既有 audio_player 测试同款同步手段；调用
-// 方保持仅在命令线程调用）。
+// 慢机预算：极端饥饿（nice19 对 8×nice0 占位，≈600x）下单条 worker 命令的调度
+// 延迟可达数秒；固定 2s 屏障会在命令尚未执行时超时并返回陈旧快照（BE-03 根因）。
+// 所有"等 worker 追上"的轮询统一用宽裕墙上时钟预算，条件满足即返回（正常档零等待）。
+constexpr auto kSlowMachineWaitBudget = std::chrono::seconds{180};
+
+// 慢机生产闸门预算：消费回调前等 worker 把内容写进 ring；非正常路径的兜底上限。
+constexpr auto kRingAvailableBudget = std::chrono::seconds{30};
+
+// 命令队列屏障：queryPlaybackClock 经 promise/future 投递到 worker 串行域。
+// 注意其内部等待上限 2s，饥饿下可能超时返回陈旧快照——不得作为"此前命令已执行"
+// 的判据；需要该判据的调用点改用下方 waitForWorker 的可观察条件版本。
 void barrier(std::shared_ptr<AudioPlaybackService>& service) {
   static_cast<void>(service->queryPlaybackClock());
+}
+
+// 慢机屏障：反复投递 queryPlaybackClock 命令（命令 FIFO 于 worker 串行域）并检查
+// 可观察条件，直到条件成立或预算耗尽。条件成立时此前入队命令必已执行（同一队列序），
+// 断言因此只评估 worker 真正处理过的状态；返回条件终值供调用方 REQUIRE。
+template <typename Predicate>
+[[nodiscard]] bool waitForWorker(std::shared_ptr<AudioPlaybackService>& service,
+                                 Predicate&& condition,
+                                 std::chrono::milliseconds budget = kSlowMachineWaitBudget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (condition()) {
+      return true;
+    }
+    static_cast<void>(service->queryPlaybackClock());
+  }
+  return condition();
 }
 
 }  // namespace
@@ -212,37 +239,39 @@ TEST_CASE("eq_service stopped_window set_equalizer applies without device reload
   REQUIRE(service);
 
   service->configureOutput(outputConfigForTest());
-  barrier(service);
   service->loadTrack(requestFor(path));
-  barrier(service);
+  // 慢机（BE-03）：等 loadTrack 真正执行到设备 initialize 后的生效快照发布
+  // （generation ≥ 1），而非 2s 屏障超时后继续——否则断言先于异步初始化执行。
+  REQUIRE(waitForWorker(service, [&] { return service->equalizerState().generation >= 1U; }));
 
   // 加载完成：设备已 initialize、未启动（停态窗口）。加载成功点经 clearDspState
   // 幂等重放发布过出厂默认配置的生效快照（代数 ≥1、实际输出率回填）。
-  REQUIRE(fake->initializeCalls == 1);
-  REQUIRE(fake->startCalls == 0);
+  REQUIRE(fake->initializeCalls.load() == 1);
+  REQUIRE(fake->startCalls.load() == 0);
   const auto baseline = service->equalizerState();
   REQUIRE(baseline.generation >= 1U);
   REQUIRE(isFactoryDefaultConfig(baseline.config));
   REQUIRE(baseline.sampleRate == kSampleRate);
 
-  const int initBefore = fake->initializeCalls;
-  const int startBefore = fake->startCalls;
-  const int stopBefore = fake->stopCalls;
-  const int uninitBefore = fake->uninitializeCalls;
+  const int initBefore = fake->initializeCalls.load();
+  const int startBefore = fake->startCalls.load();
+  const int stopBefore = fake->stopCalls.load();
+  const int uninitBefore = fake->uninitializeCalls.load();
 
   service->setEqualizer(eqFeatureConfig());
-  barrier(service);
+  // 慢机：等停态窗口真实应用完成（代数推进）后再断言生效面与零生命周期操作。
+  REQUIRE(waitForWorker(service, [&] { return service->equalizerState().generation > baseline.generation; }));
 
   // ① 停态窗口真实应用：代数推进 + 配置一致 + 实际输出率；零生命周期操作 = 无重载。
   const auto applied = service->equalizerState();
   CHECK(applied.generation > baseline.generation);
   CHECK(sameEqConfig(applied.config, eqFeatureConfig()));
   CHECK(applied.sampleRate == kSampleRate);
-  CHECK(fake->initializeCalls == initBefore);
-  CHECK(fake->startCalls == startBefore);
-  CHECK(fake->stopCalls == stopBefore);
-  CHECK(fake->uninitializeCalls == uninitBefore);
-  CHECK(!fake->started);
+  CHECK(fake->initializeCalls.load() == initBefore);
+  CHECK(fake->startCalls.load() == startBefore);
+  CHECK(fake->stopCalls.load() == stopBefore);
+  CHECK(fake->uninitializeCalls.load() == uninitBefore);
+  CHECK(!fake->started.load());
 }
 
 TEST_CASE("eq_service running set_equalizer stores until next load rebuild replays") {
@@ -253,19 +282,21 @@ TEST_CASE("eq_service running set_equalizer stores until next load rebuild repla
   REQUIRE(service);
 
   service->configureOutput(outputConfigForTest());
-  barrier(service);
   service->loadTrack(requestFor(path));
-  barrier(service);
+  REQUIRE(waitForWorker(service, [&] { return service->equalizerState().generation >= 1U; }));
   service->play();
-  barrier(service);
-  REQUIRE(fake->startCalls == 1);
-  REQUIRE(fake->started);
+  // 慢机：等 start 真正执行（fake 计数）再断言运行态，避免屏障超时后的陈旧视图。
+  REQUIRE(waitForWorker(service, [&] { return fake->started.load(); }));
+  REQUIRE(fake->startCalls.load() == 1);
+  REQUIRE(fake->started.load());
 
   const auto before = service->equalizerState();
   REQUIRE(before.generation >= 1U);
   REQUIRE(isFactoryDefaultConfig(before.config));
 
   service->setEqualizer(eqFeatureConfig());
+  // 运行中语义 = 仅存储 + PENDING 发布、生效面冻结：无可等待的正向可观察量，
+  // 单次屏障保持原样（后续 loadTrack 与它同队列序，重放断言仍会验证存储生效）。
   barrier(service);
 
   // ②a 运行中到达 = 存储 + PENDING 目标层发布：生效面在回调受理前保持冻结（本装置
@@ -273,21 +304,22 @@ TEST_CASE("eq_service running set_equalizer stores until next load rebuild repla
   const auto during = service->equalizerState();
   CHECK(during.generation == before.generation);
   CHECK(sameEqConfig(during.config, before.config));
-  CHECK(fake->startCalls == 1);
-  CHECK(fake->initializeCalls == 1);
+  CHECK(fake->startCalls.load() == 1);
+  CHECK(fake->initializeCalls.load() == 1);
 
   // ②b 下个内容边界（同格式加载路径：stop → T7 免重开 rebind + clearDspState 幂等
   // 重放存储配置）后生效——重建不丢，且无设备重开/重启。
   service->loadTrack(requestFor(path));
-  barrier(service);
+  // 慢机：等第二次加载的重放生效（代数超过 before）再断言，别让屏障超时造成陈旧读。
+  REQUIRE(waitForWorker(service, [&] { return service->equalizerState().generation > before.generation; }));
 
   const auto after = service->equalizerState();
   CHECK(after.generation > before.generation);
   CHECK(sameEqConfig(after.config, eqFeatureConfig()));
   CHECK(after.sampleRate == kSampleRate);
-  CHECK(fake->initializeCalls == 1);
-  CHECK(fake->startCalls == 1);
-  CHECK(fake->stopCalls == 1);
+  CHECK(fake->initializeCalls.load() == 1);
+  CHECK(fake->startCalls.load() == 1);
+  CHECK(fake->stopCalls.load() == 1);
 }
 
 TEST_CASE("eq_service fresh set_equalizer stores until first initialize replays") {
@@ -299,8 +331,8 @@ TEST_CASE("eq_service fresh set_equalizer stores until first initialize replays"
 
   service->configureOutput(outputConfigForTest());
   barrier(service);
-  REQUIRE(fake->initializeCalls == 0);
-  REQUIRE(fake->startCalls == 0);
+  REQUIRE(fake->initializeCalls.load() == 0);
+  REQUIRE(fake->startCalls.load() == 0);
 
   service->setEqualizer(eqFeatureConfig());
   barrier(service);
@@ -311,21 +343,22 @@ TEST_CASE("eq_service fresh set_equalizer stores until first initialize replays"
   CHECK(pending.generation == 0U);
   CHECK(pending.sampleRate == 0U);
   CHECK(isFactoryDefaultConfig(pending.config));
-  CHECK(fake->initializeCalls == 0);
-  CHECK(fake->startCalls == 0);
-  CHECK(fake->stopCalls == 0);
-  CHECK(fake->uninitializeCalls == 0);
+  CHECK(fake->initializeCalls.load() == 0);
+  CHECK(fake->startCalls.load() == 0);
+  CHECK(fake->stopCalls.load() == 0);
+  CHECK(fake->uninitializeCalls.load() == 0);
 
   // ③b 首个 loadTrack 的 initialize 幂等重放存储配置 → 生效（代数 ≥1、实际输出率）。
   service->loadTrack(requestFor(path));
-  barrier(service);
+  // 慢机：等首个 initialize 的幂等重放真正发布（代数 ≥1）再断言。
+  REQUIRE(waitForWorker(service, [&] { return service->equalizerState().generation >= 1U; }));
 
   const auto applied = service->equalizerState();
   CHECK(applied.generation >= 1U);
   CHECK(sameEqConfig(applied.config, eqFeatureConfig()));
   CHECK(applied.sampleRate == kSampleRate);
-  CHECK(fake->initializeCalls == 1);
-  CHECK(!fake->started);
+  CHECK(fake->initializeCalls.load() == 1);
+  CHECK(!fake->started.load());
 }
 
 // ============================================================
@@ -345,8 +378,8 @@ public:
 
   [[nodiscard]] bool initialize(const AudioOutputDeviceOpenRequest& request) override {
     ++initializeCalls;
-    queue = request.pcmQueue;
-    userData = request.callbackUserData;
+    queue.store(request.pcmQueue, std::memory_order_release);
+    userData.store(request.callbackUserData, std::memory_order_release);
     format.sampleRate = request.sampleRate;
     format.sampleFormat = request.sampleFormat;
     format.channelCount = request.channelCount;
@@ -356,29 +389,42 @@ public:
 
   [[nodiscard]] bool start() override {
     ++startCalls;
-    started = true;
+    started.store(true, std::memory_order_release);
     return true;
   }
 
   [[nodiscard]] bool stop() override {
     ++stopCalls;
-    started = false;
+    started.store(false, std::memory_order_release);
     return true;
   }
 
   void uninitialize() noexcept override {
     ++uninitializeCalls;
-    queue = nullptr;
-    userData = nullptr;
+    queue.store(nullptr, std::memory_order_release);
+    userData.store(nullptr, std::memory_order_release);
   }
 
   [[nodiscard]] AudioDeviceFormat currentFormat() const override { return format; }
 
   void consumeFrames(std::uint32_t frames) {
-    REQUIRE(userData != nullptr);
+    // 慢机守卫（建模真实设备）：未 initialize / 已 uninitialize 时不触发回调——
+    // 饥饿下 worker 可能尚未执行 loadTrack 的 initialize（原 REQUIRE 会致命）。
+    auto* data = userData.load(std::memory_order_acquire);
+    if (data == nullptr) {
+      return;
+    }
+    // 慢机生产闸门：worker 未把内容写进 ring 前渲染会读到静音补零，污染频谱分析的
+    // 峰值/地板标定（断言按真实正弦校准）。等可用帧就绪，宽裕截止兜底防悬挂。
+    if (auto* ring = queue.load(std::memory_order_acquire); ring != nullptr) {
+      const auto deadline = std::chrono::steady_clock::now() + kRingAvailableBudget;
+      while (ring->availableFrames() < frames && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      }
+    }
     const auto bytesPerFrame = static_cast<std::size_t>(format.channelCount) * 4U;
     callbackBuffer.assign(static_cast<std::size_t>(frames) * bytesPerFrame, 0U);
-    AudioOutputDevice::renderCallback(userData, callbackBuffer.data(), frames);
+    AudioOutputDevice::renderCallback(data, callbackBuffer.data(), frames);
   }
 
   AudioDeviceFormat format{.deviceId = "spectrum-service",
@@ -392,14 +438,15 @@ public:
                            .supportedSampleFormats = {AudioSampleFormat::Float32},
                            .supportedSampleRates = {kSampleRate},
                            .isDefaultDevice = false};
-  PcmBufferQueue* queue{nullptr};
-  AudioOutputDevice* userData{nullptr};
+  // 设备面指针/计数由 worker 线程写、测试线程读 → atomic 防数据竞争。
+  std::atomic<PcmBufferQueue*> queue{nullptr};
+  std::atomic<AudioOutputDevice*> userData{nullptr};
   std::vector<std::uint8_t> callbackBuffer{};
-  int initializeCalls{0};
-  int startCalls{0};
-  int stopCalls{0};
-  int uninitializeCalls{0};
-  bool started{false};
+  std::atomic<int> initializeCalls{0};
+  std::atomic<int> startCalls{0};
+  std::atomic<int> stopCalls{0};
+  std::atomic<int> uninitializeCalls{0};
+  std::atomic<bool> started{false};
 };
 
 // 事件捕获（worker 线程写、测试线程读 → 互斥护）。
@@ -434,8 +481,9 @@ AudioOutputConfig spectrumOutputConfigForTest() {
 }
 
 // 以 ~4.17× 实时持续驱动设备回调（800 帧/4ms）：使 PCM 消费快于频谱分析的
-// ~10ms 轮询栅（喂帧节奏由轮询主导，音频时间轴推进约 4×）。
-void driveFor(std::shared_ptr<AudioPlaybackService>& service, SpectrumServiceBackend& backend,
+// ~10ms 轮询栅（喂帧节奏由轮询主导，音频时间轴推进约 4×）。慢机下喂帧由
+// consumeFrames 内建的生产闸门自限速，service 参数保留以维持调用点签名。
+void driveFor([[maybe_unused]] std::shared_ptr<AudioPlaybackService>& service, SpectrumServiceBackend& backend,
               std::chrono::milliseconds wallMs) {
   const auto deadline = std::chrono::steady_clock::now() + wallMs;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -461,21 +509,23 @@ void driveFor(std::shared_ptr<AudioPlaybackService>& service, SpectrumServiceBac
 
 TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monotonic snapshots") {
   const auto path = writeSineFixture("eq_service_spectrum_events.wav", kSampleRate * 16U);  // 16s 内容余量
+  // 慢机失败路径防护：sink 必须先于 service 声明——测试中止时按逆序析构，service
+  // 先析构（join worker + 清 sink），worker 不会在 sink 销毁后再派发（防 UAF SIGSEGV）。
+  SpectrumEventSink sink;
   auto backend = std::make_unique<SpectrumServiceBackend>();
   auto* fake = backend.get();
   auto service = makeAudioPlaybackService(std::move(backend));
   REQUIRE(service);
 
-  SpectrumEventSink sink;
   service->setEventSink([&](BackendEvent event) { sink.push(std::move(event)); });
   service->configureOutput(spectrumOutputConfigForTest());
-  barrier(service);
   service->loadTrack(requestFor(path));
-  barrier(service);
-  REQUIRE(fake->initializeCalls == 1);
+  // 慢机：等 loadTrack 真正执行到 initialize（fake 计数），而非 2s 屏障超时后继续
+  // （BE-03：饥饿下断言先于异步初始化执行，随后生命周期竞态崩溃）。
+  REQUIRE(waitForWorker(service, [&] { return fake->initializeCalls.load() >= 1; }));
+  REQUIRE(fake->initializeCalls.load() == 1);
   service->play();
-  barrier(service);
-  REQUIRE(fake->started);
+  REQUIRE(waitForWorker(service, [&] { return fake->started.load(); }));
 
   // ① 默认关：持续驱动 ~400ms（≈1.7s 音频）零 SpectrumUpdated（门控早退零取帧）。
   driveFor(service, *fake, 400ms);
@@ -483,11 +533,11 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
   CHECK_FALSE(service->spectrumEnabled());
 
   // ② 开：~10ms 轮询节流（K=5）× 4096 窗（hop 1024）→ 首个事件应在数百 ms 内；
-  // 限 4s 预算收集 ≥3 份。
+  // 慢机改宽裕截止的收敛等待（事件驱动；固定 4s 在 ≈600x 饥饿下不足）。
   service->setSpectrumEnabled(true);
   REQUIRE(service->spectrumEnabled());
   std::vector<SpectrumSnapshot> snapshots;
-  const auto emitDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{4};
+  const auto emitDeadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
   while (snapshots.size() < 3U && std::chrono::steady_clock::now() < emitDeadline) {
     fake->consumeFrames(800U);
     std::this_thread::sleep_for(std::chrono::milliseconds{4});
@@ -524,11 +574,21 @@ TEST_CASE("eq_service spectrum_events gated by the enabled flag and stream monot
     CHECK(snapshots[index].binsDb[peak] - tailMax > 8.0F);
   }
 
-  // ③ 关：停等 ~100ms 排空在途 tick（窗口 ≤ 2ms）后计数定格，再驱动 ~300ms 零增长。
+  // ③ 关：慢机改静默收敛——连续多轮计数不变才算排空在途 tick（饥饿下单次 tick
+  // 执行可跨调度片，固定 ~100ms 窗不足），收敛后驱动窗口应零增长。
   service->setSpectrumEnabled(false);
   CHECK_FALSE(service->spectrumEnabled());
-  driveFor(service, *fake, 100ms);
-  const auto countAfterDisable = sink.spectrumSnapshots().size();
+  std::size_t quietRounds = 0U;
+  auto observed = sink.spectrumSnapshots().size();
+  const auto quietDeadline = std::chrono::steady_clock::now() + kSlowMachineWaitBudget;
+  while (quietRounds < 4U && std::chrono::steady_clock::now() < quietDeadline) {
+    fake->consumeFrames(800U);
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    const auto count = sink.spectrumSnapshots().size();
+    quietRounds = (count == observed) ? quietRounds + 1U : 0U;
+    observed = count;
+  }
+  const auto countAfterDisable = observed;
   driveFor(service, *fake, 300ms);
   CHECK(sink.spectrumSnapshots().size() == countAfterDisable);
 

@@ -1870,7 +1870,10 @@ add_test(NAME seriona.audio.waveform.strategy_b COMMAND seriona_waveform_generat
 add_test(NAME seriona.audio.waveform.thread_pool COMMAND seriona_waveform_generator_tests --test-case=*waveform*thread_pool*)
 add_test(NAME seriona.audio.waveform.public COMMAND seriona_waveform_generator_tests --test-case=*waveform*public*)
 add_test(NAME seriona.audio.waveform.perf COMMAND seriona_waveform_generator_tests --test-case=*waveform*perf*)
-set_tests_properties(seriona.audio.waveform.perf PROPERTIES TIMEOUT 900)
+# 慢机审计 BE-09：极端 CPU 饥饿（9:1 超订）下完整测量可达约 2000–3000s，900 会在正常完成前
+# 杀死进程；测试内部已有病态调度守卫（命中即跳过重型测量），此属性为守卫未触发时的兜底，
+# 取 3600 = 正常耗时 3.43s 的 ~1000x，同时保证默认 ctest（无 CLI 超时）仍有界。
+set_tests_properties(seriona.audio.waveform.perf PROPERTIES TIMEOUT 3600)
 add_test(NAME seriona.ffmpeg_audio_source COMMAND seriona_ffmpeg_audio_source_tests --test-case=*decodes*)
 add_test(NAME seriona.ffmpeg_audio_source_errors COMMAND seriona_ffmpeg_audio_source_tests --test-case=*maps*)
 add_test(NAME seriona.ffmpeg_audio_source_seek COMMAND seriona_ffmpeg_audio_source_tests --test-case=*seek*)
@@ -2002,7 +2005,9 @@ add_test(NAME seriona.scanner.env_malformed COMMAND seriona_scanner_service_test
 add_test(NAME seriona.scanner.config_scan_mode COMMAND seriona_scanner_service_tests --test-case=*force*full*)
 add_test(NAME seriona.scanner_watcher COMMAND seriona_scanner_watcher_tests)
 add_test(NAME seriona.scanner.efsw_integration COMMAND seriona_scanner_efsw_integration_tests)
-set_tests_properties(seriona.scanner.efsw_integration PROPERTIES TIMEOUT 300)
+# 慢机审计 BE-08：极端饥饿下整条实测 178–190s（正常 20.8s），300 无裕量；900 与审计/CI
+# 上限对齐（GHA 实测速度下裕量 >10x）。
+set_tests_properties(seriona.scanner.efsw_integration PROPERTIES TIMEOUT 900)
 add_test(NAME seriona.scanner.lazy_cover_gateway COMMAND seriona_scanner_lazy_cover_gateway_tests)
 add_test(NAME seriona.scanner.error_logging COMMAND seriona_scanner_error_logging_tests)
 add_test(NAME seriona.scanner.cue_adapter COMMAND seriona_scanner_cue_adapter_tests)
