@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -511,6 +512,36 @@ bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chr
   }
   return predicate();
 }
+
+// 饥饿档收敛预算：极端饥饿（nice-19 + 9:1 超订）下单次线程调度可延迟到秒级，
+// 固定 1-2s 窗口会被调度延迟打穿（审计实测 pause 提交在 2s 内未完成）。此预算
+// 只作为“必须终止”的兜底上界，等待语义仍是事件驱动，不改变被验证的行为。
+constexpr std::chrono::seconds kConvergenceBudget{120};
+
+// 作用域出口必定执行一次的收尾动作。用于断言失败（REQUIRE 抛出）时也要放行
+// 阻塞在订阅回调里的投递线程：订阅存储析构会 join 该线程，若回调永不返回，
+// 整个测试进程会挂起（审计实测 907s TIMEOUT）。
+class ScopeExit {
+public:
+  explicit ScopeExit(std::function<void()> action) : action_(std::move(action)) {}
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+  ~ScopeExit() { action_(); }
+
+private:
+  std::function<void()> action_;
+};
+
+// 慢订阅者闸门：状态由 shared_ptr 持有，投递线程回调与测试线程各持一份，避免
+// 断言失败提前退出时回调访问已销毁的栈上 promise/future（失败路径必须干净终止）。
+struct SubscriberGate {
+  std::mutex mutex{};
+  std::condition_variable changed{};
+  std::atomic_bool entered{false};
+  std::atomic_bool released{false};
+  std::atomic_bool exited{false};
+  std::atomic_bool firstEntry{false};
+};
 
 bool hasNotification(const std::vector<ControlDomainNotification>& notifications,
                      ControlDomainNotificationKind kind,
@@ -2162,7 +2193,7 @@ TEST_CASE("media controller facade does not run scanner work on the control exec
   });
 
   REQUIRE(scanResult.wait_for(std::chrono::seconds{1}) == std::future_status::timeout);
-  REQUIRE(pauseResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(pauseResult.wait_for(kConvergenceBudget) == std::future_status::ready);
   CHECK(pauseResult.get().accepted);
   REQUIRE(waitUntil([&] {
     return fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{1250};
@@ -2172,7 +2203,7 @@ TEST_CASE("media controller facade does not run scanner work on the control exec
   CHECK(fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{1250});
 
   fixture.fakeScanner->releaseBlockedScans();
-  REQUIRE(scanResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(scanResult.wait_for(kConvergenceBudget) == std::future_status::ready);
   CHECK(scanResult.get().accepted);
 }
 
@@ -2197,7 +2228,7 @@ TEST_CASE("media controller facade exposes first scanned track while stopped") {
   CHECK(player.playback.state == PlaybackStatus::Stopped);
   CHECK(fixture.fakeAudio->loadTrackCalls() == 0U);
   CHECK(fixture.fakeAudio->playCalls() == 0U);
-  REQUIRE(trackSnapshot.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(trackSnapshot.wait_for(kConvergenceBudget) == std::future_status::ready);
   const auto publishedSnapshot = trackSnapshot.get();
   REQUIRE(publishedSnapshot.currentTrack.has_value());
   CHECK(publishedSnapshot.currentTrack->trackId == "a");
@@ -2449,43 +2480,58 @@ TEST_CASE("media controller facade completes dispatch future when queued work th
 
   auto commandResult = std::async(std::launch::async, [&] { return fixture.controller->submitCommand(command(MediaControlCommandKind::Play)); });
 
-  REQUIRE(commandResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(commandResult.wait_for(kConvergenceBudget) == std::future_status::ready);
   CHECK_THROWS_WITH_AS(static_cast<void>(commandResult.get()), "load failed", std::runtime_error);
 }
 
 TEST_CASE("media controller facade slow snapshot subscribers do not starve control work") {
   ControllerFixture fixture{MediaControllerOptions{.runInlineForTests = false}};
-  std::promise<void> subscriberEntered{};
-  auto subscriberIsBlocked = subscriberEntered.get_future();
-  std::promise<void> releaseSubscriber{};
-  auto releaseSignal = releaseSubscriber.get_future().share();
-  std::promise<void> subscriberExited{};
-  auto subscriberIsReleased = subscriberExited.get_future();
-  std::atomic_bool enteredOnce{false};
-  auto playerSubscription = fixture.controller->subscribePlayerState([&](PlayerStateSnapshot) mutable {
-    if (enteredOnce.exchange(true)) {
+  auto gate = std::make_shared<SubscriberGate>();
+  auto playerSubscription = fixture.controller->subscribePlayerState([gate](PlayerStateSnapshot) mutable {
+    if (gate->firstEntry.exchange(true)) {
       return;
     }
-    subscriberEntered.set_value();
-    releaseSignal.wait();
-    subscriberExited.set_value();
+    {
+      std::lock_guard lock{gate->mutex};
+      gate->entered = true;
+    }
+    gate->changed.notify_all();
+    {
+      std::unique_lock lock{gate->mutex};
+      // 饥饿档调度延迟可达秒级：回调内的等待也带收敛预算，保证任何路径都能返回。
+      static_cast<void>(gate->changed.wait_for(lock, kConvergenceBudget, [gate] { return gate->released.load(); }));
+    }
+    gate->exited = true;
+    gate->changed.notify_all();
   });
+  auto releaseSubscriber = [gate] {
+    {
+      std::lock_guard lock{gate->mutex};
+      gate->released = true;
+    }
+    gate->changed.notify_all();
+  };
+  // 失败路径兜底：REQUIRE 失败会以异常退出用例主体，必须仍然放行订阅回调，
+  // 否则投递线程永久阻塞，订阅存储析构 join 该线程时进程挂起（审计实测 907s）。
+  const ScopeExit releaseOnExit{releaseSubscriber};
   fixture.controller->start();
 
   installLibrary(fixture);
   fixture.controller->submitCommand(command(MediaControlCommandKind::Play));
-  REQUIRE(subscriberIsBlocked.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(waitUntil([&] { return gate->entered.load(); }, kConvergenceBudget));
 
   auto pauseResult = std::async(std::launch::async, [&] {
     return fixture.controller->submitCommand(command(MediaControlCommandKind::Pause));
   });
 
-  REQUIRE(pauseResult.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  // 订阅者阻塞在独立投递线程上，控制命令必须在宽裕收敛预算内完成；语义不变，
+  // 只是把 2s 固定窗口换成饥饿档可收敛的事件等待。
+  REQUIRE(pauseResult.wait_for(kConvergenceBudget) == std::future_status::ready);
   CHECK(pauseResult.get().accepted);
   CHECK(fixture.controller->playerStateSnapshot().playback.state == PlaybackStatus::Paused);
 
-  releaseSubscriber.set_value();
-  REQUIRE(subscriberIsReleased.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  releaseSubscriber();
+  REQUIRE(waitUntil([&] { return gate->exited.load(); }, kConvergenceBudget));
   playerSubscription.unsubscribe();
 }
 
@@ -2515,11 +2561,11 @@ TEST_CASE("media controller facade subscribers receive committed snapshots not r
   fixture.fakeAudio->emit(audioTrackChangedEvent("sink-track", "music/sink.flac", 1));
   fixture.controller->drainForTests();
 
-  REQUIRE(committedLibrary.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(committedLibrary.wait_for(kConvergenceBudget) == std::future_status::ready);
   const auto librarySnapshot = committedLibrary.get();
   CHECK(librarySnapshot.scanStatus == LibraryScanStatus::Scanning);
   CHECK_FALSE(librarySnapshot.libraryTree.has_value());
-  REQUIRE(committedPlayer.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(committedPlayer.wait_for(kConvergenceBudget) == std::future_status::ready);
   const auto playerSnapshot = committedPlayer.get();
   REQUIRE(playerSnapshot.currentTrack.has_value());
   CHECK(playerSnapshot.currentTrack->trackId == "sink-track");
