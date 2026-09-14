@@ -101,6 +101,7 @@ private:
 
   void ensureStarted();
   void configureCommandModel();
+  [[nodiscard]] bool acquireBusName();
   void publishCurrentSnapshot(const PlatformMediaState& state);
   [[nodiscard]] std::optional<PlatformMediaState> currentStateSnapshot() const;
   [[nodiscard]] bool dispatchCommand(control::MediaControlCommandKind kind, std::optional<std::chrono::milliseconds> position = std::nullopt);
@@ -111,6 +112,7 @@ private:
 
   std::unique_ptr<IMprisBus> bus_{};
   std::unique_ptr<IMprisObject> object_{};
+  std::string registeredName_{};
   std::shared_ptr<CommandSinkState> commandSinkState_{std::make_shared<CommandSinkState>()};
   mutable std::mutex stateMutex_{};
   std::optional<PlatformMediaState> currentState_{};

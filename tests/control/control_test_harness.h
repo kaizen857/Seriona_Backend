@@ -253,6 +253,7 @@ public:
   void setBackendKind(metadata::MetadataBackendKind kind) noexcept;
   void setCapabilities(metadata::MetadataBackendCapabilities capabilities) noexcept;
   void setStartResult(metadata::MetadataSyncResult result) noexcept;
+  void setStartThrows(bool value) noexcept;
   void setUpdateResult(metadata::MetadataSyncResult result) noexcept;
   void setStopResult(metadata::MetadataSyncResult result) noexcept;
 
@@ -279,6 +280,7 @@ private:
   std::optional<metadata::MetadataSyncResult> lastUpdateResult_{};
   std::optional<metadata::MetadataSyncResult> lastStopResult_{};
   metadata::MetadataSyncResult startResult_{};
+  bool startThrows_{false};
   metadata::MetadataSyncResult updateResult_{};
   metadata::MetadataSyncResult stopResult_{};
   std::shared_ptr<CommandRegistration> commandRegistration_{};
