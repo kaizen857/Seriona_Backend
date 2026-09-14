@@ -527,6 +527,45 @@ TEST_CASE("scanner watcher unchanged lrc event does not publish until content re
   CHECK(songs[0].effectiveLyrics[0].text == "updated");
 }
 
+// 目录级 Modified 事件触发的 scoped 对账回归：.lrc 增/改只反映在歌词身份（sidecar hash +
+// 外部歌词空/非空态）上，路径+位置身份不变。仅比较位置身份会把这类变化误判为无变化并吞掉
+// 发布（快照歌词永不更新）——macOS FSEvents 以目录级事件投递 .lrc 变更即命中该路径。
+TEST_CASE("scanner watcher scoped scan publishes lyrics-only changes") {
+  test::TempScannerRoot temp{"scanner-watcher-scope-lyrics"};
+  const auto music = temp.path() / "music";
+  std::filesystem::create_directories(music);
+  const auto audio = test::writeAudioFixture(music, "song.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(audio, rawMetadata("Song"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto lrc = music / "song.lrc";
+  writeText(lrc, "[00:02.00]external\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3}); // mtime granularity guard
+  // 只投目录级 Modified（不投 .lrc 文件级事件）：走 scoped 对账而非文件级歌词 T0 路径。
+  watchers->states[0]->callback(directoryEvent(music, WatchEffectKind::Modified));
+  waitForLyrics(*service, LyricsSource::ExternalLrc, "external");
+
+  CHECK(reader->readCount() == 1U);
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "external");
+}
+
 TEST_CASE("scanner watcher warning error and overflow messages force root reconciliation") {
   test::TempScannerRoot temp{"scanner-watcher-warning"};
   const auto first = test::writeAudioFixture(temp.path(), "first.flac");

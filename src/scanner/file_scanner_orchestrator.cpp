@@ -3151,9 +3151,12 @@ private:
   // 树/缓存，再写入扫描结果（disk truth）。重复/嵌套 scope 合并后仍幂等，且能清理"移入后
   // 又被移出"留下的残留行。删除 + 写入 + scope 外 cue 补偿行恢复在同一事务内（R13.5）。
   // 返回 scope 子树是否发生实际变化（调用方据此决定是否发布）。非 force scope（cue 增改/
-  // 目录/孤儿源）以「路径+位置身份」多重集比较：全部命中缓存身份的 scoped 增量扫描结果与
-  // 既有条目完全一致时不发布（无变化事件不得误发「曲库已更新」）；force scope（封面）必须
-  // 无条件视为变化——artwork 刷新依赖扫描期标签重读，其变化可能不反映在位置身份上。
+  // 目录/孤儿源）以「路径+位置身份+歌词身份」多重集比较：全部命中缓存身份与歌词身份的
+  // scoped 增量扫描结果与既有条目完全一致时不发布（无变化事件不得误发「曲库已更新」）。
+  // 歌词身份 = sidecar hash + 外部歌词空/非空态——.lrc 增/改/删只反映在这两项上（带位置
+  // 身份即可覆盖，空态兜底"清除路径保留旧 hash"的删除），仅比较位置身份会把目录级事件
+  // 触发的 scoped 对账误判为无变化；force scope（封面）必须无条件视为变化——artwork 刷新
+  // 依赖扫描期标签重读，其变化可能不反映在位置身份上。
   [[nodiscard]] bool mergeScopedResult(const ScopedScanTarget& target, RootResult& result) {
     const auto rootPath = rootPathFor(target.root);
     const auto rootKey = pathKey(rootPath);
@@ -3181,7 +3184,9 @@ private:
       return relative == scopeRelText || relative.rfind(scopeRelText + "/", 0) == 0;
     };
     const auto signatureOf = [](const RootResult::PublishedSong& entry) {
-      return pathToUtf8(entry.treeRelativePath) + "\x1f" + entry.locationId.value_or(std::string{});
+      return pathToUtf8(entry.treeRelativePath) + "\x1f" + entry.locationId.value_or(std::string{}) + "\x1f" +
+             entry.song.metadata.externalLyricsHash.value_or(std::string{}) + "\x1f" +
+             (entry.song.externalLyrics.empty() ? "0" : "1");
     };
     std::vector<std::string> beforeSignatures;
     if (!target.forceTagReread) {

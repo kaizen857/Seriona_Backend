@@ -901,7 +901,7 @@ TEST_CASE("efsw integration lrc add and modify update lyrics without rescan") {
         return songs.size() == 1U && songs[0].effectiveLyricsSource == LyricsSource::ExternalLrc &&
                songs[0].effectiveLyrics.size() == 1U && songs[0].effectiveLyrics[0].text == "first line";
       },
-      std::chrono::seconds{10}));
+      kSlowConvergenceBudget));
   CHECK(log.scanStartedCount() == startedBefore);
 
   std::this_thread::sleep_for(std::chrono::milliseconds{5});
@@ -915,7 +915,7 @@ TEST_CASE("efsw integration lrc add and modify update lyrics without rescan") {
         return songs.size() == 1U && songs[0].effectiveLyrics.size() == 1U &&
                songs[0].effectiveLyrics[0].text == "second line";
       },
-      std::chrono::seconds{10}));
+      kSlowConvergenceBudget));
   CHECK(waitForScanQuiescence(log));
   CHECK(log.scanStartedCount() == startedBefore);
   CHECK(log.scanErrorCount() == 0U);
