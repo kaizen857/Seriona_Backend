@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,6 +20,7 @@
 
 #if defined(__linux__) && !defined(__APPLE__)
 #include <sdbus-c++/sdbus-c++.h>
+#include <unistd.h>
 #endif
 
 namespace seriona::metadata {
@@ -51,13 +53,31 @@ struct CommandRecorder {
   }
 };
 
+#if defined(__linux__) && !defined(__APPLE__)
+[[noreturn]] void raiseNameTakenError() {
+  // 复刻 sdbus-c++ 对 RequestName EXISTS 结果码抛出的本地错误名，供适配器识别为“名字被占”。
+  throw sdbus::Error{sdbus::Error::Name{"org.freedesktop.DBus.Error.FileExists"}, "Failed to request bus name"};
+}
+#else
+[[noreturn]] void raiseNameTakenError() { throw std::runtime_error("bus name already taken (test stub)"); }
+#endif
+
 struct RecordingMprisBus final : seriona::metadata::detail::IMprisBus {
   std::string requestedName{};
   std::string objectManagerPath{};
+  std::vector<std::string> requestAttempts{};
+  bool rejectBaseNameOnly{false};
+  bool rejectAllNames{false};
   RecordingMprisObject* object{nullptr};
   std::unique_ptr<RecordingMprisObject> ownedObject{std::make_unique<RecordingMprisObject>()};
 
-  void requestName(std::string_view name) override { requestedName = std::string{name}; }
+  void requestName(std::string_view name) override {
+    requestAttempts.emplace_back(name);
+    if (rejectAllNames || (rejectBaseNameOnly && name == seriona::metadata::detail::kMprisBusName)) {
+      raiseNameTakenError();
+    }
+    requestedName = std::string{name};
+  }
   void addObjectManager(std::string_view objectPath) override { objectManagerPath = std::string{objectPath}; }
   [[nodiscard]] std::unique_ptr<seriona::metadata::detail::IMprisObject> createObject(std::string_view) override {
     object = ownedObject.get();
@@ -489,5 +509,49 @@ TEST_CASE("metadata mpris backend command dispatch tolerates racing unsubscribe 
     }
   }
   CHECK(commandCount.load() >= 0);
+#endif
+}
+
+TEST_CASE("linux mpris adapter falls back to an instance-suffixed bus name when the base name is taken") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  busRaw->rejectBaseNameOnly = true;
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
+
+  const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true),
+                                                                         .timelineUpdateInterval = std::chrono::milliseconds{1000}});
+
+  CHECK(start.accepted);
+  REQUIRE(busRaw->requestAttempts.size() == 2U);
+  CHECK(busRaw->requestAttempts[0] == seriona::metadata::detail::kMprisBusName);
+  const std::string expectedFallback = std::string{seriona::metadata::detail::kMprisBusName} + ".instance" + std::to_string(::getpid());
+  CHECK(busRaw->requestAttempts[1] == expectedFallback);
+  CHECK(busRaw->requestedName == expectedFallback);
+  CHECK(busRaw->objectManagerPath == seriona::metadata::detail::kMprisObjectPath);
+  REQUIRE(busRaw->object != nullptr);
+  REQUIRE_FALSE(busRaw->object->published.empty());
+#endif
+}
+
+TEST_CASE("linux mpris adapter degrades without throwing when no bus name can be acquired") {
+#if !defined(__linux__) || defined(__APPLE__)
+  SUCCEED("linux-only adapter test");
+#else
+  auto bus = std::make_unique<RecordingMprisBus>();
+  auto* busRaw = bus.get();
+  busRaw->rejectAllNames = true;
+  auto adapter = seriona::metadata::detail::LinuxMprisAdapter{std::move(bus)};
+
+  const auto start = adapter.start(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true)});
+
+  CHECK_FALSE(start.accepted);
+  CHECK(start.errorCode.value_or("") == "metadata.backend.mpris_unavailable");
+  const auto update = adapter.update(seriona::metadata::PlatformMediaState{.controlState = buildSnapshot("track-01", std::filesystem::path{"covers/track.jpg"}, true)});
+  CHECK_FALSE(update.accepted);
+  REQUIRE(busRaw->requestAttempts.size() == 2U);
+  CHECK(busRaw->requestAttempts[0] == seriona::metadata::detail::kMprisBusName);
 #endif
 }

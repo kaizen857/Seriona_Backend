@@ -1,5 +1,7 @@
 #include "control_test_harness.h"
 
+#include <stdexcept>
+
 namespace seriona::control::test {
 
 DeterministicClock::TimePoint DeterministicClock::now() const noexcept {
@@ -485,6 +487,9 @@ SubscriptionHandle FakeMetadataSharingService::registerCommandCallback(MediaCont
 metadata::MetadataSyncResult FakeMetadataSharingService::start(const metadata::PlatformMediaState& state) {
   ++startCalls_;
   lastStartedState_ = state;
+  if (startThrows_) {
+    throw std::runtime_error("metadata backend start failure (test)");
+  }
   lastStartResult_ = startResult_;
   return startResult_;
 }
@@ -570,7 +575,11 @@ void FakeMetadataSharingService::setCapabilities(metadata::MetadataBackendCapabi
 }
 
 void FakeMetadataSharingService::setStartResult(metadata::MetadataSyncResult result) noexcept {
-  startResult_ = std::move(result);
+  startResult_ = result;
+}
+
+void FakeMetadataSharingService::setStartThrows(bool value) noexcept {
+  startThrows_ = value;
 }
 
 void FakeMetadataSharingService::setUpdateResult(metadata::MetadataSyncResult result) noexcept {

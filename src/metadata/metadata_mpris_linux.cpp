@@ -7,12 +7,17 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
 namespace seriona::metadata::detail {
 
 namespace {
+
+// sdbus-c++ 把 RequestName 的 EXISTS 结果码翻译成本地 sdbus::Error 的错误名。
+constexpr std::string_view kFileExistsErrorName{"org.freedesktop.DBus.Error.FileExists"};
 
 [[nodiscard]] std::string loopStatusText(control::RepeatMode mode) {
   switch (mode) {
@@ -350,12 +355,7 @@ public:
   }
 
   void requestName(std::string_view name) override {
-    try {
-      connection_->requestName(sdbus::ServiceName{std::string{name}});
-    } catch (const sdbus::Error& error) {
-      spdlog::error("MPRIS DBus error: {}", error.what());
-      throw;
-    }
+    connection_->requestName(sdbus::ServiceName{std::string{name}});
     if (!eventLoopStarted_) {
       connection_->enterEventLoopAsync();
       eventLoopStarted_ = true;
@@ -445,12 +445,43 @@ MetadataSyncResult LinuxMprisAdapter::start(const PlatformMediaState& state) {
     object_->registerModel(model_);
     object_->registerCommandHandlers(commandHandlers_);
   }
-  bus_->requestName(kMprisBusName);
-  bus_->addObjectManager(kMprisObjectPath);
-  spdlog::info("MPRIS object exported on session bus");
+  if (registeredName_.empty() && !acquireBusName()) {
+    return makeFailureResult("metadata.backend.mpris_unavailable", "MPRIS bus name unavailable");
+  }
+  spdlog::info("MPRIS object exported on session bus as {}", registeredName_);
   started_ = true;
   publishCurrentSnapshot(state);
   return MetadataSyncResult{.accepted = true, .changed = true, .state = state, .errorCode = std::nullopt, .message = {}};
+}
+
+// 总线名获取：优先常规名；被占用（sdbus-c++ 对 RequestName 的 EXISTS 结果码抛
+// FileExists）时按 MPRIS 2.2 多实例约定（"org.mpris.MediaPlayer2.<player>.instance<唯一标识>"）
+// 降级到带进程 id 的唯一名；两者都不可得或其他 DBus 错误时返回 false，
+// 调用方据此把 MPRIS 标记为不可用并继续运行——MPRIS 只是可选控制面，注册失败不得中断控制器。
+bool LinuxMprisAdapter::acquireBusName() {
+  const std::string baseName{kMprisBusName};
+  try {
+    bus_->requestName(baseName);
+    bus_->addObjectManager(kMprisObjectPath);
+    registeredName_ = baseName;
+    return true;
+  } catch (const sdbus::Error& error) {
+    if (std::string_view{error.getName()} != kFileExistsErrorName) {
+      spdlog::warn("MPRIS unavailable ({}): {}", error.getName(), error.getMessage());
+      return false;
+    }
+  }
+  const std::string fallbackName = baseName + ".instance" + std::to_string(::getpid());
+  try {
+    bus_->requestName(fallbackName);
+    bus_->addObjectManager(kMprisObjectPath);
+    registeredName_ = fallbackName;
+    spdlog::info("MPRIS bus name {} is taken; exported as {}", baseName, fallbackName);
+    return true;
+  } catch (const sdbus::Error& error) {
+    spdlog::warn("MPRIS unavailable ({}): {}", error.getName(), error.getMessage());
+    return false;
+  }
 }
 
 MetadataSyncResult LinuxMprisAdapter::update(const PlatformMediaState& state) {

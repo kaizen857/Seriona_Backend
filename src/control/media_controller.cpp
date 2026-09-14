@@ -194,8 +194,14 @@ public:
     metadataCommandSubscription_ = dependencies_.metadata->registerCommandCallback([this](const MediaControlCommand& command) {
       postMetadataCommand(command);
     });
-    const auto startResult = dependencies_.metadata->start(platformStateFromSnapshot(playerStateSnapshot()));
-    (void)startResult;
+    try {
+      const auto startResult = dependencies_.metadata->start(platformStateFromSnapshot(playerStateSnapshot()));
+      (void)startResult;
+    } catch (const std::exception& error) {
+      // metadata（MPRIS/SMTC 等平台控制面）启动异常不得影响控制器可用性：记录后继续，
+      // 与 backend 返回 !accepted 的既有降级语义一致（播放/扫描均不依赖它）。
+      spdlog::warn("metadata backend start failed: {}", error.what());
+    }
     spdlog::info("media controller started");
   }
 

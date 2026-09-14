@@ -690,6 +690,29 @@ TEST_CASE("media controller dependencies default a missing folder sort settings 
   CHECK(fakeScanner->setEventSinkCalls() == 2U);
 }
 
+TEST_CASE("media controller start survives a metadata backend that throws") {
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto fakeFolderSortSettingsStore = std::make_shared<FakeFolderSortSettingsStore>();
+  auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+  auto* metadataRaw = metadataService.get();
+  metadataRaw->setStartThrows(true);
+
+  auto controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                    .scanner = fakeScanner,
+                                                                    .metadata = std::move(metadataService),
+                                                                    .folderSortSettingsStore = fakeFolderSortSettingsStore},
+                                       MediaControllerOptions{.runInlineForTests = true});
+
+  REQUIRE_NOTHROW(controller->start());
+  CHECK(metadataRaw->startCalls() == 1U);
+
+  const std::vector<scanner::ScannerRoot> roots{{.path = std::filesystem::path{"music"}, .recursive = true}};
+  const auto scanResult = controller->scanLibrary(roots, scanner::ScanMode::Full);
+  CHECK(scanResult.accepted);
+  CHECK(fakeScanner->scanCalls() == 1U);
+}
+
 TEST_CASE("media controller dependencies carry an explicit fake folder sort settings store") {
   ControllerFixture fixture{};
 
