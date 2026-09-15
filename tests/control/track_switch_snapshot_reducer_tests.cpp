@@ -2,7 +2,6 @@
 // 需求 4 按钮锁定：selectTrack 后立即发布乐观 Playing 快照，音频层发布
 // Loading 时被抑制（快照序列无 Loading 中间态），直到真实 Playing/Stopped/Error
 // 解除；真实错误（PlaybackError）必须原样发布，不被抑制。
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest.h>
 
 #include "control/control_state_reducer.h"

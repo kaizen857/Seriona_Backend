@@ -86,7 +86,7 @@ std::vector<AudioDeviceFormat> twoFakeDevices() {
 }
 
 // 构造带能力数据的设备：默认带 48000 单格式，便于断言覆盖/保留。
-AudioDeviceFormat deviceWithCapabilities(const AudioDeviceFormat& device) {
+[[maybe_unused]] AudioDeviceFormat deviceWithCapabilities(const AudioDeviceFormat& device) {
   auto copy = device;
   copy.supportedSampleFormats = {AudioSampleFormat::Int16};
   copy.supportedSampleRates = {48000};
@@ -308,7 +308,7 @@ TEST_CASE("caching enumerator warms up in background and serves cached capabilit
 
 TEST_CASE("caching enumerator returns immediately before background refresh completes") {
   auto platform = std::make_unique<DelayedFakeFormatEnumerator>(std::chrono::milliseconds{1000});
-  auto* rawPlatform = platform.get();
+  [[maybe_unused]] auto* rawPlatform = platform.get();
   auto caching = std::make_unique<CachingDeviceFormatEnumerator>(std::move(platform));
 
   // 预热未完成时 enumerate() 立即返回空缓存，等待时间远小于平台延迟。

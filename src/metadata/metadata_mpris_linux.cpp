@@ -113,6 +113,12 @@ constexpr std::string_view kFileExistsErrorName{"org.freedesktop.DBus.Error.File
     case control::MediaControlCommandKind::ConfigureOutput:
     case control::MediaControlCommandKind::DeleteTrack:
     case control::MediaControlCommandKind::DeleteFolder:
+    case control::MediaControlCommandKind::PlayNextTrack:
+    case control::MediaControlCommandKind::ClearPlayQueue:
+    case control::MediaControlCommandKind::RemoveFromQueue:
+    case control::MediaControlCommandKind::SetTransitionConfig:
+    case control::MediaControlCommandKind::SetEqualizerConfig:
+    case control::MediaControlCommandKind::SetSpectrumEnabled:
       return false;
   }
   return false;

@@ -159,7 +159,7 @@ struct Chain {
 };
 
 // EQ 平滑收敛（3 块静音；块长下 3×blockMs>20ms → 每块 1/3、恰 3 块到位）。
-void settleEq(audio::EqualizerDspProcessor& dsp, std::uint32_t fs, std::uint32_t channels) {
+void settleEq(audio::EqualizerDspProcessor& dsp, [[maybe_unused]] std::uint32_t fs, std::uint32_t channels) {
   std::vector<float> silence(4096U * channels, 0.0f);
   for (int i = 0; i < 3; ++i) {
     dsp.process(silence.data(), 4096U);
@@ -527,7 +527,7 @@ TEST_CASE("eq dsp: 停→启清理——分段（暂停）处理与连续处理�
       }
     };
     processRange(0U, 12000U);     // 段 1
-    for (volatile int spin = 0; spin < 1; ++spin) {}  // 象征性暂停
+    for (volatile int spin = 0; spin < 1; spin = spin + 1) {}  // 象征性暂停
     processRange(12000U, 24000U); // 段 2（从冻结点继续）
     processRange(24000U, 48000U); // 段 3
     return stereo;

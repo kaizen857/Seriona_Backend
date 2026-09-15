@@ -199,7 +199,10 @@ function(seriona_enable_warnings target_name)
   if(MSVC)
     target_compile_options(${target_name} PRIVATE /W4 /permissive-)
   else()
-    target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic)
+    # 关闭 -Wmissing-field-initializers：本仓库大量使用部分指定初始化（只列相关字段），GCC/Clang 会对每个
+    # 未列出的成员各报一条；省略成员由语言保证值初始化（0/空/nullptr，非未定义行为），生产侧全部站点已
+    # 逐处审计为有意省略。其余 -Wall -Wextra -Wpedantic 全部保留。
+    target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
   endif()
 endfunction()
 
