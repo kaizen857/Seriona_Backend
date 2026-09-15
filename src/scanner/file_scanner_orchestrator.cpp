@@ -281,11 +281,15 @@ enum class ExternalLyricsCacheAction {
           .lastScanAt = std::chrono::system_clock::now()};
 }
 
+// allowedExtensions 仅用于目录树哈希的库相关性过滤；空 = defaultAudioExtensions()。真实调用方
+// 一律传入生效配置，使「决策用的哈希」与「收尾写入的基线哈希」用同一套过滤规则——否则两者不等，
+// 每次周期探测都会误判失配并升级 Full。默认参数只为测试与单文件根场景保留。
 [[nodiscard]] ScanModeDecision decideScanMode(const ScannerRoot& root,
                                              const ScanMode requestedMode,
-                                             const std::filesystem::path& databasePath) {
+                                             const std::filesystem::path& databasePath,
+                                             const std::vector<std::string>& allowedExtensions = {}) {
   const auto rootPath = rootPathFor(root);
-  const auto directoryTreeHash = computeDirectoryTreeHash(rootPath);
+  const auto directoryTreeHash = computeDirectoryTreeHash(rootPath, HashOptions{.allowedExtensions = allowedExtensions});
   if (!directoryTreeHash.hash.has_value() || requestedMode == ScanMode::Full) {
     return {.mode = ScanMode::Full, .directoryTreeHash = directoryTreeHash.hash};
   }
@@ -906,6 +910,20 @@ void publishEvent(const ScannerEventSink& sink, ScannerEventType type, std::uint
   sink(ScannerEvent{.type = type, .monotonicVersion = version, .timestamp = std::chrono::steady_clock::now(), .payload = std::move(payload)});
 }
 
+// 内部对账发布包装：把 reconcile 扫描的整条发布链一次性打上 ScannerEvent::internal 标记。
+// 发布点分散在 runScan / reconcileRoot / publishCancelled（后两者都用 runScan 传入的同一
+// sink），逐点传标记在新增发布点时会漏标——而漏标是静默失效（用户又看到「曲库已更新」）。
+// 装饰 sink 使漏标不可发生：runScan 只在取 sink 处包装一次。
+[[nodiscard]] ScannerEventSink markInternalPublications(const ScannerEventSink& sink) {
+  if (!sink) {
+    return {};
+  }
+  return [sink](ScannerEvent event) {
+    event.internal = true;
+    sink(std::move(event));
+  };
+}
+
 [[nodiscard]] WatchEffectKind watchEffectFrom(efsw::Action action) {
   switch (action) {
   case efsw::Actions::Add:
@@ -1261,7 +1279,9 @@ public:
     {
       std::scoped_lock lock{mutex_};
       config = config_;
-      sink = sink_;
+      // 内部对账（reconcile）不是用户操作：在此一次性包装 sink，其后 runScan 内的全部发布
+      // （含经 reconcileRoot / publishCancelled 的）自动带 internal 标记——发布契约第 1a 类。
+      sink = reconcile ? markInternalPublications(sink_) : sink_;
     }
     const auto effectiveConfig = effectiveScannerConfig(config);
     const auto scanVersion = ++eventVersion_;
@@ -1290,13 +1310,14 @@ public:
       spdlog::debug("scanning root: {}", pathToUtf8(root.path));
       // R4a：Reconcile 判定必须先于 config 折叠（enableIncrementalScan/forceFull 只作用于
       // 用户/常规扫描请求，不得把 Reconcile 折叠为 Full）。
+      const auto hashOptions = HashOptions{.allowedExtensions = effectiveConfig.scanner.allowedExtensions};
       ScanModeDecision decision;
       if (reconcile) {
-        const auto directoryTreeHash = computeDirectoryTreeHash(rootPathFor(root));
+        const auto directoryTreeHash = computeDirectoryTreeHash(rootPathFor(root), hashOptions);
         decision = {.mode = ScanMode::Incremental, .directoryTreeHash = directoryTreeHash.hash, .reconcile = true};
       } else {
         const auto requestedMode = (!effectiveConfig.scanner.enableIncrementalScan || effectiveConfig.scanner.forceFull) ? ScanMode::Full : mode;
-        decision = decideScanMode(root, requestedMode, databasePath_);
+        decision = decideScanMode(root, requestedMode, databasePath_, effectiveConfig.scanner.allowedExtensions);
       }
       spdlog::debug("scan mode decision for {}: {}{}", pathToUtf8(root.path),
                     decision.mode == ScanMode::Full ? "full" : "incremental", decision.reconcile ? " (reconcile)" : "");
@@ -1445,7 +1466,7 @@ public:
     spdlog::info("===============================================");
 
     publishEvent(sink, ScannerEventType::ProgressUpdated, ++eventVersion_, progress);
-    publishSnapshotEvents(published, /*publishCompletion=*/true);
+    publishSnapshotEvents(published, /*publishCompletion=*/true, /*internal=*/reconcile);
   }
 
   void startWatching(const std::vector<ScannerRoot>& roots) override {
@@ -1623,7 +1644,7 @@ public:
     } catch (const std::exception& error) {
       spdlog::warn("removeLocation failed updating locations cache: {}", error.what());
     }
-    refreshScanRootHash(*root);
+    refreshScanRootHash(*root, allowedExtensionsSnapshot());
     publishClassifierSnapshot();
     return true;
   }
@@ -3282,15 +3303,25 @@ private:
     return song;
   }
 
-  void refreshScanRootHash(const std::filesystem::path& rootPath) {
+  // config_ 由 configure() 在 mutex_ 下整体赋值（含 vector 成员），故读取必须在同一锁下快照。
+  [[nodiscard]] std::vector<std::string> allowedExtensionsSnapshot() const {
+    std::scoped_lock lock{mutex_};
+    return config_.allowedExtensions;
+  }
+
+  void refreshScanRootHash(const std::filesystem::path& rootPath, const std::vector<std::string>& allowedExtensions) {
     try {
-      const auto hash = computeDirectoryTreeHash(rootPath);
+      const auto hash = computeDirectoryTreeHash(rootPath, HashOptions{.allowedExtensions = allowedExtensions});
       if (!hash.hash.has_value()) {
         return;
       }
       cache::SQLiteCache cache{cache::ScannerCacheConfig{.databasePath = scanRootDatabasePath(databasePath_)}};
       auto scanRoot = cache.loadScanRoot(rootPath);
       if (!scanRoot.has_value()) {
+        return;
+      }
+      // 哈希未变即无需重写基线：无关条目的增删已不改变哈希，本函数对它们退化为空操作。
+      if (scanRoot->directoryTreeHash == *hash.hash) {
         return;
       }
       scanRoot->directoryTreeHash = *hash.hash;
@@ -3407,6 +3438,13 @@ private:
   // 发布契约（唯一事实来源；任务 7 建立、任务 8 明文固化，审查建议见 task-7-review §二.5）：
   //   1) 全量/增量扫描（runScan）：ScanStarted → ProgressUpdated(≥0) → PlaylistSnapshotUpdated
   //      → ScanCompleted（任一阶段错误时另有 ScanError）——即"一次扫描"的完整生命周期。
+  //   1a) 内部对账（周期 reconcile / 事件不可靠兜底，同样是 runScan，reconcile=true）：事件链
+  //      与 1) 完全相同，但整条链带 ScannerEvent::internal 标记。标记的含义不是"少发事件"，
+  //      而是"对用户不可见"：reducer 应用全部状态转换（据此自愈），只抑制两处用户可见输出
+  //      ——通知，以及"扫描进行中"（前端把 scanStatus==="running" 直接渲染成扫描进度提示并
+  //      强制显示，MainContent.qml:249-254，故只压通知不足以静默）。因此按事件计数的既有测试
+  //      （waitForScanCompletedCount 等）不受影响；只有断言通知的测试受影响。内部对账的失败
+  //      （根/缓存不可用）仍必须可见——见 reduceScannerEvent 对 ScanError 的放行。
   //   2) 文件级精准批次（applyClassifierBatch 无 scope → publishClassifierSnapshot）：
   //      PlaylistSnapshotUpdated + ScanCompleted。commit 24186ef 起的既有设计，既有测试
   //      （waitForScanCompletedCount）与前端 LibraryScanCompleted 通知均依赖，不得压制。
@@ -3414,11 +3452,16 @@ private:
   //      ScanError）；不发 ScanStarted，也不发 ScanCompleted——子树对账不是一次扫描，其完成
   //      只以最新快照表达。计划所述"不发 ScanStarted/ScanCompleted"仅指本路径。
   // 参数 publishCompletion 即第 2/1 类与第 3 类的分界：全量扫描与文件级精准批次为 true。
-  void publishSnapshotEvents(const PlaylistTreeSnapshot& published, bool publishCompletion) {
+  // 参数 internal 仅第 1a 类为 true。本函数从 sink_ 自行取 sink（不接收调用方的 sink），
+  // 无法复用 runScan 处的包装，故需显式传入。
+  void publishSnapshotEvents(const PlaylistTreeSnapshot& published, bool publishCompletion, bool internal = false) {
     ScannerEventSink sink;
     {
       std::scoped_lock lock{mutex_};
       sink = sink_;
+    }
+    if (internal) {
+      sink = markInternalPublications(sink);
     }
     publishEvent(sink, ScannerEventType::PlaylistSnapshotUpdated, ++eventVersion_, published);
     if (publishCompletion) {
@@ -3785,21 +3828,29 @@ private:
     }
 
     // 真删除才收敛（数据卫生）：Destroyed 可能是伪/错误事件（FSEvents 补发、事件映射误差）。
-    // 推入 remove 前复核磁盘存在性——仍存在（或 stat 出错）时绝不删除活索引行，改为置脏 +
-    // 请求 Reconcile；否则 batch 收尾 refreshScanRootHash 会让周期探测误以为一致，丢失变粘性。
+    // 推入 remove 前复核磁盘状态——仍存在（或 stat 出错）时绝不删除活索引行，改为请求 Reconcile；
+    // 否则 batch 收尾 refreshScanRootHash 会让周期探测误以为一致，丢失变粘性。
+    // 置脏不在此处：已消失路径既可能是无关文件（.tmp/.nfo 等），也可能是"磁盘已消失但树中仍有
+    // 索引内容的目录"——efsw 对已消失路径一律判为 File kind（watchPathKindFrom 无 stat 依据），
+    // 故不能用扩展名判定相关性，只能由"删除是否真正生效"裁决（见下方 removes 处理循环）。
     const auto pushVerifiedRemove = [&](const std::filesystem::path& rootPath, std::filesystem::path abs,
                                         std::filesystem::path rel) {
+      // exists() 对"不存在"返回 false 且不清 ec（EC 保持 Success），故本分支只覆盖"确实存在"或
+      // "stat 出错"；不能用 status()——它对同样的 ENOENT 会置 ec，会把每次正常删除误判为不可读。
       std::error_code existsError;
       if (std::filesystem::exists(abs, existsError) || existsError) {
-        spdlog::warn("destroyed event for existing path; keeping index and requesting reconcile: {}", pathToUtf8(abs));
-        requestReconcile(rootPath);
+        // 类型此时可确证：仍存在的目录或相关文件都可能让索引偏离磁盘 → 保守对账；确非目录且
+        // 扩展名无关的文件只是伪删除事件，不得触发用户可见对账。
+        std::error_code dirError;
+        if (std::filesystem::is_directory(abs, dirError) || dirError ||
+            isLibraryRelevantPath(abs, effective.scanner.allowedExtensions)) {
+          spdlog::warn("destroyed event for existing path; keeping index and requesting reconcile: {}", pathToUtf8(abs));
+          requestReconcile(rootPath);
+        }
         return;
       }
       removes.push_back(ClassifierRemove{.root = rootPath, .abs = std::move(abs), .rel = std::move(rel)});
       noteShapeChange(rootPath);
-      // 确认删除同样置脏：文件在事件后立即重建而 create 事件丢失时，批尾 refreshScanRootHash
-      // 会把删除后的形状写成新基线，丢失变粘性；脏标记让周期 Reconcile 重验证（60s 上界）。
-      markPendingReconcile(rootPath);
     };
 
     for (const auto& [key, destroy] : destroyByKey) {
@@ -3992,7 +4043,15 @@ private:
         if (treeChanged) {
           reupsertSurvivingSubtree(relText);
         }
-        anyMutation = anyMutation || treeChanged || cacheDeleted > 0 || allSongs_.size() != beforeCount;
+        const bool removedSomething = treeChanged || cacheDeleted > 0 || allSongs_.size() != beforeCount;
+        anyMutation = anyMutation || removedSomething;
+        // 确认删除置脏：文件在事件后立即重建而 create 事件丢失时，批尾 refreshScanRootHash 会把
+        // 删除后的形状写成新基线，丢失变粘性；脏标记让周期 Reconcile 重验证（60s 上界）。
+        // 仅当删除真正生效时才置脏：无关路径（无索引行、无树节点被移除）置脏会让周期探测绕过
+        // 哈希门控无条件 Reconcile，走与用户扫描相同的发布链并弹出「曲库已更新」。
+        if (removedSomething) {
+          markPendingReconcile(remove.root);
+        }
         touchedPaths.push_back(remove.rel);
       }
       // removes 已从 allSongs_ 删除整棵子树条目（含原 CUE 源音频条目）：upserts 判定隐藏
@@ -4338,7 +4397,7 @@ private:
       }
 
       for (const auto& rootPath : shapeChangedRoots) {
-        refreshScanRootHash(rootPath);
+        refreshScanRootHash(rootPath, effective.scanner.allowedExtensions);
       }
       if (anyMutation) {
         if (!ranScopedScan) {
@@ -4374,7 +4433,8 @@ private:
     return true;
   }
 
-  void reconcileRootsPeriodically(const std::vector<ScannerRoot>& roots) {
+  void reconcileRootsPeriodically(const std::vector<ScannerRoot>& roots,
+                                  const std::vector<std::string>& allowedExtensions) {
     if (roots.empty()) {
       return;
     }
@@ -4385,7 +4445,7 @@ private:
         rootsToReconcile.push_back(root);
         continue;
       }
-      const auto decision = decideScanMode(root, ScanMode::Incremental, databasePath_);
+      const auto decision = decideScanMode(root, ScanMode::Incremental, databasePath_, allowedExtensions);
       if (decision.mode == ScanMode::Full) {
         rootsToReconcile.push_back(root);
       }
@@ -4436,7 +4496,7 @@ private:
         }
       }
       if (periodicProbe) {
-        reconcileRootsPeriodically(roots);
+        reconcileRootsPeriodically(roots, allowedExtensionsSnapshot());
         continue;
       }
       {

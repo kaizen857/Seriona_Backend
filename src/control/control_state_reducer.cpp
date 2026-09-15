@@ -1054,6 +1054,14 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
 	  return {};
 	}
 	lastScannerVersion_ = event.monotonicVersion;
+
+  // 内部对账（周期 reconcile）是系统自发审计，不是用户操作：状态转换全部保留（下游据此自愈：
+  // ScanStarted 清除上次错误、ScanCompleted 结束进行中标记），只抑制"用户可见输出"。用户可见
+  // 输出恰有两处，二者都要抑制——只压通知并不够：
+  //   1) 任何通知（周期对账触发的「曲库已更新」即由此而来）；
+  //   2) scanStatus === "running"：前端把它直接渲染为扫描进度 toast 并强制显示
+  //      （MainContent.qml:249-254），故 ScanStarted 不再切换到 Scanning。
+  // ScanError 不受抑制：内部审计成功时静默、失败（根/缓存不可用）必须对用户可见。
 	if (event.type == scanner::ScannerEventType::FileScanned) {
 	  return {};
 	}
@@ -1061,19 +1069,29 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
 	auto reduction = accept();
 	library_.version = event.monotonicVersion;
 
+  // 通知出口：内部对账一律不发（见上"用户可见输出"第 1 条）。
+  const auto notify = [&](ControlDomainNotification notification) {
+    if (!event.internal) {
+      addNotification(reduction, std::move(notification));
+    }
+  };
+
   switch (event.type) {
   case scanner::ScannerEventType::ScanStarted:
-    library_.scanStatus = LibraryScanStatus::Scanning;
+    // 只对用户扫描切换 Scanning（见上：该状态是扫描进度 toast 的唯一触发源）；错误清除一律保留。
+    if (!event.internal) {
+      library_.scanStatus = LibraryScanStatus::Scanning;
+    }
     library_.lastError.reset();
-    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanStarted,
-                                                    "Library scan started",
-                                                    library_.scanStatus));
+    notify(makeScanNotification(ControlDomainNotificationKind::LibraryScanStarted,
+                                "Library scan started",
+                                library_.scanStatus));
     break;
 	  case scanner::ScannerEventType::ProgressUpdated:
 	    if (const auto* progress = std::get_if<scanner::ScanProgress>(&event.payload)) {
 	      library_.scanProgress = *progress;
 	    }
-	    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanProgressUpdated,
+	    notify(makeScanNotification(ControlDomainNotificationKind::LibraryScanProgressUpdated,
 	                                                    "Library scan progress updated",
 	                                                    library_.scanStatus));
 	    break;
@@ -1089,19 +1107,20 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
         selectFirstTrackWhenIdle(reduction);
       }
     }
-    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibrarySnapshotUpdated,
-                                                    "Library snapshot updated",
-                                                    library_.scanStatus));
+    // 内部对账：树与播放上下文照常应用（见上），仅通知被抑制（「曲库已更新」）。
+    notify(makeScanNotification(ControlDomainNotificationKind::LibrarySnapshotUpdated,
+                                "Library snapshot updated",
+                                library_.scanStatus));
     break;
   case scanner::ScannerEventType::ScanCompleted:
     library_.scanStatus = LibraryScanStatus::Completed;
-    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanCompleted,
+    notify(makeScanNotification(ControlDomainNotificationKind::LibraryScanCompleted,
                                                     "Library scan completed",
                                                     library_.scanStatus));
     break;
   case scanner::ScannerEventType::ScanStopped:
     library_.scanStatus = LibraryScanStatus::Stopped;
-    addNotification(reduction, makeScanNotification(ControlDomainNotificationKind::LibraryScanStopped,
+    notify(makeScanNotification(ControlDomainNotificationKind::LibraryScanStopped,
                                                     "Library scan stopped",
                                                     library_.scanStatus));
     break;

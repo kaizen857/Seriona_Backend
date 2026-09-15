@@ -1965,6 +1965,137 @@ TEST_CASE("scanner watcher periodic reconcile does not publish when nothing chan
   }
 }
 
+TEST_CASE("scanner watcher ignores irrelevant file churn without publishing or requesting reconcile") {
+  // 无关文件的存在性变化不得扰动索引：既不发布快照/扫描完成，也不得置脏（置脏会让周期探测
+  // 绕过哈希门控无条件 Reconcile，并弹出用户可见的「曲库已更新」）。真实音频新增须照常收敛。
+  test::TempScannerRoot temp{"scanner-watcher-irrelevant-noop"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  const auto junk = temp.path() / "notes.nfo";
+  writeText(junk, "client leftover");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(audio, rawMetadata("Song"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeFileScannerService(FileScannerServiceDependencies{
+      .metadataReader = reader,
+      .watcherFactory = watchers,
+      .databasePath = temp.dbPath(),
+      .coverExportDir = temp.path() / "covers",
+      .folderThumbnailSeam = nullptr,
+      .watcherDebounce = std::chrono::milliseconds{5},
+      .reconcileInterval = std::chrono::milliseconds{30}});
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  waitForScanCompletedCount(events, eventsMutex, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+
+  const auto countLocked = [&events, &eventsMutex](ScannerEventType type) -> std::size_t {
+    std::scoped_lock lock{eventsMutex};
+    return eventTypeCount(events, type);
+  };
+  const auto startedBefore = countLocked(ScannerEventType::ScanStarted);
+  const auto completedBefore = countLocked(ScannerEventType::ScanCompleted);
+  const auto snapshotBefore = countLocked(ScannerEventType::PlaylistSnapshotUpdated);
+
+  // 场景 1：无关文件真实删除。沉降窗覆盖多个周期探测（reconcileInterval=30ms）：一旦置脏
+  // 即会发布 ScanStarted/快照/ScanCompleted，下面的等值断言即可捕获。
+  std::filesystem::remove(junk);
+  watchers->states[0]->callback(fileEvent(junk, WatchEffectKind::Destroyed));
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+  // 场景 2：FSEvents 风格"Modified 但路径已不存在"，经 upsert 消失路径进入同一处置。
+  watchers->states[0]->callback(fileEvent(temp.path() / "ghost.tmp", WatchEffectKind::Modified));
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+
+  CHECK(reader->readCount() == 1U);
+  CHECK(songsIn(service->snapshot()).size() == 1U);
+  CHECK(countLocked(ScannerEventType::ScanStarted) == startedBefore);
+  CHECK(countLocked(ScannerEventType::ScanCompleted) == completedBefore);
+  CHECK(countLocked(ScannerEventType::PlaylistSnapshotUpdated) == snapshotBefore);
+
+  const auto added = test::writeAudioFixture(temp.path(), "added.flac");
+  reader->put(added, rawMetadata("Added"));
+  watchers->states[0]->callback(fileEvent(added, WatchEffectKind::Created));
+  waitForSnapshotSongCount(*service, 2U);
+}
+
+TEST_CASE("scanner watcher tags internal reconcile publications and leaves user scans visible") {
+  // 发布契约第 1a 类锁定：内部对账（reconcile）的整条事件链必须带 ScannerEvent::internal，
+  // 用户触发的扫描必须不带。消费方据此跳过用户可见输出——标记一旦被重构丢掉是静默失效
+  // （「曲库已更新」通知复现而既有的按类型计数断言全部照旧通过）。
+  test::TempScannerRoot temp{"scanner-watcher-internal-mark"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(audio, rawMetadata("Song"));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  // 默认 reconcileInterval（60s）令周期探测在本用例内不触发：唯一的内部对账来自下面的
+  // watcher 事件，边界由触发点决定而非时序。
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  const auto countEvents = [&events, &eventsMutex](ScannerEventType type, bool internal) -> std::size_t {
+    std::scoped_lock lock{eventsMutex};
+    return static_cast<std::size_t>(std::ranges::count_if(events, [type, internal](const ScannerEvent& event) {
+      return event.type == type && event.internal == internal;
+    }));
+  };
+  const auto allEventsFlagged = [&events, &eventsMutex](bool internal) -> bool {
+    std::scoped_lock lock{eventsMutex};
+    return std::ranges::all_of(events, [internal](const ScannerEvent& event) { return event.internal == internal; });
+  };
+  const auto waitForEvent = [&countEvents](ScannerEventType type, bool internal) {
+    for (auto attempt = 0; attempt != 2000; ++attempt) {
+      if (countEvents(type, internal) >= 1U) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    FAIL("timed out waiting for scanner event with expected internal flag");
+  };
+
+  // 内部对账的确定性入口：先开始监视（树尚未种子化），首个 watcher 事件在
+  // applyClassifierBatch 的 !treeBuilder_ 分支直接 enqueueReconcile（发布契约第 1a 类）。
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  watchers->states[0]->callback(fileEvent(audio, WatchEffectKind::Created));
+
+  waitForEvent(ScannerEventType::ScanCompleted, /*internal=*/true);
+  CHECK(countEvents(ScannerEventType::ScanStarted, true) >= 1U);
+  CHECK(countEvents(ScannerEventType::PlaylistSnapshotUpdated, true) >= 1U);
+  CHECK(countEvents(ScannerEventType::ScanCompleted, true) >= 1U);
+  // ScanStarted 由 runScan 的 sink 包装标记，快照/完成由 publishSnapshotEvents 的 internal
+  // 参数标记；整轮无第三方发布，故全量标记成立才能证明两条发布点都被覆盖。
+  CHECK(allEventsFlagged(true));
+  CHECK(songsIn(service->snapshot()).size() == 1U);
+
+  // 用户扫描对照：先停监视（无 debounce/周期探测噪声），空出事件窗后整窗断言无内部标记。
+  service->stopWatching();
+  {
+    std::scoped_lock lock{eventsMutex};
+    events.clear();
+  }
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForEvent(ScannerEventType::ScanCompleted, /*internal=*/false);
+  CHECK(countEvents(ScannerEventType::ScanStarted, false) >= 1U);
+  CHECK(countEvents(ScannerEventType::PlaylistSnapshotUpdated, false) >= 1U);
+  CHECK(countEvents(ScannerEventType::ScanCompleted, false) >= 1U);
+  CHECK(allEventsFlagged(false));
+  CHECK(countEvents(ScannerEventType::ScanStarted, true) == 0U);
+  CHECK(songsIn(service->snapshot()).size() == 1U);
+}
+
 TEST_CASE("scanner watcher falls back to rescan for first create on an un-scanned new root") {
   // 守卫语义（波 4.1 MAJOR-2 / 设计 §13.3-3）：locations.root_path 外键指向 scan_roots，
   // 而 scan_roots 行只在扫描完成时写入。新 root 尚未扫描时，其首个 create 无法精准

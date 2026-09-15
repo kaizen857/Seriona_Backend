@@ -20,6 +20,12 @@ enum class HashErrorCode {
 struct HashOptions {
   std::size_t chunkBytes{64U * 1024U};
   const std::atomic_bool* cancellationRequested{nullptr};
+  // 目录树哈希的库相关性过滤（默认开启）：只统计受支持音频、.cue、封面侧车；`.lrc` 仍无条件
+  // 排除（每次扫描都会重读）。无关条目既不改变哈希，也就不会让周期探测升级为 Full 对账。
+  // 置 false 恢复「哈希一切条目」。
+  bool libraryRelevanceFilter{true};
+  // 音频扩展名集合；空 = defaultAudioExtensions()。
+  std::vector<std::string> allowedExtensions{};
 };
 
 struct HashError {

@@ -154,6 +154,13 @@ struct ScannerEvent {
   std::uint64_t monotonicVersion{0};
   std::chrono::steady_clock::time_point timestamp{};
   ScannerEventPayload payload{ScanProgress{}};
+  // 内部对账发布（周期 reconcile、事件不可靠/丢失兜底）：系统自发的审计，不是用户操作。
+  // 消费方应用全部状态转换（据此自愈：清除上次错误、结束进行中标记），但必须抑制"用户可见
+  // 输出"，其恰有两处：通知，以及扫描进行中指示——前端把 scanStatus==="running" 直接渲染为
+  // 扫描进度提示并强制显示（MainContent.qml:249-254），故内部对账不得切入该状态。
+  // 例外：ScanError 不受此约束——内部审计成功时静默，失败（根 / 缓存不可用）必须可见。
+  // 用户触发的扫描（FileScannerService::scan）一律为 false。
+  bool internal{false};
 };
 
 using ScannerEventSink = std::function<void(ScannerEvent)>;

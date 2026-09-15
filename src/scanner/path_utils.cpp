@@ -279,6 +279,12 @@ bool isCoverSidecar(const std::filesystem::path& path) {
   return coverStems.contains(lowerAscii(stem));
 }
 
+bool isLibraryRelevantPath(const std::filesystem::path& path, const std::vector<std::string>& allowedExtensions) {
+  // isSupportedAudioExtension 已排除容器扩展名与 .cue/.lrc，因此 .cue/.lrc 需单独列出。
+  return isSupportedAudioExtension(path, allowedExtensions) || isCueSheetPath(path) ||
+         isLyricsSidecarPath(path) || isCoverSidecar(path);
+}
+
 std::filesystem::path expectedLyricsSidecarPath(const std::filesystem::path& audioPath) {
   auto sidecar = audioPath;
   sidecar.replace_extension(".lrc");

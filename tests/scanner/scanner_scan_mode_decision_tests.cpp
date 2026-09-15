@@ -166,5 +166,35 @@ TEST_CASE("scan mode decision falls back to full when scan-root cache cannot be 
   CHECK(decision.directoryTreeHash.has_value());
 }
 
+TEST_CASE("scan mode decision ignores library-irrelevant entry churn") {
+  test::TempScannerRoot temp{"scan-mode-irrelevant-churn"};
+  const auto audioPath = test::writeAudioFixture(temp.path(), "song.flac");
+  const auto databasePath = externalDatabasePath(temp);
+  const auto rootPath = rootPathFor(ScannerRoot{.path = temp.path()});
+  const auto firstDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
+  REQUIRE(firstDecision.mode == ScanMode::Full);
+  REQUIRE(firstDecision.directoryTreeHash.has_value());
+  auto cache = openScanRootCache(databasePath);
+  cache.updateScanRoot(scanRootRecord(rootPath, firstDecision, 1U, std::chrono::milliseconds{5}));
+
+  // 无关条目增删不得改变决策哈希：一旦升级 Full，周期探测就会走与用户扫描相同的发布链并弹出
+  // 「曲库已更新」——这正是用户报告「没做任何修改却收到更新提示」的成因。
+  writeText(temp.path() / "notes.txt", "unrelated text");
+  writeText(temp.path() / "scene.nfo", "scene metadata");
+  std::filesystem::create_directories(temp.path() / "downloads");
+  writeText(temp.path() / "downloads" / "__tmp.part", "in progress");
+  const auto churnedDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
+
+  CHECK(std::filesystem::exists(audioPath));
+  CHECK(churnedDecision.mode == ScanMode::Incremental);
+  CHECK(churnedDecision.directoryTreeHash == firstDecision.directoryTreeHash);
+
+  const auto newAudioPath = test::writeAudioFixture(temp.path(), "new-song.flac");
+  const auto changedDecision = decideScanMode(ScannerRoot{.path = temp.path()}, ScanMode::Incremental, databasePath);
+
+  CHECK(std::filesystem::exists(newAudioPath));
+  CHECK(changedDecision.mode == ScanMode::Full);
+}
+
 }
 }

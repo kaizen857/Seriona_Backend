@@ -11,6 +11,10 @@
 #include <fstream>
 #include <string>
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 namespace seriona::scanner {
 namespace {
 
@@ -129,6 +133,88 @@ TEST_CASE("scanner directory tree hash describes structure without reading file 
   const auto deleted = requireHash(computeDirectoryTreeHash(root.path()));
   CHECK(deleted != renamed);
 }
+
+TEST_CASE("scanner directory tree hash ignores library-irrelevant entries") {
+  test::TempScannerRoot root("scanner-directory-tree-hash-irrelevant");
+  writeTextFile(root.path() / "album" / "01.flac", "first audio bytes");
+  const auto baseline = requireHash(computeDirectoryTreeHash(root.path()));
+
+  writeTextFile(root.path() / "album" / "notes.txt", "unrelated text");
+  writeTextFile(root.path() / "album" / ".directory", "kde view properties");
+  writeTextFile(root.path() / "album" / "track.nfo", "scene metadata");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  std::filesystem::remove(root.path() / "album" / "notes.txt");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  writeTextFile(root.path() / "downloads" / "__tmp.part", "in progress");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  writeTextFile(root.path() / "album" / "01.lrc", "[00:01.00]lyric");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  writeTextFile(root.path() / "album" / "cover.jpg", "cover bytes");
+  const auto withCover = requireHash(computeDirectoryTreeHash(root.path()));
+  CHECK(withCover != baseline);
+
+  writeTextFile(root.path() / "album" / "02.flac", "second audio bytes");
+  const auto added = requireHash(computeDirectoryTreeHash(root.path()));
+  CHECK(added != withCover);
+
+  std::filesystem::remove(root.path() / "album" / "02.flac");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == withCover);
+
+  std::filesystem::remove(root.path() / "album" / "cover.jpg");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+}
+
+TEST_CASE("scanner directory tree hash raw mode hashes entries regardless of relevance") {
+  test::TempScannerRoot root("scanner-directory-tree-hash-raw");
+  writeTextFile(root.path() / "album" / "01.flac", "first audio bytes");
+  const HashOptions rawOptions{.libraryRelevanceFilter = false};
+
+  const auto baseline = requireHash(computeDirectoryTreeHash(root.path(), rawOptions));
+  writeTextFile(root.path() / "album" / "notes.txt", "unrelated text");
+  const auto churned = requireHash(computeDirectoryTreeHash(root.path(), rawOptions));
+
+  CHECK(churned != baseline);
+}
+
+#if !defined(_WIN32)
+// R1 收敛通道：不可读子目录被丢弃，恢复可读后重新参与哈希 → 父帧改变。这证明「权限恢复后树哈希
+// 变化」这条恢复通道真实存在（orchestrator 枚举不完整的净零 prune 盲区依赖它），且不依赖 errors
+// ——sortedChildren 用 skip_permission_denied，实测 EACCES 不产生 ec。
+TEST_CASE("scanner directory tree hash changes when a subtree becomes unreadable and recovers") {
+  test::TempScannerRoot root("scanner-directory-tree-hash-permission");
+  if (::geteuid() == 0) {
+    MESSAGE("running as root: permission bits are not enforced; skipping");
+    return;
+  }
+  const auto album = root.path() / "album";
+  writeTextFile(album / "01.flac", "audio bytes");
+  const auto baseline = requireHash(computeDirectoryTreeHash(root.path()));
+
+  struct AlbumPermissionRestore {
+    std::filesystem::path path;
+    ~AlbumPermissionRestore() {
+      std::error_code error;
+      std::filesystem::permissions(path, std::filesystem::perms::owner_all, error);
+    }
+  } restore{album};
+
+  std::error_code permissionError;
+  std::filesystem::permissions(album, std::filesystem::perms::none, permissionError);
+  REQUIRE_FALSE(permissionError);
+
+  const auto hidden = computeDirectoryTreeHash(root.path());
+  REQUIRE(hidden.hash.has_value());
+  CHECK(*hidden.hash != baseline);
+
+  std::filesystem::permissions(album, std::filesystem::perms::owner_all, permissionError);
+  REQUIRE_FALSE(permissionError);
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+}
+#endif
 
 TEST_CASE("scanner directory tree hash reports missing roots without partial hash") {
   test::TempScannerRoot root("scanner-directory-tree-hash-missing");

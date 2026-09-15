@@ -1,5 +1,7 @@
 #include "seriona/scanner/directory_tree_hash.h"
 
+#include "seriona/scanner/path_utils.h"
+
 #include "path_utf8.h"
 
 #include <xxhash.h>
@@ -31,12 +33,17 @@ constexpr char kHashSeparator = '\0';
   return options.cancellationRequested != nullptr && options.cancellationRequested->load();
 }
 
-// Local copy: some test binaries compile this file without path_utils.cpp.
-[[nodiscard]] bool isLyricsSidecarPath(const std::filesystem::path& path) {
-  auto extension = pathToUtf8(path.extension());
-  std::ranges::transform(extension, extension.begin(),
-                         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return extension == ".lrc";
+// 目录树哈希只关心「库相关性」条目：受支持音频、.cue 工程、封面侧车；`.lrc` 无条件排除——
+// 歌词侧车每次扫描都会重读，其变化必须留在增量路径，不能把整根升级为 Full。谓词统一取自
+// path_utils，避免同一过滤规则分处两地漂移后静默漏掉真实变化（Bazel PR #22615）。
+[[nodiscard]] bool isHashRelevantEntry(const std::filesystem::path& path, const HashOptions& options) {
+  if (isLyricsSidecarPath(path)) {
+    return false;
+  }
+  if (!options.libraryRelevanceFilter) {
+    return true;
+  }
+  return isLibraryRelevantPath(path, options.allowedExtensions);
 }
 
 [[nodiscard]] HashError makeTreeHashError(HashErrorCode code, ScannerErrorCode scannerCode,
@@ -136,9 +143,15 @@ constexpr char kHashSeparator = '\0';
   return children;
 }
 
-[[nodiscard]] DirectoryHashResult hashTreeRecursive(const std::filesystem::path& root, const std::filesystem::path& path,
-                                                    const HashOptions& options) {
-  DirectoryHashResult result;
+struct SubtreeHash {
+  std::optional<std::string> hash;
+  std::vector<HashError> errors;
+  bool hasRelevantEntries{false};
+};
+
+[[nodiscard]] SubtreeHash hashTreeRecursive(const std::filesystem::path& root, const std::filesystem::path& path,
+                                            const HashOptions& options) {
+  SubtreeHash result;
   if (isCancelled(options)) {
     result.errors.push_back(makeTreeHashError(HashErrorCode::Cancelled, ScannerErrorCode::Cancelled, path,
                                              "directory tree hash cancelled"));
@@ -215,14 +228,6 @@ constexpr char kHashSeparator = '\0';
       return result;
     }
 
-    // Lyrics sidecar (.lrc) files are re-read from disk on every scan by the
-    // lyrics reconciliation path, so their presence must not invalidate the
-    // scan-mode tree hash: an lrc-only change should stay on the incremental
-    // path instead of forcing a full TagReader rescan of the paired audio.
-    if (isLyricsSidecarPath(child.path())) {
-      continue;
-    }
-
     auto kind = treeEntryKind(child, error);
     if (!kind.has_value()) {
       result.errors.push_back(makeTreeHashError(HashErrorCode::IoFailure, ScannerErrorCode::PermissionDenied, child.path(),
@@ -232,12 +237,29 @@ constexpr char kHashSeparator = '\0';
 
     auto childHash = std::string{};
     if (*kind == "dir") {
+      // 目录必须始终下探：相关性只能由子树内容判定，目录名本身没有扩展名。
       auto childResult = hashTreeRecursive(root, child.path(), options);
       result.errors.insert(result.errors.end(), childResult.errors.begin(), childResult.errors.end());
       if (!childResult.hash.has_value()) {
         continue;
       }
+      // 子目录仅在「含库相关性内容」或「遍历出错」时参与哈希。真正的收敛保证来自「丢弃 ↔ 参与
+      // 本身改变父帧」：不可读/空目录被丢弃，一旦出现相关条目即参与，父哈希必然变化——这正是
+      // orchestrator 枚举不完整收敛（净零 prune 盲区）所依赖的通道。errors 分支是安全超集：
+      // 它覆盖 treeEntryKind/stat 失败，但对「目录不可读」不生效（sortedChildren 用
+      // skip_permission_denied，实测 EACCES 不产生 ec），故不承担收敛职责。
+      if (!childResult.hasRelevantEntries && childResult.errors.empty()) {
+        continue;
+      }
       childHash = *childResult.hash;
+      result.hasRelevantEntries = result.hasRelevantEntries || childResult.hasRelevantEntries;
+    } else {
+      // 非目录：只有库相关性条目（音频/.cue/封面）参与哈希；`.lrc` 与一切无关条目的增删改既不改变
+      // 哈希，也就不会把周期探测升级为 Full 对账。
+      if (!isHashRelevantEntry(child.path(), options)) {
+        continue;
+      }
+      result.hasRelevantEntries = true;
     }
 
     static_cast<void>(updateHash(*state, relativeUtf8(root, child.path())));
@@ -255,7 +277,8 @@ constexpr char kHashSeparator = '\0';
 }
 
 DirectoryHashResult computeDirectoryTreeHash(const std::filesystem::path& rootPath, const HashOptions& options) {
-  return hashTreeRecursive(rootPath, rootPath, options);
+  auto subtree = hashTreeRecursive(rootPath, rootPath, options);
+  return {.hash = std::move(subtree.hash), .errors = std::move(subtree.errors)};
 }
 
 }
