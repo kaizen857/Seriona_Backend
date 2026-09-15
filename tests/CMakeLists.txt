@@ -505,6 +505,7 @@ add_executable(seriona_scanner_hash_tests
   scanner/scanner_test_harness.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/directory_tree_hash.cpp
   ${PROJECT_SOURCE_DIR}/src/scanner/hash_utils.cpp
+  ${PROJECT_SOURCE_DIR}/src/scanner/path_utils.cpp
 )
 add_executable(seriona_scanner_tree_tests
   scanner/scanner_tree_tests.cpp

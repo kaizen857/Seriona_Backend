@@ -2320,6 +2320,133 @@ TEST_CASE("media controller facade publishes fatal scanner errors as library sta
   notificationSubscription.unsubscribe();
 }
 
+TEST_CASE("media controller facade applies internal audit snapshots without user-visible scan state or notifications") {
+  // 内部对账（周期 reconcile）是系统自发审计：数据面（树/播放上下文）与状态转换必须照常应用
+  // （否则事件丢失造成的真实变更永不收敛，且一次致命错误后错误横幅不再自愈），只有"用户可见
+  // 输出"被抑制——通知，以及 scanStatus==="running"（前端把该状态直接渲染成扫描进度 toast 并
+  // 强制显示，见 MainContent.qml:249-254）。
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+  fixture.controller->drainForTests();
+
+  const auto notificationCount = [&notifications, &notificationMutex]() -> std::size_t {
+    std::lock_guard lock{notificationMutex};
+    return notifications.size();
+  };
+
+  // 先制造"上一次用户扫描致命失败"的滞留状态：scanStatus=Error（前端红色横幅的唯一依据，
+  // Sidebar.qml:54）且 lastError 有值。
+  fixture.fakeScanner->emit(scannerErrorEvent("root unavailable", 5, scanner::ScannerErrorCode::RootUnavailable));
+  fixture.controller->drainForTests();
+  REQUIRE(fixture.controller->libraryStateSnapshot().scanStatus == LibraryScanStatus::Error);
+  REQUIRE(fixture.controller->libraryStateSnapshot().lastError.has_value());
+  const auto notificationsAfterUserError = notificationCount();
+  REQUIRE(notificationsAfterUserError >= 1U);
+
+  // 内部对账 ScanStarted：不得切换到 Scanning（那是扫描进度 toast 的唯一触发源），但必须照常
+  // 清除上次错误——否则每 60s 成功的对账不再自愈，红色横幅永久滞留（无关行为被改动）。
+  auto started = scanStartedEvent(6);
+  started.internal = true;
+  fixture.fakeScanner->emit(started);
+  fixture.controller->drainForTests();
+  const auto afterInternalStarted = fixture.controller->libraryStateSnapshot();
+  CHECK(afterInternalStarted.scanStatus == LibraryScanStatus::Error);
+  CHECK_FALSE(afterInternalStarted.lastError.has_value());
+
+  // 内部对账的其余发布链：ProgressUpdated → PlaylistSnapshotUpdated → ScanCompleted。
+  const auto tree = libraryTree({song("a", "music/a.flac"), song("b", "music/b.flac")}, 8U);
+  auto progress = progressUpdatedEvent(scanner::ScanProgress{.filesDiscovered = 2, .filesScanned = 2, .filesSkipped = 0,
+                                                             .errors = 0, .elapsed = std::chrono::milliseconds{0},
+                                                             .currentPath = std::nullopt},
+                                       7);
+  progress.internal = true;
+  fixture.fakeScanner->emit(progress);
+  auto snapshotEvent = scannerSnapshotEvent(tree, 8);
+  snapshotEvent.internal = true;
+  fixture.fakeScanner->emit(snapshotEvent);
+  scanner::ScannerEvent completed{.type = scanner::ScannerEventType::ScanCompleted,
+                                  .monotonicVersion = 9,
+                                  .timestamp = {},
+                                  .payload = tree};
+  completed.internal = true;
+  fixture.fakeScanner->emit(completed);
+  fixture.controller->drainForTests();
+
+  // 数据面已应用：快照树进入库状态；扫描收尾状态照常落到 Completed（保留状态转换，故错误横幅
+  // 能自愈，也保证 scanStatus 不会滞留）。
+  const auto afterInternalAudit = fixture.controller->libraryStateSnapshot();
+  REQUIRE(afterInternalAudit.libraryTree.has_value());
+  CHECK(afterInternalAudit.libraryTree->nodes.size() == tree.nodes.size());
+  CHECK(afterInternalAudit.scanStatus == LibraryScanStatus::Completed);
+  // 用户可见面静默：整轮内部对账零新增通知。
+  std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  CHECK(notificationCount() == notificationsAfterUserError);
+
+  // 正向对照（使上面的抑制断言可被证伪，而非"通知根本不产生"）：同一组事件以 internal=false
+  // 走用户路径时，通知必须照常产生、进度必须照常写入、快照通知必须出现。
+  auto userStarted = scanStartedEvent(10);
+  fixture.fakeScanner->emit(userStarted);
+  auto userProgress = progressUpdatedEvent(scanner::ScanProgress{.filesDiscovered = 2, .filesScanned = 1, .filesSkipped = 0,
+                                                                 .errors = 0, .elapsed = std::chrono::milliseconds{0},
+                                                                 .currentPath = std::nullopt},
+                                           11);
+  fixture.fakeScanner->emit(userProgress);
+  fixture.fakeScanner->emit(scannerSnapshotEvent(tree, 12));
+  scanner::ScannerEvent userCompleted{.type = scanner::ScannerEventType::ScanCompleted,
+                                      .monotonicVersion = 13,
+                                      .timestamp = {},
+                                      .payload = tree};
+  fixture.fakeScanner->emit(userCompleted);
+  fixture.controller->drainForTests();
+
+  const auto afterUserScan = fixture.controller->libraryStateSnapshot();
+  CHECK(afterUserScan.scanStatus == LibraryScanStatus::Completed);
+  CHECK(afterUserScan.scanProgress.has_value());
+  CHECK(notificationCount() > notificationsAfterUserError);
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK(hasNotificationKind(notifications, ControlDomainNotificationKind::LibrarySnapshotUpdated));
+    CHECK(hasNotificationKind(notifications, ControlDomainNotificationKind::LibraryScanStarted));
+  }
+  notificationSubscription.unsubscribe();
+}
+
+TEST_CASE("media controller facade still surfaces fatal errors raised by an internal audit") {
+  // 内部审计刻意只静默"成功与生命周期"：失败（根/缓存不可用）必须可见，否则用户会静默失去音乐库
+  // 访问权而毫无提示。
+  ControllerFixture fixture{};
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+  fixture.controller->start();
+
+  auto error = scannerErrorEvent("root unavailable", 5, scanner::ScannerErrorCode::RootUnavailable);
+  error.internal = true;
+  fixture.fakeScanner->emit(error);
+  fixture.controller->drainForTests();
+
+  const auto libraryState = fixture.controller->libraryStateSnapshot();
+  CHECK(libraryState.scanStatus == LibraryScanStatus::Error);
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return !notifications.empty();
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK(notifications.back().kind == ControlDomainNotificationKind::LibraryScanError);
+  }
+  notificationSubscription.unsubscribe();
+}
+
 TEST_CASE("media controller facade keeps scanning state for non-fatal file errors") {
   ControllerFixture fixture{};
   std::mutex notificationMutex{};

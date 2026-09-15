@@ -325,6 +325,30 @@ struct RealScannerFixture {
     }
     return false;
   }
+
+  [[nodiscard]] std::size_t notificationCount() {
+    std::lock_guard lock{notificationMutex};
+    return notifications.size();
+  }
+
+  // 泵动内联事件循环固定时长：用于"观察窗内不得发生某事"的断言（等待本身就是观察窗）。
+  void pumpFor(std::chrono::milliseconds duration) {
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline) {
+      controller->drainForTests();
+      std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    controller->drainForTests();
+  }
+
+  [[nodiscard]] bool waitForNotificationCountAbove(std::size_t baseline, std::chrono::milliseconds timeout) {
+    return waitFor([this, baseline] { return notificationCount() > baseline; }, timeout);
+  }
+
+  [[nodiscard]] std::size_t libraryTreeSize() {
+    const auto tree = controller->libraryStateSnapshot().libraryTree;
+    return tree.has_value() ? tree->nodes.size() : 0U;
+  }
 };
 
 }  // namespace
@@ -536,4 +560,47 @@ TEST_CASE("controller delete commands with real scanner: missing file is idempot
   CHECK(result.accepted);
   CHECK(result.code == MediaControllerErrorCode::None);
   CHECK(std::filesystem::exists(trackA));  // 库内曲目不受影响
+}
+
+TEST_CASE("controller with real watcher stays silent for library-irrelevant file churn") {
+  // 端到端（真实 efsw/inotify → 真实 orchestrator → 真实 reducer）：监视根内无关条目的增删必须
+  // 完全静默——不得产生任何通知，也不得扰动曲库树。这正是用户投诉的"明明没做修改却弹提示"。
+  // 与下方 "still announces a real audio file" 成对，互为非空转保证（该用例证明同一夹具在真实
+  // 音频下确实会通知）。
+  RealScannerFixture fixture{};
+  fixture.putSong("song.flac", "Song");
+  fixture.controller->start();
+  fixture.scanLibrary();
+  REQUIRE(fixture.libraryTreeReady(2U));  // root + 1 track
+
+  // 基线取在启动扫描之后：用户主动启动的扫描其通知属预期，不计入本断言。
+  const auto baseline = fixture.notificationCount();
+
+  // 无关条目：非音频扩展名 + 无扩展名隐藏文件（均不在库相关性集合内，见 isLibraryRelevantPath）。
+  writeText(fixture.root / "client-leftover.nfo", "not audio");
+  writeText(fixture.root / ".__cache-artifact", "not audio");
+  fixture.pumpFor(std::chrono::milliseconds{600});  // 越过 watcher 防抖窗，给足处理机会
+  std::filesystem::remove(fixture.root / "client-leftover.nfo");
+  std::filesystem::remove(fixture.root / ".__cache-artifact");
+  fixture.pumpFor(std::chrono::milliseconds{600});
+
+  CHECK(fixture.notificationCount() == baseline);
+  CHECK(fixture.libraryTreeSize() == 2U);  // 树未被扰动
+}
+
+TEST_CASE("controller with real watcher still announces a real audio file") {
+  // 反向对照（与上一用例成对）：监视根内新增真实音频必须照常收敛并产生用户可见通知——防止"静默"
+  // 实现过度抑制，把真实变更也一并吞掉。
+  RealScannerFixture fixture{};
+  fixture.putSong("song.flac", "Song");
+  fixture.controller->start();
+  fixture.scanLibrary();
+  REQUIRE(fixture.libraryTreeReady(2U));
+
+  const auto baseline = fixture.notificationCount();
+
+  fixture.putSong("added.flac", "Added");
+
+  REQUIRE(fixture.libraryTreeReady(3U));  // 收敛：新曲进入曲库树
+  CHECK(fixture.waitForNotificationCountAbove(baseline, std::chrono::milliseconds{5000}));
 }

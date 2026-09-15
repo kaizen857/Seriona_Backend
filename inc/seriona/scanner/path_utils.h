@@ -57,6 +57,10 @@ struct ClassifiedPath {
 // stem in {cover, front, folder, album, artwork} (ASCII case-insensitive) and
 // extension in {.png, .jpg, .jpeg, .bmp, .webp, .gif, .tiff}. Random images do not match.
 [[nodiscard]] bool isCoverSidecar(const std::filesystem::path& path);
+// 库相关性：受支持音频、.cue 工程、.lrc 歌词侧车、封面侧车。调用方必须共用本谓词——
+// 同一过滤规则分处两地会漂移并静默漏掉真实变化（Bazel PR #22615）。
+[[nodiscard]] bool isLibraryRelevantPath(const std::filesystem::path& path,
+                                         const std::vector<std::string>& allowedExtensions = {});
 [[nodiscard]] std::filesystem::path expectedLyricsSidecarPath(const std::filesystem::path& audioPath);
 [[nodiscard]] std::string serializeRelativeUtf8(const std::filesystem::path& root,
                                                 const std::filesystem::path& path);

@@ -242,6 +242,33 @@ TEST_CASE("cue sheet classification distinguishes from similar extensions") {
   CHECK(requireRelativePath(entries, "prefix.cue.bak").kind == PathEntryKind::Unsupported);
 }
 
+// 阶段 2 地基不变式：凡进入索引的路径（音频 / .cue），都必须落在目录树哈希的相关性集合内。
+// 若两者错位，该路径的变化与消失既不改变哈希、也不置脏 → 周期探测永远发现不了（静默漏变化）；
+// 且其「枚举不完整」兜底通道同时失效。当前该关系仅由 classifyScannerPath 与
+// isLibraryRelevantPath 共用 isSupportedAudioExtension 维系，此处固化为回归。同 Bazel PR #22615。
+TEST_CASE("scanner path discovery keeps every indexable path inside the tree hash relevance set") {
+  test::TempScannerRoot root("scanner-paths-hash-relevance-invariant");
+  static_cast<void>(test::writeAudioFixture(root.path(), "song.flac"));
+  std::filesystem::create_directories(root.path() / "sub");
+  static_cast<void>(test::writeAudioFixture(root.path() / "sub", "nested.flac"));
+  writeTextFile(root.path() / "notes.txt", "unrelated text");
+  writeTextFile(root.path() / "cover.jpg", "cover bytes");
+
+  const auto entries = discoverScannerPaths({.path = root.path(), .recursive = true});
+
+  std::size_t indexable = 0;
+  for (const auto& entry : entries) {
+    if (entry.kind != PathEntryKind::AudioCandidate && entry.kind != PathEntryKind::SingleFileRoot &&
+        entry.kind != PathEntryKind::CueSheet) {
+      continue;
+    }
+    ++indexable;
+    CAPTURE(entry.relativeUtf8);
+    CHECK(isLibraryRelevantPath(entry.path));
+  }
+  CHECK(indexable == 2U);
+}
+
 #if !defined(_WIN32)
 // 不可读目录根：stat 成功但 opendir 失败（skip_permission_denied 会静默吞掉 EACCES，必须用
 // 无选项预探测）。discoverScannerPaths 须把根条目降级为 PermissionDenied（size==1 守卫

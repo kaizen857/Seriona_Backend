@@ -2,7 +2,6 @@
 // 覆盖：校验失败（CommandRejected + 状态零变化）、校验通过（ConfigureOutput→
 // LoadTrack→Seek→[Play|Pause] 的顺序与 payload）、CUE 偏移、状态保留矩阵、
 // 无选中曲目时仅应用配置不重载。
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest.h>
 
 #include "control/control_state_reducer.h"

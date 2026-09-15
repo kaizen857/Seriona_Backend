@@ -69,7 +69,7 @@ private:
       std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::nanoseconds{value})};
 }
 
-[[nodiscard]] SongMetadata metadataFromCacheLocation(const cache::CachedLocation& cached) {
+[[nodiscard, maybe_unused]] SongMetadata metadataFromCacheLocation(const cache::CachedLocation& cached) {
   SongMetadata metadata{};
   metadata.trackId = cached.locationId;
   metadata.filePath = cached.filePath;
