@@ -42,7 +42,7 @@ seriona_app（静态库，仅 application_logging/runtime_paths/logging，当前
 | miniaudio 回调线程 | `seriona_audio` | 无锁读 PCM 环 + 增益/混音；EQ 激活时走 f32 中间域处理链（EQ→音量→限幅→量化）；频谱摘录零分配（实时约束，见 §11） |
 | 扫描线程（单） | `seriona_scanner` | 串行执行扫描请求（容量 16 的队列） |
 | 扫描 worker 池 | `seriona_scanner` | BS::thread_pool 并发读取元数据（TagReader 有信号量限流） |
-| watcher 线程 | `seriona_scanner` | efsw 文件系统事件经适配层映射为内部事件（跨平台后端；根自身移出/删除由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整事件入队 → 50ms 去抖归并 → 分类器精准增量更新（目录移入/移出、CUE/歌词/封面走精确或 scoped 对账；无法精准定位/事件丢失/周期探测走 Reconcile，永不回落全量重扫）；60s 周期对账兜底 |
+| watcher 线程 | `seriona_scanner` | efsw 文件系统事件经适配层映射为内部事件（跨平台后端；根自身移出/删除无后端事件时由 50ms 存活轮询兜底，内核事件队列溢出经 `e/sys/missed@<dir>` 消息上报，内部待处理队列满折叠为 per-root 脏标记——三条「事件不可靠」路径一律提交 Reconcile，永不回落全量重扫）→ 完整事件入队 → 50ms 去抖归并 → 分类器精准增量更新（目录移入/移出、CUE/歌词/封面走精确或 scoped 对账；无法精准定位/事件丢失/周期探测走 Reconcile，永不回落全量重扫）；60s 周期对账兜底 |
 | 控制事件循环（单） | `seriona_control` | 所有命令归约与后端事件处理（串行化点） |
 | 订阅投递线程（每订阅类型一个） | `seriona_control` | 快照拷贝后异步回调订阅者 |
 | 封面解析线程 | `seriona_control` | TagReader 封面提取（有界 latest-wins 队列） |
@@ -62,9 +62,8 @@ src/control/         媒体控制器、事件循环、状态归约器、播放�
                      设置存储（SQLite 文件夹排序/应用设置）
 src/app/             应用日志与运行时路径（亦编入 seriona_app）
 src/logging/         内部日志模块（无公共头，编入式复用）
-src/thumbnail/       缩略图服务（Qt/QImage，未接入任何构建目标，生产禁用）
 third_party/         vendored：doctest、miniaudio（efsw 经 FetchContent 固定 commit，非 vendored）
-tests/               doctest 测试（70+ 目标，见 §9）
+tests/               doctest 测试（声明与运行方式见 §9；注意其中若干目标/用例被整段注释禁用）
 tools/               SERIONA_BUILD_TOOLS=ON 才构建：scanner_cold_perf、miniaudio_platform_probe、
                      watch_root_move_audit
 docs/、*.md          项目演进记录文档，非事实来源
@@ -74,9 +73,9 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ### 4.1 seriona_audio（播放与波形）
 
-- `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：13 个异步控制方法 + 1 个同步 `queryPlaybackClock`（合计 14，勿与测试专用 `AudioPlayer` 的 13 个方法混淆）；所有操作入命令队列由单音频工作线程执行。
+- `AudioPlaybackService`（接口，`audio_contracts.h`）+ 唯一实现 `SingleTrackAudioPlaybackService`：接口共 13 个纯虚方法——12 个异步控制方法（`setEventSink`/`configureOutput`/`loadTrack`/`prepareNext`/`play`/`pause`/`resume`/`stop`/`seek`/`setVolume`/`setMuted`/`selectOutputDevice`）与 1 个同步只读查询 `queryPlaybackClock`；另有 8 个带默认实现的非纯虚扩展点（`configureTransition`、两参 `prepareNext` 重载、`abortTransition`、`enumeratePlaybackDevices`、`setEqualizer`、`equalizerState`、`setSpectrumEnabled`、`spectrumEnabled`）——扩展点一律非纯虚，是为了让 Noop/Fake 等实现者免于逐个覆写，把其中任何一个改成纯虚会同时打破两仓库编译。所有操作入命令队列由单音频工作线程执行。测试专用薄封装 `AudioPlayer`（声明于同一头、实现于 `src/audio/audio_player.cpp`，仅测试目标编译）以 14 个公开方法逐个转发其中的非扩展点方法，并额外提供 `setPlaybackService`；它不含那 8 个扩展点，因而不是 `AudioPlaybackService` 的完整面。
 - 播放状态机 `PlaybackStateMachine`：Idle → Loading → Ready → Playing ⇄ Paused，另有瞬时 Draining、Stopped、Error；每次迁移发 `PlaybackStateChanged`。seek 为 begin/cancel/complete 三阶段，带 generation 防过期完成。
-- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、增益、原子计数。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取）与 `isDefaultDevice`（miniaudio `isDefault` 透传），`deviceId` 为按 `context.backend` 编码的稳定文本 id（`miniaudio_device_id_encoding.h`，可持久化跨枚举复用；历史"枚举索引字符串"值在 `resolvePreferredDevice` 按纯数字兼容回退），`AudioOutputConfig.preferredDeviceId` 经 `resolvePreferredDevice` 精确匹配绑定对应设备，空串 = 系统默认，选错格式自动回退并通知。
+- `AudioOutputDevice` + 后端接口 `AudioOutputDeviceBackend`：生产后端为 `MiniaudioOutputDeviceBackend`（`MINIAUDIO_IMPLEMENTATION` 仅在该 TU 实例化）；回调经 `renderCallback` 只做无锁读队、补静音、双源包络增益/混音、按需的 EQ/限幅 f32 处理链、预分配缓冲的频谱摘录与原子计数——全部零分配/零锁/零日志（实时红线与理由见 §11）。输出格式协商（`AudioSampleFormat`，含 `Int24`）与设备枚举/选择：`enumeratePlaybackDevices` 上报设备能力（nativeDataFormats 提取）与 `isDefaultDevice`（miniaudio `isDefault` 透传），`deviceId` 为按 `context.backend` 编码的稳定文本 id（`miniaudio_device_id_encoding.h`，可持久化跨枚举复用；历史"枚举索引字符串"值在 `resolvePreferredDevice` 按纯数字兼容回退），`AudioOutputConfig.preferredDeviceId` 经 `resolvePreferredDevice` 精确匹配绑定对应设备，空串 = 系统默认，选错格式自动回退并通知。
 - `PcmBufferQueue`：无锁 SPSC 字节环 + generation 失效机制（seek 防竞态）；`PlaybackClock`：帧计数驱动（非墙钟）。
 - `AudioEventDispatcher`：锁内取 sink 副本、锁外回调；`BackendEvent` 信封带 monotonicVersion/timestamp；事件面含过渡域 `EndApproaching{remainingMs}`（终点预告）、`AdvanceCompleted{trackId}`（交接提交）与频谱显示域 `SpectrumUpdated{snapshot}`（R2：频谱快照周期外发）等载荷（追加于 `BackendEventType` 枚举末尾，见下）。
 - 播放过渡域（淡入淡出/交叉/预加载，整体自任务组 B1-B4 落地）：
@@ -97,18 +96,20 @@ docs/、*.md          项目演进记录文档，非事实来源
   - 频谱通道：实时回调内零分配摘录（预分配双缓冲 + 重建纪元防混率帧；链激活态摘录点 = EQ 后/音量前 f32、链关闭态 = 输出域最终，两态相对电平语义由域标注区分，激活态静音块补零帧）→ 音频 worker 播放中按 ~10ms 轮询节流取最新摘录块（512 帧；发布上界 ~40 Hz@44.1/48k，采样率越高随窗档递减——率依赖节奏契约见 spectrum_analyzer.h）→ av_tx FFT（Hann 周期窗，窗长按采样率分档 2048/4096/8192/16384，hop = 窗长/4 推进、每 hop 产出一份）→ 120 对数桶（20–20k），桶功率按范围重叠比例分摊（Σ可测桶 = Σ参与 FFT bin，能量守恒；窄桶由相邻 bin 共享）→ 驻留快照（采样率 <40k 按奈奎斯特截断、不可测桶与静音同置 −120 dB 地板；独立单调代数；默认关）。
   - 接线现状：控制命令链已贯通——意图经 setEqualizer 进入 worker 串行域（worker 侧目标存储 + 设备配置入口转发：配置存储恒执行、PENDING 目标层无条件发布——运行中（设备活跃回调）由回调块首受理并经 DSP 实时目标更新（applyTargets，零分配）投递，播放中调节实时生效；停态窗口即时真实应用、initialize/内容边界幂等重放，重建/交接不丢），生产经控制命令可激活 DSP。service 同步读回 equalizerState 直读设备生效面（generation = 设备单调代数——每次真实应用 +1，含停态应用与运行期回调受理，config/sampleRate = 生效真值；181 点增益曲线由控制层 reducer 先行产生并经订阅发布，读回面不编造、消费绘制以 reducer 快照曲线为准）。仍属后续接线：生效快照经 service 读回通道向控制层的重发布（控制器订阅现仍用 reducer 先行快照、sampleRate 未回填）。频谱驻留快照推送已接线（R2 频谱显示链路）：分析产出即经 `SpectrumUpdated` 事件外发（同事件通道、dispatcher 版本计数）→ 控制器直写驻留槽并推送频谱订阅（不落 reducer 状态面）；开关经 `SetSpectrumEnabled` 命令/意图直转服务原子位（纯门控、无 reducer 镜像）。
 - FFmpeg：`FfmpegAudioSource`（解复用+解码，含 MP3 尾部 ID3v1 净化与损坏尾部截断）、`FfmpegFilterPipeline`（libavfilter 图：abuffer→aformat→abuffersink，输入签名变化时惰性重建）；两者均 pimpl，公共头不暴露任何 AV 类型。
-- 波形生成：公共入口 `buildAudioWaveform`；按容器选择策略——MP4 族走 PacketBatches（单输入、250 包一批、克隆解码器）、其余走 SeekChunks（每 chunk 独立解码器 + 1 秒 preroll）；能量核运行时按 CPUID 选择 AVX2（仅 `waveform_simd_avx2.cpp` 编译期加 `-mavx2;-mfma`）/ 标量。波形生成当前仓库内无生产调用方（面向未来可视化消费）。
-- 测试专用：`AudioPlayer` 类（`src/audio/audio_player.cpp`）不在库内，仅测试目标直接编译。
+- 波形生成：公共入口 `buildAudioWaveform`；按容器选择策略——MP4 族（含 Matroska/WebM）走 PacketBatches（单输入、250 包一批、克隆解码器）、其余走 SeekChunks（每 chunk 独立解码器 + 1 秒 preroll）；能量核运行时按 CPUID 选择 AVX2（仅 `waveform_simd_avx2.cpp` 编译期加 `-mavx2;-mfma`）/ 标量。波形生成当前仓库内无生产调用方（面向未来可视化消费）。
+- 测试专用：`AudioPlayer`（类声明在 `audio_contracts.h`，实现于 `src/audio/audio_player.cpp`）的实现不进任何静态库，仅测试目标直接编译；生产播放走 `makeAudioPlaybackService`。
 
 ### 4.2 seriona_scanner（扫描与缓存）
 
-- `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, folderThumbnailSeam, watcherDebounce, reconcileInterval}`。接口另提供显式根移除 `removeRoot`（清空该根索引与缓存并停止监视）；根暂时性丢失（目录根）保留既有索引与缓存等待恢复，仅显式 `removeRoot` 清空；已索引的单文件根是例外——根自身经存在性复核确认 Destroyed 时按精准删除收敛（索引+缓存行），复核不通过（路径仍在/stat 出错）则保留索引并请求 Reconcile。
-- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 四阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 歌词协调；末段计时为空）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 按 root 合并进长期索引（缺失/不可用/不可读的 root 保留既有条目与缓存：根不可打开时按 `rootUnavailable` 上报，空枚举绝不当作磁盘真相合并）→ 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
+- `FileScannerService`（接口）+ `FileScanner` 门面 + 工厂 `makeFileScannerService([deps])`；依赖注入经 `FileScannerServiceDependencies{metadataReader, watcherFactory, databasePath, coverExportDir, folderThumbnailSeam, watcherDebounce, reconcileInterval}`。接口另提供显式根移除 `removeRoot`（清空该根索引与缓存、停止监视并重发快照；目标不是已知扫描根时返回 false、不清任何东西）；根暂时性丢失（目录根）保留既有索引与缓存等待恢复，仅显式 `removeRoot` 清空；已索引的单文件根是例外——根自身经存在性复核确认 Destroyed 时按精准删除收敛（索引+缓存行），复核不通过（路径仍在/stat 出错）则保留索引并请求 Reconcile。
+- 扫描主流程（`file_scanner_orchestrator.cpp`）：入队（容量 16）→ 单扫描线程 `runScan` → 逐 root `decideScanMode`（目录树哈希 vs 缓存比对，决定 Full/Incremental）→ `reconcileRoot` 五阶段（发现 → 增量计划/任务准备 → worker 并发元数据读取 → 收尾（含歌词协调）→ 缓存写回计时；第五段在函数内恒为 0ms——真正的缓存写回 `recordScanRootDecision` 在调用方于 `reconcileRoot` 返回后执行）→ 返回后由 `recordScanRootDecision` 做缓存写回（单事务，失败整体回滚）→ 按 root 合并进长期索引 → 聚合构建 `PlaylistTreeSnapshot` → `resolveFolderThumbnails`（扫描收尾：为非根 Directory 节点解析 node-level 缩略图）→ 发布事件。
+  - **「枚举不可用」绝不当作磁盘真相合并**（否则会抹掉既有索引与缓存）。守卫按不可用范围分三类，全部以「枚举结果恰为根条目本身且其 kind 为 Missing/PermissionDenied/Error」为判据：整根不可用 → 置 `rootUnavailable`，调用方保留该 root 既有条目与缓存、只上报 `ScanError`；scoped walk 的 scope 自身不可用 → 置 `aborted`，保留该子树既有索引并回落 Reconcile；Reconcile 在目录树哈希缺失或缓存不可读时同样置 `aborted` 中止本次对账（绝不把「空计划」当成「全部新增」而整根重读标签）。判据刻意写成「size==1 且 kind 属于不可用集合」而不是 `entries.empty()`/`front()`：枚举对缺失根也会返回根条目，用 `front()` 会把任一子项的遍历错误（ENOENT 竞态/ELOOP/EIO）误判为整根不可用，让整根扫描被静默跳过。
+  - 枚举不完整（枚举中出现 PermissionDenied/Error 条目）置 `enumerationIncomplete`：调用方仅在本次 prune 使 location 计数净下降（或计数探测失败）时才置脏，交由周期 Reconcile 重读恢复——避免持续存在的遍历错误让整根 Reconcile 每周期空转。
 - 事件顺序：ScanStarted →（每 root：ScanError/FileScanned）→ ProgressUpdated（worker 阶段按 `progressInterval`（默认 250ms）节流中途发布，结束后必发一次最终汇总；`filesScanned` 为"已完成节点数"（含内联 CUE 曲目/容器与失败任务），结束恒有 `filesScanned + filesSkipped == filesDiscovered`）→ PlaylistSnapshotUpdated → ScanCompleted；取消路径先发一条 code=Cancelled 的 ScanError 再发 ScanStopped。
 - 缓存：`SQLiteCache`，固定 v3 schema（`user_version=0` 初始化、非 0 非 3 抛 unsupported，无迁移桥）；5 张表 content/locations/lyrics/scan_roots/scan_errors + 8 个索引；WAL + `synchronous=NORMAL` + 64MB 页缓存；写事务 `BEGIN IMMEDIATE`、读写各持独立互斥锁（并发依赖 SQLite busy timeout 500ms）。**实际读写的是 `<databasePath>.scan-roots.sqlite` 独立文件**；传入的主库文件仅被打开初始化，扫描流程不读写。缓存另提供路径级精准写接口（按路径前缀删除、子树改名改写既有行、scoped 删除+写入单事务合并、歌词批量单事务对账、显式根删除），供事件驱动的精准增量更新使用，不读取元数据。
 - 身份哈希：`computeContentId`（duration/title/artist 链式 XXH64）与 `computeLocationId`（路径/大小/mtime，CUE 轨道追加 offset/index）——实现经 `hash_utils.cpp` 文本包含 `song_identity.cpp` 进入生产库。目录树哈希：XXH3_128bits 流式 Merkle（只含文件名/类型/子哈希，跳过 `.lrc`）；单文件根（常规文件）没有目录树可递归，改由规范化路径 + size + mtime 合成稳定身份哈希，同样参与 Full/Incremental/Reconcile 的模式判定与脏标记收敛，只有路径缺失/不可读才无哈希（非常规文件仍按 UnsupportedPath 处理）。身份判据不含 ctime/inode（Windows 无 inode 且裸 POSIX API 违反平台边界），因此"大小与 mtime 均未变"的原地编辑不会被 Reconcile 发现，需用户显式 `forceRescan` 兜底。
 - 并发配置：worker 数默认 `hardware_concurrency`，TagReader 并发默认同 worker 数；环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY` 覆盖，`SERIONA_SCANNER_DISABLE_CONCURRENCY=1` 强制串行。
-- 自动更新（事件驱动精准增量 + Reconcile 对账兜底）：efsw watcher（FetchContent 固定 commit 的跨平台库：Linux inotify / Windows / macOS FSEvents；适配层把 efsw 动作映射为内部 `WatchEvent`，同目录与跨目录 rename 统一为 Renamed 对，根自身移出/删除无后端事件时由存活轮询兜底，事件队列溢出经 missed 消息上报）→ 完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并去重 → 可精准定位时走路径级精准更新（树补丁 + SQLite 精准 API，不触发全根扫描）；目录移入走 scoped 子树对账（只枚举该子树并并入树/缓存，scope 内增量计划命中缓存时不重读标签，发布仅快照）；目录移出与 CUE 交叉（cue 删而源在 / 源删而 cue 在）走精确前缀删除 + 孤儿源重 upsert / cueRefresh scoped 重解析；`.lrc` 走 T0 歌词对账（按 sidecar 建条目索引，hash 每批一次、parse 仅在确有变化时执行一次，同一 `.lrc` 不重复读取）；封面走父目录 scoped 并强制重读该目录歌曲标签（封面增删不改音频 size/mtime，缓存直灌会让歌曲级 `artworkPath`/`thumbnailPath` 陈旧）；根级封面（父目录 == root）改用整根 force-reread scope，仍受 T1 成本门约束（超阈值回落 Reconcile）；非递归根没有可枚举子树，整根重读退化为普通扫描、直接 Reconcile——两条回落路径都不强制重读标签，歌曲级 `artworkPath`/`thumbnailPath` 在该场景不刷新（已记录的接受限制）。**watcher 事件路径（含无法分类兜底、watcher 消息、队列溢出、周期探测）绝不进入全量重扫**：这些场景提交内部 Reconcile（全根 stat 遍历 + locationId 比对 + 仅变化文件重读；哈希缺失/缓存不可读时中止并保留既有索引），并置 per-root 脏标记供周期探测无条件收敛（脏标记仅在 Reconcile/Full 成功收敛后清除，用户 Incremental 的哈希命中不清除；子项遍历/分类错误导致枚举不完整的根同样置脏，由周期 Reconcile 重读缓存缺失文件）；另有 60s 周期对账兜底。根自身移出/删除（目录根）保留既有索引等待恢复；已索引单文件根经复核确认的 Destroyed 按精准删除收敛，显式根清理走 `removeRoot`。
+- 自动更新（事件驱动精准增量 + Reconcile 对账兜底）：efsw watcher（FetchContent 固定 commit 的跨平台库：Linux inotify / Windows / macOS FSEvents；适配层把 efsw 动作映射为内部 `WatchEvent`，同目录与跨目录 rename 统一为 Renamed 对）。三条「事件不可靠」路径彼此独立，且都不回落全量重扫：efsw `handleMissedFileActions`（内核事件队列溢出）合成 `e/sys/missed@<dir>` 的 Watcher 通道消息 → 根调和；内部待处理事件队列（上限 1024）满时折叠为 fallback 标记 + per-root 脏标记 → Reconcile；被监视根自身被移走/删除时 efsw inotify 不投递 `IN_MOVE_SELF`/`IN_DELETE_SELF`，由 watcher 内 50ms 存活轮询兜底——根消失时合成一条根自身、无法分类的单次事件，分类器按根自身规则保留索引并回落 Reconcile。正常路径则是：完整 `WatchEvent` 入队 → 50ms 去抖归并 → 事件分类器按 rename 对 / create / modify / destroy / 自移动 × 文件 / 目录 归并去重 → 可精准定位时走路径级精准更新（树补丁 + SQLite 精准 API，不触发全根扫描）；目录移入走 scoped 子树对账（只枚举该子树并并入树/缓存，scope 内增量计划命中缓存时不重读标签，发布仅快照）；目录移出与 CUE 交叉（cue 删而源在 / 源删而 cue 在）走精确前缀删除 + 孤儿源重 upsert / cueRefresh scoped 重解析；`.lrc` 走 T0 歌词对账（按 sidecar 建条目索引，hash 每批一次、parse 仅在确有变化时执行一次，同一 `.lrc` 不重复读取）；封面走父目录 scoped 并强制重读该目录歌曲标签（封面增删不改音频 size/mtime，缓存直灌会让歌曲级 `artworkPath`/`thumbnailPath` 陈旧）；根级封面（父目录 == root）改用整根 force-reread scope，仍受 T1 成本门约束（超阈值回落 Reconcile）；非递归根没有可枚举子树，整根重读退化为普通扫描、直接 Reconcile——两条回落路径都不强制重读标签，歌曲级 `artworkPath`/`thumbnailPath` 在该场景不刷新（已记录的接受限制）。**watcher 事件路径（含无法分类兜底、watcher 消息、队列溢出、周期探测）绝不进入全量重扫**：这些场景提交内部 Reconcile（全根 stat 遍历 + locationId 比对 + 仅变化文件重读；哈希缺失/缓存不可读时中止并保留既有索引），并置 per-root 脏标记供周期探测无条件收敛（脏标记仅在 Reconcile/Full 成功收敛后清除，用户 Incremental 的哈希命中不清除；子项遍历/分类错误导致枚举不完整的根同样置脏，由周期 Reconcile 重读缓存缺失文件）；另有 60s 周期对账兜底。根自身移出/删除（目录根）保留既有索引等待恢复；已索引单文件根经复核确认的 Destroyed 按精准删除收敛，显式根清理走 `removeRoot`。
 - TagReader 适配：`TagReader::Read`/`ReadCueSheet`（全局命名空间外部库）；适配头直接包含 `<TagReader.hpp>` 并暴露其类型，属实现导向头。
 - 文件夹缩略图解析（scanner-internal `folder_thumbnail_resolver.{h,cpp}`，不进 `inc/seriona/` 稳定边界）：扫描收尾阶段为非根 Directory 节点解析 node-level 缩略图，回填 `PlaylistNode::thumbnailPath` 随快照下发（Track 节点该字段留空，歌曲缩略图走 `SongMetadata::thumbnailPath`）。case 1 经导出 seam（生产侧由 `exportFolderCoverThumbnail` 装配 `TagReader::ExportFolderCover`，ThumbnailOnly+Ignore，只查目录自身）导出封面；case 2 回退取后代歌曲中已解析缩略图的第一首（(filename, relativeDirectory) 字节序升序）；根目录恒空；确定性全序比较，seam 异常被吞掉，单文件夹失败不阻断扫描。watcher 局部批次只重解析 touched 子树 + 祖先链，未受影响目录回填上次解析结果（builder 每次重建，不回填会让文件夹封面在任意事件后消失）；缩略图缓存键含物理根（长度前缀编码），不存在跨根回填/擦除；rel 前缀命中多根（多根同 rel 合并为同一节点）时，代表值确定性地取自第一个物理根，各候选根的缓存行全部保留。
 - 测试专用：`scan_scheduler.{h,cpp}`（通用任务调度器）不编译进任何库，仅测试目标直接编译。
@@ -116,7 +117,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 ### 4.3 seriona_metadata（平台媒体集成）
 
 - `MetadataSharingService`（接口，`metadata_contracts.h`）+ `MetadataSharingServiceImpl`：`update()` 投递到内部 worker 线程异步转发给后端。
-- 后端抽象 `MetadataServiceBackend`，按 `MetadataBackendKind`（Noop/Linux/Windows）选择；Linux 下经 sdbus-c++ 在 session bus 发布 `org.mpris.MediaPlayer2.seriona`（Root + Player 两接口 vtable、PropertiesChanged 信号；仅位置变化的更新不发信号）。
+- 后端抽象 `MetadataServiceBackend`，按 `MetadataBackendKind`（Noop/Linux/Windows）选择；生产工厂仅在非 Apple 的 Linux 下选择 Linux 后端，其余平台回落 Noop。Linux 下经 sdbus-c++ 在 session bus 发布 `org.mpris.MediaPlayer2.seriona`（Root + Player 两接口 vtable、PropertiesChanged 信号；仅位置变化的更新不发信号）；常规名被占用时按 MPRIS 2.2 多实例约定回退 `org.mpris.MediaPlayer2.seriona.instance<pid>`，两者皆不可得或其它 DBus 错误时启动返回失败结果 `metadata.backend.mpris_unavailable`——MPRIS 是可选控制面，`MediaController` 对 metadata 启动异常另有兜底 try/catch，注册失败只告警、不使控制器不可用。
 - MPRIS 内部以 `IMprisBus`/`IMprisObject` 抽象隔离 sdbus（测试可注入假总线）；命令（Play/Pause/Seek/SetPosition 等）经 `registerCommandCallback` 回传控制层，带能力门禁。
 - Windows 后端为占位（接受但不发布）；`platformExtension` 为不透明 `shared_ptr<void>`。
 - 未接线：`MetadataSynchronizer`（同步计划器）编译进库但生产管线未使用；`metadataServiceSynchronize`/`metadataServiceDefaultResult`/`metadataMprisSmokeResult` 无调用点。
@@ -147,7 +148,8 @@ docs/、*.md          项目演进记录文档，非事实来源
 - 扫描数据流：`FileScannerService` 事件（含 `PlaylistTreeSnapshot`）→ control 归约更新曲库 → 播放上下文重建（当前曲消失自动续播）。
 - 头级循环依赖：`metadata_contracts.h` 包含 `control_contracts.h`，control 侧前置声明 `MetadataSharingService` 打破环。
 - 跨模块内部头耦合：`media_controller_module.cpp` 包含 scanner 私有头 `file_scanner_service_internal.h`（使用 `FileScannerServiceDependencies`）。
-- 公共契约边界：audio 看 `audio_contracts.h`，scanner 看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，control 看 `control_contracts.h`/`media_controller.h`；新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus、Windows 类型。
+- 公共契约边界：`inc/seriona/` 是稳定契约边界——audio 看 `audio_contracts.h`，scanner 看 `scanner_contracts.h`/`file_scanner_service.h`，metadata 看 `metadata_contracts.h`，control 看 `control_contracts.h`/`media_controller.h`；其中的 TagReader 适配头、SQLite cache 头、watcher 适配头等实现导向头不属稳定边界。新增稳定契约不得暴露 TagReader、SQLite、watcher、FFmpeg、MPRIS/sdbus、Windows 类型。
+- 公共契约错误风格（同属边界约定）：失败一律用 typed enum（`MediaControllerErrorCode`/`ScannerErrorCode`/`PlaybackErrorCode` 等）+ result struct（`MediaControllerCommandResult`/`ScannerTaskResult` 等）表达；异常（`std::runtime_error`/`std::invalid_argument`）只允许从实现抛出，公共头不声明 `throw`、也不使用 `std::expected`。理由是调用方（含跨模块与非 C++ 前端）需要靠返回值而非异常判断失败，且稳定契约不引入实验性标准类型。
 
 ## 6. 启动流程
 
@@ -155,7 +157,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 main(argc=2, 路径存在)                       main.cpp
   └─ runTerminalController(musicPath)        terminal_controller.cpp
       ├─ TerminalMode 检查（非 tty 退出）
-      ├─ resolveRuntimePaths → ensureDirectoriesExist     SerionaData/（便携）或 XDG 目录（安装模式）
+      ├─ resolveRuntimePaths → ensureDirectoriesExist     SerionaData/（便携）或安装模式目录（XDG / macOS ~/Library）
       ├─ (Release) av_log_set_level(AV_LOG_QUIET)
       ├─ prepareLogFile(logs/) → 生成时间戳日志名 → logging::initialize(console=off, file, level)
       ├─ makeProductionMediaController({}, library.sqlite, artwork)
@@ -169,7 +171,7 @@ main(argc=2, 路径存在)                       main.cpp
 
 运行时路径规则（`runtime_paths.cpp`）分两种构建模式（编译期宏 `SERIONA_INSTALLED_MODE` 选择，默认便携）：
 - 便携模式：可执行文件目录（Linux 经 `/proc/self/exe`）下的 `SerionaData/` 为 data root。
-- 安装模式（Linux 安装版，`cmake -DSERIONA_INSTALLED_MODE=ON`）：遵循 XDG Base Directory，应用 ID 为 `org.kaizen857.Seriona`——数据 `$XDG_DATA_HOME/org.kaizen857.Seriona`、日志 `$XDG_STATE_HOME/org.kaizen857.Seriona/logs`、封面缓存 `$XDG_CACHE_HOME/org.kaizen857.Seriona/artwork`；`XDG_*` 未设置时回退 `$HOME` 默认值，相对路径忽略（规范要求）。
+- 安装模式（`cmake -DSERIONA_INSTALLED_MODE=ON`；该宏仅施加于 `seriona_app` 与 `seriona` 可执行文件，测试目标不携带）：按平台解析，应用 ID 为 `org.kaizen857.Seriona`。Linux/其它 Unix 走 XDG Base Directory——数据 `$XDG_DATA_HOME/org.kaizen857.Seriona`、日志 `$XDG_STATE_HOME/org.kaizen857.Seriona/logs`、封面缓存 `$XDG_CACHE_HOME/org.kaizen857.Seriona/artwork`；`XDG_*` 未设置时回退 `$HOME` 默认值，相对路径忽略（规范要求）。macOS 不用 XDG，走 `~/Library/Application Support`、`~/Library/Logs`、`~/Library/Caches` 下的 `org.kaizen857.Seriona`；`.app` bundle 内绝不可写（会破坏代码签名封印并被 Gatekeeper 拒绝）。
 - 两种模式下布局一致：日志实际文件为 `logs/seriona-<时间戳>.log`（`RuntimePaths.logFile` 中的 `seriona.log` 仅为逻辑位），数据库 `library.sqlite`，封面目录 `artwork`；`resolvePortableRuntimePaths`/`resolveInstalledRuntimePaths` 均无条件编译，`resolveRuntimePaths` 依宏选择，测试直接以环境变量注入覆盖 installed 分支。
 
 ## 7. 核心运行流程
@@ -200,7 +202,7 @@ main(argc=2, 路径存在)                       main.cpp
 
 ## 8. 配置方式
 
-- 构建期（CMake 选项）：`SERIONA_BUILD_APP`（默认 ON）、`SERIONA_BUILD_TESTS`（默认 ON）、`SERIONA_BUILD_TOOLS`（默认 OFF）、`SERIONA_TAGREADER_SOURCE_DIR`（TagReader 源码路径）；三个 `SERIONA_*_SIMULATE_MISSING_*` 选项会故意令配置失败（依赖门禁演示）。
+- 构建期（CMake 选项）：`SERIONA_BUILD_APP`（默认 ON）、`SERIONA_BUILD_TESTS`（默认 ON）、`SERIONA_BUILD_TOOLS`（默认 OFF）、`SERIONA_INSTALLED_MODE`（默认 OFF，运行时路径模式见 §6）、`SERIONA_INSTALL_EXPORT`（默认 OFF；独立构建时安装导出 5 库 + 头库与 `efsw-static` 并生成 `SerionaBackendConfig`，供外部 `find_package(SerionaBackend)` 复用）、`SERIONA_TAGREADER_SOURCE_DIR`（TagReader 源码路径）；三个 `SERIONA_*_SIMULATE_MISSING_*` 选项会故意令配置失败（依赖门禁演示）。
 - 运行时：**无配置文件**。路径全部由可执行文件位置推导（§6）；scanner 并发由环境变量 `SERIONA_SCANNER_WORKERS`、`SERIONA_SCANNER_TAGREADER_CONCURRENCY`、`SERIONA_SCANNER_DISABLE_CONCURRENCY` 调节（非法值警告并忽略）。
 - 命令行：单参数（音乐根目录或文件），必须存在。
 - 日志级别：Release 构建 logger 级别 info、Debug 构建 trace；控制台 sink 在终端 UI 下恒关闭。运行时可经 `setLogLevel`（`inc/seriona/app/application_logging.h`）调整（前端设置窗口接线）。
@@ -210,10 +212,10 @@ main(argc=2, 路径存在)                       main.cpp
 - 构建：`cmake -S . -B build -DSERIONA_BUILD_TESTS=ON && cmake --build build -j<N>`；运行 `build/seriona <音乐根目录或文件>`。
 - 发现/运行：`ctest --test-dir build -N`；`ctest --test-dir build --output-on-failure`；聚焦 `ctest --test-dir build -R '<regex>' --output-on-failure`（常用：`seriona\.audio`、`seriona\.scanner`、`seriona\.metadata`、`seriona\.control`、`seriona\.logging`、`seriona\.runtime_paths`、`seriona\.application_logging`）。
 - doctest 二进制必须恰有一个 main：多数目标由 CMake 注入 `DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN`（含 `seriona_tests`，其 tests/main.cpp 不定义 main）；真正自带 main、未注入宏的是 `seriona_audio_fixture_tests`、`seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test`。注意 `seriona_scanner_cache_schema_tests` 链接裸 `sqlite3`。
-- 特殊注册：cancellation 状态机测试单独注册为 `seriona.playback_state_machine_cancellation`（普通状态机测试排除它）；`seriona.audio.waveform.perf` 超时 900s；`seriona.control_artwork_resolver` 超时 300s；`seriona.scanner.efsw_integration` 超时 300s。
+- 特殊注册：cancellation 状态机测试单独注册为 `seriona.playback_state_machine_cancellation`（普通状态机测试排除它）；`seriona.audio.waveform.perf` 超时 3600s；`seriona.control_artwork_resolver` 超时 300s；`seriona.scanner.efsw_integration` 超时 900s。
 - 禁用目标：`seriona_scanner_cache_tests`、`seriona_scanner_cache_content_tests`、v2→v3 migration、backup rollback、phase1 integration 在 `tests/CMakeLists.txt` 中整段注释，不要假设可运行。
 - 性能目标：`seriona_scanner_perf_test`、`seriona_scanner_detailed_perf_test` 只构建不注册 CTest，直接运行 `build/tests/<目标>`；`tools/scanner_cold_perf`（-DSERIONA_BUILD_TOOLS=ON）为独立冷扫描基准。
-- 测试隔离：音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture；扫描测试使用 `scanner_test_harness` 与测试接缝（`file_scanner_orchestrator_test_access.h` 的全局观察者，仅测试包含）。
+- 测试隔离红线：音频测试使用 fake `AudioOutputDeviceBackend` 或测试现场生成的短音频 fixture，不得依赖真实音频硬件、版权媒体或仓库内媒体样本——三端、无音频设备的容器与开发者本机都要给出同一结果，且不引入版权素材；扫描测试使用 `scanner_test_harness` 与测试接缝（`file_scanner_orchestrator_test_access.h` 的全局观察者，仅测试包含）。
 
 ## 10. 扩展方式
 
@@ -226,16 +228,31 @@ main(argc=2, 路径存在)                       main.cpp
 - 对外消费：订阅 `PlayerStateSnapshot`/`LibraryStateSnapshot`/`EqualizerStateSnapshot`（生效配置 + 181 点增益曲线 + 单调代数）/`SpectrumSnapshot`（频谱：订阅即收当前驻留快照，随后经 `SpectrumUpdated` 事件增量推送 120 段电平）/领域通知即可构建新前端；`AudioPlaybackService` 与 `FileScannerService` 也可独立使用。
 - 前端集成：终端控制器是 `TerminalActionReader` 抽象之上的唯一实现，新 UI 可替换入口层而保持 control 不变。
 
-## 11. 开发建议
+## 11. 架构红线与开发约束
 
-- 实时路径红线：`AudioOutputDevice::renderCallback()` 内禁止 FFmpeg、事件回调、日志、动态分配、阻塞锁、设备生命周期操作。
-- schema 红线：`SQLiteCache` schema 固定 v3，`user_version=0` 直接初始化、非 0 非 3 报错；不存在迁移桥，改 schema 必须同步 `sqlite_cache_connection.cpp` 内嵌 SQL 与 `cache/schema.sql`（一致性仅靠测试校验）。
-- 编译归属陷阱：`audio_player.cpp`、`scan_scheduler.cpp` 只被测试目标编译；`song_identity.cpp` 经 `hash_utils.cpp` 文本包含进库——生产代码不要依赖这些文件的独立编译单元身份。AVX2/FMA 参数只允许施加于 `waveform_simd_avx2.cpp`（根 CMake 仅对该文件施加 `-mavx2;-mfma`，无专门守卫；FATAL_ERROR 守卫只针对 `BS::thread_pool` 链接）。
-- 未接线代码（勿假设生效）：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `ProgressThrottle` 类（orchestrator 自持轻量时间节流，未用此类）、`platformExtension`（Windows）。设备选择已接线（§4.1：`preferredDeviceId` 解析绑定，非纯标签）。
-- 新稳定契约不得暴露第三方类型（TagReader/SQLite/watcher/FFmpeg/MPRIS/sdbus/Windows）。
-- 文档优先级：本文件低于 CMake 配置、源码与测试注册；README 仅有标题，`docs/` 为演进记录。
+以下都是「一旦破坏就会造成不可逆后果或跨平台/跨仓库回归」的约束；只读本文件的开发者不应在不知情下改动它们。
 
-## 12. 维护建议
+- **实时路径红线**：miniaudio 的最终回调落在 `AudioOutputDevice::renderCallback()`，该路径只允许做四件事——读 PCM 队列、补静音、在预分配缓冲上做增益/混音与按需的 EQ/限幅处理（含把摘录写入预分配的频谱缓冲）、更新原子计数；`renderCallback()` 内禁止 FFmpeg、禁止触发事件回调、禁止日志、禁止动态分配、禁止阻塞锁、禁止设备生命周期操作。理由是实时回调错过 deadline 会直接变成爆音或掉帧，而分配、加锁与日志都是不可预测的延迟来源。EQ/限幅/频谱之所以能进入该路径，正因为它遵守同一约束：状态预分配、新目标经原子层在块首受理、`process` 内零分配/零锁/零日志（链路细节见 §4.1）。
+- **schema 红线**：`SQLiteCache` schema 固定 v3，`user_version=0` 直接初始化 v3，任何非 0 且非 3 的版本一律按 unsupported 报错，**不存在 v2→v3 迁移桥**。因此改 schema 不等于改一个版本号：必须同步 `sqlite_cache_connection.cpp` 内嵌 SQL 与 `cache/schema.sql`（两者一致性仅靠测试校验），并显式决定既有库的处置方式——当前实现的选择就是拒绝非 3 版本，所以没有任何就地升级路径。事件驱动增量所依赖的路径级精确写接口（`deleteLocationsByPathPrefix`/`replaceLocationsBySubtree`/`replaceLocationsByPathPrefixWithSongs`/`applyLyricsCacheUpdates`/`deleteScanRoot`，`inc/seriona/scanner/cache/sqlite_cache.h`）与 60s 周期对账兜底（`reconcileInterval` 默认 60000ms）同属缓存层契约，不得绕过它们直写表。
+- **`seriona_audio` 链接红线**：`seriona_audio` 必须 **PRIVATE** 链接 `BS::thread_pool`，根 CMake 对此有 FATAL_ERROR 守卫；AVX2/FMA 编译参数只允许施加于 `src/audio/waveform_simd_avx2.cpp`（唯一需要 AVX2 内联的 TU），不得扩展到其它源文件。理由是 thread_pool 属波形生成器的私有实现依赖，漏成 PUBLIC 会把实现依赖写进公共契约与导出面；AVX2 参数外溢则让产物不再能跨机器分发（全仓基线是 `-march=x86-64`）。
+- **编译归属陷阱**：`audio_player.cpp`、`scan_scheduler.cpp` 只被测试目标编译；`song_identity.cpp` 经 `hash_utils.cpp` 文本包含进库——生产代码不要依赖这些文件的独立编译单元身份。
+- **纯 C++23 生产边界**：生产代码与公共头不得引入 Qt/QML/UI 类型，平台媒体集成只留在 `src/metadata/` 的平台私有实现内。理由是本库以静态库被三平台前端嵌入，UI 类型进入生产代码或公共契约会同时污染契约面与链接面（平台边界见 §12）。
+- **契约暴露红线**：新增稳定契约不得暴露第三方类型（TagReader/SQLite/watcher/FFmpeg/MPRIS/sdbus/Windows），错误风格遵循 §5 的 typed enum + result struct 约定。
+- **路径文本红线（往返不变式）**：所有进入路径文本通道的值（DB 键/值、trackId、日志、哈希输入、FFmpeg 路径参数）必须经 `src/scanner/path_utf8.h` 的 `pathToUtf8`/`pathFromUtf8` 往返，audio 侧同规则走 `src/audio/path_text.h`；禁止直接把 `std::filesystem::path::string()`/`generic_string()` 送进这些通道。理由是 Windows 上这两个调用按 ANSI 代码页转换，非 ASCII 路径会抛异常或乱码，而曲库路径普遍含中日文；POSIX 上两者字节一致，因此该规则不改变 Linux 行为——这也正是它容易被「本地没坏」掩盖的原因。
+- **未接线代码（勿假设生效）**：`MetadataSynchronizer`、`buildScalarWaveformBars`、scanner `ProgressThrottle` 类（orchestrator 自持轻量时间节流，未用此类）、`platformExtension`（Windows）。设备选择已接线（§4.1：`preferredDeviceId` 解析绑定，非纯标签）。
+- 文档优先级：本文件低于 CMake 配置、源码与测试注册；README 是面向用户的公开文档（非事实来源），`docs/` 为演进记录。
+
+## 12. 跨平台兼容性
+
+Windows / Linux / macOS 三端同时可配置、可构建、可通过测试是硬约束而非发布前适配项：本库以静态库被三平台前端嵌入，任一端不可构建即等于三端不可交付。
+
+- 平台差异只允许出现在三个既有平台边界内，并由根 CMake 的平台条件选择源文件：`src/audio/device/`（设备层；平台条件只选择设备格式枚举器源——非 Apple 的 Unix 用 PipeWire SPA、Windows 用 WASAPI 矩阵探测，其余平台由工厂返回空枚举器，而实际输出后端 miniaudio 是三端共用的源文件）、`src/metadata/`（平台私有实现，如 `metadata_mpris_linux.cpp`、`metadata_windows_private.cpp`）、以及 `runtime_paths.h` 的三路运行时路径解析（XDG / macOS `~/Library` / 便携模式，见 §6）。新增平台行为必须并入这些文件，或建立同等级抽象。
+- 公共头（`inc/seriona/`）与共享实现中禁止散落裸 `#ifdef _WIN32`、POSIX-only（`unistd`/`dirent`/`::realpath` 等）或 Windows-only 调用。sdbus-c++ 的依赖判定条件是 `UNIX AND NOT APPLE`，不得改写成「Linux」——两者对 macOS/BSD 的结论不同。
+- 文件监视不设平台私有源：Linux inotify / Windows ReadDirectoryChangesW / macOS FSEvents 一律由 efsw 单一文件系统后端提供（macOS 所需 CoreFoundation/CoreServices 由上游自带），不新增 watcher 平台私有实现，也不打 vendored 平台补丁。
+- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；无法同时覆盖的能力须经 CMake 条件关闭或 mock-only 降级，不得阻塞其它平台。已记录的例外是 FetchContent 供给的 `bshoshany/thread-pool` 与 efsw（Homebrew 无对应公式、外部 `find_package` 三端不可行），两者随 `SERIONA_INSTALL_EXPORT` 一并打包进导出。
+- 改动涉及平台行为而本机无法验证另一端时，必须在提交信息中说明受影响面与验证方式。
+
+## 13. 维护建议
 
 - 启动日志：`SerionaData/logs/seriona-<时间戳>.log`（5MB×3 滚动，总量超 50MB 自动清理最旧）。
 - 缓存重置：删除 `SerionaData/` 下 `*.scan-roots.sqlite`（与 `library.sqlite`）即可强制下次全量扫描并重建状态。
