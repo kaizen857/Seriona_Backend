@@ -1853,7 +1853,8 @@ private:
     preloadSlot_.reset();
     // T10：无缝直切同为接管提交——AdvanceCompleted 最先发出（先于新曲 TrackChanged/
     // 状态事件；控制器据此校验 pendingAdvance 账本并提交，窗口内无 pending 时丢弃）。
-    dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
+    dispatcher_.dispatch(BackendEventType::AdvanceCompleted,
+                         AdvanceCompleted{slot.request.trackId, slot.request.filePath});
     source_ = std::move(slot.source);
     pipeline_ = std::move(slot.pipeline);
     currentRequest_ = slot.request;
@@ -2175,7 +2176,8 @@ private:
           (slot.queue->counters().consumedFrames * 1000ULL) / rate};
     }
     if (emitAdvanceCompleted) {
-      dispatcher_.dispatch(BackendEventType::AdvanceCompleted, AdvanceCompleted{slot.request.trackId});
+      dispatcher_.dispatch(BackendEventType::AdvanceCompleted,
+                           AdvanceCompleted{slot.request.trackId, slot.request.filePath});
     }
     device_.deactivateSecondSource();
     device_.resetSourceEnvelope(0);

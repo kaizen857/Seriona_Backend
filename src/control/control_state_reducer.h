@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <map>
 #include <optional>
 #include <random>
 #include <vector>
@@ -106,6 +108,17 @@ public:
   ControlReduction reduceScannerEvent(const scanner::ScannerEvent& event);
   ControlReduction reduceArtworkResolved(const ArtworkResolveResultView& result);
 
+  // 文件夹排序规则变更事件（MediaController 在持久化成功后投递的纯数据事件，不做 I/O。
+  // 排序命令本身由 service 层落库，reducer 只负责"让播放顺序跟随排序"这一策略）：
+  // 与当前播放上下文的 (rootPath, folderNodeId) 匹配时更新 descriptor.sortRules 并重建
+  // order + 按身份重锚，使"下一首"立即跟随新排序；不匹配则零影响。
+  ControlReduction applyContextSortRules(std::filesystem::path rootPath,
+                                         std::string folderNodeId,
+                                         std::vector<FolderSortRule> rules);
+  // 启动时批量注入已持久化的规则（这些规则由先前的 ApplyFolderSortRules 落库，本次进程
+  // 尚无对应命令）：填充 activeSortRules_ 并对当前树应用一次，使重启后仍按用户设置的顺序播放。
+  ControlReduction injectSavedContextSortRules(std::vector<FolderSortSetting> settings);
+
 private:
   struct PlayableTrack {
     TrackIdentity identity{};
@@ -135,12 +148,20 @@ private:
     RepeatMode repeatMode{RepeatMode::Off};
     bool shuffle{false};
     std::uint64_t transitionConfigVersion{0};
+    // 账本目标来自临时队列队首：AdvanceCompleted 提交时需消费该条目（追加末尾，
+    // 不扰动既有指定初始化的字段顺序）。
+    bool fromTempQueue{false};
   };
 
   [[nodiscard]] std::vector<PlayableTrack> playableTracks() const;
   [[nodiscard]] std::optional<PlayableTrack> firstPlayableTrack() const;
   [[nodiscard]] std::optional<PlayableTrack> findPlayableTrack(const TrackIdentity& identity) const;
   [[nodiscard]] std::optional<PlaybackContextDescriptor> defaultContextDescriptorForTrack(const TrackIdentity& identity) const;
+  // 生效中的文件夹排序规则（key = rootPath + '\n' + folderNodeId）：由
+  // StartPlaybackFromContext（命令携带规则）与 applyContextSortRules（排序变更）写入；
+  // 兜底上下文构建据此携带规则，避免 Play/TogglePlayPause/SelectTrack 退化为 DFS 树序。
+  [[nodiscard]] static std::string sortRulesKey(const std::filesystem::path& rootPath,
+                                                const std::string& folderNodeId);
   [[nodiscard]] std::optional<PlaybackContextState> buildPlaybackContextState(PlaybackContextDescriptor descriptor,
                                                                               PlaybackContextBuildStatus* status = nullptr) const;
   [[nodiscard]] std::optional<std::size_t> selectedContextIndex() const;
@@ -151,6 +172,9 @@ private:
                                                           bool reshuffleWhenExhausted = false);
   [[nodiscard]] std::optional<PlayableTrack> previousTrack();
   [[nodiscard]] std::optional<PlayableTrack> findPlayableTrackByTrackId(const std::string& trackId) const;
+  // INV-COMMIT 采纳路径：按 trackId 解析接管曲目（先查播放上下文 order 以保留完整
+  // display/artwork/request，再回落曲库）。曲目已不在曲库时返回 nullopt，调用方停止播放。
+  [[nodiscard]] std::optional<PlayableTrack> resolveTrackForAdoption(const std::string& trackId) const;
   // 消费临时队列队首（跳过不可解析条目）；队列为空返回 nullopt。不改播放上下文 index。
   [[nodiscard]] std::optional<PlayableTrack> consumeQueueFront();
   // 将临时队列同步进 PlayerStateSnapshot::queueEntries（跨端契约）。
@@ -167,6 +191,16 @@ private:
   void markPlayerChanged(ControlReduction& reduction, std::chrono::steady_clock::time_point sampledAt = {});
   void addNotification(ControlReduction& reduction, ControlDomainNotification notification);
   void reconcilePlaybackContextAfterSnapshot(ControlReduction& reduction);
+  // 播放上下文 order 的唯一重建入口：按身份重锚当前曲（身份消失时不按旧位置取值）、
+  // 递增 orderGeneration_、并调用 onSuccessorRelationChanged。
+  void rebuildOrder(ControlReduction& reduction);
+  // 决策⑦：排序施加在控制层持有的树副本（library_.libraryTree）上，使前端（消费该快照渲染）
+  // 与播放（对该树做前序 DFS）读到同一顺序，「可见序 == 播放序」由构造保证。
+  // 仅对 activeSortRules_ 中有规则的文件夹排序其 childNodeIds，其余保持树序（决策⑥）。
+  void applyTreeSortOrder(ControlReduction& reduction);
+  // 后继关系可能已改变：已武装的预解码目标若不再是"当前后继"，撤账本 + AbortTransition，
+  // 避免"音频预解码 X、账本却是 Y"的分叉。
+  void onSuccessorRelationChanged(ControlReduction& reduction);
   void selectFirstTrackWhenIdle(ControlReduction& reduction);
   void selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback);
   void stopPlayback(ControlReduction& reduction);
@@ -239,6 +273,9 @@ private:
   bool carryAbortTransitionOnReject_{false};
   // T10 版本 token 成员：临时队列/过渡配置/输出模式的变更版本（token 快照来源）。
   std::uint64_t queueVersion_{0};
+  // 播放上下文 order 的世代：每次 rebuildOrder 递增（仅用于诊断与"顺序已变"的判定）。
+  std::uint64_t orderGeneration_{0};
+  std::map<std::string, std::vector<FolderSortRule>> activeSortRules_{};
   std::uint64_t transitionConfigVersion_{0};
   audio::AudioOutputMode outputMode_{audio::AudioOutputMode::Mixed};
   std::uint64_t lastAudioPlayerVersion_{0};

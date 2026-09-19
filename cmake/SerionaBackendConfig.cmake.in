@@ -16,6 +16,9 @@ pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
 pkg_check_modules(SERIONA_XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 find_dependency(SQLite3)
 find_dependency(spdlog)
+# ICU 由 seriona_control 以 $<LINK_ONLY:…> 形式进入导出接口（静态库不裁剪 LINK_ONLY），
+# 消费方必须能解析 ICU::uc / ICU::i18n，否则 find_package(SerionaBackend) 失败。
+find_dependency(ICU COMPONENTS uc i18n)
 # 按计划保留 find_dependency(Threads)：为潜在 -pthread 平台/消费方兜底；上游 Threads 只链到
 # efsw 目标（本仓未链接/未导出，efsw-static 的导出接口为空；CMake 不会裁剪 $<LINK_ONLY:…>）。
 # Apple 平台的 CoreFoundation/CoreServices 以 "-framework" 链接选项形式随导出接口传递，无需 find_dependency。

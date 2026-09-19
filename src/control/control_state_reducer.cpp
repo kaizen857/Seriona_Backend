@@ -1,6 +1,7 @@
 #include "control_state_reducer.h"
 
 #include "seriona/audio/equalizer_tables.h"
+#include "tree_sort.h"
 
 #include "spdlog/spdlog.h"
 
@@ -103,10 +104,6 @@ constexpr std::size_t kRecentNotificationLimit = 32;
     return "SeekFailed";
   }
   return "Unknown";
-}
-
-[[nodiscard]] bool sameTrack(const TrackIdentity& lhs, const TrackIdentity& rhs) {
-  return lhs.trackId == rhs.trackId;
 }
 
 [[nodiscard]] TrackIdentity identityFromSong(const scanner::SongMetadata& song) {
@@ -432,7 +429,7 @@ std::optional<TrackIdentity> ShuffleHistory::pop() {
 
 bool ShuffleHistory::contains(const TrackIdentity& track) const {
   return std::find_if(history_.begin(), history_.end(), [&](const TrackIdentity& item) {
-    return sameTrack(item, track);
+    return tracksMatch(item, track);
   }) != history_.end();
 }
 
@@ -722,6 +719,14 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     if (!command.playbackContext.has_value()) {
       return reject(MediaControllerErrorCode::InvalidCommand, "StartPlaybackFromContext requires a playback context");
     }
+    // 记录本次生效的排序规则：后续兜底上下文构建（Play/SelectTrack）与排序变更事件据此对齐。
+    if (!command.playbackContext->sortRules.empty()) {
+      activeSortRules_[sortRulesKey(command.playbackContext->rootPath, command.playbackContext->folderNodeId)] =
+          command.playbackContext->sortRules;
+    }
+    // 上下文命令携带规则时同样要排树：builder 已不再自行排序（决策⑦），上下文 order 直接来自
+    // 树序，故必须先排树再构建上下文，否则显式规则的起播会退回树序。
+    applyTreeSortOrder(reduction);
     PlaybackContextBuildStatus status{PlaybackContextBuildStatus::InvalidDescriptor};
     auto context = buildPlaybackContextState(*command.playbackContext, &status);
     if (!context.has_value()) {
@@ -969,7 +974,7 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           player_.timeline.position = trackPosition;
           markPlayerChanged(reduction, payload.after.sampledAt);
 	          } else if constexpr (std::is_same_v<Payload, audio::PlaybackEnded>) {
-	            if (selectedTrack_.has_value() && !sameTrack(identityFromRequest(payload.request), *selectedTrack_)) {
+	            if (selectedTrack_.has_value() && !tracksMatch(identityFromRequest(payload.request), *selectedTrack_)) {
 	              spdlog::debug("ignoring stale playback-ended event for track '{}'", payload.request.trackId);
 	              return;
 	            }
@@ -990,24 +995,33 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
 	            // 行为逐事件一致（本分支语义与抽取前等价——回归锁定）。
 	            commitAdvance(reduction, AdvanceEventSource::PlaybackEnded, payload.finalClock.sampledAt);
 	          } else if constexpr (std::is_same_v<Payload, audio::AdvanceCompleted>) {
-	            // T10：接管提交（Metis 缺口 1b）。服务在重叠交叉/无缝直切 handoff 完成时发本
-	            // 事件（先于新曲 TrackChanged/状态事件）。校验 pendingAdvance 账本：无账本 =
-	            // 陈旧/双提交 → 丢弃（双提交防重）；版本 token 或 trackId 失配 = 服务接管了
-	            // 未经批准的推进 → abort（撤账本 + 服务侧撤第二源）并按控制器当前决策重发
-	            // 普通 LoadTrack（音频层绝不自主选曲，提交语义永远由控制器裁决）。
+	            // T10：接管提交（Metis 缺口 1b）。服务在重叠交叉/无缝直切 handoff 完成时发本事件
+	            // （先于新曲 TrackChanged/状态事件）。校验 pendingAdvance 账本：
+	            //  - 无账本 = 陈旧事件、双提交、或已被显式切轨否决的旧世代接管 → 丢弃（E 加固后
+	            //    真实接管必伴随账本：显式切轨经 abortPendingAdvance 撤离服务侧预解码槽）。
+	            //  - 账本失配 = 服务接管了未经批准的目标 → abort（撤第二源 + 重新武装）并按控制器
+	            //    当前决策重发普通 LoadTrack（音频层绝不自主选曲，提交语义永远由控制器裁决）。
+	            //  - 匹配 → 提交【账本目标本身】（commitAdvance 不重推级联，见其 INV-COMMIT 说明）。
+	            // pathContradicts：filePath 为 request 语义，与账本 request.filePath 同源，可作加严。
+	            const auto pathContradicts = pendingAdvance_.has_value() && !payload.filePath.empty() &&
+	                                         !pendingAdvance_->target.request.filePath.empty() &&
+	                                         payload.filePath != pendingAdvance_->target.request.filePath;
+	            const auto ledgerMatches = pendingAdvance_.has_value() && !payload.trackId.empty() &&
+	                                       pendingAdvance_->target.identity.trackId == payload.trackId &&
+	                                       pendingTokenMatches() && !pathContradicts;
+	            if (ledgerMatches) {
+	              commitAdvance(reduction, AdvanceEventSource::AdvanceCompleted, event.timestamp);
+	              return;
+	            }
 	            if (!pendingAdvance_.has_value()) {
 	              spdlog::debug("ignoring advance-completed for '{}' without pending ledger (stale or double commit)",
 	                            payload.trackId);
 	              return;
 	            }
-	            if (payload.trackId != pendingAdvance_->target.identity.trackId || !pendingTokenMatches()) {
-	              spdlog::warn("advance-completed validation failed for '{}' (pending target '{}'): aborting transition",
-	                           payload.trackId, pendingAdvance_->target.identity.trackId);
-	              abortPendingAdvance(reduction);
-	              commitAdvance(reduction, AdvanceEventSource::PlaybackEnded, event.timestamp);
-	              return;
-	            }
-	            commitAdvance(reduction, AdvanceEventSource::AdvanceCompleted, event.timestamp);
+	            spdlog::warn("advance-completed validation failed for '{}' (pending target '{}'): aborting transition",
+	                         payload.trackId, pendingAdvance_->target.identity.trackId);
+	            abortPendingAdvance(reduction);
+	            commitAdvance(reduction, AdvanceEventSource::PlaybackEnded, event.timestamp);
 	          } else if constexpr (std::is_same_v<Payload, audio::EndApproaching>) {
 	          handleEndApproaching(reduction);
 	        } else if constexpr (std::is_same_v<Payload, audio::OutputFormatChanged>) {
@@ -1101,6 +1115,8 @@ ControlReduction ControlStateReducer::reduceScannerEvent(const scanner::ScannerE
     if (const auto* snapshot = std::get_if<scanner::PlaylistTreeSnapshot>(&event.payload)) {
       library_.libraryTree = *snapshot;
       library_.version = snapshot->version;
+      // 决策⑦：快照到达即按已生效规则排序树副本，前端渲染与播放推进随后都读这棵已排序的树。
+      applyTreeSortOrder(reduction);
       if (playbackContext_.has_value()) {
         reconcilePlaybackContextAfterSnapshot(reduction);
       } else {
@@ -1229,6 +1245,20 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::findPlaya
   return *trackIt;
 }
 
+std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::resolveTrackForAdoption(const std::string& trackId) const {
+  if (trackId.empty()) {
+    return std::nullopt;
+  }
+  if (playbackContext_.has_value()) {
+    const auto contextIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(),
+                                        [&](const PlayableTrack& track) { return track.identity.trackId == trackId; });
+    if (contextIt != playbackContext_->order.end()) {
+      return *contextIt;
+    }
+  }
+  return findPlayableTrackByTrackId(trackId);
+}
+
 std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::consumeQueueFront() {
   while (!playbackQueue_.empty()) {
     const auto entry = playbackQueue_.front();
@@ -1276,6 +1306,13 @@ std::optional<PlaybackContextDescriptor> ControlStateReducer::defaultContextDesc
     }
   }
 
+  // 携带该上下文已生效的排序规则：否则 Play/TogglePlayPause/SelectTrack 兜底路径会退回
+  // DFS 树序，与用户所见顺序分叉（表现为顺序播放跳过曲目）。
+  if (const auto sortRulesIt = activeSortRules_.find(sortRulesKey(descriptor.rootPath, descriptor.folderNodeId));
+      sortRulesIt != activeSortRules_.end()) {
+    descriptor.sortRules = sortRulesIt->second;
+  }
+
   return descriptor;
 }
 
@@ -1318,7 +1355,7 @@ std::optional<std::size_t> ControlStateReducer::selectedContextIndex() const {
     return std::nullopt;
   }
   const auto iterator = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
-    return sameTrack(track.identity, *selectedTrack_);
+    return tracksMatch(track.identity, *selectedTrack_);
   });
   if (iterator == playbackContext_->order.end()) {
     return std::nullopt;
@@ -1428,7 +1465,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
   std::vector<PlayableTrack> filtered;
   std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(filtered),
                [this](const PlayableTrack& track) {
-                 return !sameTrack(track.identity, *selectedTrack_);
+                 return !tracksMatch(track.identity, *selectedTrack_);
                });
   candidates = std::move(filtered);
   
@@ -1441,7 +1478,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
       std::vector<PlayableTrack> filtered2;
       std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(filtered2),
                    [this](const PlayableTrack& track) {
-                     return !sameTrack(track.identity, *selectedTrack_);
+                     return !tracksMatch(track.identity, *selectedTrack_);
                    });
       candidates = std::move(filtered2);
       
@@ -1457,7 +1494,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::shuffledT
   auto selected = candidates[distribution(shuffleRandom_)];
   if (playbackContext_.has_value()) {
     const auto selectedIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
-      return sameTrack(track.identity, selected.identity);
+      return tracksMatch(track.identity, selected.identity);
     });
     if (selectedIt != playbackContext_->order.end()) {
       playbackContext_->index = static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), selectedIt));
@@ -1514,7 +1551,7 @@ std::optional<ControlStateReducer::PlayableTrack> ControlStateReducer::previousT
   }
   while (auto previousIdentity = shuffleHistory_.pop()) {
     const auto previousIt = std::find_if(playbackContext_->order.begin(), playbackContext_->order.end(), [&](const PlayableTrack& track) {
-      return sameTrack(track.identity, *previousIdentity);
+      return tracksMatch(track.identity, *previousIdentity);
     });
     if (previousIt != playbackContext_->order.end()) {
       playbackContext_->index = static_cast<std::size_t>(std::distance(playbackContext_->order.begin(), previousIt));
@@ -1587,6 +1624,12 @@ void ControlStateReducer::reconcilePlaybackContextAfterSnapshot(ControlReduction
   const auto previousIndex = selectedContextIndex().value_or(playbackContext_->index);
   const auto previousTrack = selectedTrack_;
   const auto previousPlaybackState = player_.playback.state;
+  // 重建前捕获当前曲在原 order 中的后继身份：当前曲被移除时据此在新 order 中重定位。
+  std::optional<TrackIdentity> previousSuccessor;
+  if (const auto currentIndex = selectedContextIndex();
+      currentIndex.has_value() && *currentIndex + 1U < playbackContext_->order.size()) {
+    previousSuccessor = playbackContext_->order[*currentIndex + 1U].identity;
+  }
 
   if (!library_.libraryTree.has_value()) {
     playbackContext_.reset();
@@ -1627,33 +1670,170 @@ void ControlStateReducer::reconcilePlaybackContextAfterSnapshot(ControlReduction
   std::optional<std::size_t> currentIndex{};
   if (previousTrack.has_value()) {
     const auto currentIt = std::find_if(rebuilt.order.begin(), rebuilt.order.end(), [&](const PlayableTrack& track) {
-      return sameTrack(track.identity, *previousTrack);
+      return tracksMatch(track.identity, *previousTrack);
     });
     if (currentIt != rebuilt.order.end()) {
       currentIndex = static_cast<std::size_t>(std::distance(rebuilt.order.begin(), currentIt));
     }
   }
 
-  const auto reconciledIndex = currentIndex.value_or(std::min(previousIndex, rebuilt.order.size() - 1U));
-  rebuilt.index = reconciledIndex;
-  rebuilt.descriptor.anchorTrack = rebuilt.order[rebuilt.index].identity;
   const auto currentTrackStillPresent = currentIndex.has_value();
-  playbackContext_ = std::move(rebuilt);
-  shuffleHistory_.clear();
-
   if (currentTrackStillPresent) {
+    rebuilt.index = *currentIndex;
+    rebuilt.descriptor.anchorTrack = rebuilt.order[rebuilt.index].identity;
+    playbackContext_ = std::move(rebuilt);
+    shuffleHistory_.clear();
+    onSuccessorRelationChanged(reduction);
     return;
   }
 
-  const auto shouldContinuePlayback = previousPlaybackState == PlaybackStatus::Playing ||
-                                      previousPlaybackState == PlaybackStatus::Loading ||
-                                      previousPlaybackState == PlaybackStatus::Buffering ||
-                                      previousPlaybackState == PlaybackStatus::Seeking;
-  selectTrack(reduction, playbackContext_->order[playbackContext_->index], shouldContinuePlayback);
-  if (previousPlaybackState == PlaybackStatus::Paused) {
-    player_.playback.state = PlaybackStatus::Paused;
-    markPlayerChanged(reduction);
+  // 当前曲已被移除（删除/移出上下文）：在重建后的 order 中按【原后继身份】重定位，
+  // 即"删掉正在播放的歌则继续播它的下一首"。
+  std::optional<std::size_t> successorIndex;
+  if (previousSuccessor.has_value()) {
+    const auto successorIt = std::find_if(rebuilt.order.begin(), rebuilt.order.end(),
+                                          [&](const PlayableTrack& track) {
+                                            return tracksMatch(track.identity, *previousSuccessor);
+                                          });
+    if (successorIt != rebuilt.order.end()) {
+      successorIndex = static_cast<std::size_t>(std::distance(rebuilt.order.begin(), successorIt));
+    }
   }
+  if (successorIndex.has_value()) {
+    rebuilt.index = *successorIndex;
+    rebuilt.descriptor.anchorTrack = rebuilt.order[rebuilt.index].identity;
+    playbackContext_ = std::move(rebuilt);
+    shuffleHistory_.clear();
+    onSuccessorRelationChanged(reduction);
+    const auto shouldContinuePlayback = previousPlaybackState == PlaybackStatus::Playing ||
+                                        previousPlaybackState == PlaybackStatus::Loading ||
+                                        previousPlaybackState == PlaybackStatus::Buffering ||
+                                        previousPlaybackState == PlaybackStatus::Seeking;
+    selectTrack(reduction, playbackContext_->order[playbackContext_->index], shouldContinuePlayback);
+    if (previousPlaybackState == PlaybackStatus::Paused) {
+      player_.playback.state = PlaybackStatus::Paused;
+      markPlayerChanged(reduction);
+    }
+    return;
+  }
+
+  // 原后继亦不可用：保留重建后的上下文（索引仅 clamp 到有效范围）并停止播放。绝不用
+  // 旧位置索引取值起播——重排后该位置已指向无关曲目，那正是"一次跳过若干首"的成因。
+  rebuilt.index = std::min(previousIndex, rebuilt.order.size() - 1U);
+  rebuilt.descriptor.anchorTrack = rebuilt.order[rebuilt.index].identity;
+  playbackContext_ = std::move(rebuilt);
+  shuffleHistory_.clear();
+  if (previousPlaybackState != PlaybackStatus::Stopped) {
+    reduction.intents.push_back(makeIntent(ControlIntentKind::Stop));
+    stopPlayback(reduction);
+  }
+}
+
+std::string ControlStateReducer::sortRulesKey(const std::filesystem::path& rootPath,
+                                              const std::string& folderNodeId) {
+  return rootPath.generic_string() + "\n" + folderNodeId;
+}
+
+ControlReduction ControlStateReducer::applyContextSortRules(std::filesystem::path rootPath,
+                                                            std::string folderNodeId,
+                                                            std::vector<FolderSortRule> rules) {
+  auto reduction = accept();
+  // 先记录生效规则（即使当前无匹配的播放上下文）：兜底上下文构建与树排序据此取规则。
+  const auto key = sortRulesKey(rootPath, folderNodeId);
+  activeSortRules_[key] = rules;
+  applyTreeSortOrder(reduction);
+  if (!playbackContext_.has_value()) {
+    return reduction;
+  }
+  if (sortRulesKey(playbackContext_->descriptor.rootPath, playbackContext_->descriptor.folderNodeId) != key) {
+    return reduction;
+  }
+  playbackContext_->descriptor.sortRules = std::move(rules);
+  rebuildOrder(reduction);
+  return reduction;
+}
+
+ControlReduction ControlStateReducer::injectSavedContextSortRules(std::vector<FolderSortSetting> settings) {
+  auto reduction = accept();
+  for (auto& setting : settings) {
+    activeSortRules_[sortRulesKey(setting.rootPath, setting.folderNodeId)] = std::move(setting.rules);
+  }
+  applyTreeSortOrder(reduction);
+  return reduction;
+}
+
+void ControlStateReducer::applyTreeSortOrder(ControlReduction& reduction) {
+  if (!library_.libraryTree.has_value() || activeSortRules_.empty()) {
+    return;
+  }
+  // activeSortRules_ 以 rootPath + '\n' + folderNodeId 为键（播放上下文需按 rootPath 匹配）；
+  // 树节点 id 全局唯一（key 派生，单一 root 节点），故树排序只需 folderNodeId 段。
+  std::map<std::string, std::vector<FolderSortRule>> rulesByFolderNodeId;
+  for (const auto& [key, rules] : activeSortRules_) {
+    const auto delimiter = key.find('\n');
+    const auto folderNodeId = delimiter == std::string::npos ? std::string{} : key.substr(delimiter + 1U);
+    rulesByFolderNodeId[folderNodeId] = rules;
+  }
+  sortTreeChildOrderByRules(*library_.libraryTree, rulesByFolderNodeId);
+  reduction.libraryStateChanged = true;
+}
+
+void ControlStateReducer::rebuildOrder(ControlReduction& reduction) {
+  if (!playbackContext_.has_value() || !library_.libraryTree.has_value()) {
+    return;
+  }
+  const auto previousTrack = selectedTrack_;
+  auto result = buildPlaybackContextOrder(*library_.libraryTree, playbackContext_->descriptor);
+  if (result.status != PlaybackContextBuildStatus::Ready || result.order.empty()) {
+    spdlog::warn("playback order rebuild failed (status {}); keeping previous order",
+                 static_cast<int>(result.status));
+    return;
+  }
+
+  std::vector<PlayableTrack> rebuiltOrder;
+  rebuiltOrder.reserve(result.order.size());
+  for (const auto& item : result.order) {
+    rebuiltOrder.push_back(PlayableTrack{.identity = item.identity,
+                                         .request = requestFromSong(item.metadata),
+                                         .display = displayFromSong(item.metadata),
+                                         .artwork = artworkFromSong(item.metadata),
+                                         .artworkSourcePath = !item.metadata.sourceFilePath.empty() ? item.metadata.sourceFilePath : item.metadata.filePath,
+                                         .fallbackThumbnailPath = item.metadata.thumbnailPath.value_or(std::filesystem::path{}),
+                                         .parentNodeId = item.parentNodeId});
+  }
+
+  std::optional<std::size_t> anchorIndex;
+  if (previousTrack.has_value()) {
+    const auto anchorIt = std::find_if(rebuiltOrder.begin(), rebuiltOrder.end(),
+                                       [&](const PlayableTrack& track) {
+                                         return tracksMatch(track.identity, *previousTrack);
+                                       });
+    if (anchorIt != rebuiltOrder.end()) {
+      anchorIndex = static_cast<std::size_t>(std::distance(rebuiltOrder.begin(), anchorIt));
+    }
+  }
+
+  playbackContext_->order = std::move(rebuiltOrder);
+  playbackContext_->index =
+      anchorIndex.value_or(std::min(playbackContext_->index, playbackContext_->order.size() - 1U));
+  playbackContext_->descriptor.anchorTrack = playbackContext_->order[playbackContext_->index].identity;
+  ++orderGeneration_;
+  spdlog::debug("playback order rebuilt (generation {}, {} tracks, anchor index {})",
+                orderGeneration_, playbackContext_->order.size(), playbackContext_->index);
+  onSuccessorRelationChanged(reduction);
+}
+
+void ControlStateReducer::onSuccessorRelationChanged(ControlReduction& reduction) {
+  if (!pendingAdvance_.has_value()) {
+    return;
+  }
+  const auto peek = peekNaturalEndSelection();
+  if (peek.has_value() && tracksMatch(peek->track.identity, pendingAdvance_->target.identity) &&
+      peek->fromTempQueue == pendingAdvance_->fromTempQueue) {
+    return;
+  }
+  spdlog::debug("successor relation changed after order rebuild: aborting in-flight preload");
+  abortPendingAdvance(reduction);
 }
 
 void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) {
@@ -1680,7 +1860,7 @@ void ControlStateReducer::selectFirstTrackWhenIdle(ControlReduction& reduction) 
 ControlReduction ControlStateReducer::reduceArtworkResolved(const ArtworkResolveResultView& result) {
   auto reduction = accept();
   if (result.generation != artworkGeneration_ || !selectedTrack_.has_value() ||
-      !sameTrack(result.identity, *selectedTrack_)) {
+      !tracksMatch(result.identity, *selectedTrack_)) {
     spdlog::debug("stale artwork resolution dropped (generation {} vs {})", result.generation, artworkGeneration_);
     return reduction;
   }
@@ -1695,9 +1875,10 @@ ControlReduction ControlStateReducer::reduceArtworkResolved(const ArtworkResolve
 }
 
 void ControlStateReducer::selectTrack(ControlReduction& reduction, const PlayableTrack& track, bool startPlayback) {
-  // T10：任何显式切轨都是对在途过渡的否决（裁定基线⑦窗口外硬清理兜底：门控之外的
-  // 内部切轨路径同样不能遗留悬挂账本，否则下一首 EndApproaching 会基于过期账本）。
-  pendingAdvance_.reset();
+  // 任何显式切轨都是对在途过渡的否决：撤服务侧第二源/预解码槽后再加载新曲，否则账本
+  // 虽已清但重叠仍在跑，后续 AdvanceCompleted 会落 stale-drop 并与实际播放错位。
+  // 无账本时 no-op（级联内部调用点账本已由 commitAdvance 清空）。
+  abortPendingAdvance(reduction);
   // 切轨抑制（需求 4 按钮锁定）：startPlayback=true 时立即发布乐观 Playing 快照，
   // 并设置可见状态抑制 —— 音频层随后发布的 Loading 会被 reduceAudioEvent 压回
   // Playing（:621-629），直到真实 Playing/Stopped/Error 到达时解除；Error 必放行，
@@ -1848,6 +2029,7 @@ void ControlStateReducer::handleEndApproaching(ControlReduction& reduction) {
       .repeatMode = player_.repeatMode,
       .shuffle = player_.shuffle,
       .transitionConfigVersion = transitionConfigVersion_,
+      .fromTempQueue = peek->fromTempQueue,
   };
 
   audio::PrepareNextMeta meta{};
@@ -1929,9 +2111,24 @@ bool ControlStateReducer::pendingTokenMatches() const {
 void ControlStateReducer::commitAdvance(ControlReduction& reduction,
                                         AdvanceEventSource source,
                                         std::chrono::steady_clock::time_point sampledAt) {
-  // T10：提交级联（抽取自原 PlaybackEnded 分支；裁定基线⑦/⑧）。窗口内状态无变化时
-  // 重算结果必与账本目标一致（peek 同构保证），故 AC 与 PBE 共用同一条级联，仅
-  // 选曲应用方式不同（applyCommittedTrack 按 source 分发）。
+  // INV-COMMIT（音频权威）：AdvanceCompleted 表示音频服务已按账本目标完成接管并已开始
+  // 输出该曲目。此时必须提交【账本目标本身】，绝不重推级联——重推在窗口内状态变化后
+  // 可能得出另一首曲子，而 applyCommittedTrack(AdvanceCompleted) 不发 LoadTrack，结果
+  // 只会把"音频正在播放的曲目"记错，并污染后续 selectedContextIndex 反查锚点。
+  if (source == AdvanceEventSource::AdvanceCompleted && pendingAdvance_.has_value()) {
+    const auto target = pendingAdvance_->target;
+    const auto fromTempQueue = pendingAdvance_->fromTempQueue;
+    pendingAdvance_.reset();
+    // 账本目标来自临时队列队首时必须照常消费该条目（重推被跳过，但队列副作用不能少）。
+    if (fromTempQueue) {
+      consumeQueueFront();
+    }
+    applyCommittedTrack(reduction, target, source);
+    playingQueuedTrack_ = fromTempQueue;
+    markPlayerChanged(reduction, sampledAt);
+    return;
+  }
+  // PlaybackEnded（无预载的自然结束）：无音频侧已接管目标，按当前上下文级联求解下一曲。
   pendingAdvance_.reset();
   if (const auto queued = consumeQueueFront(); queued.has_value()) {
     // 临时队列优先（T7）：消费队列头部，播放上下文 index 冻结不动；

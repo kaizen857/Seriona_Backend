@@ -1,5 +1,7 @@
 #include "control/playback_context_builder.h"
 
+#include "control/text_collation.h"
+#include "control/tree_sort.h"
 #include "seriona/scanner/playlist_tree_builder.h"
 
 #include <doctest.h>
@@ -312,81 +314,75 @@ TEST_CASE("playback context builder reports missing anchors within the requested
   CHECK(std::ranges::none_of(result.order, [](const PlaybackContextOrderItem& item) { return item.identity.trackId == "loose"; }));
 }
 
-TEST_CASE("playback context builder applies sort fields directions and missing value policies") {
-  const auto snapshot = playbackTreeFixture();
+TEST_CASE("tree sort keeps tree order when no rules are registered") {
+  scanner::PlaylistTreeSnapshot tree = playbackTreeFixture();
+  const auto before = childOrders(tree);
 
-  const auto sortedFolderIds = [&](FolderSortRule rule) {
-    const auto result = buildPlaybackContextOrder(
-        snapshot, folderContext("dir:albums", track("alpha", "albums/alpha.flac"), {rule}));
-    CHECK(result.status == PlaybackContextBuildStatus::Ready);
-    return trackIds(result.order);
-  };
+  sortTreeChildOrderByRules(tree, {});
 
-  CHECK(sortedFolderIds({.field = FolderSortField::Title,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"alpha", "beta", "gamma"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Title,
-                         .direction = FolderSortDirection::Descending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"gamma", "beta", "alpha"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Artist,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::First}) ==
-        std::vector<std::string>{"beta", "alpha", "gamma"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Album,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"beta", "alpha", "gamma"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Filename,
-                         .direction = FolderSortDirection::Descending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"gamma", "beta", "alpha"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Year,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::First}) ==
-        std::vector<std::string>{"alpha", "gamma", "beta"});
-  CHECK(sortedFolderIds({.field = FolderSortField::Duration,
-                         .direction = FolderSortDirection::Descending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"beta", "alpha", "gamma"});
-  CHECK(sortedFolderIds({.field = FolderSortField::CreatedDate,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"gamma", "alpha", "beta"});
-  CHECK(sortedFolderIds({.field = FolderSortField::DiscNumber,
-                         .direction = FolderSortDirection::Descending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"gamma", "beta", "alpha"});
-  CHECK(sortedFolderIds({.field = FolderSortField::TrackNumber,
-                         .direction = FolderSortDirection::Ascending,
-                         .missingValuePolicy = FolderSortMissingValuePolicy::Last}) ==
-        std::vector<std::string>{"alpha", "beta", "gamma"});
-
-  const auto rootDuration = buildPlaybackContextOrder(
-      snapshot,
-      rootContext(track("beta", "albums/beta.flac"),
-                  {{.field = FolderSortField::Duration,
-                    .direction = FolderSortDirection::Descending,
-                    .missingValuePolicy = FolderSortMissingValuePolicy::Last}}));
-  requireReadyOrder(rootDuration, {"beta", "alpha", "gamma", "loose"}, 0U);
+  CHECK(childOrders(tree) == before);
+  const auto result = buildPlaybackContextOrder(tree, folderContext("dir:albums", track("alpha", "albums/alpha.flac")));
+  requireReadyOrder(result, {"beta", "gamma", "alpha"}, 2U);
 }
 
-TEST_CASE("playback context builder uses unsorted tree order as tie fallback for multiple sort rules") {
-  const auto snapshot = playbackTreeFixture();
+TEST_CASE("tree sort orders folder children by rules and playback follows the visible order") {
+  scanner::PlaylistTreeSnapshot tree = playbackTreeFixture();
 
-  const auto result = buildPlaybackContextOrder(
-      snapshot,
-      folderContext("dir:albums",
-                    track("beta", "albums/beta.flac"),
-                    {{.field = FolderSortField::Album,
-                      .direction = FolderSortDirection::Ascending,
-                      .missingValuePolicy = FolderSortMissingValuePolicy::Last},
-                     {.field = FolderSortField::TrackNumber,
-                      .direction = FolderSortDirection::Descending,
-                      .missingValuePolicy = FolderSortMissingValuePolicy::Last}}));
+  sortTreeChildOrderByRules(tree,
+                            {{"dir:albums",
+                              {{.field = FolderSortField::Title,
+                                .direction = FolderSortDirection::Ascending,
+                                .missingValuePolicy = FolderSortMissingValuePolicy::Last}}}});
 
-  requireReadyOrder(result, {"beta", "alpha", "gamma"}, 0U);
+  const auto& albums = requireNode(tree, "dir:albums");
+  CHECK(albums.childNodeIds == std::vector<std::string>{"track:alpha", "track:beta", "dir:albums/live"});
+
+  const auto result = buildPlaybackContextOrder(tree, folderContext("dir:albums", track("alpha", "albums/alpha.flac")));
+  requireReadyOrder(result, {"alpha", "beta", "gamma"}, 0U);
+}
+
+TEST_CASE("tree sort reorders root children and playback follows the visible order") {
+  scanner::PlaylistTreeSnapshot tree = playbackTreeFixture();
+
+  sortTreeChildOrderByRules(tree,
+                            {{"",
+                              {{.field = FolderSortField::Title,
+                                .direction = FolderSortDirection::Descending,
+                                .missingValuePolicy = FolderSortMissingValuePolicy::Last}}}});
+
+  const auto& root = requireNode(tree, "root:.");
+  CHECK(root.childNodeIds == std::vector<std::string>{"track:loose", "dir:empty", "dir:albums"});
+
+  const auto result = buildPlaybackContextOrder(tree, rootContext(track("loose", "loose.flac")));
+  requireReadyOrder(result, {"loose", "beta", "gamma", "alpha"}, 0U);
+}
+
+TEST_CASE("tree sort honors missing value policy and remains stable for equal keys") {
+  scanner::PlaylistTreeSnapshot tree = playbackTreeFixture();
+
+  sortTreeChildOrderByRules(tree,
+                            {{"dir:albums",
+                              {{.field = FolderSortField::Year,
+                                .direction = FolderSortDirection::Ascending,
+                                .missingValuePolicy = FolderSortMissingValuePolicy::First}}}});
+
+  const auto& albums = requireNode(tree, "dir:albums");
+  CHECK(albums.childNodeIds == std::vector<std::string>{"dir:albums/live", "track:alpha", "track:beta"});
+}
+
+TEST_CASE("text collation orders Chinese by pinyin and Japanese kana by gojuon") {
+  CHECK(compareCollatedText("北京", "上海") < 0);
+  CHECK(compareCollatedText("广州", "杭州") < 0);
+  CHECK(compareCollatedText("あさ", "かわ") < 0);
+  CHECK(compareCollatedText("北京", "北京") == 0);
+  CHECK(compareUtf8Bytes("北京", "北京") == 0);
+}
+
+TEST_CASE("text collation ignores case then breaks ties by bytes") {
+  CHECK(compareCollatedText("apple", "Zebra") < 0);
+  CHECK(compareCollatedText("Apple", "apple") != 0);
+  CHECK(compareCollatedText("Apple", "apple") < 0);
+  CHECK(compareCollatedText("abc", "abc") == 0);
 }
 
 }

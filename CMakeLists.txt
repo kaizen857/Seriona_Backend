@@ -54,6 +54,11 @@ pkg_check_modules(SERIONA_FFMPEG REQUIRED IMPORTED_TARGET
 
 find_package(spdlog CONFIG REQUIRED)
 
+# ICU：库内文本排序（字典序）。后端禁止引入 Qt，ICU 是三端可供给的 Unicode 排序实现
+# （Linux 系统 libicu-dev / Windows vcpkg / macOS Homebrew keg-only icu4c）。
+# 组件只用 uc（公共与数据）与 i18n（collation 所在）。
+find_package(ICU REQUIRED COMPONENTS uc i18n)
+
 FetchContent_Declare(thread_pool
   GIT_REPOSITORY https://github.com/bshoshany/thread-pool.git
   GIT_TAG v4.1.0
@@ -338,6 +343,8 @@ add_library(seriona_control STATIC
   src/control/sqlite_app_settings_store.cpp
   src/control/sqlite_folder_sort_settings_store.cpp
   src/control/subscription_store.cpp
+  src/control/text_collation.cpp
+  src/control/tree_sort.cpp
 )
 
 if(UNIX AND NOT APPLE)
@@ -414,6 +421,8 @@ target_link_libraries(seriona_control
     seriona_metadata
     SQLite3::SQLite3
     spdlog::spdlog
+    ICU::uc
+    ICU::i18n
 )
 
 seriona_enable_warnings(seriona_audio)

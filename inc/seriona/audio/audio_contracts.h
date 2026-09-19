@@ -223,10 +223,17 @@ struct EndApproaching {
   std::chrono::milliseconds remainingMs{0};
 };
 
-// T10：接管提交载荷（服务→控制器）。trackId = 已接管的下一曲标识（与控制器
+// T10：接管提交载荷（服务→控制器）。trackId + filePath = 已接管的下一曲标识（与控制器
 // EndApproaching 时经 PrepareNext 下发的选定曲一致）。无预载的普通自然结束不发本事件。
+//
+// filePath 为 request 语义（实际音频文件；CUE 派生曲为 source 音频文件，非 .cue），
+// 供控制器与 pendingAdvance 账本的 request.filePath 做【同源加严校验】：两者同为
+// request 语义才可比。曲目身份判等仍以 trackId 为唯一主键——identity.filePath 与
+// request.filePath 对 CUE 派生曲语义不同（cue 路径 vs 音频路径），不可混用（见
+// ControlStateReducer::tracksMatch 说明）。
 struct AdvanceCompleted {
   std::string trackId;
+  std::filesystem::path filePath;
 };
 
 // R2：频谱实时快照（服务→控制器，频谱显示链路）。定义位置说明：PlaybackEvent

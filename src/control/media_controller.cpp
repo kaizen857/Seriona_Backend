@@ -568,6 +568,12 @@ private:
       return rejectCommand(MediaControllerErrorCode::BackendRejected, error.what());
     }
 
+    // 落库成功后让播放顺序立即跟随新排序（reducer 不做 I/O，只接收已校验的纯数据规则）：
+    // 否则"界面已按新序、后端仍按起播时冻结的旧序推进"，表现为顺序播放跳过曲目。
+    auto reduction = reducer_.applyContextSortRules(setting.rootPath, setting.folderNodeId, setting.rules);
+    commitReduction(reduction);
+    executeIntents(reduction.intents);
+
     notificationSubscriptions_.publish(makeFolderSortAppliedNotification(setting));
     return acceptedResult();
   }
@@ -630,9 +636,13 @@ private:
   }
 
   void publishSavedFolderSortRulesForRoots(const std::vector<scanner::ScannerRoot>& roots) {
+    // 已存规则由上一次进程落库（本进程无对应 ApplyFolderSortRules 命令）：先注入 reducer，
+    // 使随后到达的快照即按用户设置排序；再逐条通知前端回填其排序规则缓存。
+    std::vector<FolderSortSetting> savedSettings;
     for (const auto& root : roots) {
       try {
         for (auto setting : dependencies_.folderSortSettingsStore->list(root.path)) {
+          savedSettings.push_back(setting);
           notificationSubscriptions_.publish(makeFolderSortAppliedNotification(std::move(setting)));
         }
       } catch (const FolderSortSettingsError& error) {
@@ -640,6 +650,12 @@ private:
       } catch (const std::exception& error) {
         spdlog::warn("failed to list saved folder sort rules for root '{}': {}", pathText(root.path), error.what());
       }
+    }
+
+    if (!savedSettings.empty()) {
+      auto reduction = reducer_.injectSavedContextSortRules(std::move(savedSettings));
+      commitReduction(reduction);
+      executeIntents(reduction.intents);
     }
   }
 

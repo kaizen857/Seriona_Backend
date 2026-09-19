@@ -1,31 +1,15 @@
 #include "playback_context_builder.h"
 
 #include <algorithm>
-#include <chrono>
-#include <cstdint>
 #include <filesystem>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
-#include <variant>
 
 namespace seriona::control {
 namespace {
 
 using NodeIndex = std::unordered_map<std::string, const scanner::PlaylistNode*>;
-
-struct StringSortValue {
-  bool missing{true};
-  std::string value{};
-};
-
-struct NumberSortValue {
-  bool missing{true};
-  std::int64_t value{0};
-};
-
-using SortValue = std::variant<StringSortValue, NumberSortValue>;
 
 [[nodiscard]] NodeIndex indexNodes(const scanner::PlaylistTreeSnapshot& snapshot) {
   NodeIndex nodes;
@@ -66,12 +50,10 @@ void appendTracksDepthFirst(const NodeIndex& nodes,
   }
 
   if (isTrackNode(*node)) {
-    const auto treeOrderIndex = order.size();
     order.push_back(PlaybackContextOrderItem{.identity = identityFromSong(*node->song),
                                              .metadata = *node->song,
                                              .nodeId = node->nodeId,
-                                             .parentNodeId = node->parentNodeId,
-                                             .treeOrderIndex = treeOrderIndex});
+                                             .parentNodeId = node->parentNodeId});
     return;
   }
 
@@ -90,122 +72,6 @@ void appendTracksDepthFirst(const NodeIndex& nodes,
   return descriptor.scope == PlaybackContextScope::Root;
 }
 
-[[nodiscard]] bool sameTrack(const TrackIdentity& left, const TrackIdentity& right) {
-  return !left.trackId.empty() && left.trackId == right.trackId && (right.filePath.empty() || left.filePath == right.filePath);
-}
-
-[[nodiscard]] StringSortValue textValue(std::string value) {
-  const auto missing = value.empty();
-  return StringSortValue{.missing = missing, .value = std::move(value)};
-}
-
-[[nodiscard]] NumberSortValue numberValue(std::optional<std::int64_t> value) {
-  if (!value.has_value()) {
-    return NumberSortValue{};
-  }
-  return NumberSortValue{.missing = false, .value = *value};
-}
-
-[[nodiscard]] std::string filenameOf(const std::filesystem::path& path) {
-  const auto filename = path.filename().generic_u8string();
-  return {filename.begin(), filename.end()};
-}
-
-[[nodiscard]] SortValue sortValueFor(const PlaybackContextOrderItem& item, const FolderSortField field) {
-  const auto& song = item.metadata;
-  switch (field) {
-    case FolderSortField::Title:
-      return textValue(song.title);
-    case FolderSortField::Artist:
-      return textValue(song.artist);
-    case FolderSortField::Album:
-      return textValue(song.album);
-    case FolderSortField::Filename:
-      return textValue(filenameOf(song.filePath));
-    case FolderSortField::Year:
-      return numberValue(song.year.transform([](const std::uint32_t value) { return static_cast<std::int64_t>(value); }));
-    case FolderSortField::Duration:
-      return numberValue(song.duration.transform([](const std::chrono::milliseconds value) { return value.count(); }));
-    case FolderSortField::CreatedDate:
-      return numberValue(song.fileMtime.transform([](const std::filesystem::file_time_type value) {
-        return static_cast<std::int64_t>(value.time_since_epoch().count());
-      }));
-    case FolderSortField::DiscNumber:
-      return numberValue(song.discNumber.transform([](const std::uint32_t value) { return static_cast<std::int64_t>(value); }));
-    case FolderSortField::TrackNumber:
-      return numberValue(song.trackNumber.transform([](const std::uint32_t value) { return static_cast<std::int64_t>(value); }));
-  }
-  return textValue({});
-}
-
-template <typename T>
-[[nodiscard]] int comparePresentValues(const T& left, const T& right) {
-  if (left < right) {
-    return -1;
-  }
-  if (right < left) {
-    return 1;
-  }
-  return 0;
-}
-
-[[nodiscard]] int compareMissing(const bool leftMissing,
-                                 const bool rightMissing,
-                                 const FolderSortMissingValuePolicy policy) {
-  if (leftMissing == rightMissing) {
-    return 0;
-  }
-  const auto leftBefore = policy == FolderSortMissingValuePolicy::First;
-  return leftMissing == leftBefore ? -1 : 1;
-}
-
-[[nodiscard]] int compareSortValue(const SortValue& left,
-                                   const SortValue& right,
-                                   const FolderSortRule& rule) {
-  return std::visit(
-      [&](const auto& leftValue, const auto& rightValue) {
-        using LeftValue = std::decay_t<decltype(leftValue)>;
-        using RightValue = std::decay_t<decltype(rightValue)>;
-        if constexpr (!std::is_same_v<LeftValue, RightValue>) {
-          return 0;
-        } else {
-          const auto missingComparison = compareMissing(leftValue.missing, rightValue.missing, rule.missingValuePolicy);
-          if (missingComparison != 0 || leftValue.missing || rightValue.missing) {
-            return missingComparison;
-          }
-
-          auto comparison = comparePresentValues(leftValue.value, rightValue.value);
-          if (rule.direction == FolderSortDirection::Descending) {
-            comparison = -comparison;
-          }
-          return comparison;
-        }
-      },
-      left,
-      right);
-}
-
-[[nodiscard]] int compareByRule(const PlaybackContextOrderItem& left,
-                                const PlaybackContextOrderItem& right,
-                                const FolderSortRule& rule) {
-  return compareSortValue(sortValueFor(left, rule.field), sortValueFor(right, rule.field), rule);
-}
-
-void sortOrder(std::vector<PlaybackContextOrderItem>& order, const std::vector<FolderSortRule>& rules) {
-  if (rules.empty()) {
-    return;
-  }
-  std::ranges::sort(order, [&](const PlaybackContextOrderItem& left, const PlaybackContextOrderItem& right) {
-    for (const auto& rule : rules) {
-      const auto comparison = compareByRule(left, right, rule);
-      if (comparison != 0) {
-        return comparison < 0;
-      }
-    }
-    return left.treeOrderIndex < right.treeOrderIndex;
-  });
-}
-
 void setAnchorStatus(PlaybackContextBuildResult& result) {
   const auto anchor = result.context.anchorTrack;
   if (!anchor.has_value()) {
@@ -214,7 +80,7 @@ void setAnchorStatus(PlaybackContextBuildResult& result) {
   }
 
   const auto anchorIterator = std::ranges::find_if(result.order, [&](const PlaybackContextOrderItem& item) {
-    return sameTrack(item.identity, *anchor);
+    return tracksMatch(item.identity, *anchor);
   });
   if (anchorIterator == result.order.end()) {
     result.status = PlaybackContextBuildStatus::AnchorNotFound;
@@ -226,6 +92,10 @@ void setAnchorStatus(PlaybackContextBuildResult& result) {
   result.anchorIndex = static_cast<std::size_t>(std::distance(result.order.begin(), anchorIterator));
 }
 
+}
+
+bool tracksMatch(const TrackIdentity& lhs, const TrackIdentity& rhs) noexcept {
+  return !lhs.trackId.empty() && lhs.trackId == rhs.trackId;
 }
 
 PlaybackContextBuildResult buildPlaybackContextOrder(const scanner::PlaylistTreeSnapshot& snapshot,
@@ -255,13 +125,15 @@ PlaybackContextBuildResult buildPlaybackContextOrder(const scanner::PlaylistTree
     return result;
   }
 
+  // 顺序即树序：文件夹内子节点顺序已由控制层按生效规则排序（决策⑦），纯 DFS 即得
+  // “可见序”。此处绝不能再对平铺结果排序——那正是 R5 的结构性分叉（全局平铺排序 ≠
+  // 逐层可见序），且会把已正确的树序再次打乱。
   appendTracksDepthFirst(nodes, contextNodeId, result.order);
   if (result.order.empty()) {
     result.status = PlaybackContextBuildStatus::EmptyContext;
     return result;
   }
 
-  sortOrder(result.order, result.context.sortRules);
   setAnchorStatus(result);
   return result;
 }
