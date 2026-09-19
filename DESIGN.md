@@ -12,7 +12,7 @@ Seriona 是一个独立的 C++23 音乐库后端：接收一个音乐根目录�
 - 构建：CMake 3.27+，C++23，仅 CXX；`CMakePresets.json` 提供 `release` 预设（输出 `build/release`）；无 CI、无格式化配置。
 - 音频解码：FFmpeg（`libavformat/libavcodec/libavutil/libavfilter/libswresample`）；输出：miniaudio（vendored 单头文件）。
 - 标签读取：外部仓库 TagReader（`TagReaderCore`），经适配层接入。
-- 元数据缓存：SQLite（固定 v3 schema）；哈希：libxxhash（XXH3/XXH64）。
+- 元数据缓存：SQLite（固定 v3 schema）；哈希：libxxhash（XXH3/XXH64）；文本排序：ICU（`uc`/`i18n`，`ucol_open` 字典序 collation，三端由 vcpkg / `libicu-dev` / Homebrew `icu4c` 供给）。
 - 平台媒体集成：Linux 上经 sdbus-c++ 发布 MPRIS 2.x 对象；Windows 仅有占位实现。
 - 日志：spdlog（默认 logger `seriona`，滚动文件 5MB×3）；测试：doctest（vendored）。
 - 并发：`bshoshany/thread-pool` v4.1.0（FetchContent 固定版本）。
@@ -127,10 +127,10 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 - `MediaController`（pimpl 门面）：`submitCommand`（24 种命令，同步阻塞直到执行完成）、`enumeratePlaybackDevices`（设备枚举）、`scanLibrary`、五路订阅（playerState/libraryState/equalizerState/spectrum/domainNotifications）、快照查询、`start/shutdown`。命令面含播放/扫描/排序、输出配置（`ConfigureOutput`，携带 `AudioOutputConfig`）、播放过渡配置（`SetTransitionConfig`，携带 `TransitionConfig`，仅更新过渡配置、无整轨重载/设备副作用）、删除（`DeleteTrack`/`DeleteFolder`，直接删原文件，目标经 `targetPath` 传入）、临时队列（`PlayNextTrack`/`ClearPlayQueue`/`RemoveFromQueue`）、均衡器参数配置（`SetEqualizerConfig`，携带 `EqualizerConfig`，校验模式/±15 dB/NaN 后生效快照 generation++ 经 equalizerState 订阅发布；音频侧处理面与接线现状见 §4.1）、频谱开关（`SetSpectrumEnabled`，携带 bool 载荷，纯门控直转音频服务原子位，无 reducer 镜像——频谱数据通道见 §4.1 接线现状）；播放快照含 `queueEntries`（`[{trackId, nodeId}]`）临时队列字段。另提供应用设置键值读写（`getAppSetting`/`setAppSetting`/`removeAppSetting`，经 `AppSettingsStore` 落库，供前端设置/导航/播放统计三控制器持久化）。
 - 命令与后端事件共用单事件循环线程：命令 → `ControlStateReducer`（纯函数归约，含 shuffle 历史、seek 状态抑制、版本去重、PlaybackEnded 自动下一曲/Repeat One、EndApproaching 决策与 AdvanceCompleted 提交账本，窗口内失效命令先 abort 再执行本体）→ `ControlReduction{result, intents, notifications}` → 提交快照 → 发布订阅者 → `executeIntents` 翻译为 audio 调用。
-- 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 多规则排序（缺失值 First/Last）+ 锚点定位；Root/Folder 两种作用域。
+- 播放上下文：`buildPlaybackContextOrder` 从播放列表树快照 DFS 收集轨道 + 锚点定位；Root/Folder 两种作用域。顺序完全取自树内各层 `childNodeIds`，构建器自身不排序。
 - 依赖注入：`MediaControllerDependencies`（audio/scanner/metadata/folderSortSettingsStore/appSettingsStore/artworkResolver），缺失自动回退 noop；生产工厂接线 miniaudio 后端、带 databasePath/coverExportDir 的 scanner、Linux metadata、SQLite 文件夹排序存储（databasePath 非空时）、SQLite 应用设置存储（与排序存储共享 databasePath）。
 - 封面解析：`ArtworkResolver`（有界 latest-wins 队列 + 结果 epoch 失效）+ 归约器 generation 校验，结果回填 `player_.artwork.localPath`。
-- 文件夹排序：`FolderSortSettingsStore` 抽象（Noop/SQLite 实现，手写 JSON 解析）；`ApplyFolderSortRules` 命令持久化、扫描启动时重放、播放上下文构建时回填。
+- 文件夹排序：`FolderSortSettingsStore` 抽象（Noop/SQLite 实现，手写 JSON 解析）；`ApplyFolderSortRules` 命令持久化、扫描启动时重放。排序语义为 ICU 字典序（`text_collation.{h,cpp}` 的 `compareCollatedText`：`zh-u-co-pinyin` + `UCOL_SECONDARY`，并列按 UTF-8 字节序 tie-break），施加在控制层曲库树副本的各层 `childNodeIds` 上（`tree_sort.{h,cpp}` 的 `sortTreeChildOrderByRules`，仅排显式设过规则的层）；扫描器与前端都不排序，前端渲染序与播放 DFS 序共用同一棵树。
 - 应用设置：`AppSettingsStore` 抽象（Noop/SQLite 实现，接口含 `set`/`get`/`remove`/`listByGroup`（按 key 排序）），`app_settings` 表 `(group_name, key, value, updated_at_ms)` 主键 `(group_name, key)`；`getAppSetting` 失败返回 nullopt（未启动/未存储），值以不透明字符串存储（后端不解释，前端负责编解码）。
 - 订阅分发：每订阅类型一个独立投递线程，快照拷贝后异步回调，避免阻塞归约线程。
 
@@ -143,7 +143,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ## 5. 模块关系
 
-- 库链接（根 CMakeLists）：`seriona_control` PRIVATE → audio/scanner/metadata/SQLite3/spdlog；`seriona_audio` PUBLIC → FFmpeg + third_party 头、PRIVATE → BS::thread_pool/spdlog；`seriona_scanner` PUBLIC → SQLite3/xxhash/TagReaderCore/thread_pool/spdlog、PRIVATE → efsw-static；`seriona_metadata` PRIVATE → spdlog（Linux 追加 sdbus-c++）。
+- 库链接（根 CMakeLists）：`seriona_control` PRIVATE → audio/scanner/metadata/SQLite3/spdlog/ICU::uc/ICU::i18n；`seriona_audio` PUBLIC → FFmpeg + third_party 头、PRIVATE → BS::thread_pool/spdlog；`seriona_scanner` PUBLIC → SQLite3/xxhash/TagReaderCore/thread_pool/spdlog、PRIVATE → efsw-static；`seriona_metadata` PRIVATE → spdlog（Linux 追加 sdbus-c++）。
 - 数据流：`terminal_io`（按键）→ `MediaControlCommand` → 事件循环 → 归约 → audio 调用 → `BackendEvent` → 归约 → 订阅者；快照同时驱动 metadata 分享。
 - 扫描数据流：`FileScannerService` 事件（含 `PlaylistTreeSnapshot`）→ control 归约更新曲库 → 播放上下文重建（当前曲消失自动续播）。
 - 头级循环依赖：`metadata_contracts.h` 包含 `control_contracts.h`，control 侧前置声明 `MetadataSharingService` 打破环。
@@ -249,7 +249,7 @@ Windows / Linux / macOS 三端同时可配置、可构建、可通过测试是�
 - 平台差异只允许出现在三个既有平台边界内，并由根 CMake 的平台条件选择源文件：`src/audio/device/`（设备层；平台条件只选择设备格式枚举器源——非 Apple 的 Unix 用 PipeWire SPA、Windows 用 WASAPI 矩阵探测，其余平台由工厂返回空枚举器，而实际输出后端 miniaudio 是三端共用的源文件）、`src/metadata/`（平台私有实现，如 `metadata_mpris_linux.cpp`、`metadata_windows_private.cpp`）、以及 `runtime_paths.h` 的三路运行时路径解析（XDG / macOS `~/Library` / 便携模式，见 §6）。新增平台行为必须并入这些文件，或建立同等级抽象。
 - 公共头（`inc/seriona/`）与共享实现中禁止散落裸 `#ifdef _WIN32`、POSIX-only（`unistd`/`dirent`/`::realpath` 等）或 Windows-only 调用。sdbus-c++ 的依赖判定条件是 `UNIX AND NOT APPLE`，不得改写成「Linux」——两者对 macOS/BSD 的结论不同。
 - 文件监视不设平台私有源：Linux inotify / Windows ReadDirectoryChangesW / macOS FSEvents 一律由 efsw 单一文件系统后端提供（macOS 所需 CoreFoundation/CoreServices 由上游自带），不新增 watcher 平台私有实现，也不打 vendored 平台补丁。
-- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；无法同时覆盖的能力须经 CMake 条件关闭或 mock-only 降级，不得阻塞其它平台。已记录的例外是 FetchContent 供给的 `bshoshany/thread-pool` 与 efsw（Homebrew 无对应公式、外部 `find_package` 三端不可行），两者随 `SERIONA_INSTALL_EXPORT` 一并打包进导出。
+- 新增依赖必须能由 vcpkg（Windows）与系统包/Homebrew（Linux/macOS）同时供给；无法同时覆盖的能力须经 CMake 条件关闭或 mock-only 降级，不得阻塞其它平台。已记录的例外是 FetchContent 供给的 `bshoshany/thread-pool` 与 efsw（Homebrew 无对应公式、外部 `find_package` 三端不可行），两者随 `SERIONA_INSTALL_EXPORT` 一并打包进导出。ICU 走标准的 `find_package(ICU ... uc i18n)` 三端供给（vcpkg / 系统包 / Homebrew `icu4c`，macOS keg-only 需注入 `ICU_ROOT`），其版本在三端可不同，同一曲库在不同平台可能排出不同顺序；该差异属已知且接受的行为。
 - 改动涉及平台行为而本机无法验证另一端时，必须在提交信息中说明受影响面与验证方式。
 
 ## 13. 维护建议
