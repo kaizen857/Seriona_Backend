@@ -14,6 +14,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace seriona::scanner {
@@ -421,6 +423,90 @@ TEST_CASE("lrc parser keeps unsynced sentinel negative when an offset tag is pre
   CHECK(offsetAfter.lines[1].text == "Second line");
 }
 
+// G3（增强 LRC 逐字标签剥离）：`<mm:ss.xx>` 只剥离标签、丢弃逐字时间轴（不实现逐字高亮），
+// 剥离后文本 = 「按标签切分的文字片段原样拼接」。多个标签 / 标签紧贴文字 / 连续标签均适用。
+TEST_CASE("lrc parser strips inline per-character timestamp tags keeping merged text") {
+  const auto basic = parseLrcText("[00:12.00]<00:12.00>Hello <00:12.50>world\n");
+  CHECK(basic.errors.empty());
+  REQUIRE(basic.lines.size() == 1U);
+  CHECK(basic.lines.front().timestamp == std::chrono::milliseconds{12000});
+  CHECK(basic.lines.front().text == "Hello world");
+
+  // 3 位小数逐字标签（§8.9.3 允许 mm:ss.xxx）。
+  const auto threeDigits = parseLrcText("[00:12.00]<00:12.340>Hello\n");
+  CHECK(threeDigits.errors.empty());
+  REQUIRE(threeDigits.lines.size() == 1U);
+  CHECK(threeDigits.lines.front().text == "Hello");
+
+  // 标签紧贴多字节文字、一行多个、无边界：剥离后必须是文字片段的原样拼接。
+  const auto adjacent = parseLrcText("[00:00.00]你<00:01.00>好<00:02.00>\n");
+  CHECK(adjacent.errors.empty());
+  REQUIRE(adjacent.lines.size() == 1U);
+  CHECK(adjacent.lines.front().text == "你好");
+}
+
+// 连续标签 / 一行 3+ 个标签 / 整行只有标签。整行只有标签时剥离结果为空串：既有解析对「带时间戳
+// 但正文为空」的行同样保留为空文本 `LyricLine`（空正文不会触发 timestamps.empty() 跳过），
+// 故此行为与既有语义一致，且不改变既有用例。
+TEST_CASE("lrc parser strips consecutive and many inline timestamp tags") {
+  const auto consecutive = parseLrcText("[00:01.00]<00:01.00><00:02.00>text\n");
+  CHECK(consecutive.errors.empty());
+  REQUIRE(consecutive.lines.size() == 1U);
+  CHECK(consecutive.lines.front().text == "text");
+
+  const auto many = parseLrcText("[00:01.00]<00:01.00>a<00:02.00>b<00:03.00>c<00:04.00>\n");
+  CHECK(many.errors.empty());
+  REQUIRE(many.lines.size() == 1U);
+  CHECK(many.lines.front().text == "abc");
+
+  const auto onlyTags = parseLrcText("[00:01.00]<00:01.00><00:02.00>\n");
+  CHECK(onlyTags.errors.empty());
+  REQUIRE(onlyTags.lines.size() == 1U);
+  CHECK(onlyTags.lines.front().text.empty());
+}
+
+// 反例（§8.9.3「比较运算」歧义，宁缺勿滥）：只有严格 mm:ss.xx / mm:ss.xxx 形态才剥离；其余 `<`/`>`
+// 是正文，必须逐字节保留。含无配对的 `>`、秒越界与超长小数等边界。
+TEST_CASE("lrc parser preserves non-timestamp angle brackets verbatim") {
+  const std::array<std::pair<std::string_view, std::string_view>, 10> preserved{{
+      {"[00:01.00]a < b\n", "a < b"},
+      {"[00:01.00]1 < 2 > 0\n", "1 < 2 > 0"},
+      {"[00:01.00]a <b> c\n", "a <b> c"},
+      {"[00:01.00]<3:4>\n", "<3:4>"},
+      {"[00:01.00]<00:1.0>\n", "<00:1.0>"},
+      {"[00:01.00]<abc>\n", "<abc>"},
+      {"[00:01.00]<00:12>\n", "<00:12>"},
+      {"[00:01.00]<00:12.3456>\n", "<00:12.3456>"},
+      {"[00:01.00]< 00:12.34 >\n", "< 00:12.34 >"},
+      {"[00:01.00]<00:61.00>\n", "<00:61.00>"},
+  }};
+
+  for (const auto& [input, expected] : preserved) {
+    CAPTURE(input);
+    const auto result = parseLrcText(std::string{input});
+    CHECK(result.errors.empty());
+    REQUIRE(result.lines.size() == 1U);
+    CHECK(std::string_view{result.lines.front().text} == expected);
+  }
+}
+
+// 与既有行为正交：逐字标签剥离只改正文文本，不改行首时间戳、多时间戳展开与 offset 应用。
+TEST_CASE("lrc parser strips inline tags without disturbing bracket timestamps or offset") {
+  const auto multi = parseLrcText("[00:02.50][00:01.00]<00:01.00>Same line\n");
+  CHECK(multi.errors.empty());
+  REQUIRE(multi.lines.size() == 2U);
+  CHECK(multi.lines[0].timestamp == std::chrono::milliseconds{1000});
+  CHECK(multi.lines[0].text == "Same line");
+  CHECK(multi.lines[1].timestamp == std::chrono::milliseconds{2500});
+  CHECK(multi.lines[1].text == "Same line");
+
+  const auto offset = parseLrcText("[offset:+500]\n[00:01.00]<00:01.00>line\n");
+  CHECK(offset.errors.empty());
+  REQUIRE(offset.lines.size() == 1U);
+  CHECK(offset.lines.front().timestamp == std::chrono::milliseconds{500});
+  CHECK(offset.lines.front().text == "line");
+}
+
 TEST_CASE("cue sheet path classification recognizes lowercase and uppercase extensions") {
   test::TempScannerRoot root("scanner-cue-extensions");
   writeTextFile(root.path() / "album.cue", "FILE \"album.flac\" FLAC\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
@@ -597,6 +683,179 @@ TEST_CASE("scanner path discovery keeps a readable root with child errors") {
   CHECK(song.path == audio);
 }
 #endif
+
+// ── G6（行内元数据 / 制作人员行丢弃）───────────────────────────────────────────
+// 判据镜像算法侧 `clean_line`（设计文档 §6.2 阶段 A）：先剥时间戳 → 再剥行内 `[tag:value]`
+// → 最后判元数据/制作人员（P1 顺序陷阱，§6.3）。语料实测形态：① `[ts]作词 : … [by:…]`
+// 1039 文件 / 2300 行；② `[ts][by:…]`（纯元数据）90 文件 / 90 行；③ 正文 + 行内 tag 162 文件；
+// 裸时间戳（无正文）837 文件 / 7496 行；G7 `[tr:…]`/`[lang:…]` 0 文件。
+
+// ① 制作人员行 + ② 纯元数据行 + 裸时间戳行 ⇒ 一律丢弃；带时间戳的正文行一条不丢。
+// ① 同时是 P1 顺序的可判负钉子：若先判制作人员/元数据、后剥时间戳，行首 `[00:00.000]`
+// 会遮住 `作词`/`[by:` 两个行首锚定判据 ⇒ 本用例必须失败。
+TEST_CASE("lrc parser drops credit-only metadata-only and bare timestamp lines") {
+  const auto credit = parseLrcText("[00:00.000]作词 : みゅー [by:agexnit]\n[00:01.00]real lyric\n");
+  CHECK(credit.errors.empty());
+  REQUIRE(credit.lines.size() == 1U);
+  CHECK(credit.lines.front().timestamp == std::chrono::milliseconds{1000});
+  CHECK(credit.lines.front().text == "real lyric");
+
+  const auto pureMetadata = parseLrcText("[00:00.000][by:夜羽小猫]\n[00:01.00]real lyric\n");
+  CHECK(pureMetadata.errors.empty());
+  REQUIRE(pureMetadata.lines.size() == 1U);
+  CHECK(pureMetadata.lines.front().text == "real lyric");
+
+  // 裸时间戳（无正文）：与 `clean_line` 的 `if not body: return None` 一致地丢弃。
+  const auto bare = parseLrcText("[00:00.19]\n[00:01.00]real lyric\n");
+  CHECK(bare.errors.empty());
+  REQUIRE(bare.lines.size() == 1U);
+  CHECK(bare.lines.front().text == "real lyric");
+
+  // 多时间戳 + 纯元数据 ⇒ 整行丢弃（不得按时间戳展开成多个空文本行）。
+  const auto multiTag = parseLrcText("[00:01.00][00:02.00][by:x]\n[00:03.00]real lyric\n");
+  CHECK(multiTag.errors.empty());
+  REQUIRE(multiTag.lines.size() == 1U);
+  CHECK(multiTag.lines.front().text == "real lyric");
+
+  // 正文位置只剩元数据标签与空白 ⇒ 同样丢弃。
+  const auto onlyMeta = parseLrcText("[00:01.00] [ti:title] \n[00:02.00]ok\n");
+  CHECK(onlyMeta.errors.empty());
+  REQUIRE(onlyMeta.lines.size() == 1U);
+  CHECK(onlyMeta.lines.front().text == "ok");
+
+  // 半角/全角冒号 + 冒号前后空白均命中制作人员判据。
+  const auto colons = parseLrcText("[00:01.00]作曲：someone\n[00:02.00]编曲 :  someone\n[00:03.00]ok\n");
+  CHECK(colons.errors.empty());
+  REQUIRE(colons.lines.size() == 1U);
+  CHECK(colons.lines.front().text == "ok");
+}
+
+// ③ 正文 + 行内 `[tag:value]`：标签剥离、正文保留（镜像 `removeInlineTags` 的全局非重叠删除）。
+TEST_CASE("lrc parser strips inline metadata tags from lyric bodies") {
+  const auto trailing = parseLrcText("[00:01.00]再见 [by:匿]\n");
+  CHECK(trailing.errors.empty());
+  REQUIRE(trailing.lines.size() == 1U);
+  CHECK(trailing.lines.front().text == "再见");
+
+  const auto embedded = parseLrcText("[00:01.00]前[ar:Artist]后\n");
+  CHECK(embedded.errors.empty());
+  REQUIRE(embedded.lines.size() == 1U);
+  CHECK(embedded.lines.front().text == "前后");
+
+  const auto multiple = parseLrcText("[00:01.00]a[ti:T]b[al:A]c\n");
+  CHECK(multiple.errors.empty());
+  REQUIRE(multiple.lines.size() == 1U);
+  CHECK(multiple.lines.front().text == "abc");
+
+  // 空 value 与下划线仍属行内 tag；不匹配的 `[...]`（无 `word:` 形态）逐字节保留。
+  const auto shapes = parseLrcText("[00:01.00]a[by:]b[_k:v]c\n");
+  CHECK(shapes.errors.empty());
+  REQUIRE(shapes.lines.size() == 1U);
+  CHECK(shapes.lines.front().text == "abc");
+
+  const auto bracketsKept = parseLrcText("[00:01.00]a [not a tag] b\n");
+  CHECK(bracketsKept.errors.empty());
+  REQUIRE(bracketsKept.lines.size() == 1U);
+  CHECK(bracketsKept.lines.front().text == "a [not a tag] b");
+}
+
+// ④ 反例（不得误伤）：制作人员关键词出现在正文中（非行首，或行首但无冒号）⇒ 必须保留。
+TEST_CASE("lrc parser preserves credit keywords appearing inside lyric bodies") {
+  const std::array<std::pair<std::string_view, std::string_view>, 6> preserved{{
+      {"[00:01.00]他说作词很难\n", "他说作词很难"},
+      {"[00:01.00]这首歌的作曲是某人\n", "这首歌的作曲是某人"},
+      {"[00:01.00]by the way\n", "by the way"},
+      {"[00:01.00]Bob Dylan\n", "Bob Dylan"},
+      {"[00:01.00]曲终人散\n", "曲终人散"},
+      {"[00:01.00]歌词里没有冒号作词\n", "歌词里没有冒号作词"},
+  }};
+
+  for (const auto& [input, expected] : preserved) {
+    CAPTURE(input);
+    const auto result = parseLrcText(std::string{input});
+    CHECK(result.errors.empty());
+    REQUIRE(result.lines.size() == 1U);
+    CHECK(std::string_view{result.lines.front().text} == expected);
+  }
+}
+
+// G6 空 body 判据的检查点必须**早于**逐字标签剥离：`[ts]<逐字标签>` 在 G6 阶段 body 非空
+// ⇒ 保留空文本行（与既有断言一致）；`[ts][by:x]` 在 G6 阶段 body 即为空 ⇒ 丢弃。
+// 若判据挪到逐字剥离之后，两者都成空串、行为不可区分（且会误丢前者的既有不变式）。
+TEST_CASE("lrc parser evaluates G6 on the body before karaoke stripping") {
+  const auto karaokeOnly = parseLrcText("[00:01.00]<00:01.00><00:02.00>\n");
+  CHECK(karaokeOnly.errors.empty());
+  REQUIRE(karaokeOnly.lines.size() == 1U);
+  CHECK(karaokeOnly.lines.front().text.empty());
+
+  const auto inlineTagOnly = parseLrcText("[00:01.00][by:x]\n");
+  CHECK(inlineTagOnly.errors.empty());
+  CHECK(inlineTagOnly.lines.empty());
+}
+
+// G7 钉子：`[tr:…]`/`[lang:…]` **不实现**语义 —— 与其它 `[tag:value]` 同样被丢弃，不产生
+// 翻译/语言输出。`LyricLine` 契约未变（编译期钉住不得新增这类字段）。
+template <typename T, typename = void>
+struct HasTranslationField : std::false_type {};
+template <typename T>
+struct HasTranslationField<T, std::void_t<decltype(std::declval<T>().translation)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasTranslatedTextField : std::false_type {};
+template <typename T>
+struct HasTranslatedTextField<T, std::void_t<decltype(std::declval<T>().translatedText)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasLanguageField : std::false_type {};
+template <typename T>
+struct HasLanguageField<T, std::void_t<decltype(std::declval<T>().language)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasLangField : std::false_type {};
+template <typename T>
+struct HasLangField<T, std::void_t<decltype(std::declval<T>().lang)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasTargetLangField : std::false_type {};
+template <typename T>
+struct HasTargetLangField<T, std::void_t<decltype(std::declval<T>().targetLang)>> : std::true_type {};
+
+TEST_CASE("lrc parser does not implement tr or lang semantics and drops those lines") {
+  static_assert(!HasTranslationField<LyricLine>::value);
+  static_assert(!HasTranslatedTextField<LyricLine>::value);
+  static_assert(!HasLanguageField<LyricLine>::value);
+  static_assert(!HasLangField<LyricLine>::value);
+  static_assert(!HasTargetLangField<LyricLine>::value);
+
+  const auto trOnly = parseLrcText("[00:00.00][tr:zh]\n[00:01.00]real lyric\n");
+  CHECK(trOnly.errors.empty());
+  REQUIRE(trOnly.lines.size() == 1U);
+  CHECK(trOnly.lines.front().text == "real lyric");
+
+  const auto langOnly = parseLrcText("[00:00.00][lang:zh]\n[00:01.00]real lyric\n");
+  CHECK(langOnly.errors.empty());
+  REQUIRE(langOnly.lines.size() == 1U);
+  CHECK(langOnly.lines.front().text == "real lyric");
+
+  // 行内出现时只剥离标签、保留正文（不得据此新增译文/语言输出）。
+  const auto inlineTag = parseLrcText("[00:01.00]hello [tr:zh]\n");
+  CHECK(inlineTag.errors.empty());
+  REQUIRE(inlineTag.lines.size() == 1U);
+  CHECK(inlineTag.lines.front().text == "hello");
+}
+
+// G6 同样作用于 G4 的无时间戳行：命中元数据/制作人员判据的丢弃；整首纯文本歌词不被误杀。
+TEST_CASE("lrc parser applies G6 to unsynced lines without dropping plain lyrics") {
+  const auto dropped = parseLrcText("作词 : someone\nFirst plain line\n");
+  CHECK(dropped.errors.empty());
+  REQUIRE(dropped.lines.size() == 1U);
+  CHECK(dropped.lines.front().text == "First plain line");
+  CHECK(dropped.lines.front().timestamp < std::chrono::milliseconds{0});
+
+  const auto kept = parseLrcText("First plain line\nSecond line\n");
+  CHECK(kept.errors.empty());
+  REQUIRE(kept.lines.size() == 2U);
+}
 
 }
 }
