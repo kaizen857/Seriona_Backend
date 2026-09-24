@@ -67,6 +67,10 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# Python
+__pycache__/
+*.pyc
+
 tmp/
 # OpenCode working directory
 .omo/
