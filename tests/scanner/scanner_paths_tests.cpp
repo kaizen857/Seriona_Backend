@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -236,6 +237,188 @@ TEST_CASE("lrc parser reads files without throwing through scanner callers") {
   CHECK(result.errors.empty());
   REQUIRE(result.lines.size() == 1U);
   CHECK(result.lines.front().timestamp == std::chrono::milliseconds{500});
+}
+
+// G1：`[offset:<±ms>]` 方向为 ts_new = ts_parsed − offset（正数 = 歌词提前显示 = 时间戳变小）。
+// 首行原时间戳 100ms < 500ms ⇒ 相减为负 ⇒ 必须夹到 0（正 offset 独有分支）。无符号值缺省视为正。
+TEST_CASE("lrc parser applies positive offset by shifting timestamps earlier and clamping at zero") {
+  const auto shifted = parseLrcText("[offset:+500]\n[00:00.10]early\n[00:01.00]later\n");
+
+  CHECK(shifted.errors.empty());
+  REQUIRE(shifted.lines.size() == 2U);
+  CHECK(shifted.lines[0].timestamp == std::chrono::milliseconds{0});
+  CHECK(shifted.lines[0].text == "early");
+  CHECK(shifted.lines[1].timestamp == std::chrono::milliseconds{500});
+  CHECK(shifted.lines[1].text == "later");
+
+  const auto bareSign = parseLrcText("[offset:500]\n[00:01.00]later\n");
+  CHECK(bareSign.errors.empty());
+  REQUIRE(bareSign.lines.size() == 1U);
+  CHECK(bareSign.lines.front().timestamp == std::chrono::milliseconds{500});
+}
+
+// G1：负 offset（ts_new = ts + |offset|）使时间戳变大，不产生负值。
+TEST_CASE("lrc parser applies negative offset by shifting timestamps later") {
+  const auto shifted = parseLrcText("[offset:-500]\n[00:01.00]first\n[00:02.50]second\n");
+
+  CHECK(shifted.errors.empty());
+  REQUIRE(shifted.lines.size() == 2U);
+  CHECK(shifted.lines[0].timestamp == std::chrono::milliseconds{1500});
+  CHECK(shifted.lines[1].timestamp == std::chrono::milliseconds{3000});
+}
+
+// 无 offset 时行为逐字节不变：混合样例（元数据 + 多时间戳 + 前后空白 + 重复行）与既有解析一致。
+// `[offset:abc]` 是无效值 ⇒ 沿用既有元数据跳过路径，不报错、不施加偏移。
+TEST_CASE("lrc parser leaves timestamps unchanged without offset tag") {
+  const auto result = parseLrcText("[ar:Artist]\r\n[00:02.50][00:01.00]  Same line  \r\n[00:01.00]Same line\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 2U);
+  CHECK(result.lines[0].timestamp == std::chrono::milliseconds{1000});
+  CHECK(result.lines[0].text == "Same line");
+  CHECK(result.lines[1].timestamp == std::chrono::milliseconds{2500});
+  CHECK(result.lines[1].text == "Same line");
+
+  const auto invalid = parseLrcText("[offset:abc]\n[00:01.00]line\n");
+  CHECK(invalid.errors.empty());
+  REQUIRE(invalid.lines.size() == 1U);
+  CHECK(invalid.lines.front().timestamp == std::chrono::milliseconds{1000});
+}
+
+// 多次出现后者覆盖前者：+500 先、-200 后 ⇒ 最终 -200 生效（1000+200=1200）。若误用首个 (+500)
+// 结果为 500ms，故该断言可判负。
+TEST_CASE("lrc parser lets the last offset tag win when it appears multiple times") {
+  const auto result = parseLrcText("[offset:+500]\n[offset:-200]\n[00:01.00]line\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 1U);
+  CHECK(result.lines.front().timestamp == std::chrono::milliseconds{1200});
+}
+
+// G4：整首无时间戳的纯文本 `.lrc` ⇒ 正文行全部保留（当前实现整首丢弃是本 todo 要修的缺陷）。
+// 时间戳断言 `< 0`（哨兵）而非 `== 0`：哨兵独立于合法时间戳 0，不参与 D22 分组。
+// 尾部重复行必须原样保留 ⇒ 同时钉住「提升晚于 unique、unsynced 不去重」这一放置决定。
+TEST_CASE("lrc parser preserves whole-file unsynced plain text with negative sentinel timestamp") {
+  const auto result = parseLrcText("First plain line\n\n  Second line  \nThird line\nThird line\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 4U);
+  CHECK(result.lines[0].text == "First plain line");
+  CHECK(result.lines[0].timestamp < std::chrono::milliseconds{0});
+  CHECK(result.lines[1].text == "Second line");
+  CHECK(result.lines[1].timestamp < std::chrono::milliseconds{0});
+  CHECK(result.lines[2].text == "Third line");
+  CHECK(result.lines[2].timestamp < std::chrono::milliseconds{0});
+  CHECK(result.lines[3].text == "Third line");
+  CHECK(result.lines[3].timestamp < std::chrono::milliseconds{0});
+}
+
+// G4 混合形态：有任一时间戳行 ⇒ 无时间戳行按 §8.9.4 丢弃（这类行通常是文件尾制作者署名）。
+// 若误把②也保留，size 会变成 3 ⇒ 可判负。既有元数据用例（纯 `[ti:]/[ar:]/[al:]` ⇒ 空）不受影响。
+TEST_CASE("lrc parser drops unsynced lines in mixed files keeping only timestamped lines") {
+  const auto result = parseLrcText("[00:01.00]timed one\nplain tail line\n[00:02.00]timed two\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 2U);
+  CHECK(result.lines[0].timestamp == std::chrono::milliseconds{1000});
+  CHECK(result.lines[0].text == "timed one");
+  CHECK(result.lines[1].timestamp == std::chrono::milliseconds{2000});
+  CHECK(result.lines[1].text == "timed two");
+}
+
+// 钉住「哨兵不复用 0」的另一半：`[00:00.000]` 是合法时间戳（语料 1,945 行 / 1,257 文件），
+// 必须作为真实 0ms 行保留，不得被当作 unsynced 排除。
+TEST_CASE("lrc parser keeps zero timestamps as real timestamps and not as unsynced marker") {
+  const auto result = parseLrcText("[00:00.000]opening line\n[00:01.00]next line\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 2U);
+  CHECK(result.lines[0].timestamp == std::chrono::milliseconds{0});
+  CHECK(result.lines[0].text == "opening line");
+  CHECK(result.lines[1].timestamp == std::chrono::milliseconds{1000});
+  CHECK(result.lines[1].text == "next line");
+}
+
+// F2：minutes 越界（uint64→int64 回绕会产出负数，与 unsynced 哨兵 -1 碰撞）必须被拒绝为畸形时间戳；
+// 任何被接受的合法时间戳恒 ≥ 0。`[323432912759040805:00.031]` 修复前实测产出 ts=-1（恰为哨兵）。
+TEST_CASE("lrc parser rejects timestamps that cannot be represented as non-negative int64 milliseconds") {
+  const auto sentinelCollision = parseLrcText("[323432912759040805:00.031]collides-with-sentinel\n");
+  REQUIRE(sentinelCollision.errors.size() == 1U);
+  CHECK(sentinelCollision.errors.front().code == LrcParseErrorCode::InvalidTimestamp);
+  CHECK(sentinelCollision.lines.empty());
+
+  const auto negativeWrap = parseLrcText("[184467440737095516:00.00]negative-wrap\n");
+  REQUIRE(negativeWrap.errors.size() == 1U);
+  CHECK(negativeWrap.errors.front().code == LrcParseErrorCode::InvalidTimestamp);
+  CHECK(negativeWrap.lines.empty());
+
+  const auto normal = parseLrcText("[00:01.00]ok\n");
+  CHECK(normal.errors.empty());
+  REQUIRE(normal.lines.size() == 1U);
+  CHECK(normal.lines.front().timestamp == std::chrono::milliseconds{1000});
+}
+
+// F1：offset 幅值上界 —— 超大幅值（正/负各一）会让 `ts − offset` 有符号溢出（UB）。越界即按无效标签
+// 跳过（同 `[offset:abc]` 路径），不报错、时间戳保持原值。
+TEST_CASE("lrc parser ignores out-of-range offset magnitudes keeping timestamps unchanged") {
+  const auto hugePositive = parseLrcText("[offset:9223372036854775807]\n[00:01.00]line\n");
+  CHECK(hugePositive.errors.empty());
+  REQUIRE(hugePositive.lines.size() == 1U);
+  CHECK(hugePositive.lines.front().timestamp == std::chrono::milliseconds{1000});
+
+  const auto hugeNegative = parseLrcText("[offset:-9223372036854775807]\n[00:01.00]line\n");
+  CHECK(hugeNegative.errors.empty());
+  REQUIRE(hugeNegative.lines.size() == 1U);
+  CHECK(hugeNegative.lines.front().timestamp == std::chrono::milliseconds{1000});
+
+  // 24h 边界：kMaxOffsetMagnitudeMs = 86'400'000 本身合法，+1 越界 ⇒ 无效标签跳过。
+  // 取 `[1441:00.00]` = 86'460'000ms（> 24h）以免被夹 0 掩盖减法结果。
+  const auto atBound = parseLrcText("[offset:+86400000]\n[1441:00.00]line\n");
+  CHECK(atBound.errors.empty());
+  REQUIRE(atBound.lines.size() == 1U);
+  CHECK(atBound.lines.front().timestamp == std::chrono::milliseconds{60000});
+
+  const auto overBound = parseLrcText("[offset:+86400001]\n[1441:00.00]line\n");
+  CHECK(overBound.errors.empty());
+  REQUIRE(overBound.lines.size() == 1U);
+  CHECK(overBound.lines.front().timestamp == std::chrono::milliseconds{86460000});
+}
+
+// NEW-1：双符号 offset 不得绕过幅值上界（旧实现按**有符号** int64 解析，第二个符号被继续接受 ⇒
+// magnitude 变负 ⇒ 负数通不过 `> kMaxOffsetMagnitudeMs` ⇒ 上界被静默绕过，`-magnitude` 与 `ts − offset`
+// 均可有符号溢出 UB）。改为**无符号**解析后，剩余以符号开头的输入必然解析失败 ⇒ 按无效标签跳过。
+TEST_CASE("lrc parser ignores double-signed offset tags that could bypass the magnitude bound") {
+  const auto doubleSigns = std::array<std::string_view, 6>{
+      "[offset:+-100000000]\n[00:01.00]line\n",   "[offset:--100000000]\n[00:01.00]line\n",
+      "[offset:+-9223372036854775807]\n[00:01.00]line\n", "[offset:--9223372036854775808]\n[00:01.00]line\n",
+      "[offset:++500]\n[00:01.00]line\n",          "[offset:-+500]\n[00:01.00]line\n"};
+
+  for (const auto input : doubleSigns) {
+    const auto result = parseLrcText(std::string{input});
+    CHECK(result.errors.empty());
+    REQUIRE(result.lines.size() == 1U);
+    CHECK(result.lines.front().timestamp == std::chrono::milliseconds{1000});
+  }
+}
+
+// F6：offset × unsynced 最高风险交互 —— offset 标签带 `[...]` 故不被收进正文；提升晚于 offset 应用，
+// 故哨兵行不经 `max(0,·)` 夹 0。断言 `== -1ms`（强于 `< 0`）钉住哨兵未被夹成 0；offset 在正文前后皆然。
+TEST_CASE("lrc parser keeps unsynced sentinel negative when an offset tag is present") {
+  const auto offsetBefore = parseLrcText("[offset:+500]\nFirst line\nSecond line\n");
+  CHECK(offsetBefore.errors.empty());
+  REQUIRE(offsetBefore.lines.size() == 2U);
+  CHECK(offsetBefore.lines[0].timestamp == std::chrono::milliseconds{-1});
+  CHECK(offsetBefore.lines[0].text == "First line");
+  CHECK(offsetBefore.lines[1].timestamp == std::chrono::milliseconds{-1});
+  CHECK(offsetBefore.lines[1].text == "Second line");
+
+  const auto offsetAfter = parseLrcText("First line\n[offset:+500]\nSecond line\n");
+  CHECK(offsetAfter.errors.empty());
+  REQUIRE(offsetAfter.lines.size() == 2U);
+  CHECK(offsetAfter.lines[0].timestamp == std::chrono::milliseconds{-1});
+  CHECK(offsetAfter.lines[0].text == "First line");
+  CHECK(offsetAfter.lines[1].timestamp == std::chrono::milliseconds{-1});
+  CHECK(offsetAfter.lines[1].text == "Second line");
 }
 
 TEST_CASE("cue sheet path classification recognizes lowercase and uppercase extensions") {
