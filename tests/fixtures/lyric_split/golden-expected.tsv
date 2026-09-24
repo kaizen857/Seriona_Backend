@@ -1,0 +1,30 @@
+# total_lines=29 files=8 unresolved_decode=0 decode_by_codec=utf-8-sig=8
+golden-lines.lrc	1	S: / 	strong	high	jAzLYEtN LYAsiance/.（みんなと理想を繋ぐ詩を謳います）	我将咏唱一首连接大家与理想的诗
+golden-lines.lrc	2	S: / 	strong	high	haf en synk/.（ハンドシェイク受領、好意を返送）	握手已接收，回赠善意
+golden-lines.lrc	3	S: / 	strong	high	haf.（受領）	已接收
+golden-lines.lrc	4	S: / 	strong	high	土　肌を見せてなお	大地啊，即便裸露着肌肤
+golden-lines.lrc	5	S: / 	strong	high	花/開かせる花/花	花／绽放的花／花
+golden-lines.lrc	6	S: / 	validate-failed	none	日文中文	
+golden-lines.lrc	7	S: / 	qq-sentinel	high	//	
+golden-lines.lrc	8	S: / 	strong	high	Shake up Tonight(シェイカップトゥナイトゥ)	Shake up Tonight(シェイカップトゥナイトゥ)
+golden-lines.lrc	9	S: / 	validate-failed	none	日文 中文	
+route-backslash.lrc	1	S:\\	strong	high	背伸びしてもいい	回首也可以 成长也可以
+route-backslash.lrc	2	S:\\	validate-failed	none	(Kill you\\)	
+route-no-convention.lrc	1	-	no-convention	none	終わり	
+route-no-convention.lrc	2	-	no-convention	none	日文中文	
+route-no-convention.lrc	3	-	no-convention	none	私を呼んでいるのは誰？	
+route-strong-bracket-fallback.lrc	1	S:/	strong	high	惚れた腫れたの馬鹿騒ぎ	愛意被潑冷水的超蠢騷動
+route-strong-bracket-fallback.lrc	2	S:/	strong-bracket-fallback	high	おぼつかぬ足取り	「/略带动摇的步伐」
+route-strong-fallback.lrc	1	S: / 	strong	high	言葉	这句话
+route-strong-fallback.lrc	2	S: / 	strong	high	矛盾	这矛盾
+route-strong-fallback.lrc	3	S: / 	strong-fallback	high	高架橋（こうかきょう） 雨（あめ）降（ふ）らす神様（かみさま / ）	高架橋 降雨之神
+route-strong-weak-fallback.lrc	1	S: / 	strong-weak-fallback	high	蔷薇を想わせる绯色の『口红』(ローズレッドルージュ / )	令人联想起玫瑰的绯色口红
+route-strong-weak-fallback.lrc	2	S: / 	strong-weak-fallback	high	あの『悲鸣は』(うたごえが / )『葡萄酒』	那悲鸣（歌声）有如葡萄美酒
+route-validate-failed.lrc	1	S: / 	strong	high	言葉	这句话
+route-validate-failed.lrc	2	S: / 	strong	high	矛盾	这矛盾
+route-validate-failed.lrc	3	S: / 	validate-failed	none	悔しいけど好きって純情 虽然不甘但还是喜欢你 这份纯情	
+route-validate-failed.lrc	4	S: / 	validate-failed	none	（Afterburner） / 揺るぎない Spirit / （Afterburner） / 坚定不移的Spirit	
+route-validate-failed.lrc	5	S: / 	strong	high	Rrha num wa ene revm	我做了一个梦
+route-weak-bracket.lrc	1	W: 	weak	medium	悔しいけど好きって純情	虽然不甘但还是喜欢你 这份纯情
+route-weak-bracket.lrc	2	W: 	bracket	high	繫がるの 真向いの熱が 今	「现在，正面的热情正紧密相连」
+route-weak-bracket.lrc	3	W: 	bracket	high	Wee paks ra … enter FRELIA.	「我将开始歌唱诗歌『METAFALICA』 经由SOL=FAGE 与芙蕾莉亚共享意识」

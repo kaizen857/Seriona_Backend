@@ -607,18 +607,35 @@ def split_document(raw_lines: Iterable[str], path: str = "", target: str = "zh")
 # 曲库遍历
 # ---------------------------------------------------------------------------
 
-def read_text_file(path: str) -> str | None:
-    """按常见编码尝试解码；解码失败返回 None（不猜测内容）。"""
+# 解码尝试顺序（首个成功即采信）。两端必须一致——`--dump-tsv` 的
+# `decode_by_codec=` 就是按这个顺序列出非零项，顺序变了首行注释就会变。
+TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "big5", "shift_jis", "utf-16")
+
+
+def read_text_file_with_codec(path: str) -> tuple[str, str] | None:
+    """同 read_text_file，但一并返回命中的编码名。
+
+    `--dump-tsv` 的首行注释要打印 `decode_by_codec=`，供 Python/C++ 两端互证
+    「看到的是同一批输入且解码一致」。两端必须**按同一顺序、首个成功即采信**；
+    该顺序就是下面的 TEXT_ENCODINGS（注意 `utf-8-sig` 在前，故无 BOM 的 UTF-8
+    也一律报 `utf-8-sig`——这是刻意的确定性口径，不是缺陷）。
+    """
     try:
         blob = open(path, "rb").read()
     except OSError:
         return None
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "big5", "shift_jis", "utf-16"):
+    for encoding in TEXT_ENCODINGS:
         try:
-            return blob.decode(encoding)
+            return blob.decode(encoding), encoding
         except UnicodeDecodeError:
             continue
     return None
+
+
+def read_text_file(path: str) -> str | None:
+    """按常见编码尝试解码；解码失败返回 None（不猜测内容）。"""
+    got = read_text_file_with_codec(path)
+    return got[0] if got is not None else None
 
 
 def iter_lrc_files(root: str) -> Iterator[str]:
@@ -1000,6 +1017,90 @@ def run_dump(root: str, target: str, pattern: str, out_path: str | None, max_row
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 模式 4：TSV 指纹（--dump-tsv）——Python/C++ 两端逐字节比对的地基
+# ---------------------------------------------------------------------------
+
+def _escape_tsv(text: str) -> str:
+    """列 3/6/7 的转义：`\\`→`\\\\`、TAB→`\\t`、LF→`\\n`。
+
+    **顺序不可换**：必须先替反斜杠，否则字面 `\\t`（作者写的转义写法）会被二次转义成
+    `\\\\t`。`--dump-tsv` 是跨语言线格式，C++ 端必须逐字复刻本函数。
+    """
+    return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+
+
+def _convention_notation(convention: str | None) -> str:
+    """列 3 的规范记号：强分隔符 `S:`+记号、弱边界 `W:`+记号、`SCRIPT`、未推断出写作 `-`。
+
+    记号本身含反斜杠（`\\`）或制表符时，再由 `_escape_tsv` 转义（`S:\\\\`、`W:\\t`）。
+    """
+    if convention is None:
+        return "-"
+    if convention == "SCRIPT":
+        return "SCRIPT"
+    if convention in STRONG_SEPARATORS:
+        return "S:" + convention
+    if convention in WEAK_BOUNDARIES:
+        return "W:" + convention
+    return convention
+
+
+def run_dump_tsv(root: str, target: str, out_path: str | None) -> int:
+    """按行输出 7 列 TSV 指纹：相对路径 / 1-based 清洗后行号 / 文档级约定 /
+    route(reason) / 置信度 / 原文 / 译文。
+
+    列 6/7 未切分时分别是「整行」与空串。行按相对路径（POSIX `/`、Unicode 码点序）
+    排序；首行注释给出 total_lines / files / unresolved_decode / decode_by_codec，
+    供闸门断言两端看到同一批输入。
+    """
+    entries: list[tuple[str, str]] = []
+    for path in iter_lrc_files(root):
+        entries.append((os.path.relpath(path, root).replace(os.sep, "/"), path))
+    entries.sort(key=lambda item: item[0])
+
+    rows: list[str] = []
+    files = 0
+    total_lines = 0
+    unresolved_decode = 0
+    codec_counts: collections.Counter = collections.Counter()
+
+    for rel, path in entries:
+        got = read_text_file_with_codec(path)
+        if got is None:
+            unresolved_decode += 1
+            continue
+        text, codec = got
+        codec_counts[codec] += 1
+        files += 1
+        doc = split_document(text.splitlines(), path, target)
+        for index, (_line, result) in enumerate(doc.results, start=1):
+            total_lines += 1
+            rows.append("\t".join((
+                rel,
+                str(index),
+                _escape_tsv(_convention_notation(doc.convention)),
+                _escape_tsv(result.reason),
+                _escape_tsv(result.confidence),
+                _escape_tsv(result.original),
+                _escape_tsv(result.translation),
+            )))
+
+    codec_part = ",".join(f"{name}={codec_counts[name]}"
+                          for name in TEXT_ENCODINGS if codec_counts[name])
+    header = (f"# total_lines={total_lines} files={files} "
+              f"unresolved_decode={unresolved_decode} decode_by_codec={codec_part}")
+    rendered = "\n".join([header] + rows) + "\n"
+
+    if out_path:
+        with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(rendered)
+        print(f"TSV 指纹已写入：{out_path}（{files} 个文件，{total_lines} 行）")
+    else:
+        sys.stdout.write(rendered)
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="歌词原文/译文切分：离线回归护栏 + 人工复核候选抽取。")
     parser.add_argument("--root", required=True, help="曲库根目录（递归查找 .lrc）")
@@ -1008,9 +1109,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--review", action="store_true", help="抽取人工复核候选清单")
     parser.add_argument("--dump", nargs="?", const="", default=None,
                         help="输出算法在全部行上的切分结果（可选：路径子串过滤，如 --dump '霞む夏の灯'）")
+    parser.add_argument("--dump-tsv", action="store_true",
+                        help="输出 7 列 TSV 行级指纹（供 Python/C++ 两端逐字节比对；默认写标准输出）")
     parser.add_argument("--max-rows", type=int, default=0, help="--dump 每个文件最多输出的行数（0=全部）")
     parser.add_argument("--out", default=None,
-                        help="输出路径；--review 默认 lyric-review.md，--dump 默认写到标准输出")
+                        help="输出路径；--review 默认 lyric-review.md，--dump/--dump-tsv 默认写到标准输出")
     parser.add_argument("--limit", type=int, default=40, help="每类复核候选展示条数")
     parser.add_argument("--samples", type=int, default=3, help="文件级复核类别每个文件附的样例行数")
     parser.add_argument("--min-agree", type=float, default=98.0, help="回归门槛：判定精确率下限(%%)")
@@ -1020,8 +1123,8 @@ def main(argv: list[str]) -> int:
     if not os.path.isdir(args.root):
         print(f"错误：目录不存在 {args.root}", file=sys.stderr)
         return 2
-    if not (args.regression or args.review or args.dump is not None):
-        parser.error("至少指定 --regression、--review 或 --dump")
+    if not (args.regression or args.review or args.dump is not None or args.dump_tsv):
+        parser.error("至少指定 --regression、--review、--dump 或 --dump-tsv")
 
     status = 0
     if args.regression:
@@ -1034,6 +1137,8 @@ def main(argv: list[str]) -> int:
                                         args.limit, args.samples))
     if args.dump is not None:
         status = max(status, run_dump(args.root, args.target, args.dump, args.out, args.max_rows))
+    if args.dump_tsv:
+        status = max(status, run_dump_tsv(args.root, args.target, args.out))
     return status
 
 
