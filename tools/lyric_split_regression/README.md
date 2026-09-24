@@ -37,7 +37,11 @@
 - 第 3/6/7 列做转义：**先 `\` → `\\`，再 TAB → `\t`、LF → `\n`**（顺序不可换）。
 - **首行注释**（唯一权威定义，本行的格式即两端契约）：
   `# total_lines=<N> files=<M> unresolved_decode=<K> decode_by_codec=<codec>=<count>[,…]`
-  —— 供闸门断言「两端看到同一批输入」并能互证**解码**一致（`decode_by_codec` 按解码尝试顺序列非零项）。
+  —— 供闸门断言「两端看到同一批输入」（`decode_by_codec` 按解码尝试顺序列非零项）。
+  ⚠️ 它**不**互证「解码文本一致」：`decode_by_codec` 相同**不代表**解出的文本相同
+  （`gb18030 A3A0` 两端都报 `gb18030` 却解出 `U+3000` vs `U+E5E5`）。闸门契约为
+  **输出行等价**（两端 7 列 TSV 逐字节相同），解码分歧若只落在被 `cleanLine` 丢弃的行上
+  可**静默通过**（见 `evidence/task-9-…/divergence-ledger.md` 的 H1/F1 条目）。
 - 用途/退出码：本模式**只读输出**，退出码 `0`；它**不改变**任何既有模式的输出。
 
 ### 语料一致性闸门 `run_parity_gate.sh`
@@ -45,11 +49,37 @@
 `./run_parity_gate.sh <corpus-root> [<cpp-dump-executable>]` 按 `corpus-manifest.tsv` 校验文件哈希 →
 跑 Python `--dump-tsv` → 跑 C++ dump（`<cpp-dump> --root <root> --dump-tsv`）→ `diff` → 打印
 `total/same/diff`（差异时另打印 `removed`/`added` 与按文件聚合的前 N 条）。
-**退出码约定**：`0`=一致 / `1`=有差异（含哈希不匹配、清单↔dump 行数不互证）/ `2`=用法错误 /
-`77`=**跳过**（语料缺失、清单缺失、未提供或不可执行 C++ dump）—— **跳过绝不等同于通过**。
+**退出码约定**：`0`=一致；`1`=有差异/失败（含哈希不匹配、清单↔dump 行数不互证，**以及
+「语料已存在但 C++ dump 未提供或不可执行」**）；`2`=用法错误（参数过多）；`77`=**跳过**，
+**恰有 4 个出口**（与脚本逐一对应）：①未提供语料根（`argv[1]` 为空且 `SERIONA_LYRICS_CORPUS`
+未设置）②语料根不是目录 ③清单 `corpus-manifest.tsv` 缺失 ④语料目录下没有 `.lrc`
+—— **跳过绝不等同于通过**。
+注意「dump 不可执行」是 **`1`（失败）而非 `77`**：语料既然在，缺 dump 就是环境/构建问题，
+不能当作跳过而静默放行（与 `tests/CMakeLists.txt` 的 `SKIP_RETURN_CODE=77` 配合时，
+只剩真正的「语料缺失」才 Skipped）。
 
 `corpus-manifest.tsv`：头部注释含所用哈希命令（`xxhsum -H3`）+ 每条 `相对路径(POSIX)\tXXH3 哈希\t清洗后行数`，
-**只含路径/哈希/行数，不含歌词正文**。C++ dump 工具在后续 todo 落地；本目录的 CTest 目标亦在其后注册。
+**只含路径/哈希/行数，不含歌词正文**。
+
+### C++ 侧 dump 工具 `seriona_lyric_split_dump`
+
+闸门需要与 Python 端**逐字节相同**的 C++ 实现，其源在
+`tools/lyric_split_dump/lyric_split_dump.cpp`（`SERIONA_BUILD_TESTS=ON` 时构建，
+输出 `build/seriona_lyric_split_dump`；开发期工具，不进发行版）。
+
+```
+seriona_lyric_split_dump --root <corpus-root> --dump-tsv [--target <zh|ja|ko|en>]
+```
+
+- **必须同时给 `--root` 与 `--dump-tsv`**，否则打印用法并退出 `2`。
+- `--target` 取值与 Python 端 `TARGET_CLASS` 的键一致，**仅 `zh/ja/ko/en`**；其它值打印用法并
+  退出 `2`（与 Python `parser.error` 对齐）；缺省 `zh`。
+- 它**复用** `src/control/lyric_split.h` 的 `splitDocument`（同一份切分实现），只自持解码回退
+  与 TSV 序列化；解码回退的**顺序/集合**与 Python `TEXT_ENCODINGS` 逐元素相同，但 ICU 编解码表
+  与 Python 同名 codec **不等价**（已登记分歧，见 `evidence/task-9-…/divergence-ledger.md`）。
+- CTest：`seriona.lyric_split.corpus_parity` 在语料存在时跑闸门；另有
+  `seriona.lyric_split.dump_utf16_bom` 用 `tests/fixtures/lyric_split_utf16/` 离线钉住
+  UTF-16 BOM 解码（不依赖语料）。
 
 ## 用法
 

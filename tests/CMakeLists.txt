@@ -464,6 +464,9 @@ add_executable(seriona_control_persistence_guardrail_tests
 add_executable(seriona_control_playback_context_builder_tests
   control/playback_context_builder_tests.cpp
 )
+add_executable(seriona_lyric_split_tests
+  control/lyric_split_tests.cpp
+)
 add_executable(seriona_artwork_resolver_tests
   control/artwork_resolver_tests.cpp
 )
@@ -813,6 +816,11 @@ target_compile_definitions(seriona_application_logging_tests PRIVATE DOCTEST_CON
 target_compile_definitions(seriona_logging_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_application_log_level_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_control_playback_context_builder_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_lyric_split_tests PRIVATE
+  DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+  SERIONA_LYRIC_SPLIT_LANG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split_lang"
+  SERIONA_LYRIC_SPLIT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split"
+)
 target_compile_definitions(seriona_artwork_resolver_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_artwork_shutdown_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_delete_commands_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -1097,6 +1105,11 @@ target_include_directories(seriona_control_persistence_guardrail_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_control_playback_context_builder_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_lyric_split_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1551,6 +1564,10 @@ target_link_libraries(seriona_control_playback_context_builder_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_lyric_split_tests PRIVATE
+  seriona_third_party_headers
+  seriona_control
+)
 target_link_libraries(seriona_artwork_resolver_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1644,6 +1661,7 @@ seriona_enable_warnings(seriona_control_folder_sort_settings_store_tests)
 seriona_enable_warnings(seriona_control_app_settings_store_tests)
 seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
 seriona_enable_warnings(seriona_control_playback_context_builder_tests)
+seriona_enable_warnings(seriona_lyric_split_tests)
 seriona_enable_warnings(seriona_artwork_resolver_tests)
 seriona_enable_warnings(seriona_media_controller_artwork_shutdown_tests)
 seriona_enable_warnings(seriona_delete_commands_tests)
@@ -1958,6 +1976,36 @@ add_test(NAME seriona.control_folder_sort_settings_store COMMAND seriona_control
 add_test(NAME seriona.control_app_settings_store COMMAND seriona_control_app_settings_store_tests)
 add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)
 add_test(NAME seriona.control_playback_context_builder COMMAND seriona_control_playback_context_builder_tests)
+add_test(NAME seriona.control.lyric_split COMMAND seriona_lyric_split_tests)
+
+# Python↔C++ 歌词切分语料一致性闸门。语料根**运行时**从 SERIONA_LYRICS_CORPUS 读
+# （argv[1] 传空串占位 ⇒ 脚本回退到该环境变量；**不得**在 configure 期用 $ENV{} 冻结，
+# 否则同一构建树无法通过设/清该变量切换「实跑」与「Skipped」）。dump 路径用
+# 目标文件表达式注入 argv[2]。SKIP_RETURN_CODE 与脚本 EXIT_SKIP=77 字面相同：
+# 未提供语料根 / 语料缺失 / 清单缺失 ⇒ Skipped（绝不是通过）。
+find_program(SERIONA_LYRICS_GATE_BASH NAMES bash)
+if(SERIONA_LYRICS_GATE_BASH)
+  add_test(NAME seriona.lyric_split.corpus_parity
+    COMMAND "${SERIONA_LYRICS_GATE_BASH}"
+            "${PROJECT_SOURCE_DIR}/tools/lyric_split_regression/run_parity_gate.sh"
+            ""
+            "$<TARGET_FILE:seriona_lyric_split_dump>")
+  set_tests_properties(seriona.lyric_split.corpus_parity PROPERTIES SKIP_RETURN_CODE 77)
+else()
+  message(STATUS "bash 未找到：不注册 seriona.lyric_split.corpus_parity（该闸门依赖 POSIX shell + xxhsum + python3）")
+endif()
+
+# UTF-16 BOM 解码的可判负钉子（F4）：只用 CMake 脚本，不依赖 python/xxhsum ⇒ 三端可跑。
+# 夹具 tests/fixtures/lyric_split_utf16 的 expected.tsv 由参考实现当场产出后固化；
+# 本目标比对 C++ dump 输出与它逐字节相同（去掉 BOM 预判 ⇒ 输出分叉 ⇒ Failed）。
+add_test(NAME seriona.lyric_split.dump_utf16_bom
+  COMMAND ${CMAKE_COMMAND}
+          -DDUMP=$<TARGET_FILE:seriona_lyric_split_dump>
+          -DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split_utf16
+          -DEXPECTED=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split_utf16/expected.tsv
+          -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/lyric_split_dump_utf16.out.tsv
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/lyric_split_dump_utf16_check.cmake)
+
 add_test(NAME seriona.control_artwork_resolver COMMAND seriona_artwork_resolver_tests)
 add_test(NAME seriona.control_artwork_shutdown COMMAND seriona_media_controller_artwork_shutdown_tests)
 add_test(NAME seriona.control.delete_commands COMMAND seriona_delete_commands_tests)

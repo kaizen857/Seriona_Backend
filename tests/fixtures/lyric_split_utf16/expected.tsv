@@ -1,0 +1,4 @@
+# total_lines=3 files=3 unresolved_decode=0 decode_by_codec=utf-16=3
+u16be.lrc	1	-	strong	high	gamma	delta
+u16le-cjk.lrc	1	-	strong	high	アルファ	甲
+u16le.lrc	1	-	strong	high	alpha	beta

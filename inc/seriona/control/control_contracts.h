@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../audio/audio_contracts.h"
@@ -387,5 +388,50 @@ using ControlDomainNotificationSubscriptionFactory = std::function<SubscriptionH
 // 均衡器/频谱订阅工厂（任务16）：返回带 unsubscribe 的 SubscriptionHandle。
 using EqualizerStateSubscriptionFactory = std::function<SubscriptionHandle(EqualizerStateSnapshotCallback)>;
 using SpectrumSubscriptionFactory = std::function<SubscriptionHandle(SpectrumSnapshotCallback)>;
+
+// ── 歌词切分：文档级约定记号（M2 契约；归属 todo 4）────────────────────────────
+// 文档级切分约定的【稳定规范记号】。约定是整首文档推断出来的（D18），且它是切分
+// 结果的【决定性输入】之一 —— 必须能进键、能比较、能持久化。记号必须与 Python
+// 参考实现（tools/lyric_split_regression/lyric_split_tool.py 的
+// `_convention_notation`）一一对应且可逆，否则跨语言闸门无法逐字节比对。
+//
+// ★ 记号形态（2026-09-24 独立复核 ★MED-R1 订正，实现前必读）：
+//   `conventionToken` 返回的是【转义前原始记号】（raw），与 Python
+//   `_convention_notation()` 的返回值逐字节相同：
+//     None                 -> "-"
+//     StrongSlashSpaced    -> "S: / "
+//     StrongFullwidthBar   -> "S:｜"
+//     StrongBar            -> "S:|"
+//     StrongFullwidthSlash -> "S:／"
+//     StrongSlash          -> "S:/"
+//     StrongBackslash      -> "S:\"            （单反斜杠，共 3 字节）
+//     WeakTab              -> "W:" + TAB 字符  （共 3 字节；**不是**字面 `\t` 两字符）
+//     WeakFullwidthSpace   -> "W:　"           （全角空格 U+3000）
+//     WeakSpace            -> "W: "
+//     ScriptTransition     -> "SCRIPT"
+//   写 TSV 第 3 列时再由与 Python `_escape_tsv` 逐字节等价的转义序列化（先 `\`→`\\`，
+//   再 TAB→`\t`，再 LF→`\n`）：StrongBackslash 的 col3 是 4 字节 `S:\\`，
+//   WeakTab 的 col3 是 4 字节 `W:\t`。**不要**把 token 本身定义成已转义形态 ——
+//   那会让 WeakTab 序列化成 5 字节，静默偏离 Python 参考实现。
+//   `S:`/`W:` 前缀区分强分隔符与弱边界（参考实现 CONVENTIONS 的顺序即优先级），
+//   也让单空格与空串在持久化层可区分。
+enum class LyricSplitConvention {
+  None,
+  StrongSlashSpaced,
+  StrongFullwidthBar,
+  StrongBar,
+  StrongFullwidthSlash,
+  StrongSlash,
+  StrongBackslash,
+  WeakTab,
+  WeakFullwidthSpace,
+  WeakSpace,
+  ScriptTransition,
+};
+
+// 枚举 -> 上表的【原始记号】。未知枚举值不静默返回空串，而是抛 std::invalid_argument。
+[[nodiscard]] std::string conventionToken(LyricSplitConvention convention);
+// 【原始记号】-> 枚举。未知记号（含已转义的 `W:\t` 字面反斜杠+t）返回 std::nullopt。
+[[nodiscard]] std::optional<LyricSplitConvention> conventionFromToken(std::string_view token);
 
 }

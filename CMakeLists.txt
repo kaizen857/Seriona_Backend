@@ -337,6 +337,7 @@ add_library(seriona_control STATIC
   src/control/artwork_resolver.cpp
   src/control/control_event_loop.cpp
   src/control/control_state_reducer.cpp
+  src/control/lyric_split.cpp
   src/control/media_controller.cpp
   src/control/media_controller_module.cpp
   src/control/playback_context_builder.cpp
@@ -461,6 +462,25 @@ endif()
 if(SERIONA_BUILD_TESTS)
   include(CTest)
   enable_testing()
+
+  # 歌词切分 C++ dump 指纹工具：Python↔C++ 语料一致性闸门
+  # （CTest 目标 seriona.lyric_split.corpus_parity，见 tests/CMakeLists.txt）的 C++ 侧。
+  # **刻意不放进 tools/**：那里整体受 SERIONA_BUILD_TOOLS（默认 OFF）包住，会让闸门在
+  # 默认构建下根本无 dump 可跑。只链 seriona_control（脱离 Qt/DB 单独跑）；ICU::uc 供
+  # ucnv 严格解码（UCNV_TO_U_CALLBACK_STOP），PRIVATE 不污染任何导出接口。
+  add_executable(seriona_lyric_split_dump
+    tools/lyric_split_dump/lyric_split_dump.cpp
+  )
+  target_include_directories(seriona_lyric_split_dump PRIVATE
+    ${PROJECT_SOURCE_DIR}/inc
+    ${PROJECT_SOURCE_DIR}/src            # 内部头 control/lyric_split.h
+  )
+  target_link_libraries(seriona_lyric_split_dump PRIVATE
+    seriona_control
+    ICU::uc
+  )
+  seriona_enable_warnings(seriona_lyric_split_dump)
+
   add_subdirectory(tests)
 endif()
 
