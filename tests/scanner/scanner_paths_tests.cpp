@@ -143,6 +143,61 @@ TEST_CASE("lrc parser normalizes line endings expands timestamps sorts and dedup
   CHECK(result.lines[1].text == "Same line");
 }
 
+// 同时间戳、文本刻意乱序且含一对相同文本。稳定按时间戳排序必须保持输入出现顺序，
+// 否则「组内第 1 行 = 原文」的配对约定（D22）不成立。
+TEST_CASE("lrc parser keeps same-timestamp lines in stable input order") {
+  const auto result = parseLrcText("[00:00.20]zeta\n[00:00.20]alpha\n[00:00.20]mid\n[00:00.20]zeta\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 4U);
+  CHECK(result.lines[0].text == "zeta");
+  CHECK(result.lines[1].text == "alpha");
+  CHECK(result.lines[2].text == "mid");
+  CHECK(result.lines[3].text == "zeta");
+}
+
+// 去重谓词保持（时间戳, 文本）：相邻的相同行被去掉。
+TEST_CASE("lrc parser collapses adjacent duplicate same-timestamp lines") {
+  const auto result = parseLrcText("[00:00.30]dup\n[00:00.30]dup\n[00:00.30]other\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 2U);
+  CHECK(result.lines[0].text == "dup");
+  CHECK(result.lines[1].text == "other");
+}
+
+// 排序键只剩时间戳后 std::ranges::unique 只去相邻重复：被不同文本隔开的重复保留。
+// 这是显式决定的去重语义（最小改动，不是「首次出现去重」）。
+TEST_CASE("lrc parser preserves non-adjacent duplicate same-timestamp lines") {
+  const auto result = parseLrcText("[00:00.40]dup\n[00:00.40]mid\n[00:00.40]dup\n");
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 3U);
+  CHECK(result.lines[0].text == "dup");
+  CHECK(result.lines[1].text == "mid");
+  CHECK(result.lines[2].text == "dup");
+}
+
+// G8 钉子：trimAscii 只去 ' '/'\t'/'\r'，全角空格（U+3000）不得被 trim（它由算法侧单独
+// 处理）。trimAscii 位于匿名命名空间、不可从测试目标链接，故经公开入口 parseLrcText 做行为断言。
+TEST_CASE("lrc parser trims ascii whitespace but preserves ideographic space") {
+  const std::string ideographicSpace = "\xE3\x80\x80";
+  std::string input;
+  input += "[00:00.00] ";
+  input += ideographicSpace;
+  input += "a";
+  input += ideographicSpace;
+  input += " \n";
+  input += "[00:00.01]  b  \n";
+
+  const auto result = parseLrcText(std::move(input));
+
+  CHECK(result.errors.empty());
+  REQUIRE(result.lines.size() == 2U);
+  CHECK(result.lines[0].text == ideographicSpace + "a" + ideographicSpace);
+  CHECK(result.lines[1].text == "b");
+}
+
 TEST_CASE("lrc parser accepts metadata-only files as empty lyrics") {
   const auto result = parseLrcText("[ti:Song]\n[ar:Artist]\n[al:Album]\n");
 

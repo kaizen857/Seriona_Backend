@@ -163,12 +163,15 @@ LrcParseResult parseLrcText(std::string text, const LrcParseOptions& options,
     }
   }
 
-  std::ranges::sort(result.lines, [](const LyricLine& lhs, const LyricLine& rhs) {
-    if (lhs.timestamp != rhs.timestamp) {
-      return lhs.timestamp < rhs.timestamp;
-    }
-    return lhs.text < rhs.text;
+  // 稳定排序，且只按时间戳：同时间戳的多行保持输入（出现）顺序，使下游「组内第 1 行 = 原文」
+  // 的配对约定（D22）成立，并与 TagReader 的 NormalizeLyrics 保持同构。此前按（时间戳, 文本）
+  // 排序会把同组行按文本重排，「第 1 行」不再可确定。
+  std::ranges::stable_sort(result.lines, [](const LyricLine& lhs, const LyricLine& rhs) {
+    return lhs.timestamp < rhs.timestamp;
   });
+  // 去重谓词保持（时间戳, 文本）不变，这是有意的决定：排序键只剩时间戳后，std::ranges::unique
+  // 的语义从「去全部重复」退化为「只去相邻重复」。不改去重实现是最小改动（不引入额外状态/
+  // 复杂度），且 D22 只要求「组内第 1 行 = 原文」——非相邻重复不改变组内首行。
   result.lines.erase(std::ranges::unique(result.lines, {}, [](const LyricLine& line) {
                        return std::pair{line.timestamp, line.text};
                      }).begin(),
