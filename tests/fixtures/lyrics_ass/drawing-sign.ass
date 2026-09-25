@@ -1,0 +1,12 @@
+[Script Info]
+Title: Drawing sign handling
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\p+1}m 0 0 l 100 0
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\p+1}m 0 0 l 1 1{\p0}After plus
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\p-1}negative turns off
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\p+0}plus zero turns off
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\p-}bare minus turns off
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\p 1}space sign stays on
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,{\p+1}m 0 0 l 2 2{\p+1}m 3 3 l 4 4{\p0}After double plus

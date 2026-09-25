@@ -29,3 +29,10 @@
 *.so binary
 *.dylib binary
 *.qm binary
+
+# 下面 3 个 fixture 依赖「磁盘上真实的 CRLF 字节」才有意义（用例名即
+# normalize crlf / normalize crlf and bom）。上面的 eol=lf 会在提交时把 CR 抹掉，
+# 使新 clone 只剩 LF —— 用例仍绿但覆盖静默失效。故显式标记为不做换行转换。
+tests/fixtures/lyrics_srt/crlf.srt      -text
+tests/fixtures/lyrics_ass/crlf-bom.ass  -text
+tests/fixtures/lyrics_ttml/crlf.ttml    -text

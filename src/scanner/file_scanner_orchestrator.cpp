@@ -81,6 +81,30 @@ static TreeBuilderObserver g_treeBuilderObserver = nullptr;
   return parseLrcFile(path);
 }
 
+// 侧车解析分派：.lrc 保留既有解析观察者 seam（既有多条 watcher/service 用例依赖它），其余格式
+// 直接走 parseLyricsSidecarFile 的分派表。
+[[nodiscard]] LrcParseResult parseLyricsSidecarFileWithTestSeam(const std::filesystem::path& path) {
+  if (lyricsSourceForSidecarPath(path) == LyricsSource::ExternalLrc) {
+    return parseLrcFileWithTestSeam(path);
+  }
+  return parseLyricsSidecarFile(path);
+}
+
+[[nodiscard]] bool isExternalLyricsSource(const LyricsSource source) noexcept {
+  switch (source) {
+    case LyricsSource::ExternalLrc:
+    case LyricsSource::ExternalSrt:
+    case LyricsSource::ExternalAss:
+    case LyricsSource::ExternalTtml:
+    case LyricsSource::ExternalText:
+      return true;
+    case LyricsSource::None:
+    case LyricsSource::EmbeddedTag:
+      return false;
+  }
+  return false;
+}
+
 [[nodiscard]] std::filesystem::path resolvePortableDataRoot() {
 #ifdef __linux__
   std::array<char, 4096> buffer{};
@@ -778,7 +802,12 @@ void publishWorkerTaskSnapshot(const std::vector<WorkerTask>& tasks,
 
 void selectEffectiveLyrics(cache::CachedSong& song) {
   if (!song.externalLyrics.empty()) {
-    song.metadata.effectiveLyricsSource = LyricsSource::ExternalLrc;
+    // 外置侧车来源由调用方在写入 externalLyrics 后预置（新解析路径）或由缓存载入预置
+    // （applyCachedLocation 取 locations.lyrics_source）。未预置时按 ExternalLrc 收敛，
+    // 保持既有 .lrc 行为不变。
+    if (!isExternalLyricsSource(song.metadata.effectiveLyricsSource)) {
+      song.metadata.effectiveLyricsSource = LyricsSource::ExternalLrc;
+    }
     song.metadata.effectiveLyrics = song.externalLyrics;
     return;
   }
@@ -838,6 +867,7 @@ void hydrateCachedCueTrack(cache::CachedSong& song,
                                                 fileTimeFromNanoseconds(*location.externalLrcMtimeNs)}
                                           : std::nullopt;
   song.metadata.externalLyricsHash = location.externalLrcHash;
+  song.metadata.effectiveLyricsSource = location.lyricsSource;
   const auto trackIdentity = pathToUtf8(cuePath) + "#track" + std::to_string(trackIndex);
   song.metadata.logicalTrackId = trackIdentity;
   song.metadata.trackId = trackIdentity;
@@ -2612,6 +2642,7 @@ private:
                                      .externalLrcMtimeNs = fileTimeNanoseconds(publishedSong.song.metadata.externalLyricsMtime),
                                      .externalLrcHash = publishedSong.song.metadata.externalLyricsHash,
                                      .externalLyrics = publishedSong.song.externalLyrics,
+                                     .effectiveLyricsSource = publishedSong.song.metadata.effectiveLyricsSource,
                                      .removeExternalLyrics = publishedSong.externalLyricsCacheAction == ExternalLyricsCacheAction::RemoveExternal});
       }
     }
@@ -2765,7 +2796,8 @@ private:
 
 	  ExternalLyricsCacheAction reconcileLyrics(cache::CachedSong& song, const ScannerConfig& config,
 	                                            std::vector<ScannerError>& errors) {
-	    const auto sidecar = expectedLyricsSidecarPath(song.metadata.filePath);
+	    const auto sidecar = resolveLyricsSidecarPath(song.metadata.filePath);
+	    const auto source = lyricsSourceForSidecarPath(sidecar);
 	    const auto hadExternalCache = !song.externalLyrics.empty() || song.metadata.externalLyricsPath.has_value() ||
 	                                  song.metadata.externalLyricsHash.has_value();
 	    auto clearExternalLyrics = [&song, hadExternalCache] {
@@ -2779,37 +2811,41 @@ private:
 	      selectEffectiveLyrics(song);
 	      return ExternalLyricsCacheAction::None;
 	    }
-	    if (!std::filesystem::is_regular_file(sidecar)) {
+	    if (sidecar.empty()) {
 	      return clearExternalLyrics();
 	    }
 
-	    const auto lrcHash = hashLyricsSidecarWithTestSeam(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
-	    const auto hashCancelled = std::ranges::any_of(lrcHash.errors, [](const HashError& error) {
+	    const auto sidecarHash = hashLyricsSidecarWithTestSeam(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
+	    const auto hashCancelled = std::ranges::any_of(sidecarHash.errors, [](const HashError& error) {
 	      return error.code == HashErrorCode::Cancelled;
 	    });
 	    if (hashCancelled) {
 	      return ExternalLyricsCacheAction::Cancelled;
 	    }
-	    for (const auto& error : lrcHash.errors) {
+	    for (const auto& error : sidecarHash.errors) {
 	      errors.push_back(scannerErrorFrom(error));
 	    }
-	    if (!lrcHash.hash.has_value()) {
+	    if (!sidecarHash.hash.has_value()) {
 	      return clearExternalLyrics();
 	    }
 
 	    const auto relativeSidecar = relativePathFor(song.metadata.filePath.parent_path(), sidecar);
-	    if (song.metadata.externalLyricsHash == lrcHash.hash && !song.externalLyrics.empty()) {
+	    if (song.metadata.externalLyricsHash == sidecarHash.hash && !song.externalLyrics.empty() &&
+	        song.metadata.effectiveLyricsSource == source) {
 	      song.metadata.externalLyricsPath = relativeSidecar;
 	      song.metadata.externalLyricsMtime = fileMtime(sidecar);
 	      selectEffectiveLyrics(song);
 	      return ExternalLyricsCacheAction::None;
 	    }
 
-	    const auto parsed = parseLrcFileWithTestSeam(sidecar);
+	    const auto parsed = parseLyricsSidecarFileWithTestSeam(sidecar);
 	    for (const auto& error : parsed.errors) {
 	      errors.push_back(scannerErrorFrom(error));
 	    }
 	    if (!parsed.errors.empty()) {
+	      return clearExternalLyrics();
+	    }
+	    if (source == LyricsSource::ExternalText && !acceptsPlainTextLyricsSidecar(parsed.lines)) {
 	      return clearExternalLyrics();
 	    }
 
@@ -2818,14 +2854,15 @@ private:
 	      return clearExternalLyrics();
 	    }
 	    song.metadata.externalLyricsPath = relativeSidecar;
-	    song.metadata.externalLyricsHash = lrcHash.hash;
+	    song.metadata.externalLyricsHash = sidecarHash.hash;
 	    song.metadata.externalLyricsMtime = fileMtime(sidecar);
+	    song.metadata.effectiveLyricsSource = source;
 	    selectEffectiveLyrics(song);
 	    return ExternalLyricsCacheAction::UpdateExternal;
 	  }
 
-  // .lrc 批次的每-lrc 探针（memo）：hash 每批一次；parse 仅在确需时执行（存在 hash 变化或
-  // 内存无外部歌词的条目），同一 .lrc 至多 parse 一次，随后按条目复用。四态语义与
+  // 侧车批次的每-侧车探针（memo）：hash 每批一次；parse 仅在确需时执行（存在 hash 变化或
+  // 内存无外部歌词的条目），同一侧车至多 parse 一次，随后按条目复用。四态语义与
   // reconcileLyrics 一致（缺失 sidecar 静默清除、hash/parse 错误上报、取消沿 Cancelled
   // 传播）；readExternalLyrics=false 时调用方直接跳过探针（与 reconcileLyrics 提前返回一致）。
   struct LyricsSidecarProbe {
@@ -2842,18 +2879,18 @@ private:
     if (!std::filesystem::is_regular_file(sidecar)) {
       return probe;
     }
-    const auto lrcHash = hashLyricsSidecarWithTestSeam(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
-    for (const auto& error : lrcHash.errors) {
+    const auto sidecarHash = hashLyricsSidecarWithTestSeam(sidecar, HashOptions{.cancellationRequested = &cancellationRequested_});
+    for (const auto& error : sidecarHash.errors) {
       if (error.code == HashErrorCode::Cancelled) {
         probe.cancelled = true;
         return probe;
       }
       errors.push_back(scannerErrorFrom(error));
     }
-    if (!lrcHash.hash.has_value()) {
+    if (!sidecarHash.hash.has_value()) {
       return probe;
     }
-    probe.hash = lrcHash.hash;
+    probe.hash = sidecarHash.hash;
     probe.mtime = fileMtime(sidecar);
     return probe;
   }
@@ -2865,7 +2902,7 @@ private:
     if (probe.parsed || probe.cancelled || !probe.hash.has_value()) {
       return;
     }
-    const auto parsed = parseLrcFileWithTestSeam(sidecar);
+    const auto parsed = parseLyricsSidecarFileWithTestSeam(sidecar);
     for (const auto& error : parsed.errors) {
       errors.push_back(scannerErrorFrom(error));
     }
@@ -2877,8 +2914,10 @@ private:
   }
 
   // 探针的按条目应用：语义与 reconcileLyrics 相同（clear/remove/None/UpdateExternal 四态）。
+  // sidecar 为空表示该曲目当前无任何候选侧车（等价于清除外部歌词）。
   [[nodiscard]] ExternalLyricsCacheAction applyLyricsSidecarProbe(cache::CachedSong& song,
                                                                  const std::filesystem::path& sidecar,
+                                                                 const LyricsSource source,
                                                                  const LyricsSidecarProbe& probe,
                                                                  const ScannerConfig& config) {
     const auto hadExternalCache = !song.externalLyrics.empty() || song.metadata.externalLyricsPath.has_value() ||
@@ -2893,11 +2932,15 @@ private:
       selectEffectiveLyrics(song);
       return ExternalLyricsCacheAction::None;
     }
-    if (!probe.hash.has_value()) {
+    if (sidecar.empty() || !probe.hash.has_value()) {
+      return clearExternalLyrics();
+    }
+    if (source == LyricsSource::ExternalText && probe.parsed && !acceptsPlainTextLyricsSidecar(probe.lines)) {
       return clearExternalLyrics();
     }
     const auto relativeSidecar = relativePathFor(song.metadata.filePath.parent_path(), sidecar);
-    if (song.metadata.externalLyricsHash == probe.hash && !song.externalLyrics.empty()) {
+    if (song.metadata.externalLyricsHash == probe.hash && !song.externalLyrics.empty() &&
+        song.metadata.effectiveLyricsSource == source) {
       song.metadata.externalLyricsPath = relativeSidecar;
       song.metadata.externalLyricsMtime = probe.mtime;
       selectEffectiveLyrics(song);
@@ -2913,6 +2956,7 @@ private:
     song.metadata.externalLyricsPath = relativeSidecar;
     song.metadata.externalLyricsHash = probe.hash;
     song.metadata.externalLyricsMtime = probe.mtime;
+    song.metadata.effectiveLyricsSource = source;
     selectEffectiveLyrics(song);
     return ExternalLyricsCacheAction::UpdateExternal;
   }
@@ -4172,89 +4216,97 @@ private:
         }
       }
 
-      // .lrc 事件（增/改/删统一）：先按 expectedLyricsSidecarPath 建 sidecar 键 → 条目索引
-      // （一次 O(allSongs_)，只为本批 touched 键建桶：内存 O(matched)）；只迭代命中桶；
-      // hash 每 lrc 一次，parse 仅在确有条目需要时执行（同 lrc 至多一次）。树侧统一 upsertSong
-      // （cue 轨按 logicalTrackId 定位，attachExternalLyrics 对 cue 轨无效）；缓存侧单事务
-      // applyLyricsCacheUpdates（不得构造 ScanRootCacheWrite，空 retained 会清库）。
-      if (!lyricsTouched.empty()) {
-        std::unordered_map<std::string, std::vector<std::size_t>> entryIndexesBySidecarKey;
-        entryIndexesBySidecarKey.reserve(lyricsTouchedKeys.size());
+      // 歌词侧车事件（增/改/删统一，含 .lrc/.srt/.ass/.ttml/.txt）：侧车与音频的对应关系是
+      // 「同目录同 basename」，故先用 touched 侧车的 stem 建一次键集，再对 allSongs_ 各取一次
+      // stem 键求交（每侧一 O(allSongs_)，与候选扩展名个数无关）。随后逐曲目按优先级**重新决议**
+      // 生效侧车（被 touched 的未必是生效者：如 .srt 变更而 .lrc 仍在；反之 .lrc 被删后由次高
+      // 优先级接管），探针按生效侧车路径 memo：同一侧车每批至多 hash/parse 一次。
+      // 树侧统一 upsertSong（cue 轨按 logicalTrackId 定位，attachExternalLyrics 对 cue 轨无效）；
+      // 缓存侧单事务 applyLyricsCacheUpdates（不得构造 ScanRootCacheWrite，空 retained 会清库）。
+      if (!lyricsTouchedKeys.empty()) {
+        std::unordered_set<std::string> touchedStemKeys;
+        touchedStemKeys.reserve(lyricsTouched.size());
+        for (const auto& touched : lyricsTouched) {
+          touchedStemKeys.insert(pathKey(touched.parent_path() / touched.stem()));
+        }
+        std::vector<std::size_t> affectedIndexes;
         for (std::size_t index = 0; index < allSongs_.size(); ++index) {
           const auto& filePath = allSongs_[index].song.metadata.filePath;
           if (filePath.empty()) {
             continue;
           }
-          const auto sidecarKey = pathKey(expectedLyricsSidecarPath(filePath));
-          if (!lyricsTouchedKeys.contains(sidecarKey)) {
-            continue;
+          if (touchedStemKeys.contains(pathKey(filePath.parent_path() / filePath.stem()))) {
+            affectedIndexes.push_back(index);
           }
-          entryIndexesBySidecarKey[sidecarKey].push_back(index);
         }
-        std::vector<cache::LyricsCacheUpdate> lyricsUpdates;
-        for (const auto& lrcPath : lyricsTouched) {
-          const auto lrcKey = pathKey(lrcPath);
-          const auto bucket = entryIndexesBySidecarKey.find(lrcKey);
-          if (bucket == entryIndexesBySidecarKey.end()) {
-            continue;
+        std::unordered_map<std::string, LyricsSidecarProbe> probeByPath;
+        const auto probeFor = [&](const std::filesystem::path& sidecarPath) -> LyricsSidecarProbe& {
+          auto iterator = probeByPath.find(pathKey(sidecarPath));
+          if (iterator == probeByPath.end()) {
+            iterator = probeByPath.emplace(pathKey(sidecarPath), probeLyricsSidecarHash(sidecarPath, upsertLyricsErrors)).first;
           }
-          LyricsSidecarProbe probe;
-          if (effective.scanner.readExternalLyrics) {
-            // readExternalLyrics=false 时不做任何 .lrc I/O（旧 reconcileLyrics 提前返回）：
-            // 默认空探针让 applyLyricsSidecarProbe 走 None（清内存、不写缓存行）。
-            probe = probeLyricsSidecarHash(lrcPath, upsertLyricsErrors);
-            if (probe.cancelled) {
+          return iterator->second;
+        };
+        std::vector<cache::LyricsCacheUpdate> lyricsUpdates;
+        for (const auto index : affectedIndexes) {
+          auto& entry = allSongs_[index];
+          const auto sidecar = resolveLyricsSidecarPath(entry.song.metadata.filePath);
+          const auto source = lyricsSourceForSidecarPath(sidecar);
+          LyricsSidecarProbe emptyProbe;
+          LyricsSidecarProbe* probe = &emptyProbe;
+          if (!sidecar.empty() && effective.scanner.readExternalLyrics) {
+            // readExternalLyrics=false 时不做任何侧车 I/O（旧 reconcileLyrics 提前返回）：空探针
+            // 让 applyLyricsSidecarProbe 走 None（清内存、不写缓存行）。
+            auto& resolved = probeFor(sidecar);
+            if (resolved.cancelled) {
               for (const auto& root : roots) {
                 markPendingReconcile(root.path);
               }
               return true;
             }
-            const auto needsParse = std::ranges::any_of(bucket->second, [&](std::size_t index) {
-              const auto& song = allSongs_[index].song;
-              return song.externalLyrics.empty() || song.metadata.externalLyricsHash != probe.hash;
-            });
-            if (needsParse) {
-              parseLyricsSidecarProbe(lrcPath, probe, upsertLyricsErrors);
+            const auto fastPath = resolved.hash.has_value() &&
+                                  entry.song.metadata.externalLyricsHash == resolved.hash &&
+                                  !entry.song.externalLyrics.empty() &&
+                                  entry.song.metadata.effectiveLyricsSource == source;
+            if (!fastPath) {
+              parseLyricsSidecarProbe(sidecar, resolved, upsertLyricsErrors);
             }
+            probe = &resolved;
           }
-          for (const auto index : bucket->second) {
-            auto& entry = allSongs_[index];
-            const auto hadExternalLyrics =
-                !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
-            const auto action = applyLyricsSidecarProbe(entry.song, lrcPath, probe, effective.scanner);
-            const auto hasExternalLyrics =
-                !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
-            // action None 且外部歌词在位状态不变才是纯 no-op（hash 未变、同内容重写或写模式打开
-            // 零写入）：内容没有变化时不得置变更/发布（与音频位置身份闸门同类），否则会误发快照
-            // 与扫描完成事件。applyLyricsSidecarProbe 在 readExternalLyrics=false 时清空内存外部
-            // 歌词但同样返回 None——那是真实可见变化，不得压制。树侧仍 upsert 以同步 path/mtime，
-            // 无发布时不可见。
-            if (action != ExternalLyricsCacheAction::None || hadExternalLyrics != hasExternalLyrics) {
-              touchedPaths.push_back(entry.treeRelativePath);
-              anyMutation = true;
-            }
-            if (hidden(entry)) {
-              // 全量语义下被 cue 隐藏的源音频不入缓存，无可更新的 location 行。
-              continue;
-            }
-            const auto location = cachedLocationFromSong(entry.song, entry.sourceRoot, entry.song.metadata.filePath,
-                                                         coverExportDir_);
-            entry.locationId = location.locationId;
-            if (action != ExternalLyricsCacheAction::None) {
-              // None（hash 未变且外部歌词已在内存中，或 readExternalLyrics=false）不写缓存：
-              // 全量扫描同样以 action != None 为门槛；且 applyLyricsCacheUpdateNoTransaction 在
-              // removeExternalLyrics=false 时硬编码 LyricsSource::ExternalLrc，写入会偏离全量语义。
-              lyricsUpdates.push_back(cache::LyricsCacheUpdate{
-                  .locationId = location.locationId,
-                  .externalLrcPath = entry.song.metadata.externalLyricsPath,
-                  .externalLrcMtimeNs = fileTimeNanoseconds(entry.song.metadata.externalLyricsMtime),
-                  .externalLrcHash = entry.song.metadata.externalLyricsHash,
-                  .externalLyrics = entry.song.externalLyrics,
-                  .effectiveLyricsSource = entry.song.metadata.effectiveLyricsSource,
-                  .removeExternalLyrics = action == ExternalLyricsCacheAction::RemoveExternal});
-            }
-            treeBuilder_->upsertSong({.relativePath = entry.treeRelativePath, .metadata = entry.song.metadata});
+          const auto hadExternalLyrics =
+              !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
+          const auto action = applyLyricsSidecarProbe(entry.song, sidecar, source, *probe, effective.scanner);
+          const auto hasExternalLyrics =
+              !entry.song.externalLyrics.empty() || entry.song.metadata.externalLyricsHash.has_value();
+          // action None 且外部歌词在位状态不变才是纯 no-op（hash 未变、同内容重写或写模式打开
+          // 零写入）：内容没有变化时不得置变更/发布（与音频位置身份闸门同类），否则会误发快照
+          // 与扫描完成事件。applyLyricsSidecarProbe 在 readExternalLyrics=false 时清空内存外部
+          // 歌词但同样返回 None——那是真实可见变化，不得压制。树侧仍 upsert 以同步 path/mtime，
+          // 无发布时不可见。
+          if (action != ExternalLyricsCacheAction::None || hadExternalLyrics != hasExternalLyrics) {
+            touchedPaths.push_back(entry.treeRelativePath);
+            anyMutation = true;
           }
+          if (hidden(entry)) {
+            // 全量语义下被 cue 隐藏的源音频不入缓存，无可更新的 location 行。
+            continue;
+          }
+          const auto location = cachedLocationFromSong(entry.song, entry.sourceRoot, entry.song.metadata.filePath,
+                                                       coverExportDir_);
+          entry.locationId = location.locationId;
+          if (action != ExternalLyricsCacheAction::None) {
+            // None（hash 未变且外部歌词已在内存中，或 readExternalLyrics=false）不写缓存：
+            // 全量扫描同样以 action != None 为门槛。
+            lyricsUpdates.push_back(cache::LyricsCacheUpdate{
+                .locationId = location.locationId,
+                .externalLrcPath = entry.song.metadata.externalLyricsPath,
+                .externalLrcMtimeNs = fileTimeNanoseconds(entry.song.metadata.externalLyricsMtime),
+                .externalLrcHash = entry.song.metadata.externalLyricsHash,
+                .externalLyrics = entry.song.externalLyrics,
+                .effectiveLyricsSource = entry.song.metadata.effectiveLyricsSource,
+                .removeExternalLyrics = action == ExternalLyricsCacheAction::RemoveExternal});
+          }
+          treeBuilder_->upsertSong({.relativePath = entry.treeRelativePath, .metadata = entry.song.metadata});
         }
         if (!lyricsUpdates.empty()) {
           cache.applyLyricsCacheUpdates(lyricsUpdates);

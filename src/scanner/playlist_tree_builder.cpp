@@ -508,14 +508,15 @@ void PlaylistTreeBuilder::attachExternalLyrics(const std::filesystem::path& audi
                                                const std::filesystem::path& lrcRelativePath,
                                                std::string lrcHash,
                                                std::filesystem::file_time_type lrcMtime,
-                                               std::vector<LyricLine> lyrics) {
+                                               std::vector<LyricLine> lyrics,
+                                               LyricsSource source) {
   const auto songKey = pathKey(audioRelativePath);
   auto iterator = impl_->nodes.find(songKey);
   if (iterator == impl_->nodes.end() || !iterator->second.node.song.has_value()) {
     return;
   }
   auto& song = *iterator->second.node.song;
-  song.effectiveLyricsSource = LyricsSource::ExternalLrc;
+  song.effectiveLyricsSource = source;
   song.effectiveLyrics = std::move(lyrics);
   song.externalLyricsPath = lrcRelativePath;
   song.externalLyricsHash = std::move(lrcHash);

@@ -139,18 +139,24 @@ TEST_CASE("scanner directory tree hash ignores library-irrelevant entries") {
   writeTextFile(root.path() / "album" / "01.flac", "first audio bytes");
   const auto baseline = requireHash(computeDirectoryTreeHash(root.path()));
 
-  writeTextFile(root.path() / "album" / "notes.txt", "unrelated text");
+  writeTextFile(root.path() / "album" / "notes.log", "unrelated text");
   writeTextFile(root.path() / "album" / ".directory", "kde view properties");
   writeTextFile(root.path() / "album" / "track.nfo", "scene metadata");
   CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
 
-  std::filesystem::remove(root.path() / "album" / "notes.txt");
+  std::filesystem::remove(root.path() / "album" / "notes.log");
   CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
 
   writeTextFile(root.path() / "downloads" / "__tmp.part", "in progress");
   CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
 
   writeTextFile(root.path() / "album" / "01.lrc", "[00:01.00]lyric");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  writeTextFile(root.path() / "album" / "01.srt", "1\n00:00:01,000 --> 00:00:02,000\nsrt lyric\n");
+  CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
+
+  writeTextFile(root.path() / "album" / "01.txt", "plain lyric\n");
   CHECK(requireHash(computeDirectoryTreeHash(root.path())) == baseline);
 
   writeTextFile(root.path() / "album" / "cover.jpg", "cover bytes");
@@ -174,7 +180,7 @@ TEST_CASE("scanner directory tree hash raw mode hashes entries regardless of rel
   const HashOptions rawOptions{.libraryRelevanceFilter = false};
 
   const auto baseline = requireHash(computeDirectoryTreeHash(root.path(), rawOptions));
-  writeTextFile(root.path() / "album" / "notes.txt", "unrelated text");
+  writeTextFile(root.path() / "album" / "notes.nfo", "unrelated text");
   const auto churned = requireHash(computeDirectoryTreeHash(root.path(), rawOptions));
 
   CHECK(churned != baseline);

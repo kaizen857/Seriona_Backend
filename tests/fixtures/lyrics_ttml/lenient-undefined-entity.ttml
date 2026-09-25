@@ -1,0 +1,9 @@
+<tt xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+      <p begin="0s">A &nbsp; B</p>
+      <p begin="1s">bare & here</p>
+      <p begin="2s">illegal &#0; and &#xD800; refs</p>
+    </div>
+  </body>
+</tt>

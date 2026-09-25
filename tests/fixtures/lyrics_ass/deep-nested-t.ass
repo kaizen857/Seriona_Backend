@@ -1,0 +1,13 @@
+[Script Info]
+Title: Deep nested \t (iterative expansion, no depth limit)
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\p1)))))))))))))))))}m 0 0
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\p0))))))))))))))))))))))))))))))))))))))))))))))))))}after fifty
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\p1}payload{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\p0)))))))))))))))))}VISIBLE17
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\t(\p1\p0)}order off
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\t(\p0\p1)}m 0 0
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\p1}pay{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\p0))))))))))))))))}BOUNDARY16
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,{\p1}pay{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\p0)))))))))))))))))}BOUNDARY17
+Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,{\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\t(\fs(\p1)))))))))))))))))))))}non t bracket deep

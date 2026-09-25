@@ -12,7 +12,7 @@ Seriona 是一个独立的 C++23 音乐库后端：接收一个音乐根目录�
 - 构建：CMake 3.27+，C++23，仅 CXX；`CMakePresets.json` 提供 `release` 预设（输出 `build/release`）；无 CI、无格式化配置。
 - 音频解码：FFmpeg（`libavformat/libavcodec/libavutil/libavfilter/libswresample`）；输出：miniaudio（vendored 单头文件）。
 - 标签读取：外部仓库 TagReader（`TagReaderCore`），经适配层接入。
-- 元数据缓存：SQLite（固定 v3 schema）；哈希：libxxhash（XXH3/XXH64）；文本排序：ICU（`uc`/`i18n`，`ucol_open` 字典序 collation，三端由 vcpkg / `libicu-dev` / Homebrew `icu4c` 供给）。
+- 元数据缓存：SQLite（固定 v3 schema）；哈希：libxxhash（XXH3/XXH64）；文本排序：ICU（`uc`/`i18n`，`ucol_open` 字典序 collation，三端由 vcpkg / `libicu-dev` / Homebrew `icu4c` 供给）；歌词侧车文本的编码识别（6 步回退）复用同一 ICU（`uc` 的 `ucnv_*`，严格解码）。
 - 平台媒体集成：Linux 上经 sdbus-c++ 发布 MPRIS 2.x 对象；Windows 仅有占位实现。
 - 日志：spdlog（默认 logger `seriona`，滚动文件 5MB×3）；测试：doctest（vendored）。
 - 并发：`bshoshany/thread-pool` v4.1.0（FetchContent 固定版本）。
@@ -143,7 +143,7 @@ docs/、*.md          项目演进记录文档，非事实来源
 
 ## 5. 模块关系
 
-- 库链接（根 CMakeLists）：`seriona_control` PRIVATE → audio/scanner/metadata/SQLite3/spdlog/ICU::uc/ICU::i18n；`seriona_audio` PUBLIC → FFmpeg + third_party 头、PRIVATE → BS::thread_pool/spdlog；`seriona_scanner` PUBLIC → SQLite3/xxhash/TagReaderCore/thread_pool/spdlog、PRIVATE → efsw-static；`seriona_metadata` PRIVATE → spdlog（Linux 追加 sdbus-c++）。
+- 库链接（根 CMakeLists）：`seriona_control` PRIVATE → audio/scanner/metadata/SQLite3/spdlog/ICU::uc/ICU::i18n；`seriona_audio` PUBLIC → FFmpeg + third_party 头、PRIVATE → BS::thread_pool/spdlog；`seriona_scanner` PUBLIC → SQLite3/xxhash/TagReaderCore/thread_pool/spdlog、PRIVATE → efsw-static/ICU::uc；`seriona_metadata` PRIVATE → spdlog（Linux 追加 sdbus-c++）。
 - 数据流：`terminal_io`（按键）→ `MediaControlCommand` → 事件循环 → 归约 → audio 调用 → `BackendEvent` → 归约 → 订阅者；快照同时驱动 metadata 分享。
 - 扫描数据流：`FileScannerService` 事件（含 `PlaylistTreeSnapshot`）→ control 归约更新曲库 → 播放上下文重建（当前曲消失自动续播）。
 - 头级循环依赖：`metadata_contracts.h` 包含 `control_contracts.h`，control 侧前置声明 `MetadataSharingService` 打破环。

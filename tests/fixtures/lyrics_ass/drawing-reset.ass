@@ -1,0 +1,14 @@
+[Script Info]
+Title: Drawing reset
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\p1}m 0 0{\p}Real lyric
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\p1}m 0 0{\pX}After pX
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\p1}m 0 0{\pos(1,2)}still drawing
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\p1}m 0 0{\pbo1}still drawing too
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\p1}m 0 0{\p 1}space keeps drawing
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\p1}m 0 0{\p-1}negative turns off
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,{\p1}m 0 0{\p0}zero turns off
+Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,{\p1}m 0 0{\p}first\Nsecond
+Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,{\p 1}space alone turns on

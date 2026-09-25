@@ -154,6 +154,10 @@ MappedTagMetadata mapRawTagMetadata(const RawTagMetadata& raw,
   metadata.duration = toMilliseconds(raw.duration);
   metadata.logicalTrackId = pathToUtf8(raw.filePath);
   result.embeddedLyrics = mapLyrics(raw.embeddedLyrics);
+  // 本分支只决定「映射期是否把内嵌歌词装为生效歌词」；生产调用点一律传 false（映射后由扫描链的
+  // selectEffectiveLyrics 重判外置侧车是否覆盖内嵌，来源含 .lrc/.srt/.ass/.ttml/.txt）。
+  // 即：侧车覆盖内嵌的**生产决策点**在 file_scanner_orchestrator.cpp 的 selectEffectiveLyrics，
+  // 不在此处。改动本行不会改变侧车优先级，勿在此处添加按格式的判定。
   if (!externalLyricsOverrideActive && !result.embeddedLyrics.empty()) {
     metadata.effectiveLyricsSource = LyricsSource::EmbeddedTag;
     metadata.effectiveLyrics = result.embeddedLyrics;

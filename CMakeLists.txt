@@ -309,6 +309,7 @@ add_library(seriona_scanner STATIC
   src/scanner/directory_tree_hash.cpp
   src/scanner/hash_utils.cpp
   src/scanner/lrc_parser.cpp
+  src/scanner/lyric_reference_pairing.cpp
   src/scanner/path_utils.cpp
   src/scanner/playlist_tree_builder.cpp
   src/scanner/folder_thumbnail_resolver.cpp
@@ -413,6 +414,11 @@ target_link_libraries(seriona_scanner
 # $<LINK_ONLY:efsw-static> 形式进入导出接口，导出段因此必须把 efsw-static
 # 一并加入 SerionaBackendTargets（见文件末尾导出段）。
 target_link_libraries(seriona_scanner PRIVATE efsw-static)
+
+# G5a：纯文本歌词的 6 步编码回退用 ICU ucnv（UCNV_TO_U_CALLBACK_STOP 严格解码）。属实现细节
+# （公共头不暴露 ICU 类型）⇒ PRIVATE；静态库的 PRIVATE 依赖以 $<LINK_ONLY:ICU::uc> 进入导出
+# 接口，消费者仍能链到符号。ICU 已是本文件上部的 REQUIRED 依赖，不是新依赖。
+target_link_libraries(seriona_scanner PRIVATE ICU::uc)
 
 
 target_link_libraries(seriona_control

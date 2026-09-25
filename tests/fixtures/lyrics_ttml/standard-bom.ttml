@@ -1,0 +1,10 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns:tt="http://www.w3.org/ns/ttml" xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+      <p begin="00:00:01.000">First line</p>
+      <p begin="00:00:05.500">Second line</p>
+      <p begin="00:01:02.003">Third line</p>
+    </div>
+  </body>
+</tt>

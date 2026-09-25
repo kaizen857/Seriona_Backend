@@ -1,0 +1,8 @@
+[Script Info]
+Title: Breaks
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:07.00,0:00:09.00,Default,,0,0,0,,Original line\NTranslated line
+Dialogue: 0,0:00:10.00,0:00:12.00,Default,,0,0,0,,soft\nbreak here
+Dialogue: 0,0:00:13.00,0:00:14.00,Default,,0,0,0,,hard\hspace

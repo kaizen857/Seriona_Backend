@@ -46,7 +46,8 @@ public:
                             const std::filesystem::path& lrcRelativePath,
                             std::string lrcHash,
                             std::filesystem::file_time_type lrcMtime,
-                            std::vector<LyricLine> lyrics);
+                            std::vector<LyricLine> lyrics,
+                            LyricsSource source = LyricsSource::ExternalLrc);
   [[nodiscard]] PlaylistTreeSnapshot publish();
   [[nodiscard]] PlaylistTreeStats stats() const noexcept;
 

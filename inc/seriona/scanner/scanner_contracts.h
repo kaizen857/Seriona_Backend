@@ -49,6 +49,14 @@ enum class LyricsSource {
   None,
   EmbeddedTag,
   ExternalLrc,
+  // G5：外置歌词侧车的新增格式来源。**追加于末尾**——None/EmbeddedTag/ExternalLrc 的 ordinal
+  // 不变（该枚举以 TEXT 落库到 locations.lyrics_source；映射函数见
+  // src/scanner/cache/sqlite_cache.cpp 的 lyricsSourceText/parseLyricsSource 与
+  // sqlite_cache_connection.cpp 的 lyricsSourceText，共 3 处，需同步）。
+  ExternalSrt,
+  ExternalAss,
+  ExternalTtml,
+  ExternalText,
 };
 
 struct ScannerRoot {

@@ -5,6 +5,7 @@
 
 #include "seriona/scanner/cache/sqlite_cache.h"
 #include "seriona/scanner/directory_tree_hash.h"
+#include "seriona/scanner/path_utils.h"
 
 #include <doctest.h>
 #include <sqlite3.h>
@@ -574,6 +575,155 @@ TEST_CASE("scanner service scans hashes caches lyrics and skips unchanged reread
   CHECK(parseCallCount == 1U);
   const auto cachedLocation = cachedLocationForPath(sidecar, rootPath, first);
   CHECK(cachedLocation.externalLrcHash == firstLocation.externalLrcHash);
+}
+
+TEST_CASE("scanner service attaches every new sidecar format and round-trips it through the cache") {
+  test::TempScannerRoot temp{"scanner-service-new-sidecar-formats"};
+  const auto srtAudio = test::writeAudioFixture(temp.path(), "srt.flac");
+  const auto assAudio = test::writeAudioFixture(temp.path(), "ass.flac");
+  const auto ttmlAudio = test::writeAudioFixture(temp.path(), "ttml.flac");
+  const auto txtAudio = test::writeAudioFixture(temp.path(), "txt.flac");
+
+  writeText(temp.path() / "srt.srt", "1\n00:00:01,000 --> 00:00:02,000\nsrt external\n");
+  writeText(temp.path() / "ass.ass",
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,ass external\n");
+  writeText(temp.path() / "ttml.ttml", "<tt><body><p begin=\"3s\">ttml external</p></body></tt>\n");
+  writeText(temp.path() / "txt.txt", "txt external\n");
+
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(srtAudio, rawMetadata("Srt", {RawTagLyricLine{std::chrono::milliseconds{100}, "srt embedded"}}));
+  reader->put(assAudio, rawMetadata("Ass", {RawTagLyricLine{std::chrono::milliseconds{100}, "ass embedded"}}));
+  reader->put(ttmlAudio, rawMetadata("Ttml", {RawTagLyricLine{std::chrono::milliseconds{100}, "ttml embedded"}}));
+  reader->put(txtAudio, rawMetadata("Txt", {RawTagLyricLine{std::chrono::milliseconds{100}, "txt embedded"}}));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 4U);
+  const auto findSong = [&songs](const std::filesystem::path& audio) -> const SongMetadata& {
+    const auto found = std::ranges::find(songs, audio, &SongMetadata::filePath);
+    REQUIRE(found != songs.end());
+    return *found;
+  };
+
+  const auto& srtSong = findSong(srtAudio);
+  CHECK(srtSong.effectiveLyricsSource == LyricsSource::ExternalSrt);
+  REQUIRE(srtSong.effectiveLyrics.size() == 1U);
+  CHECK(srtSong.effectiveLyrics[0].text == "srt external");
+  CHECK(srtSong.effectiveLyrics[0].timestamp == std::chrono::milliseconds{1000});
+
+  const auto& assSong = findSong(assAudio);
+  CHECK(assSong.effectiveLyricsSource == LyricsSource::ExternalAss);
+  REQUIRE(assSong.effectiveLyrics.size() == 1U);
+  CHECK(assSong.effectiveLyrics[0].text == "ass external");
+  CHECK(assSong.effectiveLyrics[0].timestamp == std::chrono::milliseconds{2000});
+
+  const auto& ttmlSong = findSong(ttmlAudio);
+  CHECK(ttmlSong.effectiveLyricsSource == LyricsSource::ExternalTtml);
+  REQUIRE(ttmlSong.effectiveLyrics.size() == 1U);
+  CHECK(ttmlSong.effectiveLyrics[0].text == "ttml external");
+  CHECK(ttmlSong.effectiveLyrics[0].timestamp == std::chrono::milliseconds{3000});
+
+  const auto& txtSong = findSong(txtAudio);
+  CHECK(txtSong.effectiveLyricsSource == LyricsSource::ExternalText);
+  REQUIRE(txtSong.effectiveLyrics.size() == 1U);
+  CHECK(txtSong.effectiveLyrics[0].text == "txt external");
+
+  cache::SQLiteCache sidecar{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+  const auto rootPath = canonicalRootPath(temp.path());
+  const auto srtLocation = cachedLocationForPath(sidecar, rootPath, srtAudio);
+  const auto assLocation = cachedLocationForPath(sidecar, rootPath, assAudio);
+  const auto ttmlLocation = cachedLocationForPath(sidecar, rootPath, ttmlAudio);
+  const auto txtLocation = cachedLocationForPath(sidecar, rootPath, txtAudio);
+  CHECK(srtLocation.lyricsSource == LyricsSource::ExternalSrt);
+  CHECK(assLocation.lyricsSource == LyricsSource::ExternalAss);
+  CHECK(ttmlLocation.lyricsSource == LyricsSource::ExternalTtml);
+  CHECK(txtLocation.lyricsSource == LyricsSource::ExternalText);
+  CHECK(sidecar.loadLyrics(srtLocation.locationId, "external").size() == 1U);
+  CHECK(sidecar.loadLyrics(txtLocation.locationId, "external").size() == 1U);
+  CHECK(sidecar.loadLyrics(srtLocation.locationId, "embedded").size() == 1U);
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Incremental);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 2U, kEventWaitBudget));
+  const auto cachedSongs = songsIn(service->snapshot());
+  REQUIRE(cachedSongs.size() == 4U);
+  const auto findCached = [&cachedSongs](const std::filesystem::path& audio) -> const SongMetadata& {
+    const auto found = std::ranges::find(cachedSongs, audio, &SongMetadata::filePath);
+    REQUIRE(found != cachedSongs.end());
+    return *found;
+  };
+  CHECK(findCached(srtAudio).effectiveLyricsSource == LyricsSource::ExternalSrt);
+  CHECK(findCached(srtAudio).effectiveLyrics[0].text == "srt external");
+  CHECK(findCached(assAudio).effectiveLyricsSource == LyricsSource::ExternalAss);
+  CHECK(findCached(assAudio).effectiveLyrics[0].text == "ass external");
+  CHECK(findCached(ttmlAudio).effectiveLyricsSource == LyricsSource::ExternalTtml);
+  CHECK(findCached(ttmlAudio).effectiveLyrics[0].text == "ttml external");
+  CHECK(findCached(txtAudio).effectiveLyricsSource == LyricsSource::ExternalText);
+  CHECK(findCached(txtAudio).effectiveLyrics[0].text == "txt external");
+}
+
+TEST_CASE("scanner service enforces sidecar priority and plain text acceptance") {
+  test::TempScannerRoot temp{"scanner-service-sidecar-priority"};
+  const auto priorityAudio = test::writeAudioFixture(temp.path(), "priority.flac");
+  const auto unrelatedAudio = test::writeAudioFixture(temp.path(), "unrelated.flac");
+  const auto longAudio = test::writeAudioFixture(temp.path(), "long.flac");
+  const auto atLimitAudio = test::writeAudioFixture(temp.path(), "atlimit.flac");
+
+  writeText(temp.path() / "priority.lrc", "[00:01.00]lrc wins\n");
+  writeText(temp.path() / "priority.srt", "1\n00:00:01,000 --> 00:00:02,000\nsrt loses\n");
+  writeText(temp.path() / "notes.txt", "unrelated rip log\n");
+  std::string longText;
+  for (std::size_t index = 0; index < kPlainTextLyricsMaxLines + 1U; ++index) {
+    longText += "long line\n";
+  }
+  writeText(temp.path() / "long.txt", longText);
+  std::string atLimitText;
+  for (std::size_t index = 0; index < kPlainTextLyricsMaxLines; ++index) {
+    atLimitText += "at limit line\n";
+  }
+  writeText(temp.path() / "atlimit.txt", atLimitText);
+
+  auto reader = std::make_shared<FakeServiceMetadataReader>();
+  reader->put(priorityAudio, rawMetadata("Priority", {RawTagLyricLine{std::chrono::milliseconds{100}, "priority embedded"}}));
+  reader->put(unrelatedAudio, rawMetadata("Unrelated", {RawTagLyricLine{std::chrono::milliseconds{100}, "unrelated embedded"}}));
+  reader->put(longAudio, rawMetadata("Long", {RawTagLyricLine{std::chrono::milliseconds{100}, "long embedded"}}));
+  reader->put(atLimitAudio, rawMetadata("AtLimit"));
+  auto service = makeService(temp, reader);
+  ScannerEventLog eventLog;
+  service->setEventSink([&eventLog](ScannerEvent event) { eventLog.push(std::move(event)); });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  REQUIRE(eventLog.waitForEventCount(ScannerEventType::ScanCompleted, 1U, kEventWaitBudget));
+  const auto songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 4U);
+  const auto findSong = [&songs](const std::filesystem::path& audio) -> const SongMetadata& {
+    const auto found = std::ranges::find(songs, audio, &SongMetadata::filePath);
+    REQUIRE(found != songs.end());
+    return *found;
+  };
+
+  const auto& prioritySong = findSong(priorityAudio);
+  CHECK(prioritySong.effectiveLyricsSource == LyricsSource::ExternalLrc);
+  REQUIRE(prioritySong.effectiveLyrics.size() == 1U);
+  CHECK(prioritySong.effectiveLyrics[0].text == "lrc wins");
+
+  const auto& unrelatedSong = findSong(unrelatedAudio);
+  CHECK(unrelatedSong.effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  REQUIRE(unrelatedSong.effectiveLyrics.size() == 1U);
+  CHECK(unrelatedSong.effectiveLyrics[0].text == "unrelated embedded");
+
+  const auto& longSong = findSong(longAudio);
+  CHECK(longSong.effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  REQUIRE(longSong.effectiveLyrics.size() == 1U);
+  CHECK(longSong.effectiveLyrics[0].text == "long embedded");
+
+  const auto& atLimitSong = findSong(atLimitAudio);
+  CHECK(atLimitSong.effectiveLyricsSource == LyricsSource::ExternalText);
+  CHECK(atLimitSong.effectiveLyrics.size() == kPlainTextLyricsMaxLines);
 }
 
 TEST_CASE("scanner service runScan characterizes main database scanner schema side effect") {

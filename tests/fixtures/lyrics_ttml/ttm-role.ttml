@@ -1,0 +1,8 @@
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <body>
+    <div>
+      <p begin="0s" xml:id="L1">Original</p>
+      <p begin="1s" ttm:role="translation">role tagged translation</p>
+    </div>
+  </body>
+</tt>

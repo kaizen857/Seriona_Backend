@@ -467,6 +467,9 @@ add_executable(seriona_control_playback_context_builder_tests
 add_executable(seriona_lyric_split_tests
   control/lyric_split_tests.cpp
 )
+add_executable(seriona_lyric_reference_pairing_tests
+  scanner/lyric_reference_pairing_tests.cpp
+)
 add_executable(seriona_artwork_resolver_tests
   control/artwork_resolver_tests.cpp
 )
@@ -572,6 +575,10 @@ add_executable(seriona_scanner_incremental_plan_tests
 )
 add_executable(seriona_scanner_incremental_e2e_tests
   scanner/scanner_incremental_e2e_tests.cpp
+  scanner/scanner_test_harness.cpp
+)
+add_executable(seriona_scanner_lyrics_formats_e2e_tests
+  scanner/scanner_lyrics_formats_e2e_tests.cpp
   scanner/scanner_test_harness.cpp
 )
 add_executable(seriona_scanner_perf_test
@@ -780,7 +787,13 @@ target_compile_definitions(seriona_terminal_controller_tests PRIVATE
   DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
   SERIONA_TERMINAL_CONTROLLER_TESTING
 )
-target_compile_definitions(seriona_scanner_paths_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_paths_tests PRIVATE
+  DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+  SERIONA_PLAIN_TEXT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyrics_plain_text"
+  SERIONA_SRT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyrics_srt"
+  SERIONA_ASS_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyrics_ass"
+  SERIONA_TTML_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyrics_ttml"
+)
 target_compile_definitions(seriona_scanner_hash_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_tree_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_scheduler_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -794,6 +807,7 @@ target_compile_definitions(seriona_scanner_phase2_tsan_stress_tests PRIVATE DOCT
 target_compile_definitions(seriona_scanner_scan_mode_decision_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_incremental_plan_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_incremental_e2e_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_compile_definitions(seriona_scanner_lyrics_formats_e2e_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_cache_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_scanner_cache_basic_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 # target_compile_definitions(seriona_scanner_cache_content_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -821,6 +835,7 @@ target_compile_definitions(seriona_lyric_split_tests PRIVATE
   SERIONA_LYRIC_SPLIT_LANG_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split_lang"
   SERIONA_LYRIC_SPLIT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/lyric_split"
 )
+target_compile_definitions(seriona_lyric_reference_pairing_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_artwork_resolver_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_media_controller_artwork_shutdown_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
 target_compile_definitions(seriona_delete_commands_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
@@ -1114,6 +1129,11 @@ target_include_directories(seriona_lyric_split_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
+target_include_directories(seriona_lyric_reference_pairing_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
 target_include_directories(seriona_artwork_resolver_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1204,6 +1224,11 @@ target_include_directories(seriona_scanner_incremental_plan_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/doctest
 )
 target_include_directories(seriona_scanner_incremental_e2e_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/inc
+  ${PROJECT_SOURCE_DIR}/src/scanner
+  ${PROJECT_SOURCE_DIR}/third_party/doctest
+)
+target_include_directories(seriona_scanner_lyrics_formats_e2e_tests PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_SOURCE_DIR}/src/scanner
   ${PROJECT_SOURCE_DIR}/third_party/doctest
@@ -1568,6 +1593,10 @@ target_link_libraries(seriona_lyric_split_tests PRIVATE
   seriona_third_party_headers
   seriona_control
 )
+target_link_libraries(seriona_lyric_reference_pairing_tests PRIVATE
+  seriona_third_party_headers
+  seriona_scanner
+)
 target_link_libraries(seriona_artwork_resolver_tests PRIVATE
   seriona_third_party_headers
   seriona_control
@@ -1662,6 +1691,7 @@ seriona_enable_warnings(seriona_control_app_settings_store_tests)
 seriona_enable_warnings(seriona_control_persistence_guardrail_tests)
 seriona_enable_warnings(seriona_control_playback_context_builder_tests)
 seriona_enable_warnings(seriona_lyric_split_tests)
+seriona_enable_warnings(seriona_lyric_reference_pairing_tests)
 seriona_enable_warnings(seriona_artwork_resolver_tests)
 seriona_enable_warnings(seriona_media_controller_artwork_shutdown_tests)
 seriona_enable_warnings(seriona_delete_commands_tests)
@@ -1701,6 +1731,7 @@ seriona_enable_warnings(seriona_scanner_phase2_tsan_stress_tests)
 seriona_enable_warnings(seriona_scanner_scan_mode_decision_tests)
 seriona_enable_warnings(seriona_scanner_incremental_plan_tests)
 seriona_enable_warnings(seriona_scanner_incremental_e2e_tests)
+seriona_enable_warnings(seriona_scanner_lyrics_formats_e2e_tests)
 seriona_enable_warnings(seriona_scanner_perf_test)
 seriona_enable_warnings(seriona_scanner_detailed_perf_test)
 # seriona_enable_warnings(seriona_scanner_cache_tests)
@@ -1775,6 +1806,7 @@ target_link_libraries(seriona_scanner_tagreader_concurrency_stress_tests PRIVATE
 )
 target_link_libraries(seriona_scanner_paths_tests PRIVATE
   spdlog::spdlog
+  ICU::uc
 )
 target_link_libraries(seriona_scanner_tree_tests PRIVATE
   spdlog::spdlog
@@ -1810,6 +1842,7 @@ target_link_libraries(seriona_scanner_scan_mode_decision_tests PRIVATE
   ${SERIONA_TAGREADER_TARGET}
   BS::thread_pool
   spdlog::spdlog
+  ICU::uc
 )
 target_link_libraries(seriona_scanner_incremental_plan_tests PRIVATE
   efsw-static
@@ -1818,8 +1851,14 @@ target_link_libraries(seriona_scanner_incremental_plan_tests PRIVATE
   ${SERIONA_TAGREADER_TARGET}
   BS::thread_pool
   spdlog::spdlog
+  ICU::uc
 )
 target_link_libraries(seriona_scanner_incremental_e2e_tests PRIVATE
+  seriona_scanner
+  SQLite3::SQLite3
+  PkgConfig::SERIONA_XXHASH
+)
+target_link_libraries(seriona_scanner_lyrics_formats_e2e_tests PRIVATE
   seriona_scanner
   SQLite3::SQLite3
   PkgConfig::SERIONA_XXHASH
@@ -1977,6 +2016,7 @@ add_test(NAME seriona.control_app_settings_store COMMAND seriona_control_app_set
 add_test(NAME seriona.control_persistence_guardrails COMMAND seriona_control_persistence_guardrail_tests)
 add_test(NAME seriona.control_playback_context_builder COMMAND seriona_control_playback_context_builder_tests)
 add_test(NAME seriona.control.lyric_split COMMAND seriona_lyric_split_tests)
+add_test(NAME seriona.scanner_lyric_reference_pairing COMMAND seriona_lyric_reference_pairing_tests)
 
 # Python↔C++ 歌词切分语料一致性闸门。语料根**运行时**从 SERIONA_LYRICS_CORPUS 读
 # （argv[1] 传空串占位 ⇒ 脚本回退到该环境变量；**不得**在 configure 期用 $ENV{} 冻结，
@@ -2031,6 +2071,7 @@ add_test(NAME seriona.scanner.phase2_tsan_stress COMMAND seriona_scanner_phase2_
 add_test(NAME seriona.scanner.scan_mode_decision COMMAND seriona_scanner_scan_mode_decision_tests)
 add_test(NAME seriona.scanner.incremental_plan COMMAND seriona_scanner_incremental_plan_tests)
 add_test(NAME seriona.scanner.incremental_e2e COMMAND seriona_scanner_incremental_e2e_tests)
+add_test(NAME seriona.scanner.lyrics_formats_e2e COMMAND seriona_scanner_lyrics_formats_e2e_tests)
 # add_test(NAME seriona.scanner_cache COMMAND seriona_scanner_cache_tests)
 add_test(NAME seriona.scanner.cache.basic COMMAND seriona_scanner_cache_basic_tests)
 # add_test(NAME seriona.scanner.cache.content COMMAND seriona_scanner_cache_content_tests)

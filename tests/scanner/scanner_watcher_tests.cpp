@@ -461,6 +461,71 @@ TEST_CASE("scanner watcher updates lrc only without TagReader and handles delete
   }
 }
 
+TEST_CASE("scanner watcher classifies new sidecar formats as lyrics changes") {
+  test::TempScannerRoot temp{"scanner-watcher-new-sidecar"};
+  const auto audio = test::writeAudioFixture(temp.path(), "song.flac");
+  auto reader = std::make_shared<FakeWatcherMetadataReader>();
+  reader->put(audio, rawMetadata("Song", {RawTagLyricLine{std::chrono::milliseconds{100}, "embedded"}}));
+  auto watchers = std::make_shared<CapturingWatcherFactory>();
+  std::vector<ScannerEvent> events;
+  std::mutex eventsMutex;
+  auto service = makeWatcherService(temp, reader, watchers);
+  service->setEventSink([&events, &eventsMutex](ScannerEvent event) {
+    std::scoped_lock lock{eventsMutex};
+    events.push_back(std::move(event));
+  });
+
+  service->scan({ScannerRoot{.path = temp.path()}}, ScanMode::Full);
+  waitForSnapshotSongCount(*service, 1U);
+  service->startWatching({ScannerRoot{.path = temp.path()}});
+  REQUIRE(watchers->states.size() == 1U);
+  CHECK(reader->readCount() == 1U);
+
+  const auto srt = temp.path() / "song.srt";
+  writeText(srt, "1\n00:00:02,000 --> 00:00:03,000\nfirst srt\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  watchers->states[0]->callback(fileEvent(srt, WatchEffectKind::Modified));
+  waitForLyrics(*service, LyricsSource::ExternalSrt, "first srt");
+  auto songs = songsIn(service->snapshot());
+  CHECK(reader->readCount() == 1U);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalSrt);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "first srt");
+  CHECK(songs[0].effectiveLyrics[0].timestamp == std::chrono::milliseconds{2000});
+
+  writeText(srt, "1\n00:00:04,000 --> 00:00:05,000\nsecond srt\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds{3});
+  watchers->states[0]->callback(fileEvent(srt, WatchEffectKind::Modified));
+  waitForLyrics(*service, LyricsSource::ExternalSrt, "second srt");
+  songs = songsIn(service->snapshot());
+  CHECK(reader->readCount() == 1U);
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::ExternalSrt);
+  REQUIRE(songs[0].effectiveLyrics.size() == 1U);
+  CHECK(songs[0].effectiveLyrics[0].text == "second srt");
+  {
+    std::scoped_lock lock{eventsMutex};
+    CHECK(scanStartedCount(events) == 1U);
+  }
+  {
+    cache::SQLiteCache sidecarCache{cache::ScannerCacheConfig{.databasePath = scannerSidecarPath(temp)}};
+    const auto locations = sidecarCache.loadLocationsByRoot(canonicalRootPath(temp.path()));
+    REQUIRE(locations.size() == 1U);
+    CHECK(locations[0].lyricsSource == LyricsSource::ExternalSrt);
+    REQUIRE(locations[0].externalLrcPath.has_value());
+    CHECK(locations[0].externalLrcPath->filename() == "song.srt");
+  }
+
+  std::filesystem::remove(srt);
+  watchers->states[0]->callback(fileEvent(srt, WatchEffectKind::Destroyed));
+  waitForLyrics(*service, LyricsSource::EmbeddedTag, "embedded");
+  songs = songsIn(service->snapshot());
+  REQUIRE(songs.size() == 1U);
+  CHECK(songs[0].effectiveLyricsSource == LyricsSource::EmbeddedTag);
+  CHECK(songs[0].effectiveLyrics[0].text == "embedded");
+}
+
 // 零变化 .lrc 事件回归：hash 未变的同内容重写（mtime 可推进）不得发布快照与扫描完成——
 // 否则同步工具/编辑器的同内容保存会误发「曲库已更新/曲库扫描完成」。真实内容变化（hash
 // 推进）必须照常对账并发布。

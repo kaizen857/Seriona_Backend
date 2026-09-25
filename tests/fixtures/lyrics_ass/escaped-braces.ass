@@ -1,0 +1,12 @@
+[Script Info]
+Title: Escaped braces
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,x \{a\} y
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,\{open
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,a\}b
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,\{escaped brace\}
+Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,\\{a}b
+Dialogue: 0,0:00:11.00,0:00:12.00,Default,,0,0,0,,\{a\}b\{c
+Dialogue: 0,0:00:13.00,0:00:14.00,Default,,0,0,0,,{\i1}styled{\i0} and \{literal\}

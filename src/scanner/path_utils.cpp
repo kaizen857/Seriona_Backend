@@ -265,7 +265,12 @@ bool isCueSheetPath(const std::filesystem::path& path) {
 }
 
 bool isLyricsSidecarPath(const std::filesystem::path& path) {
-  return normalizedExtension(path) == ".lrc";
+  // G5 范围界定：受支持的歌词侧车扩展名集合（含 .txt/.srt/.ass/.ttml）。
+  // .krc / .qrc / .yrc 明确不纳入：它们分别是酷狗、QQ 音乐、网易云音乐的**专有/加密**歌词格式，
+  // 需要各自的私有解码方案，本仓库不实现（D33 记「代码注释说明为何不纳入」；G5 原表亦列为
+  // 「不修」）。以本注释固定该决策，避免后续被当作遗漏补齐。
+  static const auto supported = extensionSet(lyricsSidecarExtensions());
+  return supported.contains(normalizedExtension(path));
 }
 
 bool isCoverSidecar(const std::filesystem::path& path) {
@@ -280,15 +285,65 @@ bool isCoverSidecar(const std::filesystem::path& path) {
 }
 
 bool isLibraryRelevantPath(const std::filesystem::path& path, const std::vector<std::string>& allowedExtensions) {
-  // isSupportedAudioExtension 已排除容器扩展名与 .cue/.lrc，因此 .cue/.lrc 需单独列出。
+  // isSupportedAudioExtension 已排除容器扩展名与 .cue/歌词侧车，因此 .cue/歌词侧车需单独列出。
   return isSupportedAudioExtension(path, allowedExtensions) || isCueSheetPath(path) ||
          isLyricsSidecarPath(path) || isCoverSidecar(path);
 }
 
 std::filesystem::path expectedLyricsSidecarPath(const std::filesystem::path& audioPath) {
   auto sidecar = audioPath;
-  sidecar.replace_extension(".lrc");
+  sidecar.replace_extension(lyricsSidecarExtensions().front());
   return sidecar;
+}
+
+const std::vector<std::string>& lyricsSidecarExtensions() {
+  static const std::vector<std::string> extensions{".lrc", ".srt", ".ass", ".ttml", ".txt"};
+  return extensions;
+}
+
+std::vector<std::filesystem::path> candidateLyricsSidecarPaths(const std::filesystem::path& audioPath) {
+  std::vector<std::filesystem::path> candidates;
+  candidates.reserve(lyricsSidecarExtensions().size());
+  for (const auto& extension : lyricsSidecarExtensions()) {
+    auto candidate = audioPath;
+    candidate.replace_extension(extension);
+    candidates.push_back(std::move(candidate));
+  }
+  return candidates;
+}
+
+LyricsSource lyricsSourceForSidecarPath(const std::filesystem::path& path) {
+  const auto extension = normalizedExtension(path);
+  if (extension == ".lrc") {
+    return LyricsSource::ExternalLrc;
+  }
+  if (extension == ".srt") {
+    return LyricsSource::ExternalSrt;
+  }
+  if (extension == ".ass") {
+    return LyricsSource::ExternalAss;
+  }
+  if (extension == ".ttml") {
+    return LyricsSource::ExternalTtml;
+  }
+  if (extension == ".txt") {
+    return LyricsSource::ExternalText;
+  }
+  return LyricsSource::None;
+}
+
+std::filesystem::path resolveLyricsSidecarPath(const std::filesystem::path& audioPath) {
+  for (const auto& candidate : candidateLyricsSidecarPaths(audioPath)) {
+    std::error_code error;
+    if (std::filesystem::is_regular_file(candidate, error)) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
+bool acceptsPlainTextLyricsSidecar(const std::vector<LyricLine>& lines) {
+  return !lines.empty() && lines.size() <= kPlainTextLyricsMaxLines;
 }
 
 std::string serializeRelativeUtf8(const std::filesystem::path& root, const std::filesystem::path& path) {
@@ -377,9 +432,11 @@ ClassifiedPath classifyScannerPath(const std::filesystem::path& root, const std:
   }
   if (isSupportedAudioExtension(canonicalPath, config.allowedExtensions)) {
     result.kind = canonicalPath == canonicalRoot ? PathEntryKind::SingleFileRoot : PathEntryKind::AudioCandidate;
-    const auto sidecar = expectedLyricsSidecarPath(canonicalPath);
-    if (config.readExternalLyrics && std::filesystem::is_regular_file(sidecar, error)) {
-      result.sidecarLyricsPath = sidecar;
+    if (config.readExternalLyrics) {
+      const auto sidecar = resolveLyricsSidecarPath(canonicalPath);
+      if (!sidecar.empty()) {
+        result.sidecarLyricsPath = sidecar;
+      }
     }
     return result;
   }

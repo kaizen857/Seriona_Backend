@@ -1,0 +1,19 @@
+[Script Info]
+Title: Drawing lexer (bracket args + backslash-space)
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\p(1)}m 0 0 l 100 0
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\p(2)}x 50 y 60
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\p(1,2)}m 0 0
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\p1(0)}bracket arg wins
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\p(1)}drawing drops this line
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\p(1)}m 0 0{\p0}After bracket
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,{\ p1}m 0 0 l 100 0
+Dialogue: 0,0:00:08.00,0:00:09.00,Default,,0,0,0,,{\ p 1}m 0 0
+Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,{\p1}m 0 0{\ p0}After space reset
+Dialogue: 0,0:00:10.00,0:00:11.00,Default,,0,0,0,,{\p()}empty bracket off
+Dialogue: 0,0:00:11.00,0:00:12.00,Default,,0,0,0,,{\ppos(1,2)}m 0 0
+Dialogue: 0,0:00:12.00,0:00:13.00,Default,,0,0,0,,{\p1()}empty bracket falls back
+Dialogue: 0,0:00:13.00,0:00:14.00,Default,,0,0,0,,{\fs(\p1)}fs bracket keeps text
+Dialogue: 0,0:00:14.00,0:00:15.00,Default,,0,0,0,,{\t(\p1)}m 0 0

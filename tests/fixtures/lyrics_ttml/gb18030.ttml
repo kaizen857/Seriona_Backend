@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="gb18030"?>
+<tt xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+      <p begin="0s">第一行歌词</p>
+      <p begin="1s">第二行歌词</p>
+    </div>
+  </body>
+</tt>

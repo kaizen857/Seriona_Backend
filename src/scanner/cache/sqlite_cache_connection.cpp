@@ -79,7 +79,7 @@ private:
 [[nodiscard]] std::chrono::system_clock::time_point msToSystemTime(const std::int64_t value) { return std::chrono::system_clock::time_point{std::chrono::milliseconds{value}}; }
 [[nodiscard]] std::string scanModeText(const ScanMode mode) { return mode == ScanMode::Full ? "full" : "incremental"; }
 [[nodiscard]] ScanMode parseScanMode(const std::string& value) { if (value == "full") { return ScanMode::Full; } if (value == "incremental") { return ScanMode::Incremental; } throw std::runtime_error("unknown cached scan mode"); }
-[[nodiscard]] std::string lyricsSourceText(const LyricsSource source) { switch (source) { case LyricsSource::None: return "none"; case LyricsSource::EmbeddedTag: return "embedded_tag"; case LyricsSource::ExternalLrc: return "external_lrc"; } throw std::runtime_error("unknown lyrics source"); }
+[[nodiscard]] std::string lyricsSourceText(const LyricsSource source) { switch (source) { case LyricsSource::None: return "none"; case LyricsSource::EmbeddedTag: return "embedded_tag"; case LyricsSource::ExternalLrc: return "external_lrc"; case LyricsSource::ExternalSrt: return "external_srt"; case LyricsSource::ExternalAss: return "external_ass"; case LyricsSource::ExternalTtml: return "external_ttml"; case LyricsSource::ExternalText: return "external_text"; } throw std::runtime_error("unknown lyrics source"); }
 [[nodiscard]] std::string errorCodeText(const ScannerErrorCode code) {
   switch (code) { case ScannerErrorCode::RootUnavailable: return "root_unavailable"; case ScannerErrorCode::PermissionDenied: return "permission_denied"; case ScannerErrorCode::UnsupportedFile: return "unsupported_file"; case ScannerErrorCode::MetadataReadFailed: return "metadata_read_failed"; case ScannerErrorCode::CacheUnavailable: return "cache_unavailable"; case ScannerErrorCode::Cancelled: return "cancelled"; }
   throw std::runtime_error("unknown scanner error code");
@@ -343,7 +343,7 @@ void SQLiteCache::clearErrorsNoTransaction(const std::filesystem::path& rootPath
 }
 
 void SQLiteCache::applyLyricsCacheUpdateNoTransaction(const LyricsCacheUpdate& update) {
-  const auto nextSource = update.removeExternalLyrics ? update.effectiveLyricsSource : LyricsSource::ExternalLrc;
+  const auto nextSource = update.effectiveLyricsSource;
   Statement updateLocation{asDb(db_),
                            "UPDATE locations "
                            "SET lyrics_source=?1, external_lrc_path=?2, external_lrc_mtime_ns=?3, external_lrc_hash=?4 "

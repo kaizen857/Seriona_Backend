@@ -1,0 +1,10 @@
+<tt xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+      <p begin="0s">A<span>B<span>C</span>D</span>E</p>
+      <p begin="1s"><span>   leading   spaces   </span></p>
+      <p begin="2s"><span>one</span><span>two</span></p>
+      <p begin="3s"><span>x</span><unknown-element>y</unknown-element></p>
+    </div>
+  </body>
+</tt>

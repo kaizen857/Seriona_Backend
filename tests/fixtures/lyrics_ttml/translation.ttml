@@ -1,0 +1,12 @@
+<tt xmlns="http://www.w3.org/ns/ttml">
+  <body>
+    <div>
+      <p begin="0s" xml:id="L1">Original one</p>
+      <p begin="1s" xml:id="L2">Original two</p>
+      <translation xml:lang="es">
+        <text for="L1">Translated one</text>
+        <text for="L2">Translated two</text>
+      </translation>
+    </div>
+  </body>
+</tt>

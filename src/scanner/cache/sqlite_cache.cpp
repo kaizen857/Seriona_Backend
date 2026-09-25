@@ -45,6 +45,14 @@ namespace {
     return "embedded_tag";
   case LyricsSource::ExternalLrc:
     return "external_lrc";
+  case LyricsSource::ExternalSrt:
+    return "external_srt";
+  case LyricsSource::ExternalAss:
+    return "external_ass";
+  case LyricsSource::ExternalTtml:
+    return "external_ttml";
+  case LyricsSource::ExternalText:
+    return "external_text";
   }
   throw std::runtime_error("unknown lyrics source");
 }
@@ -58,6 +66,18 @@ namespace {
   }
   if (value == "external_lrc") {
     return LyricsSource::ExternalLrc;
+  }
+  if (value == "external_srt") {
+    return LyricsSource::ExternalSrt;
+  }
+  if (value == "external_ass") {
+    return LyricsSource::ExternalAss;
+  }
+  if (value == "external_ttml") {
+    return LyricsSource::ExternalTtml;
+  }
+  if (value == "external_text") {
+    return LyricsSource::ExternalText;
   }
   throw std::runtime_error("unknown cached lyrics source");
 }

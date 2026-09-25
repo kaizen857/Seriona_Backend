@@ -1,0 +1,7 @@
+﻿[Script Info]
+Title: CRLF
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:20.00,0:00:22.00,Default,,0,0,0,,CRLF first
+Dialogue: 0,0:00:23.00,0:00:25.00,Default,,0,0,0,,CRLF second

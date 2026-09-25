@@ -1,0 +1,7 @@
+[Script Info]
+Title: Shuffled
+
+[Events]
+Format: Effect, Style, Start, End, Name, Text
+Dialogue: ,Default,0:00:02.00,0:00:04.00,alice,Shuffled one
+Dialogue: ,Alt,0:00:06.00,0:00:08.00,bob,Shuffled two
