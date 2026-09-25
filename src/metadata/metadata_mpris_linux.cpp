@@ -119,6 +119,10 @@ constexpr std::string_view kFileExistsErrorName{"org.freedesktop.DBus.Error.File
     case control::MediaControlCommandKind::SetTransitionConfig:
     case control::MediaControlCommandKind::SetEqualizerConfig:
     case control::MediaControlCommandKind::SetSpectrumEnabled:
+    case control::MediaControlCommandKind::SetLyricsTargetLanguage:
+    case control::MediaControlCommandKind::UpsertLyricSplitCorrection:
+    case control::MediaControlCommandKind::RemoveLyricSplitCorrection:
+    case control::MediaControlCommandKind::ClearLyricSplitCorrections:
       return false;
   }
   return false;

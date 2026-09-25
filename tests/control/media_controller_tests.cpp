@@ -1,8 +1,13 @@
 #include "control_test_harness.h"
 
 #include "../../src/control/media_controller_module.h"
+// C：直接实例化订阅存储模板需要一个「拷贝即抛」的快照类型（SubscriptionStore 的容量点
+// 之一就是快照拷贝），而模板定义在 .cpp 内。包含它以在本 TU 内实例化自定义快照类型；
+// header 末尾的 extern template 声明阻止 6 个既有类型在本 TU 内被重复实例化。
+#include "../../src/control/subscription_store.cpp"
 
 #include "seriona/control/folder_sort_settings_store.h"
+#include "seriona/control/lyric_split_store.h"
 #include "seriona/control/media_controller.h"
 
 #include <doctest.h>
@@ -18,6 +23,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -2910,4 +2916,1530 @@ TEST_CASE("media controller keeps logical CUE identity and artwork after a cache
   CHECK(snapshot.artwork->thumbnailPath == std::filesystem::path{"/thumbs/cue-01.png"});
   REQUIRE(snapshot.display.has_value());
   CHECK(snapshot.display->album == "Cue Album");
+}
+
+// ── 当前曲目切分歌词订阅（todo 27：TrackLyricsSnapshot + 订阅工厂 + 发布时机）──────
+
+namespace {
+
+constexpr std::string_view kTrackLyricsLineOriginal = "悔しいけど好きって純情 虽然不甘但还是喜欢你 这份纯情";
+constexpr std::string_view kTrackLyricsLineSecond = "そら 天空";
+
+std::vector<scanner::LyricLine> spacedLyricLines() {
+  return {scanner::LyricLine{.timestamp = std::chrono::milliseconds{0}, .text = std::string{kTrackLyricsLineOriginal}},
+          scanner::LyricLine{.timestamp = std::chrono::milliseconds{1000}, .text = std::string{kTrackLyricsLineSecond}}};
+}
+
+scanner::SongMetadata lyricsSong(std::string id, std::string path, std::vector<scanner::LyricLine> lyrics) {
+  auto metadata = song(std::move(id), std::move(path));
+  metadata.effectiveLyrics = std::move(lyrics);
+  return metadata;
+}
+
+// 注入真实（SQLite）歌词切分存储，并保留 shared_ptr 别名：测试既可用纠错命令
+// （UpsertLyricSplitCorrection 等）驱动，也可直接读写该 store 做断言与布景。
+struct TrackLyricsFixture {
+  std::shared_ptr<control_test::FakeAudioPlaybackService> fakeAudio{std::make_shared<control_test::FakeAudioPlaybackService>()};
+  std::shared_ptr<control_test::FakeFileScannerService> fakeScanner{std::make_shared<control_test::FakeFileScannerService>()};
+  std::shared_ptr<LyricSplitStore> store{};
+  std::unique_ptr<MediaController> controller{};
+  std::filesystem::path databasePath{};
+
+  explicit TrackLyricsFixture(MediaControllerOptions options = MediaControllerOptions{.runInlineForTests = true}) {
+    databasePath = uniqueMediaControllerDatabasePath();
+    std::error_code cleanupError{};
+    std::filesystem::remove(databasePath, cleanupError);
+
+    auto metadataService = std::make_unique<control_test::FakeMetadataSharingService>();
+    store = makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath});
+    controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                 .scanner = fakeScanner,
+                                                                 .metadata = std::move(metadataService),
+                                                                 .lyricSplitStore = store},
+                                     options);
+  }
+
+  ~TrackLyricsFixture() {
+    controller.reset();
+    store.reset();
+    std::error_code cleanupError{};
+    std::filesystem::remove(databasePath, cleanupError);
+  }
+};
+
+void installTrackLyricsLibrary(TrackLyricsFixture& fixture,
+                               std::vector<scanner::LyricLine> lyrics = spacedLyricLines(),
+                               std::uint64_t treeVersion = 20,
+                               std::uint64_t eventVersion = 1) {
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({lyricsSong("a", "music/a.flac", std::move(lyrics)), song("b", "music/b.flac")}, treeVersion),
+      eventVersion));
+  fixture.controller->drainForTests();
+}
+
+}
+
+TEST_CASE("track lyrics subscription delivers the current snapshot immediately and again after unsubscribe stops") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+
+  REQUIRE(received.size() == 1U);
+  CHECK(received.front().trackId.empty());
+  CHECK(received.front().lines.empty());
+  CHECK(received.front().freshness.version == 0U);
+
+  handle.unsubscribe();
+  installTrackLyricsLibrary(fixture);
+  CHECK(received.size() == 1U);
+}
+
+TEST_CASE("track lyrics subscription republishes on current track change with full line detail") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+  // 曲库快照到达时归约器自动选中首曲（selectFirstTrackWhenIdle），故订阅即得 "a" 的
+  // 全量行快照 —— 这里同时校验契约字段与逐行内容。
+  REQUIRE(received.size() == 1U);
+  const auto first = received.front();
+  CHECK(first.trackId == "a");
+  CHECK(first.targetLanguage == "zh");
+  CHECK(first.convention == LyricSplitConvention::WeakSpace);
+  CHECK(first.position == TranslationPosition::LastLanguageSegment);
+  REQUIRE(first.lines.size() == 2U);
+
+  CHECK(first.lines[0].text == kTrackLyricsLineOriginal);
+  CHECK(first.lines[0].original == "悔しいけど好きって純情");
+  CHECK(first.lines[0].translation == "虽然不甘但还是喜欢你 这份纯情");
+  CHECK(first.lines[0].split == true);
+  CHECK(first.lines[0].manualOverride == false);
+  CHECK(first.lines[1].text == kTrackLyricsLineSecond);
+  CHECK(first.lines[1].original == "そら");
+  CHECK(first.lines[1].translation == "天空");
+  CHECK(first.lines[0].timestamp == std::chrono::milliseconds{0});
+  CHECK(first.lines[1].timestamp == std::chrono::milliseconds{1000});
+
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track("b", "music/b.flac");
+  REQUIRE(fixture.controller->submitCommand(select).accepted);
+
+  REQUIRE(received.size() == 2U);
+  CHECK(received.back().trackId == "b");
+  CHECK(received.back().lines.empty());
+  CHECK(received.back().freshness.version > first.freshness.version);
+  handle.unsubscribe();
+}
+
+TEST_CASE("track lyrics subscription republishes on target language change") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+  REQUIRE(received.size() == 1U);
+  REQUIRE(received.front().trackId == "a");
+  CHECK(received.front().targetLanguage == "zh");
+
+  MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "ja");
+  CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "ja");
+
+  REQUIRE(received.size() == 2U);
+  CHECK(received.back().trackId == "a");
+  CHECK(received.back().targetLanguage == "ja");
+  CHECK(received.back().lines.size() == 2U);
+  handle.unsubscribe();
+}
+
+TEST_CASE("track lyrics subscription republishes on manual correction add and remove") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+  REQUIRE(received.size() == 1U);
+  REQUIRE(received.front().lines.size() == 2U);
+  CHECK(received.front().lines[1].manualOverride == false);
+  CHECK(received.front().lines[1].autoOriginal.empty());
+
+  fixture.store->upsertManual(LyricSplitEntry{.rawText = std::string{kTrackLyricsLineSecond},
+                                             .targetLanguage = "zh",
+                                             .convention = received.front().convention,
+                                             .original = "空（人工）",
+                                             .translation = "天空（人工）"});
+  MediaControllerInternalAccess::refreshTrackLyrics(*fixture.controller);
+
+  REQUIRE(received.size() == 2U);
+  const auto& corrected = received.back().lines[1];
+  CHECK(corrected.manualOverride == true);
+  CHECK(corrected.text == kTrackLyricsLineSecond);
+  CHECK(corrected.original == "空（人工）");
+  CHECK(corrected.translation == "天空（人工）");
+  CHECK(corrected.autoOriginal == "そら");
+  CHECK(corrected.autoTranslation == "天空");
+  CHECK(received.back().lines[0].manualOverride == false);
+
+  fixture.store->removeManual(std::string{kTrackLyricsLineSecond}, "zh", received.back().convention);
+  MediaControllerInternalAccess::refreshTrackLyrics(*fixture.controller);
+
+  REQUIRE(received.size() == 3U);
+  const auto& restored = received.back().lines[1];
+  CHECK(restored.manualOverride == false);
+  CHECK(restored.original == "そら");
+  CHECK(restored.translation == "天空");
+  handle.unsubscribe();
+}
+
+TEST_CASE("track lyrics subscription republishes when lyrics change on rescan") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+  REQUIRE(received.size() == 1U);
+  REQUIRE(received.front().lines.size() == 2U);
+
+  std::vector<scanner::LyricLine> rescanned{
+      scanner::LyricLine{.timestamp = std::chrono::milliseconds{0}, .text = "うみ 大海"},
+      scanner::LyricLine{.timestamp = std::chrono::milliseconds{1000}, .text = "ほし 星星"}};
+  installTrackLyricsLibrary(fixture, std::move(rescanned), 30, 2);
+
+  REQUIRE(received.size() == 2U);
+  const auto& snapshot = received.back();
+  CHECK(snapshot.trackId == "a");
+  REQUIRE(snapshot.lines.size() == 2U);
+  CHECK(snapshot.lines[0].text == "うみ 大海");
+  CHECK(snapshot.lines[0].original == "うみ");
+  CHECK(snapshot.lines[0].translation == "大海");
+  CHECK(snapshot.lines[1].text == "ほし 星星");
+  CHECK(snapshot.freshness.version > received.front().freshness.version);
+  handle.unsubscribe();
+}
+
+TEST_CASE("track lyrics snapshot freshness advances strictly across consecutive publishes") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::vector<TrackLyricsSnapshot> received;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    received.push_back(std::move(snapshot));
+  });
+  REQUIRE(received.size() == 1U);
+
+  MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "ja");
+  REQUIRE(received.size() == 2U);
+  const auto firstVersion = received.back().freshness.version;
+
+  MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "zh");
+  REQUIRE(received.size() == 3U);
+  const auto secondVersion = received.back().freshness.version;
+
+  CHECK(secondVersion > firstVersion);
+
+  // 同一语言重复设置不重发布（值未变即短路），版本因此保持不变。
+  MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "zh");
+  CHECK(received.size() == 3U);
+  CHECK(received.back().freshness.version == secondVersion);
+  handle.unsubscribe();
+}
+
+TEST_CASE("track lyrics refresh executes on the control event loop worker thread when not inline") {
+  // 非 inline 模式下 ControlEventLoop::drainForTests() 是 no-op（它只在 inline 模式干活），
+  // 且本用例全程不调用它 —— 因此快照能出现，只可能是 workerMain 在 worker_ 上执行的。
+  TrackLyricsFixture fixture{MediaControllerOptions{.runInlineForTests = false}};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+  REQUIRE(waitUntil([&] { return fixture.controller->playerStateSnapshot().currentTrack.has_value(); }));
+
+  const auto callerThread = std::this_thread::get_id();
+  std::mutex receivedMutex{};
+  std::vector<TrackLyricsSnapshot> received;
+  std::vector<std::thread::id> callbackThreads;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{receivedMutex};
+    callbackThreads.push_back(std::this_thread::get_id());
+    received.push_back(std::move(snapshot));
+  });
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{receivedMutex};
+    return !received.empty();
+  }));
+
+  MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "ja");
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{receivedMutex};
+    return !received.empty() && received.back().targetLanguage == "ja";
+  }));
+
+  {
+    std::lock_guard lock{receivedMutex};
+    REQUIRE(received.size() >= 2U);
+    REQUIRE(received.back().trackId == "a");
+    REQUIRE(received.back().lines.size() == 2U);
+    for (const auto threadId : callbackThreads) {
+      CHECK(threadId != callerThread);
+    }
+  }
+  handle.unsubscribe();
+}
+
+// ── 歌词切分控制命令（todo 28：目标语言 + 三条纠错命令 + payload 落地）────────────
+
+namespace {
+
+MediaControlCommand setLyricsTargetLanguageCommand(std::string language) {
+  MediaControlCommand command{};
+  command.kind = MediaControlCommandKind::SetLyricsTargetLanguage;
+  command.lyricsTargetLanguage = std::move(language);
+  return command;
+}
+
+MediaControlCommand upsertCorrectionCommand(std::string rawText,
+                                            std::string original,
+                                            std::string translation,
+                                            std::optional<std::string> convention) {
+  MediaControlCommand command{};
+  command.kind = MediaControlCommandKind::UpsertLyricSplitCorrection;
+  command.lyricRawText = std::move(rawText);
+  command.lyricOriginal = std::move(original);
+  command.lyricTranslation = std::move(translation);
+  command.lyricConvention = std::move(convention);
+  return command;
+}
+
+MediaControlCommand removeCorrectionCommand(std::string rawText, std::optional<std::string> convention) {
+  MediaControlCommand command{};
+  command.kind = MediaControlCommandKind::RemoveLyricSplitCorrection;
+  command.lyricRawText = std::move(rawText);
+  command.lyricConvention = std::move(convention);
+  return command;
+}
+
+MediaControlCommand clearCorrectionsCommand() {
+  MediaControlCommand command{};
+  command.kind = MediaControlCommandKind::ClearLyricSplitCorrections;
+  return command;
+}
+
+// 目标语言变更后需要重发布，故订阅者按「最新一次快照」断言。
+struct TrackLyricsCollector {
+  mutable std::mutex mutex{};
+  std::vector<TrackLyricsSnapshot> snapshots{};
+
+  [[nodiscard]] std::size_t size() const {
+    std::lock_guard lock{mutex};
+    return snapshots.size();
+  }
+
+  [[nodiscard]] TrackLyricsSnapshot latest() const {
+    std::lock_guard lock{mutex};
+    return snapshots.back();
+  }
+};
+
+}
+
+TEST_CASE("lyrics commands: existing command kind ordinals are unchanged and the four lyrics kinds are appended last") {
+  // 钉住既有 ordinals：追加只允许发生在末尾，任何中间插入都会改变序列化兼容性。
+  // 既有 ordinal 由编译期探针实测取得；任何中间插入都会打破这些钉点。
+  CHECK(static_cast<int>(MediaControlCommandKind::Play) == 0);
+  CHECK(static_cast<int>(MediaControlCommandKind::SelectTrack) == 12);
+  CHECK(static_cast<int>(MediaControlCommandKind::ApplyFolderSortRules) == 14);
+  CHECK(static_cast<int>(MediaControlCommandKind::SetSpectrumEnabled) == 23);
+
+  // 新增四条必须【紧接】既有末位之后且逐位连续 —— 相对判定，避免手抄绝对数字。
+  const auto spectrum = static_cast<int>(MediaControlCommandKind::SetSpectrumEnabled);
+  CHECK(static_cast<int>(MediaControlCommandKind::SetLyricsTargetLanguage) == spectrum + 1);
+  CHECK(static_cast<int>(MediaControlCommandKind::UpsertLyricSplitCorrection) == spectrum + 2);
+  CHECK(static_cast<int>(MediaControlCommandKind::RemoveLyricSplitCorrection) == spectrum + 3);
+  CHECK(static_cast<int>(MediaControlCommandKind::ClearLyricSplitCorrections) == spectrum + 4);
+}
+
+TEST_CASE("lyrics commands: SetLyricsTargetLanguage republishes under the new language") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const auto initial = collector.latest();
+  REQUIRE(initial.trackId == "a");
+  CHECK(initial.targetLanguage == "zh");
+  REQUIRE(initial.lines.size() == 2U);
+
+  const auto result = fixture.controller->submitCommand(setLyricsTargetLanguageCommand("ja"));
+  CHECK(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::None);
+  CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "ja");
+
+  REQUIRE(collector.size() == 2U);
+  const auto after = collector.latest();
+  CHECK(after.targetLanguage == "ja");
+  CHECK(after.trackId == initial.trackId);
+  CHECK(after.freshness.version > initial.freshness.version);
+  // 约定随目标语言重算（inferSplitConvention 是语言参数化函数），故此处不比对约定相等，
+  // 只要求它仍是可往返的合法记号。
+  REQUIRE(conventionFromToken(conventionToken(after.convention)).has_value());
+  CHECK(*conventionFromToken(conventionToken(after.convention)) == after.convention);
+
+  // 交叉断言：订阅者看到的目标语言 = 实际切分落库所用语言（该语言下确有该行的条目）。
+  CHECK(fixture.store->load(std::string{kTrackLyricsLineOriginal}, "ja", after.convention).has_value());
+  CHECK_FALSE(fixture.store->load(std::string{kTrackLyricsLineOriginal}, "ko", after.convention).has_value());
+
+  // 同值重复设置：幂等接受、不重发布。
+  const auto repeat = fixture.controller->submitCommand(setLyricsTargetLanguageCommand("ja"));
+  CHECK(repeat.accepted);
+  CHECK(collector.size() == 2U);
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics commands: unsupported target language is rejected without changing state") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const auto before = collector.latest();
+
+  for (const auto* rejected : {"fr", "zh-Hans", "ZH", ""}) {
+    const auto result = fixture.controller->submitCommand(setLyricsTargetLanguageCommand(rejected));
+    CHECK_FALSE(result.accepted);
+    CHECK(result.code == MediaControllerErrorCode::InvalidCommand);
+  }
+  CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "zh");
+  CHECK(collector.size() == 1U);
+  CHECK(collector.latest().targetLanguage == before.targetLanguage);
+
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotification(notifications, ControlDomainNotificationKind::CommandRejected,
+                           MediaControllerErrorCode::InvalidCommand);
+  }));
+
+  // 缺失 payload 同样走拒绝路径。
+  MediaControlCommand missing{};
+  missing.kind = MediaControlCommandKind::SetLyricsTargetLanguage;
+  const auto missingResult = fixture.controller->submitCommand(missing);
+  CHECK_FALSE(missingResult.accepted);
+  CHECK(missingResult.code == MediaControllerErrorCode::InvalidCommand);
+
+  notificationSubscription.unsubscribe();
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics commands: UpsertLyricSplitCorrection writes the manual row using every payload field") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const auto before = collector.latest();
+  REQUIRE(before.lines.size() == 2U);
+  CHECK(before.lines[1].manualOverride == false);
+
+  // 约定取自快照（前端唯一来源），而不是控制层自行推断。
+  const std::string convention = conventionToken(before.convention);
+  auto upsert = upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空（人工）", "天空（人工）", convention);
+  const auto result = fixture.controller->submitCommand(upsert);
+  CHECK(result.accepted);
+
+  REQUIRE(collector.size() == 2U);
+  const auto after = collector.latest();
+  REQUIRE(after.lines.size() == 2U);
+  const auto& corrected = after.lines[1];
+  CHECK(corrected.manualOverride == true);
+  CHECK(corrected.text == kTrackLyricsLineSecond);
+  CHECK(corrected.original == "空（人工）");
+  CHECK(corrected.translation == "天空（人工）");
+  CHECK(corrected.autoOriginal == "そら");
+  CHECK(corrected.autoTranslation == "天空");
+  CHECK(after.lines[0].manualOverride == false);
+  CHECK(after.convention == before.convention);
+
+  // 落库键用的是快照约定 + 当前目标语言。
+  const auto stored = fixture.store->load(std::string{kTrackLyricsLineSecond}, "zh", before.convention);
+  REQUIRE(stored.has_value());
+  CHECK(stored->source == LyricSplitSource::Manual);
+  CHECK(stored->rawText == kTrackLyricsLineSecond);
+  CHECK(stored->original == "空（人工）");
+  CHECK(stored->translation == "天空（人工）");
+  CHECK(stored->targetLanguage == "zh");
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics commands: RemoveLyricSplitCorrection restores the automatic result") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const std::string convention = conventionToken(collector.latest().convention);
+
+  REQUIRE(fixture.controller
+              ->submitCommand(upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空", "天空（人工）", convention))
+              .accepted);
+  REQUIRE(collector.size() == 2U);
+  REQUIRE(collector.latest().lines[1].manualOverride == true);
+
+  const auto result = fixture.controller->submitCommand(removeCorrectionCommand(std::string{kTrackLyricsLineSecond}, convention));
+  CHECK(result.accepted);
+
+  REQUIRE(collector.size() == 3U);
+  const auto after = collector.latest();
+  REQUIRE(after.lines.size() == 2U);
+  CHECK(after.lines[1].manualOverride == false);
+  CHECK(after.lines[1].original == "そら");
+  CHECK(after.lines[1].translation == "天空");
+  CHECK(after.freshness.version > collector.snapshots[1].freshness.version);
+
+  const auto stored = fixture.store->load(std::string{kTrackLyricsLineSecond}, "zh", collector.latest().convention);
+  REQUIRE(stored.has_value());
+  CHECK(stored->source == LyricSplitSource::Auto);
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics commands: ClearLyricSplitCorrections clears every manual row and falls back to auto") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const std::string convention = conventionToken(collector.latest().convention);
+
+  REQUIRE(fixture.controller
+              ->submitCommand(upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空", "天空（人工）", convention))
+              .accepted);
+  REQUIRE(fixture.controller
+              ->submitCommand(upsertCorrectionCommand(std::string{kTrackLyricsLineOriginal}, "悔", "悔（人工）", convention))
+              .accepted);
+  REQUIRE(fixture.store->listManual().size() == 2U);
+
+  const auto beforeClear = collector.latest();
+  REQUIRE(beforeClear.lines[0].manualOverride == true);
+  REQUIRE(beforeClear.lines[1].manualOverride == true);
+
+  const auto result = fixture.controller->submitCommand(clearCorrectionsCommand());
+  CHECK(result.accepted);
+  CHECK(fixture.store->listManual().empty());
+
+  const auto after = collector.latest();
+  REQUIRE(after.lines.size() == 2U);
+  for (const auto& line : after.lines) {
+    CHECK(line.manualOverride == false);
+  }
+  // 清空纠错只回退行级覆盖，不改文档级约定（与清空前捕获的值比较，而非自比）。
+  CHECK(after.convention == beforeClear.convention);
+  CHECK(after.lines[0].original == beforeClear.lines[0].autoOriginal);
+  CHECK(after.lines[1].original == beforeClear.lines[1].autoOriginal);
+  CHECK(after.freshness.version > beforeClear.freshness.version);
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics commands: missing lyricConvention is rejected and never silently falls back") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  installTrackLyricsLibrary(fixture);
+
+  std::mutex notificationMutex{};
+  std::vector<ControlDomainNotification> notifications{};
+  auto notificationSubscription = fixture.controller->subscribeDomainNotifications([&](ControlDomainNotification notification) {
+    std::lock_guard lock{notificationMutex};
+    notifications.push_back(std::move(notification));
+  });
+
+  TrackLyricsCollector collector{};
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+  REQUIRE(collector.size() == 1U);
+  const auto before = collector.latest();
+  REQUIRE(before.lines.size() == 2U);
+
+  // 缺 lyricConvention：拒绝（不回退成「当前曲目推断出的约定」而静默写库）。
+  const auto upsertResult =
+      fixture.controller->submitCommand(upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空", "天空（人工）", std::nullopt));
+  CHECK_FALSE(upsertResult.accepted);
+  CHECK(upsertResult.code == MediaControllerErrorCode::InvalidCommand);
+
+  const auto removeResult =
+      fixture.controller->submitCommand(removeCorrectionCommand(std::string{kTrackLyricsLineSecond}, std::nullopt));
+  CHECK_FALSE(removeResult.accepted);
+  CHECK(removeResult.code == MediaControllerErrorCode::InvalidCommand);
+
+  // 无静默回退：该行在任何约定下都没有 manual 落库，快照也不变。
+  // （该键下可能存在刷新期写入的 auto 行 —— 那正是正常惰性切分产物，不是被拒绝的纠错）
+  CHECK(fixture.store->listManual().empty());
+  if (const auto existing = fixture.store->load(std::string{kTrackLyricsLineSecond}, "zh", before.convention); existing.has_value()) {
+    CHECK(existing->source != LyricSplitSource::Manual);
+  }
+  CHECK(collector.size() == 1U);
+  CHECK(collector.latest().lines[1].manualOverride == false);
+
+  REQUIRE(waitUntil([&] {
+    std::lock_guard lock{notificationMutex};
+    return hasNotification(notifications, ControlDomainNotificationKind::CommandRejected,
+                           MediaControllerErrorCode::InvalidCommand);
+  }));
+  {
+    std::lock_guard lock{notificationMutex};
+    CHECK(notificationKindCount(notifications, ControlDomainNotificationKind::CommandRejected) >= 2U);
+  }
+
+  // 空 rawText 同样拒绝。
+  const auto emptyRaw =
+      fixture.controller->submitCommand(upsertCorrectionCommand("", "空", "天空（人工）", conventionToken(before.convention)));
+  CHECK_FALSE(emptyRaw.accepted);
+  CHECK(emptyRaw.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.store->listManual().empty());
+
+  // 未知约定记号同样拒绝（不得当成合法键写入）。
+  const auto unknownToken =
+      fixture.controller->submitCommand(upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空", "天", "not-a-convention"));
+  CHECK_FALSE(unknownToken.accepted);
+  CHECK(unknownToken.code == MediaControllerErrorCode::InvalidCommand);
+  CHECK(fixture.store->listManual().empty());
+
+  notificationSubscription.unsubscribe();
+  handle.unsubscribe();
+}
+
+// ── S16 修复轮：B1（异常不得逃出公共 API）与 B2（进度 tick 不得重算）──────────────
+
+namespace {
+
+// 所有 load 都抛错：模拟 SQLite BUSY/库损坏等，用来验证异常不会穿到公共 API（B1）。
+class ThrowingLyricSplitStore final : public LyricSplitStore {
+public:
+  void putAuto(LyricSplitEntry) override {}
+  void upsertManual(LyricSplitEntry) override {}
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view, std::string_view,
+                                                    LyricSplitConvention) const override {
+    throw LyricSplitStoreError{LyricSplitStoreErrorCode::StorageError, "injected load failure"};
+  }
+  void removeManual(std::string_view, std::string_view, LyricSplitConvention) override {}
+  void clearManual() override {}
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return {}; }
+  [[nodiscard]] std::string algoVersion() const override { return "1"; }
+};
+
+struct ThrowingStoreFixture {
+  std::shared_ptr<control_test::FakeAudioPlaybackService> fakeAudio{std::make_shared<control_test::FakeAudioPlaybackService>()};
+  std::shared_ptr<control_test::FakeFileScannerService> fakeScanner{std::make_shared<control_test::FakeFileScannerService>()};
+  std::shared_ptr<ThrowingLyricSplitStore> store{std::make_shared<ThrowingLyricSplitStore>()};
+  std::unique_ptr<MediaController> controller{};
+
+  ThrowingStoreFixture() {
+    controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                 .scanner = fakeScanner,
+                                                                 .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                                                 .lyricSplitStore = store},
+                                     MediaControllerOptions{.runInlineForTests = true});
+    controller->start();
+  }
+
+  ~ThrowingStoreFixture() { controller->shutdown(); }
+};
+
+// 计数 store：统计 load 调用次数，用来把「不得逐 tick 重算」钉成可判负断言（B2）。
+class CountingLyricSplitStore final : public LyricSplitStore {
+public:
+  explicit CountingLyricSplitStore(std::shared_ptr<LyricSplitStore> inner) : inner_(std::move(inner)) {}
+  void setFailing(bool failing) { failing_.store(failing); }
+  void putAuto(LyricSplitEntry entry) override { inner_->putAuto(std::move(entry)); }
+  void upsertManual(LyricSplitEntry entry) override { inner_->upsertManual(std::move(entry)); }
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view rawText, std::string_view targetLanguage,
+                                                    LyricSplitConvention convention) const override {
+    loadCalls_.fetch_add(1);
+    if (failing_.load()) {
+      throw LyricSplitStoreError{LyricSplitStoreErrorCode::StorageError, "injected load failure"};
+    }
+    return inner_->load(rawText, targetLanguage, convention);
+  }
+  void removeManual(std::string_view rawText, std::string_view targetLanguage, LyricSplitConvention convention) override {
+    inner_->removeManual(rawText, targetLanguage, convention);
+  }
+  void clearManual() override { inner_->clearManual(); }
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return inner_->listManual(); }
+  [[nodiscard]] std::string algoVersion() const override { return inner_->algoVersion(); }
+
+  [[nodiscard]] int loadCalls() const { return loadCalls_.load(); }
+
+private:
+  std::shared_ptr<LyricSplitStore> inner_;
+  mutable std::atomic<int> loadCalls_{0};
+  mutable std::atomic<bool> failing_{false};
+};
+
+struct CountingLyricsFixture {
+  std::shared_ptr<control_test::FakeAudioPlaybackService> fakeAudio{std::make_shared<control_test::FakeAudioPlaybackService>()};
+  std::shared_ptr<control_test::FakeFileScannerService> fakeScanner{std::make_shared<control_test::FakeFileScannerService>()};
+  std::shared_ptr<CountingLyricSplitStore> counting{};
+  std::unique_ptr<MediaController> controller{};
+  std::filesystem::path databasePath{};
+
+  CountingLyricsFixture() {
+    databasePath = uniqueMediaControllerDatabasePath();
+    std::error_code cleanupError{};
+    std::filesystem::remove(databasePath, cleanupError);
+
+    counting = std::make_shared<CountingLyricSplitStore>(
+        makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath}));
+    controller = makeMediaController(MediaControllerDependencies{.audio = fakeAudio,
+                                                                 .scanner = fakeScanner,
+                                                                 .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                                                 .lyricSplitStore = counting},
+                                     MediaControllerOptions{.runInlineForTests = true});
+    controller->start();
+  }
+
+  ~CountingLyricsFixture() {
+    controller->shutdown();
+    controller.reset();
+    counting.reset();
+    std::error_code cleanupError{};
+    std::filesystem::remove(databasePath, cleanupError);
+  }
+
+  void installLibraryWithTwoLyricsTracks() {
+    fakeScanner->emit(scannerSnapshotEvent(
+        libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()),
+                     lyricsSong("c", "music/c.flac", spacedLyricLines()),
+                     song("b", "music/b.flac")},
+                    20),
+        1));
+    controller->drainForTests();
+  }
+};
+
+}
+
+TEST_CASE("lyrics commands: a throwing store never escapes the public API") {
+  ThrowingStoreFixture fixture{};
+  fixture.fakeScanner->emit(scannerSnapshotEvent(
+      libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()), song("b", "music/b.flac")}, 20), 1));
+  fixture.controller->drainForTests();
+
+  SUBCASE("SetLyricsTargetLanguage") {
+    MediaControllerCommandResult result{};
+    CHECK_NOTHROW(result = fixture.controller->submitCommand(setLyricsTargetLanguageCommand("ja")));
+    // 语言是内存设置：命令确定地成功，重发布失败只被记录/跳过（返回码与可观察状态一致）。
+    CHECK(result.accepted);
+    CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "ja");
+  }
+
+  SUBCASE("generic player command path") {
+    CHECK_NOTHROW((void)fixture.controller->submitCommand(command(MediaControlCommandKind::Play)));
+    auto select = command(MediaControlCommandKind::SelectTrack);
+    select.track = track("b", "music/b.flac");
+    CHECK_NOTHROW((void)fixture.controller->submitCommand(select));
+  }
+
+  SUBCASE("correction commands") {
+    const std::string convention = conventionToken(LyricSplitConvention::StrongSlashSpaced);
+    MediaControllerCommandResult upsert{};
+    MediaControllerCommandResult remove{};
+    MediaControllerCommandResult clear{};
+    CHECK_NOTHROW(upsert = fixture.controller->submitCommand(
+                      upsertCorrectionCommand(std::string{kTrackLyricsLineSecond}, "空", "天空（人工）", convention)));
+    CHECK_NOTHROW(remove = fixture.controller->submitCommand(
+                      removeCorrectionCommand(std::string{kTrackLyricsLineSecond}, convention)));
+    CHECK_NOTHROW(clear = fixture.controller->submitCommand(clearCorrectionsCommand()));
+    CHECK(upsert.accepted);
+    CHECK(remove.accepted);
+    CHECK(clear.accepted);
+  }
+
+  SUBCASE("internal refresh seam") {
+    CHECK_NOTHROW(MediaControllerInternalAccess::refreshTrackLyrics(*fixture.controller));
+    CHECK_NOTHROW(MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "ko"));
+  }
+}
+
+TEST_CASE("track lyrics snapshot is not recomputed on scan progress or playback position ticks") {
+  CountingLyricsFixture fixture{};
+  fixture.installLibraryWithTwoLyricsTracks();
+
+  const int afterInstall = fixture.counting->loadCalls();
+  REQUIRE(afterInstall >= 2);
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  const std::string selectedTrack = fixture.controller->playerStateSnapshot().currentTrack->trackId;
+  REQUIRE(selectedTrack == "a");
+
+  SUBCASE("scan progress ticks do not recompute") {
+    for (std::uint64_t index = 0; index < 5; ++index) {
+      scanner::ScanProgress progress{};
+      progress.filesScanned = index + 1;
+      fixture.fakeScanner->emit(progressUpdatedEvent(progress, 100 + index));
+      fixture.controller->drainForTests();
+    }
+    CHECK(fixture.counting->loadCalls() == afterInstall);
+  }
+
+  SUBCASE("playback position ticks do not recompute") {
+    for (std::uint64_t index = 0; index < 5; ++index) {
+      fixture.fakeAudio->emit(audioPositionUpdatedEvent(selectedTrack, std::chrono::milliseconds{100 * (index + 1)}, 200 + index));
+      fixture.controller->drainForTests();
+    }
+    // 证明 tick 确实被归约器处理了（否则「没重算」是空过），再断言没有重算。
+    CHECK(fixture.controller->playerStateSnapshot().timeline.position == std::chrono::milliseconds{500});
+    CHECK(fixture.counting->loadCalls() == afterInstall);
+  }
+
+  SUBCASE("a new library tree version does recompute") {
+    fixture.fakeScanner->emit(scannerSnapshotEvent(
+        libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()),
+                     lyricsSong("c", "music/c.flac", spacedLyricLines()),
+                     song("b", "music/b.flac")},
+                    21),
+        2));
+    fixture.controller->drainForTests();
+    CHECK(fixture.counting->loadCalls() > afterInstall);
+  }
+
+  SUBCASE("switching to another track does recompute") {
+    auto select = command(MediaControlCommandKind::SelectTrack);
+    select.track = track("c", "music/c.flac");
+    REQUIRE(fixture.controller->submitCommand(select).accepted);
+    REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+    CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "c");
+    CHECK(fixture.counting->loadCalls() > afterInstall);
+  }
+}
+
+// ── S16 修复轮第 2 轮：F1（失败不串轨 + 有界恢复 + 限频重试）与 F2（publish 不抛出）──
+
+namespace {
+
+// 拷贝构造在被 arm 后抛 std::bad_alloc：模拟订阅回调拷贝失败（F2）。
+// std::function 要求目标可拷贝，构造函数允许抛。
+struct ThrowingCopyLyricsCallback {
+  std::shared_ptr<std::atomic<bool>> armed{std::make_shared<std::atomic<bool>>(false)};
+
+  ThrowingCopyLyricsCallback() = default;
+  ThrowingCopyLyricsCallback(const ThrowingCopyLyricsCallback& other) : armed(other.armed) {
+    if (armed && armed->load()) {
+      throw std::bad_alloc{};
+    }
+  }
+  ThrowingCopyLyricsCallback(ThrowingCopyLyricsCallback&&) noexcept = default;
+  ThrowingCopyLyricsCallback& operator=(const ThrowingCopyLyricsCallback& other) {
+    armed = other.armed;
+    if (armed && armed->load()) {
+      throw std::bad_alloc{};
+    }
+    return *this;
+  }
+  ThrowingCopyLyricsCallback& operator=(ThrowingCopyLyricsCallback&&) noexcept = default;
+  ~ThrowingCopyLyricsCallback() = default;
+
+  void operator()(const TrackLyricsSnapshot&) const {}
+};
+
+void subscribeLyrics(MediaController& controller, TrackLyricsCollector& collector, SubscriptionHandle& handle) {
+  handle = controller.subscribeTrackLyrics([&collector](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+}
+
+MediaControlCommand selectTrackCommand(std::string id, std::string path) {
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track(std::move(id), std::move(path));
+  return select;
+}
+
+}
+
+TEST_CASE("lyrics refresh: a failing store never leaves another track's snapshot on the subscription") {
+  CountingLyricsFixture fixture{};
+  fixture.installLibraryWithTwoLyricsTracks();
+
+  TrackLyricsCollector collector{};
+  SubscriptionHandle handle{};
+  subscribeLyrics(*fixture.controller, collector, handle);
+  REQUIRE(collector.latest().trackId == "a");
+  REQUIRE(collector.latest().lines.size() == 2U);
+  const auto versionBefore = collector.latest().freshness.version;
+
+  fixture.counting->setFailing(true);
+  REQUIRE(fixture.controller->submitCommand(selectTrackCommand("c", "music/c.flac")).accepted);
+  REQUIRE(fixture.controller->playerStateSnapshot().currentTrack.has_value());
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "c");
+
+  // 失败回退发布的是【当前曲目 + 空行】，而不是上一首 "a" 的旧内容。
+  const auto snapshot = collector.latest();
+  CHECK(snapshot.trackId == "c");
+  CHECK(snapshot.lines.empty());
+  CHECK(snapshot.targetLanguage == "zh");
+  CHECK(snapshot.freshness.version > versionBefore);
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics refresh: recovers on the next trigger once the store heals") {
+  CountingLyricsFixture fixture{};
+  fixture.installLibraryWithTwoLyricsTracks();
+
+  TrackLyricsCollector collector{};
+  SubscriptionHandle handle{};
+  subscribeLyrics(*fixture.controller, collector, handle);
+
+  fixture.counting->setFailing(true);
+  REQUIRE(fixture.controller->submitCommand(selectTrackCommand("c", "music/c.flac")).accepted);
+  REQUIRE(collector.latest().trackId == "c");
+  REQUIRE(collector.latest().lines.empty());
+
+  fixture.counting->setFailing(false);
+  // 单次触发即恢复：只用播放位置 tick，不依赖换曲/换语言/纠错这类无关触发。
+  fixture.fakeAudio->emit(audioPositionUpdatedEvent("c", std::chrono::milliseconds{100}, 500));
+  fixture.controller->drainForTests();
+
+  const auto snapshot = collector.latest();
+  CHECK(snapshot.trackId == "c");
+  REQUIRE(snapshot.lines.size() == 2U);  // 先确立尺寸，避免后续索引在失败态下越界
+  CHECK_FALSE(snapshot.lines[0].original.empty());
+  CHECK(snapshot.lines[0].manualOverride == false);
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics refresh: sustained store failure retries at a bounded rate") {
+  CountingLyricsFixture fixture{};
+  fixture.installLibraryWithTwoLyricsTracks();
+  fixture.counting->setFailing(true);
+
+  REQUIRE(fixture.controller->submitCommand(selectTrackCommand("c", "music/c.flac")).accepted);
+  const int attemptsBeforeTicks = fixture.counting->loadCalls();
+
+  const auto startedAt = std::chrono::steady_clock::now();
+  constexpr int kTicks = 50;
+  for (int index = 0; index < kTicks; ++index) {
+    fixture.fakeAudio->emit(
+        audioPositionUpdatedEvent("c", std::chrono::milliseconds{100 * (index + 1)}, 600 + static_cast<std::uint64_t>(index)));
+    fixture.controller->drainForTests();
+  }
+  const auto elapsedMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startedAt).count();
+
+  const int attempts = fixture.counting->loadCalls() - attemptsBeforeTicks;
+  // 限频上界：失败后前 2 次可立即重试，之后约每 1s 一次。
+  const int allowedUpperBound = 2 + static_cast<int>(elapsedMs / 1000);
+  CHECK(attempts <= allowedUpperBound);
+  CHECK(attempts < kTicks);
+  // 持续失败期间订阅面仍是【当前曲目】（不是上一首），且行内容为空。
+  TrackLyricsCollector collector{};
+  SubscriptionHandle handle{};
+  subscribeLyrics(*fixture.controller, collector, handle);
+  const auto snapshot = collector.latest();
+  CHECK(snapshot.trackId == "c");
+  CHECK(snapshot.lines.empty());
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics refresh: a subscriber whose copy throws does not break the public API") {
+  CountingLyricsFixture fixture{};
+  fixture.installLibraryWithTwoLyricsTracks();
+
+  auto armed = std::make_shared<std::atomic<bool>>(false);
+  ThrowingCopyLyricsCallback callback{};
+  callback.armed = armed;
+  auto handle = fixture.controller->subscribeTrackLyrics(callback);
+  armed->store(true);
+
+  MediaControllerCommandResult languageResult{};
+  CHECK_NOTHROW(languageResult = fixture.controller->submitCommand(setLyricsTargetLanguageCommand("ja")));
+  CHECK(languageResult.accepted);
+  CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "ja");
+
+  // 内部 seam 路径同样不抛出。
+  CHECK_NOTHROW(MediaControllerInternalAccess::refreshTrackLyrics(*fixture.controller));
+  CHECK_NOTHROW(MediaControllerInternalAccess::setLyricsTargetLanguage(*fixture.controller, "ko"));
+  CHECK(MediaControllerInternalAccess::lyricsTargetLanguage(*fixture.controller) == "ko");
+
+  armed->store(false);
+  handle.unsubscribe();
+}
+
+
+// ── S16 修复轮第 3 轮：P1（提交必须以「提交时刻」的实时状态为准）────────────────
+//
+// 锁外窗口是 F3 有意为之（store I/O 不持锁）。窗口内状态【可以】被改写：`Impl::scanLibrary`
+// 不经事件循环、在调用者线程执行；此外 inline 测试模式下事件循环可重入。下面的用例用
+// 「在 store.load() 内部推进控制器状态」的确定性重入精确制造「拷贝 → 改写 → 提交」交错，
+// 不依赖任何 sleep 或线程竞争：若提交块不做实时状态复核，陈旧快照会在新状态之后被补发。
+
+namespace {
+
+// store.load 被调用时（构建阶段、锁外）执行一次注册的回调，用于重入控制器推进状态。
+// 回调在自身锁外执行，故可安全地重入控制器（重入可能再触发一次 load，此时 pending_ 已空）。
+class ReentrantLyricSplitStore final : public LyricSplitStore {
+public:
+  explicit ReentrantLyricSplitStore(std::shared_ptr<LyricSplitStore> inner) : inner_(std::move(inner)) {}
+
+  void onNextLoad(std::function<void()> action) {
+    std::lock_guard lock{mutex_};
+    pending_ = std::move(action);
+  }
+
+  void putAuto(LyricSplitEntry entry) override { inner_->putAuto(std::move(entry)); }
+  void upsertManual(LyricSplitEntry entry) override { inner_->upsertManual(std::move(entry)); }
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view rawText, std::string_view targetLanguage,
+                                                    LyricSplitConvention convention) const override {
+    std::function<void()> action;
+    {
+      std::lock_guard lock{mutex_};
+      action = std::move(pending_);
+      pending_ = {};
+    }
+    if (action) {
+      action();
+    }
+    return inner_->load(rawText, targetLanguage, convention);
+  }
+  void removeManual(std::string_view rawText, std::string_view targetLanguage, LyricSplitConvention convention) override {
+    inner_->removeManual(rawText, targetLanguage, convention);
+  }
+  void clearManual() override { inner_->clearManual(); }
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return inner_->listManual(); }
+  [[nodiscard]] std::string algoVersion() const override { return inner_->algoVersion(); }
+
+private:
+  std::shared_ptr<LyricSplitStore> inner_;
+  mutable std::mutex mutex_;
+  mutable std::function<void()> pending_{};
+};
+
+std::vector<std::string> deliveredTrackIds(const TrackLyricsCollector& collector) {
+  std::lock_guard lock{collector.mutex};
+  std::vector<std::string> delivered;
+  delivered.reserve(collector.snapshots.size());
+  for (const auto& snapshot : collector.snapshots) {
+    delivered.push_back(snapshot.trackId);
+  }
+  return delivered;
+}
+
+}
+
+TEST_CASE("lyrics refresh: a snapshot built from stale inputs is discarded at commit (P1: track)") {
+  const auto databasePath = uniqueMediaControllerDatabasePath();
+  std::error_code cleanupError{};
+  std::filesystem::remove(databasePath, cleanupError);
+
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto reentrant = std::make_shared<ReentrantLyricSplitStore>(
+      makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath}));
+  auto controller = makeMediaController(
+      MediaControllerDependencies{.audio = fakeAudio,
+                                  .scanner = fakeScanner,
+                                  .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                  .lyricSplitStore = reentrant},
+      MediaControllerOptions{.runInlineForTests = true});
+  controller->start();
+
+  TrackLyricsCollector collector{};
+  auto handle = controller->subscribeTrackLyrics([&collector](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+
+  const auto buildTree = [](std::uint64_t version) {
+    return libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()),
+                        lyricsSong("c", "music/c.flac", spacedLyricLines())},
+                       version);
+  };
+
+  // 基线：曲库树 v20，当前曲目 a，已发布 (a, v20)。
+  fakeScanner->emit(scannerSnapshotEvent(buildTree(20), 1));
+  controller->drainForTests();
+  REQUIRE(collector.latest().trackId == "a");
+  REQUIRE(collector.latest().lines.size() == 2U);
+  const std::uint64_t baselineVersion = collector.latest().freshness.version;
+
+  // 下一次构建（锁外的 store.load）期间重入并切到 c：这会提交 (c, v21)。
+  reentrant->onNextLoad([&controller] {
+    auto select = command(MediaControlCommandKind::SelectTrack);
+    select.track = track("c", "music/c.flac");
+    const auto result = controller->submitCommand(select);
+    CHECK(result.accepted);
+  });
+
+  // 触发会重算的刷新：曲库树 v20 → v21（当前曲目仍是 a，故外层拷贝是 (a, v21)）。
+  fakeScanner->emit(scannerSnapshotEvent(buildTree(21), 2));
+  controller->drainForTests();
+
+  // 陈旧提交必须被丢弃：状态改写后只发生了一次发布（c, baseline+1）。
+  CHECK(collector.latest().trackId == "c");
+  CHECK(collector.latest().lines.size() == 2U);
+  CHECK(collector.latest().freshness.version == baselineVersion + 1U);
+  const auto delivered = deliveredTrackIds(collector);
+  const auto firstC = std::ranges::find(delivered, std::string{"c"});
+  REQUIRE(firstC != delivered.end());
+  CHECK(std::ranges::find(firstC, delivered.end(), std::string{"a"}) == delivered.end());
+
+  handle.unsubscribe();
+  controller->shutdown();
+  controller.reset();
+  reentrant.reset();
+  std::filesystem::remove(databasePath, cleanupError);
+}
+
+TEST_CASE("lyrics refresh: a snapshot built from a stale target language is discarded at commit (P1: language)") {
+  const auto databasePath = uniqueMediaControllerDatabasePath();
+  std::error_code cleanupError{};
+  std::filesystem::remove(databasePath, cleanupError);
+
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto reentrant = std::make_shared<ReentrantLyricSplitStore>(
+      makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath}));
+  auto controller = makeMediaController(
+      MediaControllerDependencies{.audio = fakeAudio,
+                                  .scanner = fakeScanner,
+                                  .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                  .lyricSplitStore = reentrant},
+      MediaControllerOptions{.runInlineForTests = true});
+  controller->start();
+
+  TrackLyricsCollector collector{};
+  auto handle = controller->subscribeTrackLyrics([&collector](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+
+  const auto buildTree = [](std::uint64_t version) {
+    return libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()),
+                        lyricsSong("c", "music/c.flac", spacedLyricLines())},
+                       version);
+  };
+
+  // 基线：默认目标语言 zh，当前曲目 a，已发布 (a, v20, zh)。
+  fakeScanner->emit(scannerSnapshotEvent(buildTree(20), 1));
+  controller->drainForTests();
+  REQUIRE(collector.latest().trackId == "a");
+  REQUIRE(collector.latest().targetLanguage == "zh");
+  const std::uint64_t baselineVersion = collector.latest().freshness.version;
+
+  // 构建期间重入并改目标语言：提交 (a, v21, ja)。
+  reentrant->onNextLoad([&controller] { MediaControllerInternalAccess::setLyricsTargetLanguage(*controller, "ja"); });
+
+  fakeScanner->emit(scannerSnapshotEvent(buildTree(21), 2));
+  controller->drainForTests();
+
+  // 陈旧提交（zh）必须被丢弃：改语言后只发布了一次（ja, baseline+1）。
+  CHECK(collector.latest().targetLanguage == "ja");
+  CHECK(collector.latest().freshness.version == baselineVersion + 1U);
+
+  handle.unsubscribe();
+  controller->shutdown();
+  controller.reset();
+  reentrant.reset();
+  std::filesystem::remove(databasePath, cleanupError);
+}
+
+// ── S16 修复轮第 3 轮：P2（订阅面回调拷贝异常不得逃出公共 API）──────────────────
+namespace {
+
+// 拷贝构造在被 arm 后抛 std::bad_alloc：模拟域通知订阅回调拷贝失败（P2）。
+// std::function 要求目标可拷贝，构造函数允许抛；事件循环/rejectCommand 路径无
+// 捕获层，泄漏即逃出 submitCommand。
+struct ThrowingCopyDomainCallback {
+  std::shared_ptr<std::atomic<bool>> armed{std::make_shared<std::atomic<bool>>(false)};
+
+  ThrowingCopyDomainCallback() = default;
+  ThrowingCopyDomainCallback(const ThrowingCopyDomainCallback& other) : armed(other.armed) {
+    if (armed && armed->load()) {
+      throw std::bad_alloc{};
+    }
+  }
+  ThrowingCopyDomainCallback(ThrowingCopyDomainCallback&&) noexcept = default;
+  ThrowingCopyDomainCallback& operator=(const ThrowingCopyDomainCallback& other) {
+    armed = other.armed;
+    if (armed && armed->load()) {
+      throw std::bad_alloc{};
+    }
+    return *this;
+  }
+  ThrowingCopyDomainCallback& operator=(ThrowingCopyDomainCallback&&) noexcept = default;
+  ~ThrowingCopyDomainCallback() = default;
+
+  void operator()(const ControlDomainNotification&) const {}
+};
+
+}
+
+TEST_CASE("media controller: a domain notification subscriber whose copy throws does not escape submitCommand") {
+  ControllerFixture fixture{};
+  fixture.controller->start();
+  installLibrary(fixture);
+
+  auto armed = std::make_shared<std::atomic<bool>>(false);
+  ThrowingCopyDomainCallback callback{};
+  callback.armed = armed;
+  auto handle = fixture.controller->subscribeDomainNotifications(callback);
+  armed->store(true);
+
+  // SelectTrack 缺 track 身份 → reduceCommand 走 rejectCommand → 通知发布（拷贝回调）。
+  auto invalid = command(MediaControlCommandKind::SelectTrack);
+  MediaControllerCommandResult result{};
+  CHECK_NOTHROW(result = fixture.controller->submitCommand(invalid));
+  CHECK_FALSE(result.accepted);
+  CHECK(result.code == MediaControllerErrorCode::InvalidCommand);
+
+  armed->store(false);
+  handle.unsubscribe();
+}
+
+
+// ── S16 修复轮第 4 轮：A（投递有序）/ B（store 内容作第 4 输入）/ C（异常边界穷尽）/ D（非 std 异常）──
+
+namespace {
+
+// 在第 N 次 load 【返回之后】执行一次回调：模拟「刷新 A 已读完 store，随后 store 内容被命令
+// 改写」的确定性交错（B）。读在触发之前发生，故 A 拿到的是改写前的内容。
+class CorrectionDuringBuildStore final : public LyricSplitStore {
+public:
+  explicit CorrectionDuringBuildStore(std::shared_ptr<LyricSplitStore> inner) : inner_(std::move(inner)) {}
+
+  void fireAfterLoad(int count, std::function<void()> action) {
+    std::lock_guard lock{mutex_};
+    afterCount_ = count;
+    afterAction_ = std::move(action);
+  }
+
+  void putAuto(LyricSplitEntry entry) override { inner_->putAuto(std::move(entry)); }
+  void upsertManual(LyricSplitEntry entry) override { inner_->upsertManual(std::move(entry)); }
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view rawText, std::string_view targetLanguage,
+                                                    LyricSplitConvention convention) const override {
+    const auto result = inner_->load(rawText, targetLanguage, convention);
+    std::function<void()> action;
+    {
+      std::lock_guard lock{mutex_};
+      if (afterCount_ > 0 && ++loadCount_ >= afterCount_) {
+        afterCount_ = 0;
+        action = std::move(afterAction_);
+        afterAction_ = {};
+      }
+    }
+    if (action) {
+      action();
+    }
+    return result;
+  }
+  void removeManual(std::string_view rawText, std::string_view targetLanguage, LyricSplitConvention convention) override {
+    inner_->removeManual(rawText, targetLanguage, convention);
+  }
+  void clearManual() override { inner_->clearManual(); }
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return inner_->listManual(); }
+  [[nodiscard]] std::string algoVersion() const override { return inner_->algoVersion(); }
+
+private:
+  std::shared_ptr<LyricSplitStore> inner_;
+  mutable std::mutex mutex_;
+  mutable int loadCount_{0};
+  mutable int afterCount_{0};
+  mutable std::function<void()> afterAction_{};
+};
+
+// load 抛非 std 异常类型（D）：自定义 store 合法可触发。
+class NonStdThrowingLyricSplitStore final : public LyricSplitStore {
+public:
+  explicit NonStdThrowingLyricSplitStore(std::shared_ptr<LyricSplitStore> inner) : inner_(std::move(inner)) {}
+
+  void setFailing(bool failing) { failing_.store(failing); }
+  void putAuto(LyricSplitEntry entry) override { inner_->putAuto(std::move(entry)); }
+  void upsertManual(LyricSplitEntry entry) override { inner_->upsertManual(std::move(entry)); }
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view rawText, std::string_view targetLanguage,
+                                                    LyricSplitConvention convention) const override {
+    loadCalls_.fetch_add(1);
+    if (failing_.load()) {
+      throw 42;  // 非 std 异常类型
+    }
+    return inner_->load(rawText, targetLanguage, convention);
+  }
+  void removeManual(std::string_view rawText, std::string_view targetLanguage, LyricSplitConvention convention) override {
+    inner_->removeManual(rawText, targetLanguage, convention);
+  }
+  void clearManual() override { inner_->clearManual(); }
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return inner_->listManual(); }
+  [[nodiscard]] std::string algoVersion() const override { return inner_->algoVersion(); }
+
+  [[nodiscard]] int loadCalls() const { return loadCalls_.load(); }
+
+private:
+  std::shared_ptr<LyricSplitStore> inner_;
+  mutable std::atomic<int> loadCalls_{0};
+  mutable std::atomic<bool> failing_{false};
+};
+
+scanner::PlaylistTreeSnapshot twoLyricsTracksTree(std::uint64_t version) {
+  return libraryTree({lyricsSong("a", "music/a.flac", spacedLyricLines()),
+                      lyricsSong("c", "music/c.flac", spacedLyricLines())},
+                     version);
+}
+
+// 拷贝即抛的快照类型（C）。
+struct ThrowingCopySnapshot {
+  std::shared_ptr<std::atomic<bool>> armed{std::make_shared<std::atomic<bool>>(false)};
+  std::vector<int> payload{1, 2, 3};
+
+  ThrowingCopySnapshot() = default;
+  ThrowingCopySnapshot(const ThrowingCopySnapshot& other) : armed(other.armed), payload(other.payload) {
+    if (armed && armed->load()) {
+      throw std::bad_alloc{};
+    }
+  }
+  ThrowingCopySnapshot(ThrowingCopySnapshot&&) noexcept = default;
+  ThrowingCopySnapshot& operator=(const ThrowingCopySnapshot&) = delete;
+  ThrowingCopySnapshot& operator=(ThrowingCopySnapshot&&) = delete;
+  ~ThrowingCopySnapshot() = default;
+};
+
+}
+
+TEST_CASE("track lyrics delivery is monotonic and ends on the current track under callback re-entry (A)") {
+  TrackLyricsFixture fixture{};
+  fixture.controller->start();
+  fixture.fakeScanner->emit(scannerSnapshotEvent(twoLyricsTracksTree(20), 1));
+  fixture.controller->drainForTests();
+
+  std::vector<std::uint64_t> versions;
+  std::vector<std::string> trackIds;
+  int deliveries = 0;
+  auto handle = fixture.controller->subscribeTrackLyrics([&](TrackLyricsSnapshot snapshot) {
+    // 首次投递是订阅初投；第二次（显式刷新的发布）在回调内重入换曲，使一次更新的发布
+    // 发生在本次投递回调内部（Sync/inline 模式）—— 与 S16 第 4 轮评审探针同型。
+    if (++deliveries == 2) {
+      auto select = command(MediaControlCommandKind::SelectTrack);
+      select.track = track("c", "music/c.flac");
+      CHECK(fixture.controller->submitCommand(select).accepted);
+    }
+    versions.push_back(snapshot.freshness.version);
+    trackIds.push_back(snapshot.trackId);
+  });
+
+  MediaControllerInternalAccess::refreshTrackLyrics(*fixture.controller);
+
+  REQUIRE(versions.size() >= 2U);
+  // 投递 version 严格递增：更旧的投递被丢弃，或被延后到最新之后（不会以旧版本收尾）。
+  CHECK(std::ranges::is_sorted(versions));
+  CHECK(trackIds.back() == "c");
+  CHECK(fixture.controller->playerStateSnapshot().currentTrack->trackId == "c");
+
+  // 交叉核对内部已提交快照（订阅即得当前快照）。
+  std::string internalTrackId{"<none>"};
+  auto probeHandle = fixture.controller->subscribeTrackLyrics(
+      [&internalTrackId](TrackLyricsSnapshot snapshot) { internalTrackId = snapshot.trackId; });
+  CHECK(internalTrackId == "c");
+
+  probeHandle.unsubscribe();
+  handle.unsubscribe();
+}
+
+TEST_CASE("lyrics refresh: a build that read the store before a correction is discarded (B: store revision)") {
+  const auto databasePath = uniqueMediaControllerDatabasePath();
+  std::error_code cleanupError{};
+  std::filesystem::remove(databasePath, cleanupError);
+
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto store = std::make_shared<CorrectionDuringBuildStore>(
+      makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath}));
+  auto controller = makeMediaController(
+      MediaControllerDependencies{.audio = fakeAudio,
+                                  .scanner = fakeScanner,
+                                  .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                  .lyricSplitStore = store},
+      MediaControllerOptions{.runInlineForTests = true});
+  controller->start();
+
+  TrackLyricsCollector collector{};
+  auto handle = controller->subscribeTrackLyrics([&collector](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+
+  fakeScanner->emit(scannerSnapshotEvent(twoLyricsTracksTree(20), 1));
+  controller->drainForTests();
+  REQUIRE(collector.latest().trackId == "a");
+  REQUIRE(collector.latest().lines.size() == 2U);
+  REQUIRE(collector.latest().lines[0].manualOverride == false);
+  const std::uint64_t baselineVersion = collector.latest().freshness.version;
+  const std::string convention = conventionToken(collector.latest().convention);
+  const std::string rawText = collector.latest().lines[0].text;
+
+  // 下一次 build 在锁外读 store；该 store 在读完后触发重入：提交一条手工纠错，其刷新会
+  // 发布 manualOverride=true 的快照。computed A 的四个输入里只有 store 内容变了。
+  store->fireAfterLoad(2, [&] {
+    const auto result = controller->submitCommand(upsertCorrectionCommand(rawText, "纠正原文", "纠正译文", convention));
+    CHECK(result.accepted);
+  });
+
+  // 触发 A：曲库树 v20 → v21。
+  fakeScanner->emit(scannerSnapshotEvent(twoLyricsTracksTree(21), 2));
+  controller->drainForTests();
+
+  // A 基于改写前的 store 内容，必须被丢弃：订阅面保留带纠错的最新快照，版本只推进一次。
+  const auto latest = collector.latest();
+  CHECK(latest.trackId == "a");
+  CHECK(latest.freshness.version == baselineVersion + 1U);
+  REQUIRE(latest.lines.size() == 2U);
+  CHECK(latest.lines[0].manualOverride == true);
+  CHECK(latest.lines[0].original == "纠正原文");
+  CHECK(latest.lines[0].translation == "纠正译文");
+
+  handle.unsubscribe();
+  controller->shutdown();
+  controller.reset();
+  store.reset();
+  std::filesystem::remove(databasePath, cleanupError);
+}
+
+TEST_CASE("subscription store: a throwing snapshot copy does not escape publish or the initial delivery (C)") {
+  using Store = SubscriptionStore<ThrowingCopySnapshot>;
+
+  // 异步 publish：快照拷贝抛异常 ⇒ 不抛出，且计入异常数。
+  {
+    Store store({}, SubscriptionDeliveryMode::Async);
+    auto snapshot = ThrowingCopySnapshot{};
+    auto handle = store.subscribe([](const ThrowingCopySnapshot&) {});
+    snapshot.armed->store(true);
+    CHECK_NOTHROW(store.publish(snapshot));
+    CHECK(store.exceptionCount() == 1U);
+    snapshot.armed->store(false);
+    handle.unsubscribe();
+  }
+
+  // 同步 publish：同样不抛出（回调查看的是 const 引用，不拷贝快照）。
+  {
+    Store store({}, SubscriptionDeliveryMode::Sync);
+    auto snapshot = ThrowingCopySnapshot{};
+    auto handle = store.subscribe([](const ThrowingCopySnapshot&) {});
+    snapshot.armed->store(true);
+    CHECK_NOTHROW(store.publish(snapshot));
+    snapshot.armed->store(false);
+    handle.unsubscribe();
+  }
+
+  // 初投（invokeSubscriber 的异步路径）：快照拷贝抛异常 ⇒ subscribe 不抛出。
+  {
+    Store store({}, SubscriptionDeliveryMode::Async);
+    std::optional<ThrowingCopySnapshot> initial{std::in_place};
+    initial->armed->store(true);
+    SubscriptionHandle handle{};
+    CHECK_NOTHROW(handle = store.subscribe([](const ThrowingCopySnapshot&) {}, std::move(initial)));
+    handle.unsubscribe();
+  }
+}
+
+TEST_CASE("lyrics refresh: a non-std store failure publishes the current track and stays bounded (D)") {
+  const auto databasePath = uniqueMediaControllerDatabasePath();
+  std::error_code cleanupError{};
+  std::filesystem::remove(databasePath, cleanupError);
+
+  auto fakeAudio = std::make_shared<control_test::FakeAudioPlaybackService>();
+  auto fakeScanner = std::make_shared<control_test::FakeFileScannerService>();
+  auto store = std::make_shared<NonStdThrowingLyricSplitStore>(
+      makeSQLiteLyricSplitStore(LyricSplitStoreConfig{.databasePath = databasePath}));
+  auto controller = makeMediaController(
+      MediaControllerDependencies{.audio = fakeAudio,
+                                  .scanner = fakeScanner,
+                                  .metadata = std::make_unique<control_test::FakeMetadataSharingService>(),
+                                  .lyricSplitStore = store},
+      MediaControllerOptions{.runInlineForTests = true});
+  controller->start();
+
+  TrackLyricsCollector collector{};
+  auto handle = controller->subscribeTrackLyrics([&collector](TrackLyricsSnapshot snapshot) {
+    std::lock_guard lock{collector.mutex};
+    collector.snapshots.push_back(std::move(snapshot));
+  });
+
+  fakeScanner->emit(scannerSnapshotEvent(twoLyricsTracksTree(20), 1));
+  controller->drainForTests();
+  REQUIRE(collector.latest().trackId == "a");
+  REQUIRE(collector.latest().lines.size() == 2U);
+
+  store->setFailing(true);
+  auto select = command(MediaControlCommandKind::SelectTrack);
+  select.track = track("c", "music/c.flac");
+  REQUIRE(controller->submitCommand(select).accepted);
+
+  // 非 std 异常同样走统一失败收尾：订阅面是【当前曲目 + 空行】，不是上一首的行。
+  CHECK(collector.latest().trackId == "c");
+  CHECK(collector.latest().lines.empty());
+
+  const int attemptsBeforeTicks = store->loadCalls();
+  const auto startedAt = std::chrono::steady_clock::now();
+  constexpr int kTicks = 20;
+  for (int index = 0; index < kTicks; ++index) {
+    fakeAudio->emit(audioPositionUpdatedEvent("c", std::chrono::milliseconds{100 * (index + 1)},
+                                              600 + static_cast<std::uint64_t>(index)));
+    controller->drainForTests();
+  }
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - startedAt).count();
+
+  const int attempts = store->loadCalls() - attemptsBeforeTicks;
+  // 限频上界：失败后前 2 次可立即重试，之后约每 1s 一次（与 std 异常路径同一条记账）。
+  const int allowedUpperBound = 2 + static_cast<int>(elapsedMs / 1000);
+  CHECK(attempts <= allowedUpperBound);
+  CHECK(attempts < kTicks);
+  CHECK(collector.latest().trackId == "c");
+  CHECK(collector.latest().lines.empty());
+
+  handle.unsubscribe();
+  controller->shutdown();
+  controller.reset();
+  store.reset();
+  std::filesystem::remove(databasePath, cleanupError);
 }

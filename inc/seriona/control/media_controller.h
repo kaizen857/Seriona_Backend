@@ -39,6 +39,9 @@ public:
   // 频谱订阅：注册后立即以当前频谱快照回调一次；无生效频谱输出时回调空快照
   // （generation=0），此后每次频谱更新再次回调。
   SubscriptionHandle subscribeSpectrum(SpectrumSnapshotCallback callback);
+  // 当前曲目切分歌词订阅：注册后立即以当前快照回调一次，此后当前曲目变更、目标语言
+  // 变更、该曲目手工纠错增删、曲目歌词因重扫变更时各重发布一次全量行快照。
+  SubscriptionHandle subscribeTrackLyrics(TrackLyricsSnapshotCallback callback);
   [[nodiscard]] PlayerStateSnapshot playerStateSnapshot() const;
   [[nodiscard]] LibraryStateSnapshot libraryStateSnapshot() const;
   [[nodiscard]] std::vector<audio::AudioDeviceFormat> enumeratePlaybackDevices() const;
@@ -48,6 +51,9 @@ public:
 
 private:
   class Impl;
+  // 内部 seam 访问点：定义在私有头 src/control/media_controller_module.h，仅供控制层
+  // 测试与后续控制命令接线使用，不属稳定前端契约。
+  friend struct MediaControllerInternalAccess;
   std::unique_ptr<Impl> impl_;
 };
 

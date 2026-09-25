@@ -5,7 +5,9 @@
 #include "seriona/audio/device/audio_device_format_enumerator.h"
 #include "seriona/control/app_settings_store.h"
 #include "seriona/control/folder_sort_settings_store.h"
+#include "seriona/control/lyric_split_store.h"
 #include "seriona/control/media_controller.h"
+#include "lyric_split.h"
 #include "seriona/metadata/metadata_contracts.h"
 #include "scanner/file_scanner_service_internal.h"
 #include "seriona/scanner/file_scanner_service.h"
@@ -17,7 +19,9 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace seriona::control {
 namespace {
@@ -89,6 +93,31 @@ public:
       AppSettingsStoreConfig{.databasePath = std::move(databasePath)})};
 }
 
+class NoopLyricSplitStore final : public LyricSplitStore {
+public:
+  void putAuto(LyricSplitEntry) override {}
+  void upsertManual(LyricSplitEntry) override {}
+  [[nodiscard]] std::optional<LyricSplitEntry> load(std::string_view, std::string_view, LyricSplitConvention) const override {
+    return std::nullopt;
+  }
+  void removeManual(std::string_view, std::string_view, LyricSplitConvention) override {}
+  void clearManual() override {}
+  [[nodiscard]] std::vector<LyricSplitEntry> listManual() const override { return {}; }
+  [[nodiscard]] std::string algoVersion() const override { return std::string{kLyricSplitAlgoVersion}; }
+};
+
+[[nodiscard]] std::shared_ptr<LyricSplitStore> makeNoopLyricSplitStore() {
+  return std::make_shared<NoopLyricSplitStore>();
+}
+
+[[nodiscard]] std::shared_ptr<LyricSplitStore> makeLyricSplitStore(std::filesystem::path databasePath) {
+  if (databasePath.empty()) {
+    return makeNoopLyricSplitStore();
+  }
+  return std::shared_ptr<LyricSplitStore>{makeSQLiteLyricSplitStore(
+      LyricSplitStoreConfig{.databasePath = std::move(databasePath)})};
+}
+
 [[nodiscard]] const char* backendKindText(metadata::MetadataBackendKind kind) {
   switch (kind) {
   case metadata::MetadataBackendKind::Noop:
@@ -135,6 +164,7 @@ MediaControllerDependencies makeDefaultMediaControllerDependencies() {
   dependencies.metadata = metadata::makeMetadataSharingService(metadata::MetadataSharingOptions{});
   dependencies.folderSortSettingsStore = makeNoopFolderSortSettingsStore();
   dependencies.appSettingsStore = makeNoopAppSettingsStore();
+  dependencies.lyricSplitStore = makeNoopLyricSplitStore();
   return dependencies;
 }
 
@@ -160,6 +190,7 @@ MediaControllerDependencies makeProductionMediaControllerDependencies(
   dependencies.scanner = scanner::makeFileScannerService(std::move(scannerDeps));
   dependencies.metadata = metadata::makeMetadataSharingService(makeProductionMetadataOptions());
   dependencies.folderSortSettingsStore = makeFolderSortSettingsStore(settingsDatabasePath);
+  dependencies.lyricSplitStore = makeLyricSplitStore(settingsDatabasePath);
   dependencies.appSettingsStore = makeAppSettingsStore(std::move(settingsDatabasePath));
   return dependencies;
 }
@@ -194,6 +225,9 @@ void normalizeMediaControllerDependencies(MediaControllerDependencies& dependenc
   }
   if (!dependencies.appSettingsStore) {
     dependencies.appSettingsStore = makeNoopAppSettingsStore();
+  }
+  if (!dependencies.lyricSplitStore) {
+    dependencies.lyricSplitStore = makeNoopLyricSplitStore();
   }
 }
 

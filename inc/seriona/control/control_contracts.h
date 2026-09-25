@@ -22,6 +22,7 @@ namespace seriona::control {
 
 class FolderSortSettingsStore;
 class AppSettingsStore;
+class LyricSplitStore;
 
 enum class PlaybackStatus {
   Stopped,
@@ -287,6 +288,8 @@ struct MediaControllerDependencies {
   std::shared_ptr<AppSettingsStore> appSettingsStore;
   // Optional artwork resolver; when null, artwork resolve intents are dropped.
   std::shared_ptr<ArtworkResolveService> artworkResolver;
+  // 歌词切分条目存储（内容寻址 auto/manual 表）；null 时读写安全降级。
+  std::shared_ptr<LyricSplitStore> lyricSplitStore;
 };
 
 enum class MediaControlCommandKind {
@@ -330,6 +333,16 @@ enum class MediaControlCommandKind {
   // 载荷=spectrumEnabled 字段）。纯门控转发至音频服务原子位（无 reducer 镜像、
   // 不触碰播放/均衡器状态，同 SetMuted/SetVolume 直转先例）。追加末尾保持兼容。
   SetSpectrumEnabled,
+  // 歌词切分命令（W2）：①改目标语言（载荷=lyricsTargetLanguage，取值限
+  // zh/ja/ko/en，非法值走命令拒绝路径）；②③对当前曲目单行手工纠错做增/删
+  // （载荷=lyricRawText + 原文译文 + lyricConvention，缺约定字段即拒绝）；
+  // ④清空手工纠错。四条均为控制层实现，追加末尾保持序列化兼容。
+  SetLyricsTargetLanguage,
+  UpsertLyricSplitCorrection,
+  RemoveLyricSplitCorrection,
+  // 全库语义（清空全部手工纠错），仅供 store 层单测使用，不供前端调用；前端的
+  // 「恢复自动识别」按当前曲目逐行走本组的增/删命令。追加末尾保持兼容。
+  ClearLyricSplitCorrections,
 };
 
 struct MediaControlCommand {
@@ -358,6 +371,17 @@ struct MediaControlCommand {
   std::optional<audio::EqualizerConfig> equalizerConfig;
   // SetSpectrumEnabled 载荷（R2）：频谱分析开关目标值。追加末尾保持序列化兼容。
   std::optional<bool> spectrumEnabled;
+  // 歌词切分命令载荷（W2）。全部追加末尾保持序列化兼容。
+  // 改目标语言的目标值（zh/ja/ko/en）。
+  std::optional<std::string> lyricsTargetLanguage;
+  // 单行手工纠错的键 = 清洗行（cleanLine 之后），取自 TrackLyricsSnapshot.lines[].text。
+  std::optional<std::string> lyricRawText;
+  // 纠错后的原文/译文。
+  std::optional<std::string> lyricOriginal;
+  std::optional<std::string> lyricTranslation;
+  // 本曲目的文档级约定（前端唯一来源 = TrackLyricsSnapshot.convention）。它是键的一部分，
+  // 缺该字段即拒绝本命令——绝不回退为控制层自行推断的约定。
+  std::optional<std::string> lyricConvention;
 };
 
 using PlayerStateSnapshotCallback = std::function<void(PlayerStateSnapshot)>;
@@ -433,5 +457,72 @@ enum class LyricSplitConvention {
 [[nodiscard]] std::string conventionToken(LyricSplitConvention convention);
 // 【原始记号】-> 枚举。未知记号（含已转义的 `W:\t` 字面反斜杠+t）返回 std::nullopt。
 [[nodiscard]] std::optional<LyricSplitConvention> conventionFromToken(std::string_view token);
+
+// ── 歌词切分条目（内容寻址 store 的持久化单元）────────────────────────────────
+// 追加在文件末尾的独立区块：既有 ordinal 与既有 payload 一律不变
+// （该头既有约定见上方 MediaControlCommand 的「Last member on purpose」注释）。
+// 自动结果与手工纠错【同型】，由 `source` 区分；键 = (rawText, targetLanguage,
+// convention, source) 四维（约定是必填维度，见 M2 实测）。
+
+enum class LyricSplitSource { Auto, Manual };
+
+struct LyricSplitEntry {           // 自动结果与手工纠错【同型】
+  std::string rawText;             // ★= 清洗行（cleanLine 之后）；内容寻址的键 + 管理列表展示
+  std::string targetLanguage;      // 'zh' / 'ja' / 'ko' / 'en'
+  LyricSplitConvention convention{LyricSplitConvention::None};  // ★ 文档级约定，必须在键内
+  std::string original;
+  std::string translation;         // 空串 = 显式「此行无译文」
+  LyricSplitSource source{LyricSplitSource::Auto};
+  std::string algoVersion;         // 见下「算法版本」；auto 行必填，manual 行空
+  // 该条目最后一次被写入的时间。**由 store 在 `putAuto`/`upsertManual` 内写 `system_clock::now()`**。
+  // 仅用于诊断/未来淘汰策略，**不参与键、不参与 `load` 的命中判定**（键仍是四维 + `algo_version`）。
+  std::chrono::system_clock::time_point updatedAt{};
+};
+
+// ── 当前曲目切分歌词（独立快照 + 订阅）────────────────────────────────────────
+// 追加在文件末尾的独立区块：既有 ordinal 与既有 payload 一律不变。
+
+// 译文位置策略：R7/D6 的内部扩展点。当前仅一种实现，不暴露为用户设置。
+enum class TranslationPosition { LastLanguageSegment };
+
+// 单行切分结果。刻意【不】复用 scanner::LyricLine：库树不切分（D21），
+// 往共享契约上加字段只会让全库每行白背 4 个空串并破坏无关消费者。
+struct SplitLyricLine {
+  std::chrono::milliseconds timestamp{0};
+  std::string text;          // ★= rawText 口径：cleanLine 之后的【清洗行】（不是文件原始行、不含时间戳/元数据）
+  std::string original;      // 原文；未切分时 == text
+  std::string translation;   // 译文；空 = 无
+  bool split{false};         // 是否成功切分
+  bool manualOverride{false};// 本行当前是否命中 manual 行（用户手工纠错）
+  // 被 manual 覆盖【之前】的自动判定结果 —— 仅当 `manualOverride == true` 时有意义，
+  // 供行级菜单的「查看本行自动判定」展示（D14 菜单第 4 项）；未覆盖时二者为空。
+  // 【零额外成本】：todo 26 的流程本就在切分/查表阶段先得到 auto 结果，此处只是把它留下。
+  std::string autoOriginal;
+  std::string autoTranslation;
+  // 【纠错管理列表的唯一来源】：列表 = 本快照中 `manualOverride == true` 的行。
+  // 不新增「全库读命令」，前端也不直接调用 store（`Seriona/AGENTS.md:36` 禁前端直连 DB）。
+  // 注意：这里【不】放 confidence。置信度只在算法层以字符串记号表示（LyricSplitResult.confidence）
+  // 并仅用于路由判定；快照不携带它（D24：不向用户暴露置信度）。
+};
+
+struct TrackLyricsSnapshot {
+  // 每次发布本快照都递增 `version` 并把 `sampledAt` 置为发布时间（同 `PlayerStateSnapshot` 的既有语义）。
+  // **不得**留空不动：恒为 `{0, {}}` 会让前端的刷新判定永远失效。
+  SnapshotFreshness freshness{};
+  std::string trackId;
+  std::string targetLanguage;   // 产出本结果时所用目标语言
+  // 本曲目的【文档级约定】（D18：整首推断一次）。约定是 storage key 的组成部分，
+  // 因此前端做单条 Upsert/Remove 时必须回传它 —— 这是本快照里约定的唯一来源
+  // （前端不再有 `listManual()` 通路）。
+  LyricSplitConvention convention{LyricSplitConvention::None};
+  TranslationPosition position{TranslationPosition::LastLanguageSegment};
+  std::vector<SplitLyricLine> lines;
+};
+
+// 当前曲目切分歌词的订阅面（M2 契约；归属 todo 27）。
+// 追加在本文件末尾独立区块：既有声明与既有 ordinal 一律不变。
+using TrackLyricsSnapshotCallback = std::function<void(TrackLyricsSnapshot)>;
+using TrackLyricsSubscriptionCallback = TrackLyricsSnapshotCallback;
+using TrackLyricsSubscriptionFactory = std::function<SubscriptionHandle(TrackLyricsSnapshotCallback)>;
 
 }

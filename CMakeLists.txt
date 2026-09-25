@@ -344,8 +344,10 @@ add_library(seriona_control STATIC
   src/control/playback_context_builder.cpp
   src/control/sqlite_app_settings_store.cpp
   src/control/sqlite_folder_sort_settings_store.cpp
+  src/control/sqlite_lyric_split_store.cpp
   src/control/subscription_store.cpp
   src/control/text_collation.cpp
+  src/control/track_lyrics_split.cpp
   src/control/tree_sort.cpp
 )
 

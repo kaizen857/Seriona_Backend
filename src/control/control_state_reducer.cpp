@@ -753,6 +753,13 @@ ControlReduction ControlStateReducer::reduceCommand(const MediaControlCommand& c
     return reject(MediaControllerErrorCode::InvalidCommand, "Delete commands must be handled by MediaController");
   case MediaControlCommandKind::ApplyFolderSortRules:
     return reject(MediaControllerErrorCode::InvalidCommand, "ApplyFolderSortRules must be handled by MediaController");
+  case MediaControlCommandKind::SetLyricsTargetLanguage:
+  case MediaControlCommandKind::UpsertLyricSplitCorrection:
+  case MediaControlCommandKind::RemoveLyricSplitCorrection:
+  case MediaControlCommandKind::ClearLyricSplitCorrections:
+    // 歌词切分命令涉及内容寻址存储 I/O 与重发布，必须经 MediaController（service 层）
+    // 执行；reducer 不直接做存储操作，也不承载目标语言状态。
+    return reject(MediaControllerErrorCode::InvalidCommand, "Lyrics commands must be handled by MediaController");
   }
 
   return reject(MediaControllerErrorCode::InvalidCommand, "Unsupported media control command");

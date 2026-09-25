@@ -218,7 +218,7 @@ void SubscriptionStore<Snapshot>::unsubscribe(std::size_t subscriptionId) noexce
 template <typename Snapshot>
 void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
   std::vector<std::pair<std::size_t, Callback>> deliveries;
-  {
+  try {
     std::lock_guard lock{state_->mutex};
     deliveries.reserve(state_->subscribers.size());
     for (const auto& [subscriptionId, subscriber] : state_->subscribers) {
@@ -226,6 +226,12 @@ void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
         deliveries.emplace_back(subscriptionId, subscriber.callback);
       }
     }
+  } catch (...) {
+    // 回调拷贝（std::function 目标拷贝、容器分配）可能抛出。控制命令路径
+    // submitCommand → rejectCommand → 通知发布没有捕获层，泄漏即逃出公共 API；
+    // 投递属尽力而为，故在此终结异常并只记账（subscriptionId 0 = 非单个订阅者）。
+    reportException(0, std::current_exception());
+    return;
   }
 
   const auto mode = state_->mode;
@@ -242,8 +248,113 @@ void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
     return;
   }
 
-  const auto worker = deliveryWorkerFor(state_.get());
+  std::shared_ptr<SubscriptionDeliveryWorker> worker;
+  try {
+    worker = deliveryWorkerFor(state_.get());
+  } catch (...) {
+    reportException(0, std::current_exception());
+    return;
+  }
   for (const auto& [subscriptionId, callback] : deliveries) {
+    // 逐订阅者隔离（C）：快照拷贝、weak_ptr 构造、lambda 捕获回调的拷贝、入队
+    // —— 任何一步抛出都只终结并记账该订阅者，不影响其它订阅者，也不外泄给
+    // publish 的调用方（submitCommand / 内部 seam 在发布路径上没有捕获层）。
+    try {
+      const auto snapshotCopy = snapshot;
+      const auto weakState = std::weak_ptr<State>{state_};
+      worker->submit([subscriptionId, callback, snapshotCopy, weakState] {
+      const auto lockedState = weakState.lock();
+      if (!lockedState) {
+        return;
+      }
+      {
+        std::lock_guard lock{lockedState->mutex};
+        const auto found = lockedState->subscribers.find(subscriptionId);
+        if (found == lockedState->subscribers.end() || !found->second.active) {
+          return;
+        }
+      }
+      try {
+        callback(snapshotCopy);
+      } catch (...) {
+        SubscriptionExceptionReporter reporter;
+        SubscriptionExceptionReport report{.subscriptionId = subscriptionId};
+        report.exception = std::current_exception();
+        {
+          std::lock_guard lock{lockedState->mutex};
+          report.totalExceptionCount = ++lockedState->exceptionCount;
+          reporter = lockedState->exceptionReporter;
+        }
+        if (reporter) {
+          reporter(report);
+        }
+      }
+      });
+    } catch (...) {
+      reportException(subscriptionId, std::current_exception());
+    }
+  }
+}
+
+template <typename Snapshot>
+std::size_t SubscriptionStore<Snapshot>::subscriberCount() const {
+  std::lock_guard lock{state_->mutex};
+  return state_->subscribers.size();
+}
+
+template <typename Snapshot>
+std::size_t SubscriptionStore<Snapshot>::exceptionCount() const {
+  std::lock_guard lock{state_->mutex};
+  return state_->exceptionCount;
+}
+
+template <typename Snapshot>
+void SubscriptionStore<Snapshot>::clear() noexcept {
+  try {
+    std::lock_guard lock{state_->mutex};
+    state_->subscribers.clear();
+  } catch (...) {
+    discardUnhandledException(std::current_exception());
+  }
+}
+
+template <typename Snapshot>
+typename SubscriptionStore<Snapshot>::Callback SubscriptionStore<Snapshot>::callbackFor(std::size_t subscriptionId) const {
+  try {
+    std::lock_guard lock{state_->mutex};
+    const auto found = state_->subscribers.find(subscriptionId);
+    if (found == state_->subscribers.end() || !found->second.active) {
+      return {};
+    }
+
+    return found->second.callback;
+  } catch (...) {
+    // 回调拷贝可能抛出：无回调可投递即返回空，不外泄给 subscribe/初投路径。
+    return {};
+  }
+}
+
+template <typename Snapshot>
+void SubscriptionStore<Snapshot>::invokeSubscriber(std::size_t subscriptionId, const Snapshot& snapshot) {
+  const auto callback = callbackFor(subscriptionId);
+  if (!callback) {
+    return;
+  }
+
+  if (state_->mode == SubscriptionDeliveryMode::Sync) {
+    try {
+      callback(snapshot);
+    } catch (...) {
+      reportException(subscriptionId, std::current_exception());
+    }
+    return;
+  }
+
+  // 初投路径与 publish 的异步分支同型（C）：获取 worker、快照拷贝、weak_ptr 构造、
+  // lambda 捕获回调的拷贝与入队全部在 try 内；任何一步抛出都终结并记账，不外泄给
+  // subscribe → 调用方（subscribeTrackLyrics 等）。
+  try {
+    const auto worker = deliveryWorkerFor(state_.get());
     const auto snapshotCopy = snapshot;
     const auto weakState = std::weak_ptr<State>{state_};
     worker->submit([subscriptionId, callback, snapshotCopy, weakState] {
@@ -274,89 +385,9 @@ void SubscriptionStore<Snapshot>::publish(const Snapshot& snapshot) {
         }
       }
     });
-  }
-}
-
-template <typename Snapshot>
-std::size_t SubscriptionStore<Snapshot>::subscriberCount() const {
-  std::lock_guard lock{state_->mutex};
-  return state_->subscribers.size();
-}
-
-template <typename Snapshot>
-std::size_t SubscriptionStore<Snapshot>::exceptionCount() const {
-  std::lock_guard lock{state_->mutex};
-  return state_->exceptionCount;
-}
-
-template <typename Snapshot>
-void SubscriptionStore<Snapshot>::clear() noexcept {
-  try {
-    std::lock_guard lock{state_->mutex};
-    state_->subscribers.clear();
   } catch (...) {
-    discardUnhandledException(std::current_exception());
+    reportException(subscriptionId, std::current_exception());
   }
-}
-
-template <typename Snapshot>
-typename SubscriptionStore<Snapshot>::Callback SubscriptionStore<Snapshot>::callbackFor(std::size_t subscriptionId) const {
-  std::lock_guard lock{state_->mutex};
-  const auto found = state_->subscribers.find(subscriptionId);
-  if (found == state_->subscribers.end() || !found->second.active) {
-    return {};
-  }
-
-  return found->second.callback;
-}
-
-template <typename Snapshot>
-void SubscriptionStore<Snapshot>::invokeSubscriber(std::size_t subscriptionId, const Snapshot& snapshot) {
-  const auto callback = callbackFor(subscriptionId);
-  if (!callback) {
-    return;
-  }
-
-  if (state_->mode == SubscriptionDeliveryMode::Sync) {
-    try {
-      callback(snapshot);
-    } catch (...) {
-      reportException(subscriptionId, std::current_exception());
-    }
-    return;
-  }
-
-  const auto worker = deliveryWorkerFor(state_.get());
-  const auto snapshotCopy = snapshot;
-  const auto weakState = std::weak_ptr<State>{state_};
-  worker->submit([subscriptionId, callback, snapshotCopy, weakState] {
-    const auto lockedState = weakState.lock();
-    if (!lockedState) {
-      return;
-    }
-    {
-      std::lock_guard lock{lockedState->mutex};
-      const auto found = lockedState->subscribers.find(subscriptionId);
-      if (found == lockedState->subscribers.end() || !found->second.active) {
-        return;
-      }
-    }
-    try {
-      callback(snapshotCopy);
-    } catch (...) {
-      SubscriptionExceptionReporter reporter;
-      SubscriptionExceptionReport report{.subscriptionId = subscriptionId};
-      report.exception = std::current_exception();
-      {
-        std::lock_guard lock{lockedState->mutex};
-        report.totalExceptionCount = ++lockedState->exceptionCount;
-        reporter = lockedState->exceptionReporter;
-      }
-      if (reporter) {
-        reporter(report);
-      }
-    }
-  });
 }
 
 template <typename Snapshot>
@@ -389,5 +420,6 @@ template class SubscriptionStore<LibraryStateSnapshot>;
 template class SubscriptionStore<ControlDomainNotification>;
 template class SubscriptionStore<audio::EqualizerStateSnapshot>;
 template class SubscriptionStore<audio::SpectrumSnapshot>;
+template class SubscriptionStore<TrackLyricsSnapshot>;
 
 }
