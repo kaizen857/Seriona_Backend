@@ -208,3 +208,24 @@ TEST_CASE("seek Loading suppression regression: seek keeps visible state while b
   CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Playing);
   CHECK(fixture.reducer.playerState().timeline.position == std::chrono::milliseconds{1500});
 }
+
+TEST_CASE("paused seek confirmation releases Loading suppression without hiding errors") {
+  ReducerFixture fixture{};
+  fixture.installLibrary();
+  fixture.selectTrack("a", "/music/a.flac");
+  fixture.reducer.reduceAudioEvent(fixture.stateEvent(audio::PlaybackState::Playing));
+  fixture.reduce(MediaControlCommandKind::Pause);
+  fixture.reducer.reduceAudioEvent(fixture.stateEvent(audio::PlaybackState::Paused));
+  fixture.reducer.reduceCommand(MediaControlCommand{.kind = MediaControlCommandKind::SeekTo,
+                                                    .position = std::chrono::milliseconds{1500}});
+  fixture.reducer.reduceAudioEvent(fixture.stateEvent(audio::PlaybackState::Loading));
+  CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Paused);
+  fixture.reducer.reduceAudioEvent(fixture.stateEvent(audio::PlaybackState::Paused));
+  CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Paused);
+  CHECK(fixture.reducer.playerState().timeline.position == std::chrono::milliseconds{1500});
+  fixture.reducer.reduceAudioEvent(fixture.stateEvent(audio::PlaybackState::Loading));
+  CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Loading);
+  fixture.reducer.reduceAudioEvent(fixture.errorEvent(audio::PlaybackErrorCode::SeekFailed, "seek failed"));
+  CHECK(fixture.reducer.playerState().playback.state == PlaybackStatus::Error);
+  CHECK(fixture.reducer.playerState().playback.errorCode == "SeekFailed");
+}

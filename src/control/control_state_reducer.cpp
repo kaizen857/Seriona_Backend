@@ -928,7 +928,8 @@ ControlReduction ControlStateReducer::reduceAudioEvent(const audio::BackendEvent
           } else {
             player_.playback.state = mappedState;
             spdlog::debug("state: {}", playbackStatusName(mappedState));
-            if (mappedState == PlaybackStatus::Playing || mappedState == PlaybackStatus::Stopped || mappedState == PlaybackStatus::Error) {
+            if (mappedState == PlaybackStatus::Playing || mappedState == PlaybackStatus::Paused ||
+                mappedState == PlaybackStatus::Stopped || mappedState == PlaybackStatus::Error) {
               visibleStateDuringSeek_.reset();
             }
           }
