@@ -1960,6 +1960,16 @@ add_test(NAME seriona.audio_output_device COMMAND seriona_audio_output_device_te
 add_test(NAME seriona.audio_output_device_envelope COMMAND seriona_audio_output_device_envelope_tests)
 add_test(NAME seriona.audio_output_device_dualsource COMMAND seriona_audio_output_device_dualsource_tests)
 add_test(NAME seriona.playback_clock COMMAND seriona_playback_clock_tests)
+add_executable(seriona_playback_seek_transaction_tests
+  audio/playback_seek_transaction_tests.cpp
+  ${PROJECT_SOURCE_DIR}/src/audio/playback_state_machine.cpp
+)
+target_compile_definitions(seriona_playback_seek_transaction_tests PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
+target_include_directories(seriona_playback_seek_transaction_tests PRIVATE ${PROJECT_SOURCE_DIR}/inc)
+target_link_libraries(seriona_playback_seek_transaction_tests PRIVATE seriona_third_party_headers spdlog::spdlog)
+seriona_enable_warnings(seriona_playback_seek_transaction_tests)
+add_test(NAME seriona.playback_seek_transaction COMMAND seriona_playback_seek_transaction_tests)
+
 add_test(NAME seriona.playback_state_machine COMMAND seriona_playback_state_machine_tests --test-case-exclude=*cancellation*)
 add_test(NAME seriona.playback_state_machine_cancellation COMMAND seriona_playback_state_machine_tests --test-case=*cancellation*)
 add_test(NAME seriona.audio_event_dispatcher COMMAND seriona_audio_event_dispatcher_tests)

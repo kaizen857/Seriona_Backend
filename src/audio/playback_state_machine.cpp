@@ -32,8 +32,7 @@ void PlaybackStateMachine::loadTrack(const TrackPlaybackRequest& request) {
   ++generation_;
   currentTrack_ = request;
   hasTrack_ = true;
-  pendingSeekBefore_.reset();
-  pendingSeekAfter_.reset();
+  pendingSeek_.reset();
   clock_ = makeClock(request.offset.value_or(std::chrono::milliseconds{0}), false);
   changeState(PlaybackState::Loading);
   emitTrackChanged(currentTrack_);
@@ -50,8 +49,7 @@ void PlaybackStateMachine::completeLoad() {
 
 void PlaybackStateMachine::fail(PlaybackErrorCode code, std::string message, std::string detail) {
   ++generation_;
-  pendingSeekBefore_.reset();
-  pendingSeekAfter_.reset();
+  pendingSeek_.reset();
   changeState(PlaybackState::Error);
   emitError(code, std::move(message), std::move(detail));
 }
@@ -75,10 +73,9 @@ void PlaybackStateMachine::pause() {
   // 后控制层补发 pause 以保持暂停，物理上无副作用；重复 pause 仍被拒绝。
   if (state_ == PlaybackState::Playing || state_ == PlaybackState::Draining ||
       state_ == PlaybackState::Ready ||
-      (state_ == PlaybackState::Loading && pendingSeekAfter_.has_value())) {
+      (state_ == PlaybackState::Loading && pendingSeek_.has_value())) {
     clock_.continuous = false;
-    pendingSeekBefore_.reset();
-    pendingSeekAfter_.reset();
+    pendingSeek_.reset();
     changeState(PlaybackState::Paused);
     return;
   }
@@ -98,8 +95,7 @@ void PlaybackStateMachine::resume() {
 
 void PlaybackStateMachine::stop() {
   ++generation_;
-  pendingSeekBefore_.reset();
-  pendingSeekAfter_.reset();
+  pendingSeek_.reset();
   clock_.continuous = false;
   changeState(PlaybackState::Stopped);
 }
@@ -116,30 +112,27 @@ std::uint64_t PlaybackStateMachine::beginSeek(std::chrono::milliseconds position
 
   ++generation_;
   const bool wasContinuous = state_ == PlaybackState::Playing;
-  pendingSeekBefore_ = clock_;
-  pendingSeekAfter_ = makeClock(position, wasContinuous);
-  clock_ = *pendingSeekAfter_;
+  pendingSeek_ = PendingSeek{state_, clock_, makeClock(position, wasContinuous)};
+  clock_ = pendingSeek_->after;
   changeState(PlaybackState::Loading);
   return generation_;
 }
 
 void PlaybackStateMachine::cancelSeek(PlaybackErrorCode code, std::string message, std::string detail) {
-  if (!pendingSeekBefore_ || !pendingSeekAfter_ || state_ != PlaybackState::Loading) {
+  if (!pendingSeek_ || state_ != PlaybackState::Loading) {
     emitError(code, std::move(message), std::move(detail));
     return;
   }
 
-  const auto previous = *pendingSeekBefore_;
-  const auto rollbackState = previous.continuous ? PlaybackState::Playing : PlaybackState::Ready;
-  clock_ = previous;
-  pendingSeekBefore_.reset();
-  pendingSeekAfter_.reset();
-  changeState(rollbackState);
+  const auto pending = *pendingSeek_;
+  clock_ = pending.before;
+  pendingSeek_.reset();
+  changeState(pending.restoreState);
   emitError(code, std::move(message), std::move(detail));
 }
 
 void PlaybackStateMachine::completeSeek(std::uint64_t generation) {
-  if (generation != generation_) {
+  if (generation != generation_ || !pendingSeek_) {
     return;
   }
 
@@ -147,16 +140,15 @@ void PlaybackStateMachine::completeSeek(std::uint64_t generation) {
 }
 
 void PlaybackStateMachine::completeSeek() {
-  if (!pendingSeekBefore_ || !pendingSeekAfter_ || state_ != PlaybackState::Loading) {
+  if (!pendingSeek_ || state_ != PlaybackState::Loading) {
     emitError(PlaybackErrorCode::SeekFailed, "completeSeek requires a pending seek", "illegal transition");
     return;
   }
 
-  const bool resumePlayback = pendingSeekAfter_->continuous;
-  emitPositionDiscontinuity(*pendingSeekBefore_, *pendingSeekAfter_, "seek");
-  pendingSeekBefore_.reset();
-  pendingSeekAfter_.reset();
-  changeState(resumePlayback ? PlaybackState::Playing : PlaybackState::Ready);
+  const auto pending = *pendingSeek_;
+  emitPositionDiscontinuity(pending.before, pending.after, "seek");
+  pendingSeek_.reset();
+  changeState(pending.restoreState);
 }
 
 void PlaybackStateMachine::naturalEnd() {
@@ -184,7 +176,7 @@ std::uint64_t PlaybackStateMachine::generation() const { return generation_; }
 PlaybackClockSnapshot PlaybackStateMachine::clock() const { return clock_; }
 
 bool PlaybackStateMachine::hasPendingSeek() const {
-  return pendingSeekBefore_.has_value() || pendingSeekAfter_.has_value();
+  return pendingSeek_.has_value();
 }
 
 void PlaybackStateMachine::changeState(PlaybackState nextState) {

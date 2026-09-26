@@ -1741,37 +1741,32 @@ TEST_CASE("audio_player_t11 seek: seek while paused stays instant even with fade
   const auto eventsAtSeek = player.events.size();
   player.player.seek(900ms);
 
-  // 事件立即发出（无需驱动：暂停 seek 瞬时路径不依赖包络推进）。但 Loading→PD→Ready
-  // 由 worker 分次 push（互斥日志），Loading 与 PD 之间隔着 fillQueue 解码（耗时窗口）——
-  // 只等日志增长会停在 Loading 后、PD/Ready 未入列的半途快照（间歇 sawReady=false /
-  // PD==0）。等 Ready（序列终态：completeSeek 内 PD 先于 Ready 连续入列，见 Ready ⇒
-  // PD 必已入列，快照完整）。
+  // 等本次 seek 的最终 Paused 事件，避免在 worker 解码期间读取仅含 Loading 的快照。
   REQUIRE(waitUntil([&] {
     const auto snapshot = player.events.snapshot();
     return std::any_of(snapshot.begin() + static_cast<std::ptrdiff_t>(eventsAtSeek), snapshot.end(),
                        [](const BackendEvent& event) {
                          return event.type == BackendEventType::PlaybackStateChanged &&
-                                std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Ready;
+                                std::get<PlaybackStateChanged>(event.payload).state == PlaybackState::Paused;
                        });
   }));
   const auto postSeek = player.events.snapshot();
   REQUIRE(postSeek.size() > eventsAtSeek);
-  // Loading→（PD）→ Ready（暂停 seek 非连续 → 完成后 Ready；后续 play 再回 Playing）。
   bool sawLoading = false;
-  bool sawReady = false;
+  bool sawPaused = false;
   for (std::size_t i = eventsAtSeek; i < postSeek.size(); ++i) {
     if (postSeek[i].type == BackendEventType::PlaybackStateChanged) {
       const auto& change = std::get<PlaybackStateChanged>(postSeek[i].payload);
       if (change.state == PlaybackState::Loading) {
         sawLoading = true;
       }
-      if (change.state == PlaybackState::Ready) {
-        sawReady = true;
+      if (change.state == PlaybackState::Paused) {
+        sawPaused = true;
       }
     }
   }
   CHECK(sawLoading);
-  CHECK(sawReady);
+  CHECK(sawPaused);
   const auto postSeekWindow = postSeek.begin() + static_cast<std::ptrdiff_t>(eventsAtSeek);
   CHECK(std::count_if(postSeekWindow, postSeek.end(), [](const BackendEvent& event) {
           return event.type == BackendEventType::PositionDiscontinuity;
@@ -1787,8 +1782,7 @@ TEST_CASE("audio_player_t11 seek: seek while paused stays instant even with fade
   CHECK(frozen.position >= 895ms);
   CHECK(frozen.position <= 905ms);
 
-  // 可继续 play（Ready → Playing），位置从 seek 目标续走。
-  player.player.play();
+  player.player.resume();
   REQUIRE(waitUntil([&] {
     const auto states = statesFrom(player.events.snapshot());
     return !states.empty() && states.back() == PlaybackState::Playing;
@@ -2428,4 +2422,3 @@ TEST_CASE("audio_player_t13 manual switch: pause during FullCrossfade overlap ab
 }
 
 }  // namespace seriona::audio
-

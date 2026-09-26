@@ -55,8 +55,12 @@ private:
   TrackPlaybackRequest currentTrack_{};
   bool hasTrack_{false};
   PlaybackClockSnapshot clock_{};
-  std::optional<PlaybackClockSnapshot> pendingSeekBefore_{};
-  std::optional<PlaybackClockSnapshot> pendingSeekAfter_{};
+  struct PendingSeek {
+    PlaybackState restoreState;
+    PlaybackClockSnapshot before;
+    PlaybackClockSnapshot after;
+  };
+  std::optional<PendingSeek> pendingSeek_{};
 };
 
 }
